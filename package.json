@@ -1,0 +1,28 @@
+{
+  "name": "crosschain",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A minimal proof-of-stake blockchain with Tendermint consensus, built from first principles as a learning tool.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "localnet": "node scripts/localnet.ts",
+    "cli": "node src/cli.ts",
+    "bench": "node --expose-gc bench/run.ts",
+    "bench:genesis": "node --expose-gc bench/run.ts genesis scale"
+  },
+  "dependencies": {
+    "@noble/post-quantum": "^0.7.1",
+    "lmdb": "^3.5.9",
+    "stream-json": "^3.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5"
+  }
+}
