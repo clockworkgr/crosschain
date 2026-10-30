@@ -70,7 +70,7 @@ export interface NodeConfig {
   log?: Logger;
   logLevel?: LogLevel;
   /** Heap thresholds and sampling for the memory guard (see memory.ts); tests inject their own `stats`. */
-  memory?: Partial<Omit<MemoryGuardOptions, 'log' | 'onLevel'>>;
+  memory?: Partial<Omit<MemoryGuardOptions, 'log' | 'onLevel' | 'onSample'>>;
   /** Collection scheduling after commits; `gc: null` turns it off. */
   gc?: Partial<Omit<GcSchedulerOptions, 'log'>>;
 }
@@ -266,7 +266,21 @@ export class Node {
     if (this.app instanceof CoreApp && this.cfg.limits?.maxEvidenceAgeMs === undefined) limits.maxEvidenceAgeMs = this.app.stakingParameters().unbondingPeriodMs;
 
     this.gcScheduler = new GcScheduler({ log: this.log, ...this.cfg.gc });
-    this.memoryGuard = new MemoryGuard({ log: this.log, ...this.cfg.memory, onLevel: (level, stats) => this.onMemoryLevel(level, stats) });
+    this.memoryGuard = new MemoryGuard({
+      log: this.log,
+      ...this.cfg.memory,
+      onLevel: (level, stats) => this.onMemoryLevel(level, stats),
+      onSample: (level, stats) => {
+        if (!(this.app instanceof CoreApp)) return;
+        const est = this.app.db.rebuildEstimate();
+        if (est.indexTrees === 0 && est.trees === 0) return;
+        // While something is dropped, the heap of the last few samples: garbage between collections included, since
+        // that is what the levels are taken from.
+        this.recentHeap.push(stats.heapUsed);
+        if (this.recentHeap.length > Node.REBUILD_WINDOW) this.recentHeap.shift();
+        if (level === 'ok') this.rebuildWhatFits(stats);
+      },
+    });
 
     this.consensus = new Consensus({
       chainId: this.chainId,
@@ -459,13 +473,60 @@ export class Node {
     if (this.app instanceof CoreApp) {
       const db = this.app.db;
       db.setHotLimit(Node.HOT_OBJECTS[level]);
-      // The second dial: from `pressure` on the index trees are dropped and every index read goes to LMDB through
-      // the overlay of the block in progress; back at `ok` they are rebuilt from LMDB. `warn` leaves them as they are.
-      if (level === 'pressure' || level === 'critical') db.dropIndexTrees();
-      else if (level === 'ok') db.rebuildIndexTrees();
+      // The second and third dials: from `pressure` on the index trees are dropped, every index read going to LMDB
+      // through the overlay of the block in progress, and then the Merkle trees, every root and proof reading its
+      // paths from LMDB (STATE-PAGING.md section 7); back at `ok` both are rebuilt from LMDB. `warn` leaves them.
+      if (level === 'pressure' || level === 'critical') {
+        db.dropIndexTrees();
+        db.dropTrees();
+        this.deferredRebuild = null;
+        this.recentHeap = [];
+      }
     }
     this.shed(level === 'pressure' || level === 'critical');
     for (const fn of this.memoryListeners) fn(level, stats);
+  }
+
+  /** What the last deferred rebuild was waiting for, so the log says it once rather than at every sample. */
+  private deferredRebuild: string | null = null;
+  /** Heap used at each guard sample since the last drop, the latest REBUILD_WINDOW of them. */
+  private recentHeap: number[] = [];
+  /** How many samples after a drop the heap is watched before anything is rebuilt: ten seconds at the default interval. */
+  static readonly REBUILD_WINDOW = 10;
+
+  /**
+   * At `ok`, rebuild what was dropped, but only what fits: dropping can take the heap from above the pressure line to
+   * below the ok line in one go, and rebuilding all of it then would take it straight back, and the node would drop
+   * and rebuild at every sample. One sample is not enough to judge by either: right after a major collection the heap
+   * reads a few hundred MiB lower than it will a second later. So nothing is rebuilt until REBUILD_WINDOW samples
+   * have been seen since the drop, and then a tier is rebuilt when its estimated heap
+   * (ObjectDatabase.rebuildEstimate) fits under the warn line beside the highest of those samples, the index trees
+   * first; otherwise it stays dropped, which the node runs fine on, and the guard asks again at every sample while
+   * the level is `ok`.
+   */
+  private rebuildWhatFits(stats: MemoryStats): void {
+    if (!(this.app instanceof CoreApp)) return;
+    const db = this.app.db;
+    const est = db.rebuildEstimate();
+    if (est.indexTrees === 0 && est.trees === 0) return;
+    if (this.recentHeap.length < Node.REBUILD_WINDOW) return;
+    const peak = Math.max(...this.recentHeap);
+    let room = this.memoryGuard.o.warnAt * stats.heapLimit - peak;
+    if (est.indexTrees > 0 && est.indexTrees <= room) {
+      db.rebuildIndexTrees();
+      room -= est.indexTrees;
+      // The samples from before it do not count for the next tier: the heap is larger by that much now.
+      this.recentHeap = this.recentHeap.map((h) => h + est.indexTrees);
+      this.log('info', 'memory: index trees rebuilt', { estimate: `${Math.round(est.indexTrees / 1048576)} MiB` });
+    }
+    if (est.trees > 0 && est.trees <= room) {
+      db.rebuildTrees();
+      this.log('info', 'memory: Merkle trees rebuilt', { estimate: `${Math.round(est.trees / 1048576)} MiB` });
+    }
+    const left = db.rebuildEstimate();
+    const waiting = left.indexTrees + left.trees > 0 ? `${Math.round((left.indexTrees + left.trees) / 1048576)} MiB` : null;
+    if (waiting && waiting !== this.deferredRebuild) this.log('info', 'memory: staying paged until the heap has room to rebuild', { needs: waiting, room: `${Math.round(Math.max(0, room) / 1048576)} MiB` });
+    this.deferredRebuild = waiting;
   }
 
   private shed(on: boolean): void {

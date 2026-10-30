@@ -5,7 +5,8 @@
  *   npm run bench -- db app       # only these suites
  *
  * Suites: crypto, codec, db, store, app, network, and genesis (npm run
- * bench:genesis; a large genesis file, minutes). Numbers are for one
+ * bench:genesis; a large genesis file, minutes), scale and paging (the same
+ * large state, run through the memory guard's modes). Numbers are for one
  * process on one machine; the network suite runs four validators in that
  * process, so it measures the engine and the application, not the wire.
  */
@@ -20,9 +21,10 @@ const suites: Record<string, () => Promise<void>> = {
   network: async () => (await import('./network.bench.ts')).run(),
   genesis: async () => (await import('./genesis.bench.ts')).run(),
   scale: async () => (await import('./scale.bench.ts')).run(),
+  paging: async () => (await import('./paging.bench.ts')).run(),
 };
 
-/** The genesis and scale suites each build a gigabyte of state and take minutes, so they run only when asked. */
+/** The genesis, scale and paging suites each build a gigabyte of state and take minutes, so they run only when asked. */
 const DEFAULT_SUITES = ['crypto', 'codec', 'db', 'store', 'app', 'network'];
 
 const wanted = process.argv.slice(2).filter((a) => !a.startsWith('-'));

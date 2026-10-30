@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { CoreApp } from '../src/app/core/app.ts';
+import { CoreApp, openObjectDatabase } from '../src/app/core/app.ts';
 import { makeAuthority, type Authority } from '../src/app/core/authority.ts';
 import { signedTxBytes, signTransaction, withFees } from '../src/app/core/client.ts';
 import { appGenesisBytes, authorityJson, DEFAULT_FEES } from '../src/app/core/genesis.ts';
@@ -323,10 +323,17 @@ describe('core application: index entries in the store', () => {
   const INDEX = Uint8Array.of(0x69);
   const stored = (kv: MemoryKv) => [...kv.range(INDEX, prefixEnd(INDEX))].map(([k, v]) => `${toHex(k)}=${toHex(v)}`);
   const live = (app: CoreApp) => [...app.db.indexEntries()].map(([k, v]) => `${toHex(k)}=${toHex(v)}`);
-  /** The store holds exactly the entries the indices hold, and, where the trees are resident, agrees with them entry by entry. */
+  const TREES = [Uint8Array.of(0x6e), Uint8Array.of(0x74)];
+  const storedTrees = (kv: MemoryKv) => TREES.flatMap((p) => [...kv.range(p, prefixEnd(p))]).map(([k, v]) => `${toHex(k)}=${toHex(v)}`).sort();
+  const liveTrees = (app: CoreApp) => [...app.db.treeEntries()].map(([k, v]) => `${toHex(k)}=${toHex(v)}`).sort();
+  /**
+   * The store holds exactly the entries the indices hold, and, where the trees are resident, agrees with them entry
+   * by entry; and it holds the Merkle trees' chunks and nodes as the database has them.
+   */
   const consistent = (app: CoreApp, kv: MemoryKv) => {
     expect(stored(kv)).toEqual(live(app));
     expect(app.db.checkIndexStore()).toEqual([]);
+    expect(storedTrees(kv)).toEqual(liveTrees(app));
   };
 
   it('writes the entries with every commit, reopens from them, and fills in a store that predates them', async () => {
@@ -398,8 +405,103 @@ describe('core application: index entries in the store', () => {
     const kv = new MemoryKv();
     CoreApp.writeImportedState(kv, imported, app.lastHeight, app.lastAppHash);
     expect(stored(kv)).toEqual(live(app));
+    expect(storedTrees(kv)).toEqual(liveTrees(app));
     const synced = makeApp(kv);
     expect(toHex(synced.lastAppHash)).toBe(toHex(app.lastAppHash));
     consistent(synced, kv);
+  });
+  it('writes the trees with every commit and restarts from them, with the proofs of the original', async () => {
+    const kv = new MemoryKv();
+    const app = makeApp(kv);
+    const twin = makeApp();
+    const both = async (txs: Uint8Array[]) => {
+      const [a, b] = [await block(app, txs), await block(twin, txs)];
+      expect(toHex(a.appHash)).toBe(toHex(b.appHash));
+    };
+    consistent(app, kv);
+    await both([tx([createOp('alice', makeAuthority([alice.publicKey]))]), tx([createOp('bob', makeAuthority([bob.publicKey]))])]);
+    const aliceId = app.accountByName('alice')!.id;
+    const bobId = app.accountByName('bob')!.id;
+    await both([tx([transferOp(FAUCET_ID, aliceId, 5000n)]), tx([transferOp(FAUCET_ID, bobId, 5000n)])]);
+    await both([tx([transferOp(aliceId, bobId, 10n)], [alice]), tx([createOp('carol', makeAuthority([carol.publicKey]))])]);
+    consistent(app, kv);
+    const proofsOf = (a: CoreApp) => {
+      const out: string[] = [];
+      for (let h = a.lowestProvableHeight; h <= a.lastHeight; h++) {
+        for (const id of [FAUCET_ID, aliceId, bobId, objectId(TYPE.account, 9), objectId(TYPE.balance, 2)]) out.push(toHex(proofBytesAt(a, id, h)));
+        for (const name of ['alice', 'carol', 'nobody']) out.push(toHex(keyProofToBytes(a.proveAccountName(name, h))));
+      }
+      return out;
+    };
+    // From the chunks and nodes: the same hash and every proof in the window as the instance that wrote them.
+    const reopened = makeApp(kv);
+    expect(toHex(reopened.lastAppHash)).toBe(toHex(app.lastAppHash));
+    expect(proofsOf(reopened)).toEqual(proofsOf(app));
+    consistent(reopened, kv);
+    // Recomputing from the objects instead comes to the same, and so does taking the trees and hashing every leaf.
+    for (const opts of [{ fromTrees: false }, { checkLeaves: true }, { trees: false }]) {
+      const opened = openObjectDatabase(kv, CORE_TYPES, { retainVersions: 4, ...opts })!;
+      expect(toHex(opened.appHash)).toBe(toHex(app.lastAppHash));
+      for (let h = opened.db.lowestVersion; h <= opened.db.currentVersion; h++) expect(toHex(proofToBytes(opened.db.proofAt(aliceId, h)))).toBe(toHex(proofBytesAt(app, aliceId, BigInt(h))));
+    }
+    // A leaf that does not match its object is caught when the leaves are checked.
+    const tampered = new MemoryKv();
+    tampered.write((w) => {
+      for (const [k, v] of kv.range(new Uint8Array([0]), new Uint8Array([0xff]))) w.put(k, v);
+      w.put(key((k) => k.u8(0x6f).u64(aliceId)), kv.get(key((k) => k.u8(0x6f).u64(bobId)))!);
+    });
+    expect(() => openObjectDatabase(tampered, CORE_TYPES, { retainVersions: 4, checkLeaves: true })).toThrow(/does not hash to its leaf/);
+    expect(() => openObjectDatabase(tampered, CORE_TYPES, { retainVersions: 4, fromTrees: false })).toThrow(/do not hash to the stored app hash/);
+    // The reopened app keeps producing the hashes of one that never stopped.
+    const txs = [tx([transferOp(bobId, aliceId, 3n)], [bob])];
+    const [r1, r2] = [await block(reopened, txs), await block(twin, txs)];
+    expect(toHex(r1.appHash)).toBe(toHex(r2.appHash));
+    consistent(reopened, kv);
+
+    // A store written before the trees were has none: opening it computes them and writes them once.
+    const old = new MemoryKv();
+    old.write((w) => {
+      for (const [k, v] of kv.range(new Uint8Array([0]), new Uint8Array([0xff]))) if (k[0] !== 0x74 && k[0] !== 0x6e) w.put(k, v);
+    });
+    expect(storedTrees(old)).toEqual([]);
+    const migrated = makeApp(old);
+    expect(toHex(migrated.lastAppHash)).toBe(toHex(reopened.lastAppHash));
+    expect(storedTrees(old)).toEqual(storedTrees(kv));
+    consistent(migrated, old);
+  });
+
+  it('runs blocks with the Merkle trees dropped and rebuilt, with the hashes and proofs of an app that keeps them', async () => {
+    const kv = new MemoryKv();
+    const paged = makeApp(kv);
+    const resident = makeApp();
+    const both = async (txs: Uint8Array[]) => {
+      const [a, b] = [await block(paged, txs), await block(resident, txs)];
+      expect(toHex(a.appHash)).toBe(toHex(b.appHash));
+      expect(a.txResults).toEqual(b.txResults);
+      for (let h = resident.lowestProvableHeight; h <= resident.lastHeight; h++) {
+        expect(toHex(proofBytesAt(paged, FAUCET_ID, h))).toBe(toHex(proofBytesAt(resident, FAUCET_ID, h)));
+        for (const name of ['alice', 'bob']) expect(toHex(keyProofToBytes(paged.proveAccountName(name, h)))).toBe(toHex(keyProofToBytes(resident.proveAccountName(name, h))));
+      }
+    };
+    paged.db.dropTrees();
+    paged.db.dropIndexTrees();
+    expect(paged.db.memory()).toMatchObject({ trees: 'dropped', indexTrees: 'dropped' });
+    await both([tx([createOp('alice', makeAuthority([alice.publicKey]))])]);
+    const aliceId = paged.accountByName('alice')!.id;
+    // Checked against the pending session while everything is dropped, as admission would be.
+    expect((await paged.checkTx(tx([createOp('alice', makeAuthority([carol.publicKey]))]))).error).toMatch(/taken/);
+    expect((await paged.checkTx(tx([transferOp(FAUCET_ID, aliceId, 1n)]))).ok).toBe(true);
+    await both([tx([transferOp(FAUCET_ID, aliceId, 5000n)]), tx([createOp('bob', makeAuthority([bob.publicKey]))])]);
+    paged.db.rebuildTrees();
+    await both([tx([transferOp(aliceId, FAUCET_ID, 7n)], [alice])]);
+    consistent(paged, kv);
+    // Dropped in the middle of a block's pending writes: the mempool's session is open between blocks.
+    expect((await paged.checkTx(tx([createOp('dave', makeAuthority([dave.publicKey]))]))).ok).toBe(true);
+    paged.db.dropTrees();
+    await both([tx([createOp('carol', makeAuthority([carol.publicKey]))])]);
+    expect(storedTrees(kv)).toEqual(liveTrees(resident));
+    paged.db.rebuildTrees();
+    paged.db.rebuildIndexTrees();
+    consistent(paged, kv);
   });
 });

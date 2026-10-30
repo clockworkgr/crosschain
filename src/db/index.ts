@@ -39,7 +39,8 @@
  * An index marked `authenticated` (unique only) also keeps a sparse Merkle
  * tree (smt.ts) over its keys, whose root goes into the type's leaf in the
  * state root, so a key can be proven present or absent. Those trees are
- * tier three and stay resident whatever happens to the B+ trees.
+ * tier three: the database drops and rebuilds them with the dense trees,
+ * whatever happens to the B+ trees, and they take the same writes either way.
  */
 import { decode, type Reader } from '../codec/reader.ts';
 import type { Writer } from '../codec/writer.ts';
@@ -51,7 +52,7 @@ import type { Arena } from './arena.ts';
 import { BPlusTree } from './bptree.ts';
 import { deepFreeze } from './freeze.ts';
 import { afterPrefix, EMPTY_VALUE, entryKey, INDEX_HEADER, indexHeader, overlaid, until, type IndexEntryChange, type IndexStore } from './indexstore.ts';
-import { SparseMerkleTree } from './smt.ts';
+import { nodeHeader, SparseMerkleTree } from './smt.ts';
 
 export class DbError extends Error {
   constructor(message: string) {
@@ -85,6 +86,9 @@ export const MAX_INSTANCE = 2 ** 32 - 2;
 export interface HotBudget {
   limit: number;
   size: number;
+  /** Reads answered from the cache, and reads that decoded from the arena, since the database was made. */
+  hits: number;
+  misses: number;
 }
 
 /** One secondary index: its definition, where its entries live in the store, and its tree or, while that is dropped, its overlay. */
@@ -142,6 +146,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
   /** Secondary indices in definition order (an index's position is its place here), and by name. */
   private readonly secondary: Secondary<T>[] = [];
   private readonly byName = new Map<string, Secondary<T>>();
+  private readonly retain: number;
   /** Arena reference of each committed instance (-1 when absent) and its encoding's length. */
   private refs = new Float64Array(0);
   private lens = new Uint32Array(0);
@@ -159,9 +164,12 @@ export class TypeIndex<T extends { id: ObjectId }> {
    * value and index the new one); kept, they make a root's index changes a comparison instead of a re-encoding.
    */
   private readonly dirtyKeys = new Map<number, DirtyKeys>();
+  /** Objects the arena holds a committed encoding for: each has one entry in every index, for estimates. */
+  committedCount = 0;
 
   constructor(type: ObjectType<T>, retainVersions: number, arena: Arena, budget: HotBudget, base: IndexStore, resident = true) {
     this.type = type;
+    this.retain = retainVersions;
     this.arena = arena;
     this.budget = budget;
     this.base = base;
@@ -173,14 +181,21 @@ export class TypeIndex<T extends { id: ObjectId }> {
       this.byName.set(ix.name, s);
       if (ix.authenticated) {
         if (!ix.unique) throw new Error(`${type.name}.${ix.name}: only unique indices can be authenticated`);
-        this.trees.set(ix.name, new SparseMerkleTree(retainVersions));
+        this.trees.set(ix.name, new SparseMerkleTree(retainVersions, nodeHeader(type.id, position)));
         this.authenticated.push(ix.name);
       }
     });
   }
 
-  /** Replace an authenticated index's tree, after a rebuild with history. */
+  /** An empty sparse tree for an authenticated index, keyed in the store as the index's own is. */
+  freshTree(name: string): SparseMerkleTree {
+    return new SparseMerkleTree(this.retain, nodeHeader(this.type.id, this.secondary.indexOf(this.secondaryIndex(name))));
+  }
+
+  /** Replace an authenticated index's tree, after a rebuild with history; if the old one was dropped, so is the new one. */
   replaceTree(name: string, tree: SparseMerkleTree): void {
+    const source = this.trees.get(name)?.dropSource;
+    if (source) tree.drop(source);
     this.trees.set(name, tree);
   }
 
@@ -268,9 +283,11 @@ export class TypeIndex<T extends { id: ObjectId }> {
     if (v !== undefined) {
       // A cached object, or a tombstone (null), which reads as absent.
       this.touched[instance] = 1;
+      this.budget.hits++;
       return v ?? undefined;
     }
     if (this.refAt(instance) < 0) return undefined;
+    this.budget.misses++;
     const obj = this.decodeAt(instance);
     this.cache(instance, obj);
     return obj;
@@ -424,15 +441,17 @@ export class TypeIndex<T extends { id: ObjectId }> {
     this.ensure(instance);
     this.refs[instance] = this.arena.alloc(this.type.id, instance, bytes);
     this.lens[instance] = bytes.length;
+    this.committedCount++;
   }
 
   /**
-   * After importBytes: fill the sparse trees, and the B+ trees when resident, from the store's entries. They come
-   * in key order, which is the B+ tree's cheapest order to grow in.
+   * After importBytes: fill the B+ trees when resident, and the sparse trees unless `sparse` is false (their nodes
+   * were loaded from the store), from the store's entries. They come in key order, which is the B+ tree's cheapest
+   * order to grow in.
    */
-  loadIndexEntries(): void {
+  loadIndexEntries(sparse = true): void {
     for (const s of this.secondary) {
-      const smt = this.trees.get(s.def.name);
+      const smt = sparse ? this.trees.get(s.def.name) : undefined;
       if (!s.tree && !smt) continue;
       for (const [k, v] of this.base.range(s.header, afterPrefix(s.header)!)) {
         const key = k.subarray(INDEX_HEADER);
@@ -545,9 +564,13 @@ export class TypeIndex<T extends { id: ObjectId }> {
    */
   flush(instance: number, bytes: Uint8Array | null): void {
     const old = this.refAt(instance);
-    if (old >= 0) this.arena.free(old);
+    if (old >= 0) {
+      this.arena.free(old);
+      this.committedCount--;
+    }
     this.ensure(instance);
     if (bytes) {
+      this.committedCount++;
       this.refs[instance] = this.arena.alloc(this.type.id, instance, bytes);
       this.lens[instance] = bytes.length;
     } else {
@@ -600,6 +623,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
     this.pinned.clear();
     this.dirtyKeys.clear();
     this.nextInstance = 0;
+    this.committedCount = 0;
     for (const s of this.secondary) {
       s.tree?.clear();
       s.overlay?.clear();

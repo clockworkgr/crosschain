@@ -31,6 +31,16 @@
  * the application writes, given as `indexStore`; between a root and the
  * application's write of it (dropChanges) the root's own changes are laid
  * over that store, so a read never sees an index older than the objects.
+ *
+ * The trees are reported the same way (STATE-PAGING.md section 5): each
+ * root lists the dense trees' chunks and the sparse trees' nodes it changed,
+ * and the store keeps them beside the objects. dropTrees() lets every tree
+ * go at once, dense and sparse together, since one dial is all the guard
+ * needs: roots, proofs and key proofs then read the store, the dense chunks
+ * through a small shared LRU (treeChunks), and give the same answers. The
+ * history of past versions stays in memory either way. rebuildTrees() reads
+ * them back. A restart can take the trees from the store too (loadTrees)
+ * instead of hashing every object and inserting every key again.
  */
 import { decode, type Reader } from '../codec/reader.ts';
 import { encode, type Writer } from '../codec/writer.ts';
@@ -41,7 +51,7 @@ import { deepFreeze } from './freeze.ts';
 import { DbError, TypeIndex, type HotBudget, type ObjectType } from './index.ts';
 import { MemoryIndexStore, overlaid, until, type IndexEntryChange, type IndexStore } from './indexstore.ts';
 import { BPlusTree } from './bptree.ts';
-import { DenseMerkleTree, EMPTY, type TreeRecords } from './merkle.ts';
+import { ChunkCache, DenseMerkleTree, EMPTY, type StoreChange, type TreeRecords } from './merkle.ts';
 import { objectLeaf, typeLeaf, type KeyProof, type ObjectProof } from './proof.ts';
 import { SparseMerkleTree } from './smt.ts';
 
@@ -62,23 +72,43 @@ export interface DatabaseOptions {
   indexStore?: IndexStore;
   /** Start with the B+ trees of the secondary indices dropped, every index read going to the store; default resident. */
   indexTrees?: boolean;
+  /** Start with the Merkle trees (dense chunks and sparse nodes) dropped, read from the store; default resident. */
+  trees?: boolean;
+  /** How many dense tree chunks (32 KiB at most each) dropped trees keep cached between reads. */
+  treeChunks?: number;
 }
 
-/** Where `indexTrees` defaults from; the test setup turns it off to run every suite on the fallback (INDEX_TREES=0). */
+/** Where `indexTrees` and `trees` default from; the test setup turns them off to run every suite on the fallbacks (INDEX_TREES=0, TREES=0). */
 let defaultIndexTrees = true;
+let defaultTrees = true;
 export function setDefaultIndexTrees(resident: boolean): void {
   defaultIndexTrees = resident;
+}
+export function setDefaultTrees(resident: boolean): void {
+  defaultTrees = resident;
 }
 
 /** What the database holds in memory besides the trees and indices, for the memory guard and status. */
 export interface DatabaseMemory {
   arena: ArenaStats;
+  /** The decoded objects: every one kept (resident), or a bounded cache over the arena (capped). */
+  objects: 'resident' | 'capped';
   hotObjects: number;
   hotLimit: number;
   /** Bytes of past values kept for the retention window. */
   historyBytes: number;
   /** The secondary indices' B+ trees: all resident, all dropped (reads go to the store), or some of each. */
   indexTrees: 'resident' | 'dropped' | 'partial';
+  /** The Merkle trees, dense and sparse: resident, or dropped with every node read from the store. */
+  trees: 'resident' | 'dropped';
+  /** Dense tree chunks cached for dropped trees, and how many may be. */
+  treeChunks: number;
+  treeChunkLimit: number;
+  /** Reads the decoded-object cache answered and reads that decoded, and the same for the chunk cache: the hit rates. */
+  hotHits: number;
+  hotMisses: number;
+  chunkHits: number;
+  chunkMisses: number;
 }
 
 export interface ObjectChange {
@@ -113,6 +143,12 @@ export interface Changes {
    * Empty for a database that keeps no index store (none given and the trees resident).
    */
   indices: IndexEntryChange[];
+  /**
+   * Dense tree chunks and sparse tree nodes written (value) or deleted (null), as store keys, in no particular
+   * order (no key appears twice). The values may be views of live chunks: write them before the next root, then
+   * call dropChanges(). Empty for a database with no store and its trees resident.
+   */
+  trees: StoreChange[];
 }
 
 export function encodeHistory(w: Writer, h: HistoryRecord): void {
@@ -171,6 +207,14 @@ export class UndoSession {
 
 const SNAPSHOT_VERSION = 2;
 const DEFAULT_RETAIN = 100;
+/** Chunks a dropped tree set keeps cached: at most 8 MiB, and most are smaller (the upper levels' chunks are short). */
+const DEFAULT_TREE_CHUNKS = 256;
+/**
+ * Heap a resident index entry takes (its slot in a B+ tree and its key), and a sparse tree leaf with its share of
+ * inner nodes: what dropping them gave back at 192,000 accounts (STATE-PAGING.md section 7), for estimates only.
+ */
+const INDEX_ENTRY_HEAP = 210;
+const SPARSE_LEAF_HEAP = 1000;
 /** Unbounded: with memory to spare every decoded object stays, and the node runs as it did before the arena. The memory guard caps it. */
 const DEFAULT_HOT = Infinity;
 
@@ -210,10 +254,21 @@ export class ObjectDatabase {
   private importsIndexed: boolean | null = null;
   /** What a dropped index reads: the store as of the last root. */
   private readonly base: IndexStore;
+  /** Chunks dropped dense trees have read, shared by all of them. */
+  private readonly chunkCache: ChunkCache;
+  /** Without an application store: the trees' chunks and nodes in memory, kept only while the trees are dropped. */
+  private ownTreeStore: MemoryIndexStore | null = null;
+  /** What dropped trees read: the store as of the last root, with the roots not yet written on top. */
+  private readonly treeBase: IndexStore;
+  private treesResident: boolean;
+  /** The store already holds the trees as of the version the first root computes (a restart): that root reports none. */
+  private treesStored = false;
+  /** The trees were read from the store (loadTrees), not computed from the objects. */
+  private treesLoaded = false;
 
   constructor(types: ObjectType<any>[], opts: DatabaseOptions = {}) {
     this.retain = Math.max(0, opts.retainVersions ?? DEFAULT_RETAIN);
-    this.hotBudget = { limit: Math.max(0, opts.hotObjects ?? DEFAULT_HOT), size: 0 };
+    this.hotBudget = { limit: Math.max(0, opts.hotObjects ?? DEFAULT_HOT), size: 0, hits: 0, misses: 0 };
     this.arena = new Arena({
       refOf: (type, instance) => this.types.get(type)?.refAt(instance) ?? -1,
       relocate: (type, instance, ref) => this.types.get(type)!.relocate(instance, ref),
@@ -232,14 +287,29 @@ export class ObjectDatabase {
         return pending ? overlaid(stored, until(pending.entriesFrom(start), end)) : stored;
       },
     };
+    this.chunkCache = new ChunkCache(opts.treeChunks ?? DEFAULT_TREE_CHUNKS);
+    this.treeBase = {
+      get: (k) => {
+        const v = this.unwrittenEntries()?.get(k);
+        return v !== undefined ? (v ?? undefined) : (this.store ?? this.ownTreeStore)?.get(k);
+      },
+      range: (start, end) => {
+        const stored = (this.store ?? this.ownTreeStore)?.range(start, end) ?? [][Symbol.iterator]();
+        const pending = this.unwrittenEntries();
+        return pending ? overlaid(stored, until(pending.entriesFrom(start), end)) : stored;
+      },
+    };
     for (const t of types) {
       if (this.types.has(t.id)) throw new Error(`duplicate object type ${t.id}`);
+      if (t.id === TOP_TREE) throw new Error(`type id ${TOP_TREE} names the tree over the types`);
       this.types.set(t.id, new TypeIndex(t, this.retain, this.arena, this.hotBudget, this.base, resident));
-      this.trees.set(t.id, new DenseMerkleTree(this.retain));
+      this.trees.set(t.id, new DenseMerkleTree(this.retain, t.id));
     }
     this.order = [...this.types.keys()].sort((a, b) => a - b);
-    this.top = new DenseMerkleTree(this.retain);
+    this.top = new DenseMerkleTree(this.retain, TOP_TREE);
     this.top.resize(this.order.length);
+    this.treesResident = true;
+    if (!(opts.trees ?? defaultTrees)) this.dropTrees();
   }
 
   private typeIndex<T extends AnyObject>(type: ObjectType<T>): TypeIndex<T> {
@@ -280,6 +350,16 @@ export class ObjectDatabase {
     this.changes = null;
     this.unwritten = [];
     this.unwrittenMap = null;
+    for (const tree of this.denseTrees()) tree.release();
+  }
+
+  /** The tree over the types, then every type's tree. */
+  private denseTrees(): DenseMerkleTree[] {
+    return [this.top, ...this.order.map((t) => this.trees.get(t)!)];
+  }
+
+  private sparseTrees(): SparseMerkleTree[] {
+    return this.order.flatMap((t) => [...this.typeIndexById(t).trees.values()]);
   }
 
   private backing(): IndexStore | null {
@@ -367,7 +447,102 @@ export class ObjectDatabase {
    */
   loadIndexEntries(): void {
     if (!this.store || this.importsIndexed !== true || this.version >= 0) throw new DbError('index entries are loaded from the store only after an indexed import');
-    for (const ti of this.types.values()) ti.loadIndexEntries();
+    // The sparse trees come from the entries unless their nodes are already in place: loaded, or in the store a
+    // dropped tree reads.
+    const sparse = this.treesResident ? !this.treesLoaded : !this.treesStored;
+    for (const ti of this.types.values()) ti.loadIndexEntries(sparse);
+  }
+
+  // ---- the tree tier ----
+
+  /**
+   * Drop every Merkle tree, the dense chunks and the sparse nodes together: from now on a root reads the paths it
+   * changes from the store (dense chunks through the shared LRU) and writes the changed ones back through the change
+   * list, and proofs walk the store. Sessions may be open: the trees hold nothing of them but the sparse trees'
+   * writes, which become pending writes. Without an application store the trees go to a store in memory.
+   */
+  dropTrees(): void {
+    if (!this.treesResident) return;
+    if (!this.store) {
+      // What a store written at every root would hold now: the trees as of the last root (nothing before the first).
+      const own = new MemoryIndexStore();
+      if (this.version >= 0) own.apply(Array.from(this.treeEntries(), ([key, value]) => ({ key, value })));
+      this.ownTreeStore = own;
+    }
+    for (const tree of this.denseTrees()) tree.drop(this.treeBase, this.chunkCache);
+    for (const smt of this.sparseTrees()) smt.drop(this.treeBase);
+    this.treesResident = false;
+  }
+
+  /** Read every dropped tree back from the store and keep it resident again. */
+  rebuildTrees(): void {
+    if (this.treesResident) return;
+    for (const tree of this.denseTrees()) tree.rebuild();
+    for (const smt of this.sparseTrees()) smt.rebuild();
+    this.chunkCache.clear();
+    this.ownTreeStore = null;
+    this.treesResident = true;
+  }
+
+  /** Whether the Merkle trees are resident. */
+  get treesAreResident(): boolean {
+    return this.treesResident;
+  }
+
+  /**
+   * About how many bytes of heap rebuilding what is dropped would take, per tier (0 for a resident one): every
+   * committed object has one entry in each of its type's indices and one leaf in each authenticated index's sparse
+   * tree. The memory guard rebuilds only what fits.
+   */
+  rebuildEstimate(): { indexTrees: number; trees: number } {
+    let entries = 0;
+    let leaves = 0;
+    let dropped = false;
+    for (const ti of this.types.values()) {
+      if (!ti.resident) {
+        dropped = true;
+        entries += ti.committedCount * ti.type.indices.length;
+      }
+      leaves += ti.committedCount * ti.authenticated.length;
+    }
+    // A dropped tier never reads zero, however empty, so that zero means nothing is dropped.
+    return { indexTrees: dropped ? Math.max(1, entries * INDEX_ENTRY_HEAP) : 0, trees: this.treesResident ? 0 : Math.max(1, leaves * SPARSE_LEAF_HEAP) };
+  }
+
+  /** Every dense chunk and sparse node as of the last root, as store keys and values: what a store written from scratch holds. */
+  *treeEntries(): IterableIterator<[Uint8Array, Uint8Array]> {
+    for (const tree of this.denseTrees()) yield* tree.entries();
+    for (const smt of this.sparseTrees()) yield* smt.entries();
+  }
+
+  /**
+   * After importing objects whose trees the store holds as of the version about to be rooted (a restart): take the
+   * trees from the store instead of computing them, so the first root hashes no object and inserts no key, and
+   * reports nothing. With `checkLeaves`, every imported object is still hashed and compared with its leaf.
+   */
+  loadTrees(checkLeaves = false): void {
+    if (!this.store || this.importsIndexed !== true || this.version >= 0) throw new DbError('trees are loaded from the store only after an indexed import');
+    if (this.treesResident) {
+      for (const tree of this.denseTrees()) tree.load(this.treeBase);
+      for (const smt of this.sparseTrees()) smt.load(this.treeBase);
+    }
+    if (checkLeaves) {
+      for (const type of this.order) this.trees.get(type)!.resize(this.typeIndexById(type).nextInstance);
+      for (const id of this.dirty) {
+        const ti = this.typeIndexById(typeOf(id));
+        const bytes = ti.bytesOf(instanceOf(id));
+        if (bytes && !bytesEqual(objectLeaf(id, bytes), this.trees.get(typeOf(id))!.node(0, instanceOf(id)))) throw new DbError(`object ${id} does not hash to its leaf in the stored tree`);
+      }
+    }
+    this.dirty.clear();
+    this.treesStored = true;
+    this.treesLoaded = true;
+  }
+
+  /** The store holds the trees as of the version the first root computes, which computes them again anyway (a restart): report none. */
+  assumeStoredTrees(): void {
+    if (!this.store || this.version >= 0) throw new DbError('only a database about to take its first root over a store can assume its trees are stored');
+    this.treesStored = true;
   }
 
   /** Change the hot caches' shared budget at run time (the memory guard's first dial); the excess is evicted at once. */
@@ -380,7 +555,21 @@ export class ObjectDatabase {
     const withIndices = [...this.types.values()].filter((ti) => ti.type.indices.length > 0);
     const resident = withIndices.filter((ti) => ti.resident).length;
     const indexTrees = resident === withIndices.length ? 'resident' : resident === 0 ? 'dropped' : 'partial';
-    return { arena: this.arena.stats, hotObjects: this.hotBudget.size, hotLimit: this.hotBudget.limit, historyBytes: this.historyBytes, indexTrees };
+    return {
+      arena: this.arena.stats,
+      objects: this.hotBudget.limit === Infinity ? 'resident' : 'capped',
+      hotObjects: this.hotBudget.size,
+      hotLimit: this.hotBudget.limit,
+      historyBytes: this.historyBytes,
+      indexTrees,
+      trees: this.treesResident ? 'resident' : 'dropped',
+      treeChunks: this.chunkCache.size,
+      treeChunkLimit: this.chunkCache.limit,
+      hotHits: this.hotBudget.hits,
+      hotMisses: this.hotBudget.misses,
+      chunkHits: this.chunkCache.hits,
+      chunkMisses: this.chunkCache.misses,
+    };
   }
 
   // ---- reads ----
@@ -653,6 +842,10 @@ export class ObjectDatabase {
     }
     this.dirty.clear();
     this.shadow.clear();
+    // The trees' changes go to the store whenever there is one, and always while the trees are dropped, the store
+    // being where they live; not from the first root of a restart, whose trees the store already has.
+    const reportTrees = (this.store !== null && !(first && this.treesStored)) || !this.treesResident;
+    const treeChanges: StoreChange[] = [];
     const indices = removed.length === 0 ? added : removed.concat(added);
     // The store dropped indices read must say what this root says before the overlays are emptied.
     if (this.store) {
@@ -685,8 +878,15 @@ export class ObjectDatabase {
       const ti = this.typeIndexById(type);
       const tree = this.trees.get(type)!;
       tree.resize(ti.nextInstance);
+      tree.reporting = reportTrees;
       const typeRoot = tree.root(version);
-      const indexRoots = ti.authenticated.map((name) => ti.trees.get(name)!.commit(version));
+      for (const c of tree.takeChunks()) treeChanges.push(c);
+      const indexRoots = ti.authenticated.map((name) => {
+        const smt = ti.trees.get(name)!;
+        const r = smt.commit(version, reportTrees);
+        for (const c of smt.takeNodes()) treeChanges.push(c);
+        return r;
+      });
       const previous = this.lastIndexRoots.get(type);
       if (!previous || indexRoots.some((r, i) => !bytesEqual(r, previous[i]!))) touched.add(type);
       this.lastIndexRoots.set(type, indexRoots);
@@ -694,10 +894,19 @@ export class ObjectDatabase {
       const recs = tree.lastRecords;
       if (keepHistory && (recs.nodes.length > 0 || recs.sizeBefore !== null)) record.trees.push({ tree: type, records: recs });
     }
+    this.top.reporting = reportTrees;
     const root = this.top.root(version);
+    for (const c of this.top.takeChunks()) treeChanges.push(c);
     if (keepHistory && this.top.lastRecords.nodes.length > 0) record.trees.push({ tree: TOP_TREE, records: this.top.lastRecords });
+    // As with the index entries: dropped trees must read what this root wrote before the store has it.
+    if (this.store) {
+      if (treeChanges.length > 0) {
+        this.unwritten.push(treeChanges);
+        if (this.unwrittenMap) for (const c of treeChanges) this.unwrittenMap.set(c.key, c.value);
+      }
+    } else this.ownTreeStore?.apply(treeChanges);
     this.version = version;
-    this.changes = { version, objects, counters, history: keepHistory ? record : null, indices };
+    this.changes = { version, objects, counters, history: keepHistory ? record : null, indices, trees: treeChanges };
     if (this.retain > 0) this.pruneHistory(version - this.retain);
     // Slabs the block left more than half dead are compacted now, while the node idles.
     this.arena.maintain();
@@ -845,7 +1054,7 @@ export class ObjectDatabase {
       for (const instance of ti.instances()) candidates.add(objectId(type, instance));
       for (const id of this.valueHistory.keys()) if (typeOf(id) === type) candidates.add(id);
       for (const name of ti.authenticated) {
-        const rebuilt = new SparseMerkleTree(this.retain);
+        const rebuilt = ti.freshTree(name);
         const put = (obj: AnyObject | null) => obj && rebuilt.set(ti.keyFor(obj, name), encode((w) => w.u64(obj.id)));
         const drop = (obj: AnyObject | null) => obj && rebuilt.delete(ti.keyFor(obj, name));
         for (const id of candidates) put(this.getAt(ti.type, id, lowest));

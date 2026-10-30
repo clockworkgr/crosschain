@@ -3,7 +3,9 @@
  * root per version, lookups through the B+ tree indices, proofs, undo, and
  * the sparse Merkle tree behind authenticated unique indices. At the end, the
  * same lookups and scans with the index trees dropped (STATE-PAGING.md
- * section 4.2): from an in-memory store, and from LMDB as a node reads them.
+ * section 4.2): from an in-memory store, and from LMDB as a node reads them;
+ * and roots and proofs with the Merkle trees dropped (section 5.2), their
+ * chunks and nodes read from LMDB.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -108,6 +110,15 @@ export async function run(): Promise<void> {
     root = db.root();
   });
   await bench('rebuild the index trees (in-memory store)', { iterations: 1, warmup: 0 }, () => db.rebuildIndexTrees());
+  // The Merkle trees dropped with no store behind: the database keeps their chunks and nodes in an in-memory map.
+  await bench('drop the Merkle trees (into an in-memory store)', { iterations: 1, warmup: 0 }, () => db.dropTrees());
+  for (const k of [1000, 10_000]) {
+    await bench(`modify ${k.toLocaleString('en-US')} balances + root, Merkle trees dropped (in-memory store)`, {}, () => {
+      for (let i = 0; i < k; i++) db.modify(BalanceType, objectId(TYPE.balance, rnd(N)), (b) => ({ ...b, amount: b.amount + 1n }));
+      root = db.root();
+    });
+  }
+  await bench('rebuild the Merkle trees (in-memory store)', { iterations: 1, warmup: 0 }, () => db.rebuildTrees());
 
   // The same state over LMDB, as a restarted node holds it: objects imported as bytes, index entries in the store.
   const dir = mkdtempSync(join(tmpdir(), 'crosschain-dbbench-'));
@@ -115,10 +126,12 @@ export async function run(): Promise<void> {
   const kv = env.store('app');
   kv.write((w) => {
     for (const [k, v] of db.indexEntries()) w.put(k, v);
+    for (const [k, v] of db.treeEntries()) w.put(k, v);
   });
   const paged = new ObjectDatabase(CORE_TYPES, { retainVersions: 100, indexStore: kv, indexTrees: false });
   for (const [id, bytes] of db.exportObjects()) paged.importObject(id, bytes, true);
   for (const [t, n] of db.counters()) paged.setCounter(t, n);
+  paged.loadTrees();
   paged.loadIndexEntries();
   paged.root(db.currentVersion);
   paged.dropChanges();
@@ -126,6 +139,52 @@ export async function run(): Promise<void> {
   await bench('scan 100 entries of a non-unique index, trees dropped (LMDB)', { batch: 100 }, scan100(paged));
   await bench('rebuild the index trees (from LMDB)', { iterations: 1, warmup: 0 }, () => paged.rebuildIndexTrees());
   await bench('lookup by unique index, trees rebuilt from LMDB', { batch: 1000 }, lookups(paged));
+
+  // Roots over LMDB as a node takes them: every root's changes written before the next, as the application's commit
+  // does (untimed here; the app suite's commit row measures it). Resident, the trees only report what they changed;
+  // dropped, each root reads the paths it changes from LMDB, the dense chunks through the shared LRU.
+  const persist = () => {
+    const changes = paged.lastChanges;
+    if (!changes) return;
+    kv.write((w) => {
+      for (const c of [...changes.indices, ...changes.trees]) {
+        if (c.value) w.put(c.key, c.value);
+        else w.del(c.key);
+      }
+    });
+    paged.dropChanges();
+  };
+  const modifyRoot = (k: number) => () => {
+    for (let i = 0; i < k; i++) paged.modify(BalanceType, objectId(TYPE.balance, rnd(N)), (b) => ({ ...b, amount: b.amount + 1n }));
+    paged.root();
+  };
+  let written = 0;
+  const countWritten = () => {
+    written += paged.lastChanges?.trees.reduce((n, c) => n + c.key.length + (c.value?.length ?? 0), 0) ?? 0;
+    persist();
+  };
+  for (const k of [1000, 10_000]) {
+    persist();
+    written = 0;
+    const r = await bench(`modify ${k.toLocaleString('en-US')} balances + root, Merkle trees resident (LMDB)`, { before: countWritten }, modifyRoot(k));
+    // Each iteration's setup writes the root before it: the warmup's and all but the last measured one.
+    fact(`tree chunks a root of ${k.toLocaleString('en-US')} modifications writes`, fmtBytes(written / r.iterations));
+  }
+  persist();
+  await bench('drop the Merkle trees (LMDB)', { iterations: 1, warmup: 0 }, () => paged.dropTrees());
+  for (const k of [1000, 10_000]) await bench(`modify ${k.toLocaleString('en-US')} balances + root, Merkle trees dropped (LMDB)`, { before: persist }, modifyRoot(k));
+  persist();
+  fact('dense chunks cached while dropped', `${paged.memory().treeChunks} of ${paged.memory().treeChunkLimit}`);
+  await bench('object proof (current version), Merkle trees dropped (LMDB)', { batch: 100 }, () => {
+    for (let i = 0; i < 100; i++) paged.proof(objectId(TYPE.balance, rnd(N)));
+  });
+  await bench('object proof at a past version, Merkle trees dropped (LMDB)', { batch: 100 }, () => {
+    for (let i = 0; i < 100; i++) paged.proofAt(objectId(TYPE.balance, rnd(N)), paged.currentVersion - 1 - rnd(3));
+  });
+  await bench('name proof, Merkle trees dropped (LMDB)', { batch: 100 }, () => {
+    for (let i = 0; i < 100; i++) paged.proveKey(AccountType, 'byName', key((k) => k.str(`acct${rnd(A)}`)));
+  });
+  await bench('rebuild the Merkle trees (from LMDB)', { iterations: 1, warmup: 0 }, () => paged.rebuildTrees());
   await env.close();
   rmSync(dir, { recursive: true, force: true });
 }

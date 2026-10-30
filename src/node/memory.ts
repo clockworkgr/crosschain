@@ -40,10 +40,29 @@ export interface MemoryStats {
   rss: number;
 }
 
+/**
+ * The old generation's limit in bytes, when the process was started with one (--max-old-space-size, as the CLI does).
+ * V8's heap_size_limit adds the young generation's reserve to it (three semi-spaces, 192 MiB with 64 MiB ones), which
+ * long-lived objects never fill: the process aborts when the old generation is full, so on a heap of 744 MiB the
+ * levels' lines, taken from 936 MiB, would sit past the point of the abort and `pressure` would never come.
+ */
+function oldGenerationLimit(): number | null {
+  const flags = [...process.execArgv, ...(process.env.NODE_OPTIONS ?? '').split(/\s+/)];
+  let mib: number | null = null;
+  for (const f of flags) {
+    const m = /^--max[-_]old[-_]space[-_]size=(\d+)$/.exec(f);
+    if (m) mib = Number(m[1]);
+  }
+  return mib === null ? null : mib * 1048576;
+}
+
+const OLD_LIMIT = oldGenerationLimit();
+
 export function memoryStats(): MemoryStats {
   const h = getHeapStatistics();
   const m = process.memoryUsage();
-  return { heapUsed: h.used_heap_size, heapLimit: h.heap_size_limit, heapTotal: h.total_heap_size, arrayBuffers: m.arrayBuffers, external: m.external, rss: m.rss };
+  const heapLimit = OLD_LIMIT !== null ? Math.min(OLD_LIMIT, h.heap_size_limit) : h.heap_size_limit;
+  return { heapUsed: h.used_heap_size, heapLimit, heapTotal: h.total_heap_size, arrayBuffers: m.arrayBuffers, external: m.external, rss: m.rss };
 }
 
 export type MemoryLevel = 'ok' | 'warn' | 'pressure' | 'critical';
@@ -63,12 +82,14 @@ export interface MemoryGuardOptions {
   log: Logger;
   /** Called on every level change, with the sample that caused it. */
   onLevel?: (level: MemoryLevel, stats: MemoryStats) => void;
+  /** Called after every sample, with the level it left the guard at. */
+  onSample?: (level: MemoryLevel, stats: MemoryStats) => void;
 }
 
 const MiB = (n: number) => Math.round(n / 1048576);
 
 export class MemoryGuard {
-  readonly o: Required<Omit<MemoryGuardOptions, 'onLevel'>> & Pick<MemoryGuardOptions, 'onLevel'>;
+  readonly o: Required<Omit<MemoryGuardOptions, 'onLevel' | 'onSample'>> & Pick<MemoryGuardOptions, 'onLevel' | 'onSample'>;
   private levelIndex = 0;
   private timer: NodeJS.Timeout | null = null;
   private last: MemoryStats;
@@ -118,6 +139,7 @@ export class MemoryGuard {
       else this.o.log('info', 'memory: easing', fields);
       this.o.onLevel?.(level, s);
     }
+    this.o.onSample?.(this.level, s);
     return this.level;
   }
 }

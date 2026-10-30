@@ -6,10 +6,10 @@ import { instanceOf, objectId } from '../src/db/id.ts';
 import { DbError, type ObjectType } from '../src/db/index.ts';
 import { key } from '../src/db/keys.ts';
 import { BPlusTree } from '../src/db/bptree.ts';
-import { DenseMerkleTree, EMPTY, heightFor, innerHash, rootFromPath } from '../src/db/merkle.ts';
-import { encodeKeyProof, proofFromBytes, proofToBytes, verifyKeyProof, verifyObjectProof } from '../src/db/proof.ts';
+import { ChunkCache, DenseMerkleTree, EMPTY, heightFor, innerHash, rootFromPath, type StoreChange } from '../src/db/merkle.ts';
+import { encodeKeyProof, keyProofToBytes, proofFromBytes, proofToBytes, verifyKeyProof, verifyObjectProof } from '../src/db/proof.ts';
 import { encode } from '../src/codec/writer.ts';
-import { SparseMerkleTree, smtProofRoot } from '../src/db/smt.ts';
+import { nodeHeader, SparseMerkleTree, smtProofRoot, type SmtProof } from '../src/db/smt.ts';
 
 interface Item {
   id: bigint;
@@ -140,12 +140,12 @@ function prng(seed: number): (n: number) => number {
   };
 }
 
-/** Write a root's index changes and objects to a store, as the application's commit does, and tell the database. */
+/** Write a root's index and tree changes to a store, as the application's commit does, and tell the database. */
 function persistIndex(db: ObjectDatabase, kv: MemoryKv): void {
   const changes = db.lastChanges;
   if (!changes) return;
   kv.write((w) => {
-    for (const c of changes.indices) {
+    for (const c of [...changes.indices, ...changes.trees]) {
       if (c.value) w.put(c.key, c.value);
       else w.del(c.key);
     }
@@ -376,6 +376,171 @@ describe('object database: index entries and dropped index trees', () => {
       return { roots, seen };
     };
     expect(run(true)).toEqual(run(false));
+  });
+});
+
+/** Apply one root's tree changes (or any change list) to a store. */
+function writeChanges(kv: MemoryKv, changes: StoreChange[]): void {
+  kv.write((w) => {
+    for (const c of changes) {
+      if (c.value) w.put(c.key, c.value);
+      else w.del(c.key);
+    }
+  });
+}
+
+/** The store's dense chunks and sparse nodes, and a database's trees as it says a store should hold them, both sorted. */
+const storedTrees = (kv: MemoryKv) => [...kv.range(Uint8Array.of(0x6e), Uint8Array.of(0x6f)), ...kv.range(Uint8Array.of(0x74), Uint8Array.of(0x75))].map(([k, v]) => `${toHex(k)}=${toHex(v)}`).sort();
+const treeView = (db: ObjectDatabase) => [...db.treeEntries()].map(([k, v]) => `${toHex(k)}=${toHex(v)}`).sort();
+
+/** Everything a version can be asked to prove: its root, every item and the counter object, names present and absent, ranges, type leaves. */
+function proofsAt(db: ObjectDatabase, v: number, names: string[]): string {
+  const out = [toHex(db.rootAt(v))];
+  const count = db.countAt(ItemType.id, v);
+  for (let i = 0; i <= count + 1; i++) out.push(toHex(proofToBytes(db.proofAt(objectId(ItemType.id, i), v))));
+  out.push(toHex(proofToBytes(db.proofAt(objectId(CounterType.id, 0), v))));
+  for (const name of names) out.push(toHex(keyProofToBytes(db.proveKeyAt(ItemType, 'byName', key((k) => k.str(name)), v))));
+  for (const [from, to] of [[0, count], [0, 1], [count >> 1, count], [1, 7], [count - 2, count]] as const) if (from >= 0 && from < to && to <= count) out.push(db.rangeProofAt(ItemType.id, from, to, v).map(toHex).join(','));
+  for (const t of [ItemType.id, CounterType.id]) {
+    const l = db.typeLeafProofAt(t, v);
+    out.push(`${l.nextInstance}:${toHex(l.typeRoot)}:${l.indexRoots.map(toHex).join(',')}:${l.topSiblings.map(toHex).join(',')}`);
+  }
+  return out.join(' ');
+}
+
+describe('object database: trees on disk and dropped trees', () => {
+  it('reports the chunks and nodes each root changes, so a store written from them holds the trees', () => {
+    const kv = new MemoryKv();
+    const db = new ObjectDatabase([ItemType, CounterType], { indexStore: kv });
+    for (let i = 0; i < 1500; i++) mk(db, `n${i}`, i % 5); // more than a chunk of leaves
+    db.root(1);
+    const first = db.lastChanges!.trees;
+    // The first root writes every chunk of the item tree and the tree over the types, and every node of the name tree:
+    // a leaf per name and at least one inner node fewer.
+    expect(first.filter((c) => c.key[0] === 0x74).length).toBeGreaterThan(3);
+    expect(first.filter((c) => c.key[0] === 0x6e).length).toBeGreaterThanOrEqual(1500 * 2 - 1);
+    persistIndex(db, kv);
+    expect(storedTrees(kv)).toEqual(treeView(db));
+    // A value change rewrites the leaf's path in the item tree and the type leaf, and no sparse node.
+    db.modify(ItemType, objectId(7, 3), (o) => ({ ...o, value: 9n }));
+    db.root(2);
+    expect(db.lastChanges!.trees.some((c) => c.key[0] === 0x6e)).toBe(false);
+    expect(db.lastChanges!.trees.every((c) => c.value !== null)).toBe(true);
+    persistIndex(db, kv);
+    expect(storedTrees(kv)).toEqual(treeView(db));
+    // Removing the whole second chunk of leaves deletes its chunk; renames move and collapse sparse nodes.
+    for (let i = 1024; i < 1500; i++) db.remove(ItemType, objectId(7, i));
+    db.modify(ItemType, objectId(7, 5), (o) => ({ ...o, name: 'renamed' }));
+    db.root(3);
+    expect(db.lastChanges!.trees.some((c) => c.key[0] === 0x74 && c.value === null)).toBe(true);
+    expect(db.lastChanges!.trees.some((c) => c.key[0] === 0x6e && c.value === null)).toBe(true);
+    persistIndex(db, kv);
+    expect(storedTrees(kv)).toEqual(treeView(db));
+    // A database with no store and its trees resident reports none.
+    const quiet = new ObjectDatabase([ItemType, CounterType], { trees: true });
+    mk(quiet, 'a', 1);
+    quiet.root(1);
+    expect(quiet.lastChanges!.trees).toEqual([]);
+  });
+
+  it('gives the same roots, object proofs, key proofs and range proofs with the trees dropped, at every version in the window, through undo and compaction', () => {
+    const r = prng(5);
+    // Long names make objects of 3 KB, so a few versions of rewrites leave slabs mostly dead and the arena compacts.
+    const long = (n: string) => `${n}-${'x'.repeat(3000)}`;
+    const a = new ObjectDatabase([ItemType, CounterType], { retainVersions: 4 });
+    const kv = new MemoryKv();
+    const b = new ObjectDatabase([ItemType, CounterType], { retainVersions: 4, indexStore: kv, treeChunks: 3 });
+    const both = (f: (db: ObjectDatabase) => void) => {
+      f(a);
+      f(b);
+    };
+    const names: string[] = [long('nobody')];
+    const items = () => [...a.exportObjects()].filter(([id]) => id >> 48n === 7n).map(([id]) => id);
+    let compacted = false;
+    let delayed = false;
+    for (let v = 0; v < 26; v++) {
+      if (delayed) persistIndex(b, kv);
+      for (let i = 0; i < 4; i++) {
+        const name = long(`v${v}-${i}`);
+        names.push(name);
+        both((db) => mk(db, name, i % 3, BigInt(v)));
+      }
+      const ids = items();
+      for (let i = 0; i < 12; i++) {
+        const id = ids[r(ids.length)]!;
+        const rename = r(4) === 0 ? long(`r${v}-${i}`) : null;
+        if (rename) names.push(rename);
+        both((db) => db.modify(ItemType, id, (o) => ({ ...o, value: o.value + 1n, name: rename ?? o.name })));
+      }
+      if (v % 2 === 1) {
+        const id = ids[r(ids.length)]!;
+        both((db) => db.remove(ItemType, id));
+      }
+      if (v === 6) both((db) => db.create(CounterType, (id) => ({ id, n: 1n })));
+      if (v > 6) both((db) => db.modify(CounterType, objectId(3, 0), (o) => ({ ...o, n: o.n + 1n })));
+      // A session that renames, creates and removes, undone or kept; the dial turns inside it.
+      const sa = a.startSession();
+      const sb = b.startSession();
+      const pick = items();
+      const victim = pick[r(pick.length)]!;
+      const renamed = pick[r(pick.length)]!;
+      const taken = a.get(ItemType, renamed)!.name;
+      both((db) => db.remove(ItemType, victim));
+      if (renamed !== victim) both((db) => db.modify(ItemType, renamed, (o) => ({ ...o, name: long(`s${v}`) })));
+      both((db) => mk(db, renamed !== victim ? taken : long(`t${v}`), 2));
+      if (v % 6 === 1) b.dropTrees();
+      if (v % 6 === 4) b.rebuildTrees();
+      if (v % 3 === 0) {
+        sa.undo();
+        sb.undo();
+      } else {
+        names.push(long(`s${v}`), long(`t${v}`));
+        sa.commit();
+        sb.commit();
+      }
+      if (v === 20) b.dropTrees();
+      const dead = b.memory().arena.dead;
+      expect(toHex(b.root(v)), `root ${v}`).toBe(toHex(a.root(v)));
+      if (b.memory().arena.dead < dead) compacted = true; // a slab more than half dead was copied out and released
+      // Sometimes the store is written only before the next block: proofs in between read the root's own changes.
+      delayed = v % 4 === 2;
+      if (!delayed) {
+        persistIndex(b, kv);
+        expect(storedTrees(kv)).toEqual(treeView(a));
+      }
+      const probe = [...names.slice(-12), names[0]!, long('v0-1')];
+      for (let old = a.lowestVersion; old <= v; old++) expect(proofsAt(b, old, probe), `version ${old} at ${v}`).toBe(proofsAt(a, old, probe));
+      expect(b.memory().treeChunks).toBeLessThanOrEqual(3);
+    }
+    expect(compacted).toBe(true);
+    expect(b.memory().trees).toBe('dropped');
+    // The chunk cache was both used and too small to hold everything: some reads hit it, some went to the store.
+    expect(b.memory().chunkHits).toBeGreaterThan(0);
+    expect(b.memory().chunkMisses).toBeGreaterThan(0);
+    b.rebuildTrees();
+    for (let old = a.lowestVersion; old <= a.currentVersion; old++) expect(proofsAt(b, old, names.slice(-20))).toBe(proofsAt(a, old, names.slice(-20)));
+  });
+
+  it('runs on trees dropped from the start, with or without a store behind', () => {
+    const run = (opts: { trees: boolean; store: boolean }) => {
+      const kv = new MemoryKv();
+      const db = new ObjectDatabase([ItemType, CounterType], { retainVersions: 3, trees: opts.trees, ...(opts.store ? { indexStore: kv } : {}) });
+      const seen: string[] = [];
+      for (let v = 0; v < 6; v++) {
+        for (let i = 0; i < 300; i++) mk(db, `v${v}-${i}`, i % 4, BigInt(i));
+        if (v > 0) for (let i = 0; i < 50; i++) db.remove(ItemType, objectId(7, 300 * (v - 1) + 2 * i));
+        seen.push(toHex(db.root(v)));
+        if (opts.store) persistIndex(db, kv);
+        seen.push(proofsAt(db, Math.max(0, v - 2), ['v0-1', 'v0-2', `v${v}-7`]));
+      }
+      // What rebuilding would take comes from the objects, not from what was resident when the trees went: a leaf of
+      // the name tree per live item (1,800 created, 250 removed).
+      expect(db.rebuildEstimate().trees).toBe(opts.trees ? 0 : 1550 * 1000);
+      return seen;
+    };
+    const resident = run({ trees: true, store: false });
+    expect(run({ trees: false, store: false })).toEqual(resident);
+    expect(run({ trees: false, store: true })).toEqual(resident);
   });
 });
 
@@ -622,6 +787,49 @@ describe('dense merkle tree: chunks and versions', () => {
   });
 });
 
+describe('dense merkle tree: dropped', () => {
+  const leaf = (i: number, v: number) => sha256(new Uint8Array([i & 0xff, i >> 8, v]));
+
+  it('reads its chunks through a bounded cache and computes the same roots and paths as a resident tree', () => {
+    const kv = new MemoryKv();
+    const cache = new ChunkCache(2);
+    const a = new DenseMerkleTree(3, 5);
+    const b = new DenseMerkleTree(3, 5);
+    b.reporting = true;
+    const r = prng(9);
+    const roots: Uint8Array[] = [];
+    for (let v = 0; v < 14; v++) {
+      // Growing across chunk boundaries and powers of two, rewriting leaves, emptying some and a whole chunk.
+      const size = 600 + 250 * v;
+      a.resize(size);
+      b.resize(size);
+      for (let n = 0; n < 40; n++) {
+        const i = r(size);
+        const h = n % 7 === 0 ? EMPTY : leaf(i, v);
+        a.setLeaf(i, h);
+        b.setLeaf(i, h);
+      }
+      if (v === 9) for (let i = 1024; i < 2048; i++) for (const t of [a, b]) t.setLeaf(i, EMPTY);
+      roots.push(a.root(v));
+      expect(toHex(b.root(v)), `root ${v}`).toBe(toHex(roots[v]!));
+      writeChanges(kv, b.takeChunks());
+      b.release();
+      if (v === 3 || v === 10) b.drop(kv, cache);
+      if (v === 7) b.rebuild();
+      expect(cache.size).toBeLessThanOrEqual(2);
+      for (let old = a.lowestVersion; old <= v; old++) {
+        expect(toHex(b.rootAt(old))).toBe(toHex(a.rootAt(old)));
+        const n = a.sizeAt(old);
+        for (const i of [0, 1, 1023, 1024, n - 1, r(n)]) if (i < n) expect(b.pathAt(i, old).map(toHex)).toEqual(a.pathAt(i, old).map(toHex));
+        expect(b.rangeProofAt(n >> 2, n - 3, old).map(toHex)).toEqual(a.rangeProofAt(n >> 2, n - 3, old).map(toHex));
+      }
+      const chunks = (t: DenseMerkleTree) => [...t.entries()].map(([k, x]) => `${toHex(k)}=${toHex(x)}`).sort();
+      expect(chunks(b)).toEqual(chunks(a));
+    }
+    expect(b.resident).toBe(false);
+  });
+});
+
 describe('object database: versions', () => {
   it('reproduces at a later version the proofs it made at the time', () => {
     const db = new ObjectDatabase([ItemType, CounterType], { retainVersions: 5 });
@@ -798,6 +1006,52 @@ describe('sparse merkle tree', () => {
       expect(smtProofRoot(k(`a${i - 2}`), t.proveAt(k(`a${i - 2}`), i))!.value).toBeNull();
     }
     expect(() => t.rootAt(2)).toThrow(/not available/);
+  });
+});
+
+describe('sparse merkle tree: dropped', () => {
+  const k = (n: number) => new TextEncoder().encode(`key${n}`);
+  const header = nodeHeader(9, 0);
+  const proofHex = (p: SmtProof) => `${p.siblings.map(toHex).join(',')}|${p.leaf ? `${toHex(p.leaf.keyHash)}=${toHex(p.leaf.value)}` : '-'}`;
+
+  it('gives the roots and proofs of a resident tree, writing back only the nodes it changed', () => {
+    const kv = new MemoryKv();
+    const a = new SparseMerkleTree(3, header);
+    const b = new SparseMerkleTree(3, header);
+    const r = prng(21);
+    for (let v = 0; v < 40; v++) {
+      // A small key space, so leaves split and collapse often.
+      for (let i = 0; i < 25; i++) {
+        const n = r(120);
+        if (r(3) === 0) {
+          a.delete(k(n));
+          b.delete(k(n));
+        } else {
+          const value = new Uint8Array([r(256), v]);
+          a.set(k(n), value);
+          b.set(k(n), value);
+        }
+      }
+      // Dropped between commits, and in the middle of writes (they become pending), rebuilt in between.
+      if (v === 3 || v === 22) b.drop(kv);
+      if (v === 12 || v === 30) b.rebuild();
+      for (let n = 0; n < 120; n += 7) expect(b.get(k(n))).toEqual(a.get(k(n)));
+      if (v === 17) {
+        b.drop(kv);
+        a.set(k(500), new Uint8Array([1]));
+        b.set(k(500), new Uint8Array([1]));
+      }
+      a.commit(v);
+      expect(toHex(b.commit(v, true)), `root ${v}`).toBe(toHex(a.rootHash()));
+      writeChanges(kv, b.takeNodes());
+      const nodes = [...kv.range(header, Uint8Array.of(0x6e, 0, 9, 1))].map(([x, y]) => `${toHex(x)}=${toHex(y)}`).sort();
+      expect(nodes).toEqual([...a.entries()].map(([x, y]) => `${toHex(x)}=${toHex(y)}`).sort());
+      expect(b.lowestVersion).toBe(a.lowestVersion);
+      for (let old = a.lowestVersion; old <= v; old++) {
+        expect(toHex(b.rootAt(old))).toBe(toHex(a.rootAt(old)));
+        for (let n = 0; n < 130; n += 5) expect(proofHex(b.proveAt(k(n), old)), `key ${n} at ${old}`).toBe(proofHex(a.proveAt(k(n), old)));
+      }
+    }
   });
 });
 
