@@ -615,10 +615,15 @@ paging, so the operator knows whether to add memory or a faster disk.
    index trees and then the Merkle trees at `pressure`, and rebuilds what fits at `ok` (7);
    `npm run bench -- paging` reports blocks and transfers per second and the memory at each
    mode, and a node whose guard reaches `pressure` on its real heap keeps committing (7.1).
-   A real `--heap` below the state size is not what the benchmark runs: a node opening its
-   store builds every tier resident before the guard samples, so a heap smaller than the
-   resident state aborts at startup; the in-process node is given its real heap figures
-   against a limit the benchmark chooses. Opening a store with the tiers dropped when the
+   The node runs under a real `--max-old-space-size`. A node opening its store builds every
+   tier resident before the guard samples, so a heap smaller than what opening takes (about
+   two thirds of the resident heap: 400 of 595 MiB at 192,000 accounts, 1,000 of 1,563 at
+   514,000) aborts at startup. Above that it opens and pages: a matrix of three states (34,000,
+   192,000 and 514,000 accounts) against five limits (0.8, 1.0, 1.25, 1.5 and 2.0 times the
+   resident heap) committed blocks for the whole run in every cell, with 15 to 25% of
+   throughput lost while paged at the two larger sizes and the smallest state cycling through
+   `pressure` and `critical` because the load's own growth is several times that state
+   (docs/benchmarks.md 4.13 has the table). Opening a store with the tiers dropped when the
    heap is known to be too small is not built.
 
 ## 10. Defaults

@@ -600,8 +600,11 @@ node's answer, unproven.
   with the 64 MiB semi-spaces, which long-lived objects never fill, and a guard measured
   against it put `pressure` past the point of the abort. And a store cannot yet be opened with
   its tiers already dropped: a node builds every tier resident before the guard samples, so a
-  `--heap` below the resident state still aborts at startup; give the node a `--heap` the
-  resident state fits under, and the guard pages what the load adds. What no dial sheds is the
+  `--heap` below what opening the store takes, about two thirds of the resident heap
+  (docs/benchmarks.md section 4.13), still aborts at startup; above that the node opens and
+  pages from its first samples, down to 0.8 times the resident heap in the measured runs, at 15
+  to 25% of throughput. Give the node a `--heap` the resident state fits under when you can,
+  and the guard pages only what the load adds. What no dial sheds is the
   version history window (`retain.versions`) and the recent transaction ids, which grow with
   every block of scattered transfers; a node that lives at its limit under load alternates
   between `warn` and `pressure` on them, and a smaller window or a larger heap is the fix.
@@ -638,7 +641,7 @@ node's answer, unproven.
 | `memory: shedding load`, then `shedding load: mempool paused, costly requests refused` | the heap is 85% full (`pressure`): the mempool admits and fetches nothing, costly RPC calls and new streams are refused, the signature cache is dropped, the database's cache is capped at 10,000 decoded objects and its index trees and Merkle trees are dropped, lookups, scans, roots and proofs reading the store; consensus and block sync go on. `memory: easing` and `load shedding over` follow once the heap falls 5 points below the threshold; the trees come back only when they fit (next row) |
 | `memory: staying paged until the heap has room to rebuild` | the heap eased to `ok` with the index trees or the Merkle trees dropped, and rebuilding them (`needs`) does not fit under the `warn` line beside the heap of the last ten samples (`room`). Nothing is wrong: the node runs on the store, slower (section 12), and rebuilds when the room appears (`memory: index trees rebuilt`, `memory: Merkle trees rebuilt`); a larger `--heap` brings the trees back for good |
 | `memory: heap at the limit; stopping before the process aborts (raise --max-old-space-size or --heap)`, then exit code 3 | the heap is 95% full (`critical`); the node stopped cleanly rather than wait for V8 to abort it. Start it again with a larger `--heap`, or on a machine with more memory: one block's working set did not fit even with every tier dropped, and nothing but the limit changes that |
-| the process aborts while loading the state (V8's out-of-memory error), or reaches `critical` as soon as it starts | the `--heap` is below the resident state: a store is opened with every tier resident before the guard can page anything (section 12). Start with a `--heap` the resident state fits under; the guard pages what the load adds |
+| the process aborts while loading the state (V8's out-of-memory error), or reaches `critical` as soon as it starts | the `--heap` is below what opening the store takes, about two thirds of the resident heap: a store is opened with every tier resident before the guard can page anything (section 12). Start with a larger `--heap`; from about 0.8 times the resident heap upward the node opens and pages, and with the resident state under the limit the guard pages only what the load adds |
 | `--heap takes a size in MiB, at least 256` | `--heap` was given something other than a whole number of MiB of 256 or more |
 | `gc: not exposed; collections run when V8 decides (start with --expose-gc to schedule them after commits)` | the node runs without `--expose-gc`: `start` found `--max-old-space-size` already set and did not wrap itself, or the node is embedded in a program. Nothing is wrong; collections are simply not scheduled after commits |
 | `operation 0 states a fee of X, the schedule requires Y` | the fee schedule changed after the transaction was built; rebuild it |

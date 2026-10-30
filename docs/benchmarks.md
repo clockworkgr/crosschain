@@ -539,6 +539,45 @@ In all: 107 blocks and 59,128 transfers in 40 s (1,478 a second, against 1,700 t
 first eight seconds), 79 of the blocks and 44,036 of the transfers committed with the Merkle
 trees dropped, and no abort.
 
+The same node run over three states and five heap limits, each limit a multiple of the state's
+resident heap (the first run of each size at the default 1.25, which is also how the resident
+figure is learned), secp256k1 throughout, forty seconds each:
+
+| genesis | accounts | resident heap | heap limit (factor) | opened the store at | blocks in 40 s | transfers/s | blocks with the Merkle trees dropped | levels seen | lowest heap |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| 10 MB | 34,267 | 122 MiB | 98 MiB (0.8) | 115 MiB | 153 | 365 | 153 | ok, warn, pressure, critical | 52 MiB |
+| | | | 122 MiB (1.0) | 115 MiB | 118 | 354 | 118 | ok, warn, pressure, critical | 56 MiB |
+| | | | 153 MiB (1.25) | 124 MiB | 145 | 491 | 145 | ok, warn, pressure, critical | 83 MiB |
+| | | | 183 MiB (1.5) | 118 MiB | 146 | 552 | 132 | ok, warn, pressure, critical | 114 MiB |
+| | | | 244 MiB (2.0) | 124 MiB | 141 | 822 | 127 | ok, warn, pressure | 88 MiB |
+| 56 MB | 191,896 | 595 MiB | 476 MiB (0.8) | 411 MiB | 123 | 1,145 | 123 | ok, warn, pressure | 83 MiB |
+| | | | 595 MiB (1.0) | 394 MiB | 117 | 1,197 | 104 | ok, warn, pressure | 158 MiB |
+| | | | 744 MiB (1.25) | 400 MiB | 106 | 1,443 | 77 | ok, warn, pressure | 212 MiB |
+| | | | 893 MiB (1.5) | 419 MiB | 109 | 1,502 | 67 | ok, warn, pressure | 327 MiB |
+| | | | 1,190 MiB (2.0) | 404 MiB | 114 | 1,544 | 40 | ok, warn, pressure | 458 MiB |
+| 150 MB | 514,008 | 1,563 MiB | 1,250 MiB (0.8) | 997 MiB | 97 | 1,247 | 91 | ok, warn, pressure | 71 MiB |
+| | | | 1,563 MiB (1.0) | 1,015 MiB | 97 | 1,282 | 63 | ok, warn, pressure | 260 MiB |
+| | | | 1,953 MiB (1.25) | 1,005 MiB | 105 | 1,382 | 25 | ok, warn, pressure | 502 MiB |
+| | | | 2,345 MiB (1.5) | 1,020 MiB | 123 | 1,512 | 0 | ok, warn | 1,113 MiB |
+| | | | 3,126 MiB (2.0) | 1,072 MiB | 118 | 1,497 | 0 | ok | 1,110 MiB |
+
+Every run committed blocks for the whole forty seconds, down to a limit of 0.8 times the
+resident heap, and none died. Opening the store took about two thirds of the resident heap
+(400 of 595 MiB, 1,000 of 1,563), and that, not the resident figure, is the floor a `--heap`
+must clear: between the two the node opens and pages from its first samples. Paging costs 15
+to 25% of throughput at the two larger sizes (1,145 against 1,544 transfers a second at
+192,000 accounts, 1,247 against 1,512 at 514,000), all of it in commits over dropped trees, and
+it is paid in proportion to the time spent paged: at twice the resident heap the
+514,000-account node never dropped a tree, while the 192,000-account one still touched
+`pressure` once, because the load's own growth (the pending session, the history window, the
+recent transaction ids, a few hundred MiB over forty seconds whatever the state) is a larger
+share of its heap. The smallest state is the odd one out: against 122 MiB of resident state
+that growth is several times the state, so every limit up to twice the resident figure cycled
+through `pressure`, the four smallest touched `critical` (where `start` would have stopped the
+node cleanly; the benchmark's node only reports it), and admission was refused for most of the
+run, 86,000 of 106,000 submissions at 1.25. The 350 to 800 transfers a second there are that
+refusal, not slow blocks. A small state wants a heap sized to the load, not to the state.
+
 Then the database alone, in the parent process after the node session (so with a full history
 window): blocks of 500 random transfers, six per mode, checked through `checkTx` first as
 admission does, then finalized and committed to LMDB; the modes added up as the guard's levels
@@ -709,9 +748,11 @@ paged, items 1 and 3 below.
    between the decoded cache and the index trees; it is not built, so the encoded copy of every
    object stays in memory whatever the level.
 3. **Opening a store with its tiers dropped.** A node builds every tier resident before the guard
-   samples, so a `--heap` below the resident state aborts at startup rather than paging from the
-   first block; opening with the index trees and Merkle trees dropped when the heap is known to
-   be too small for them is what would let a state larger than the heap run at all.
+   samples, so a `--heap` below what opening the store takes, about two thirds of the resident
+   heap (section 4.13), aborts at startup rather than paging from the first block; between that
+   and the resident heap the node opens and pages at once. Opening with the index trees and
+   Merkle trees dropped when the heap is known to be too small for them is what would let a
+   state larger than the heap run at all.
 4. **The sparse trees' past versions at restart.** The store holds the current nodes, not past
    ones, so a restart rebuilds the name tree's retained versions by replaying every account, 3.5 s
    of the 5.2 s restart at 192,000 accounts (section 4.12); keeping the window's before-images in

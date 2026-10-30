@@ -850,8 +850,10 @@ done about each finding.
   commit. Of `STATE-PAGING.md` three things are not built: cold arena slabs are not
   released at `warn`, so the encoded copy of every object stays in memory at every
   level; a store cannot be opened with its tiers already dropped, so a node whose
-  `--heap` is below its resident state aborts at startup rather than paging from the
-  first block; and the store holds the sparse trees' current nodes only, so a restart
+  `--heap` is below what opening the store takes (about two thirds of its resident
+  heap, measured in docs/benchmarks.md 4.13) aborts at startup rather than paging from
+  the first block, while from 0.8 times the resident heap upward it opens and pages
+  at 15 to 25% of throughput; and the store holds the sparse trees' current nodes only, so a restart
   rebuilds their past versions by replaying every account, most of what remains of a
   restart (3.5 s of 5.2 at 192,000 accounts). And chunks of 1,024 hashes on disk make a
   block scattered over the state rewrite nearly every chunk it touches, a fifth of the
