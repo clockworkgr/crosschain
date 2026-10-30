@@ -17,7 +17,7 @@ the subject of the [tutorial](tutorial/00-overview.md); design decisions are in
 ```sh
 git clone <this repository> crosschain && cd crosschain
 npm install
-npm test                 # 137 tests, about a minute
+npm test                 # 146 tests, about a minute
 CHAIN_SCHEME=secp256k1 npm test   # the same suite on secp256k1 keys (one ML-DSA-only case is skipped)
 npm run typecheck
 ```
@@ -75,14 +75,27 @@ One terminal per node:
 node src/cli.ts start ./testnet/node0
 node src/cli.ts start ./testnet/node1
 node src/cli.ts start ./testnet/node2
-node src/cli.ts start ./testnet/node3
+node src/cli.ts start ./testnet/node3 --heap 2048   # a heap limit of your own, in MiB
 ```
 
-`start` reads `config.json` and the `genesis.json` in the parent directory, opens LMDB under
-`nodeN/data/lmdb`, connects to the seeds, and serves RPC on the configured address. Every five
-seconds it logs a status line: height, peers, mempool size, consensus round, active validator
-count and the community pool. `SIGINT` or `SIGTERM` shuts down cleanly. Logs go to stderr;
-`LOG=debug` shows every proposal, vote and timeout, `LOG=warn` only problems.
+`start <nodeDir> [--heap <MiB>]` first runs itself again as a child process under a heap limit,
+because V8's own default is a few gigabytes whatever the machine has, and a state that outgrows
+it aborts the process with no chance to stop cleanly: `--max-old-space-size` of three quarters
+of physical memory, or the `--heap` figure in MiB (a whole number, at least 256), together with
+`--max-semi-space-size=64` (a larger young generation, so fewer minor collections) and
+`--expose-gc` (so the node can schedule collections after commits). It prints `start: running
+the node under a N MiB heap limit (--heap <MiB> changes it), collections scheduled after
+commits`, passes `SIGINT` and `SIGTERM` on to the child, whose shutdown runs once however many
+it gets, and exits with the child's code. When `--max-old-space-size` is already in effect (in
+`node`'s own arguments or in `NODE_OPTIONS`), or `CROSSCHAIN_CHILD` is set, it runs in place
+instead. The node then reads `config.json` and the `genesis.json` in the parent directory, opens
+LMDB under `nodeN/data/lmdb`, connects to the seeds, and serves RPC on the configured address.
+Every five seconds it logs a status line: height, peers, mempool size, consensus round, active
+validator count, the community pool, `heap=<used>/<limit> MiB`, `memory=<level>` (the memory
+guard's level, section 12) and `gc=<n> pauses, <total> ms, longest <max> ms` (every garbage
+collection V8 ran since start). `SIGINT` or `SIGTERM` shuts down cleanly; so does the guard's
+`critical` level, with exit code 3, so a supervisor can restart the node with a larger `--heap`.
+Logs go to stderr; `LOG=debug` shows every proposal, vote and timeout, `LOG=warn` only problems.
 
 Blocks are produced as soon as more than two thirds of the voting power is connected: with four
 equal validators, three of them. The default timeouts give roughly one block a second on a
@@ -124,7 +137,7 @@ their operator account.
 | command | what it does |
 |---|---|
 | `init [dir=./testnet] [validators=4] [basePort=26656] [--scheme ml-dsa-44\|secp256k1]` | writes a genesis, a keystore and one directory per validator, every key of the named scheme, ML-DSA-44 when absent (section 3.1) |
-| `start <nodeDir>` | runs a node with its RPC (section 3.2) |
+| `start <nodeDir> [--heap <MiB>]` | runs a node with its RPC under a heap limit of three quarters of memory, or the given size in MiB (section 3.2); stops cleanly with exit code 3 when the heap nears the limit |
 | `join <dir> <nodeN> <seedAddr> <trustHeight> <trustHash> [basePort=26700]` | writes a directory for a node that joins by state sync from a header the operator trusts (section 9); refuses to touch a directory that already has a `config.json` |
 | `keys list` | names, schemes and addresses in the keystore (`--keystore <path>`, default `./keystore.json`, for every `keys` command) |
 | `keys add <name> [--scheme ml-dsa-44\|secp256k1]` | generates a key under that name, of the given scheme (ML-DSA-44 when absent); it must be the chain's, which `status` reports |
@@ -195,7 +208,9 @@ that embeds one.
 
 Environment: `LOG` sets the log level (`debug`, `info`, `warn`, `error`); `CHAIN_PASSPHRASE`
 the keystore passphrase. `CHAIN_SCHEME` is read only by the local network script, the tests and
-the benchmarks (section 2); a node follows the scheme its genesis names.
+the benchmarks (section 2); a node follows the scheme its genesis names. `CROSSCHAIN_CHILD` is
+set by `start` for the child process it runs the node in (section 3.2); `NODE_OPTIONS` with a
+`--max-old-space-size` of your own makes `start` run in place under that limit.
 
 Data lives under `nodeN/data`: the LMDB environment in `lmdb` holds two stores, `chain` (blocks,
 commits, validator sets, results, the transaction index, the headers a state-synced node keeps
@@ -325,11 +340,11 @@ verifiers decode them unchanged. `params`, when present, is an object; a `height
 the latest. A request without an `id` is a notification: the method runs, nothing is answered (not
 even an error), a body holding only notifications gets HTTP 204 with no content, and a batch that
 mixes them with requests is answered for the requests alone. `GET /health` answers
-`{height, peers}`.
+`{height, peers, memory}`, the last the memory guard's level (section 12).
 
 | method | parameters | result | costly |
 |---|---|---|---|
-| `status` | | chain id, protocol version, `signatureScheme` (`ml-dsa-44` or `secp256k1`), latest height, hash, time and app hash, `catchingUp`, `lowestHeight` kept, `joinedAt` (state sync; forgotten at a restart), peer count, this node's validator address, `rpcVersion` | |
+| `status` | | chain id, protocol version, `signatureScheme` (`ml-dsa-44` or `secp256k1`), latest height, hash, time and app hash, `catchingUp`, `lowestHeight` kept, `joinedAt` (state sync; forgotten at a restart), peer count, this node's validator address, `memory` (`level`, `shedding`, and in bytes `heapUsed`, `heapLimit`, `heapTotal`, `arrayBuffers`, `external`, `rss`; and `database`, the object database's own figures: `arena` with its `slabs` and, in bytes, their `capacity`, the `used` bytes written into them and the `dead` ones among those, `hotObjects` and `hotLimit` for the decoded objects cached and their cap, `null` while unbounded, and `historyBytes` for the past values the provable window keeps; `database` is `null` for an application other than the core one), `gc` (`available`; the collections V8 ran since start as `collections`, `minor`, `major`, `incremental`, their pauses as `totalMs`, `maxMs`, `lastMs`; the `scheduledMinor` and `scheduledMajor` ones the node asked for), `rpcVersion` | |
 | `genesis` | | the genesis document (without any application state file path) | |
 | `header` | `height?` | the header; below the lowest block, one the node keeps alone when it has it (section 9) | |
 | `block` | `height?` | header, transactions (hex), last commit, evidence, commit | yes |
@@ -344,7 +359,7 @@ mixes them with requests is answered for the requests alone. `GET /health` answe
 | `balance` | `account`, `asset?` | one balance | |
 | `accountHistory` | `account`, `from?`, `limit?` (default 20, max 100), `reverse?` | history entries with sequence numbers, oldest first from sequence `from`; with `reverse`, newest first, and `from` counts entries back from the newest | yes |
 | `tx` | `hash`, `prove?` | where the transaction landed, its result, the decoded operations, and inclusion and result proofs | yes |
-| `broadcastTx` | `tx` (hex), `mode?` (`sync`, the default, or `commit`), `timeoutMs?` (default 30,000, at most 120,000) | `sync`: the mempool's verdict, `added` or `seen`; `commit`: waits for inclusion and returns height, position and result | yes |
+| `broadcastTx` | `tx` (hex), `mode?` (`sync`, the default, or `commit`), `timeoutMs?` (default 30,000, at most 120,000) | `sync`: the mempool's verdict, `added` or `seen`; `commit`: waits for inclusion and returns height, position and result; `-32004` while the mempool is paused under memory pressure | yes |
 | `accounts` | `limit?` (default 50, max 200), `after?` | accounts by name with their core balance, paged by name; `after` is the last name of the previous page and is not repeated | yes |
 | `parameters` | | the core asset, the fee schedule and the staking parameters in force | |
 | `proposals` | | open parameter proposals with the full parameters each would adopt | yes |
@@ -370,6 +385,11 @@ the node no longer has a provable version for), `-32001` not found, `-32002` the
 the transaction (the message says why), `-32003` not included before the timeout, `-32004` rate
 limited.
 
+While the node sheds load under memory pressure (section 12), `broadcastTx` and every costly
+method answer `-32004` with `node under memory pressure` before the rate limiter is consulted,
+and `GET /events` answers HTTP 503; the cheap methods, `/health` and the streams already open
+keep working, and everything resumes once the heap eases.
+
 Limits per client address: a token bucket of 100 refilled at 50 a second. Every HTTP request
 spends one token, and is refused with HTTP 429 when it cannot; each costly method in it spends 4
 more, answered as a `-32004` error inside the HTTP 200 response. A batch of up to 20 requests
@@ -393,7 +413,8 @@ A client that reconnects sends `Last-Event-ID: <height>` and receives the blocks
 within the last 1,000; the replay costs as much as a costly call and is refused with 429 when the
 client cannot afford it, rather than opening a stream with a gap. The replay stops at a block the
 node has pruned. A stream whose client has stopped reading is closed once a megabyte of events is
-queued for it; the client resumes with `Last-Event-ID`.
+queued for it; the client resumes with `Last-Event-ID`. No stream is opened while the node
+sheds load under memory pressure: the request gets HTTP 503, and the client tries again later.
 
 ## 9. Joining a running chain
 
@@ -510,16 +531,48 @@ node's answer, unproven.
   sets are never pruned and grow with use.
 - **Memory.** The whole state stays in memory by design: about 1.1 GB per gigabyte of genesis,
   plus the version history (changed objects times the retention window) and, during a state
-  sync join, two more copies. Node's default heap suffices for a gigabyte. Per account with its
-  balance and two keys the measured cost is 6.1 KB under ML-DSA-44 and 3.5 KB under secp256k1
-  (docs/benchmarks.md section 7): the keys account for the difference, the object database's
-  own objects, indices and trees for the rest, so ten million accounts need tens of gigabytes
-  of heap under either scheme and `--max-old-space-size` above Node's default. On disk the
-  same accounts are 3.3 KB and 190 bytes each.
+  sync join, two more copies. `start` runs the node under a heap limit of three quarters of
+  physical memory (`--heap <MiB>` sets another; section 3.2), since V8's own default is a few
+  gigabytes whatever the machine has, and a state that outgrows the limit aborts the process.
+  Per account with its balance and two keys the measured cost is 6.1 KB under ML-DSA-44 and
+  3.5 KB under secp256k1 (docs/benchmarks.md section 7): the keys account for the difference,
+  the object database's own objects, indices and trees for the rest (about 3.2 KB, of which the
+  decoded objects are 0.55 KB and the indices, the name tree and the Merkle trees the other
+  2.65 KB), so ten million accounts need tens of gigabytes of heap under either scheme and a
+  `--heap` to match. On disk the same accounts are 3.3 KB and 190 bytes each.
+- **The memory guard.** The node samples its heap every second and holds a level by how full
+  it is. `ok`: nothing, and the object database keeps every object it has decoded. `warn`, at
+  70% of the limit (`memory: heap filling`): a major collection is started and the database's
+  cache of decoded objects is capped at 100,000, the rest evicted at once. `pressure`, at 85%
+  (`memory: shedding load`): the cache is capped at 10,000, and the mempool stops admitting
+  transactions and fetches none that peers announce, costly RPC methods and new event streams
+  are refused, and the signature cache is dropped, while consensus and block sync go on with
+  whatever is pooled, so a validator keeps voting and a full node keeps following. `critical`, at 95% (`memory: heap at the limit; stopping before the process
+  aborts`): the CLI stops the node cleanly, RPC, node, store and verifier in that order, and
+  exits with code 3, so a supervisor restarts it with a larger heap instead of finding a
+  process V8 aborted. A level is left only once the heap is 5 points below the threshold it
+  was entered at (`memory: easing`), so a heap hovering at a threshold does not flap, and
+  one sample may cross several levels. With the cache capped, an object evicted and read again
+  is decoded afresh from the database's arena of encoded bytes, about a microsecond for an
+  account, so a block of transfers among random accounts takes about twice as long
+  (docs/benchmarks.md section 4.10); back at `ok` the cap is lifted. What the guard buys is a
+  clean stop and a reason, and through the cache a little room (decoded objects are about a
+  sixth of the heap), not a way to run a live state larger than the heap: the fix for that is
+  `--heap` or a machine with more memory. Two figures to read with care. The limit the node
+  reports includes the young generation, so `--heap 512` shows as about 704 MiB (512 plus
+  three 64 MiB semi-spaces). And array buffers (ML-DSA keys, stored bytes, the database's
+  arena) live outside the V8 heap and outside the guard's fraction, so a machine that runs out of physical memory for them meets
+  the operating system's killer, not the guard; `status` reports `arrayBuffers` and `rss`
+  beside the heap figures. Collections are scheduled as well: right after every commit, the
+  idle moment before the next proposal, a minor collection runs, and a major one is started
+  once the heap has grown by 256 MiB or a tenth of the limit since the last; the status line
+  and `status` count every pause V8 takes, scheduled or not.
 - **CPU.** Signature verification is the only heavy work; the node uses a worker pool of all
   cores but one. One core verifies about 1,100 ML-DSA-44 or 1,400 secp256k1 signatures a second.
 - **Monitoring.** The status log line, `GET /health`, and `status` (`catchingUp` is true when a
-  peer is more than one block ahead).
+  peer is more than one block ahead). All three carry the memory guard's level (`memory`); the
+  status line and `status` also count the garbage collection pauses since start with their
+  total and longest duration (`gc`), so a node whose pauses grow can be seen before it stalls.
 - **Upgrades.** There is no deployed network and encodings may change between versions. A node
   whose data directory belongs to another chain id refuses to start; a block from another
   protocol version is rejected by validation.
@@ -533,6 +586,12 @@ node's answer, unproven.
 | `connection refused` in the log | a seed is not running yet; the node keeps dialling and starts once it has peers |
 | no blocks, round numbers climbing in `status` | two thirds or less of the voting power is online; more than two thirds is needed |
 | `rate limited` (`-32004`) | the client exceeded the token bucket: a request spends one token and each costly call four more, from 100 refilled at 50 a second |
+| `node under memory pressure` (`-32004`), or HTTP 503 from `/events` | the node is shedding load at the guard's `pressure` level (section 12): broadcasts, costly calls and new event streams are refused until the heap eases; cheap calls and `/health`, which reports the level, still answer |
+| `memory: heap filling` | the heap is 70% full (`warn`); a major collection was started and the database's cache capped at 100,000 decoded objects. Watch `heap=` in the status line, and plan a larger `--heap` if it keeps climbing |
+| `memory: shedding load`, then `shedding load: mempool paused, costly requests refused` | the heap is 85% full (`pressure`): the mempool admits and fetches nothing, costly RPC calls and new streams are refused, the signature cache is dropped, the database's cache is capped at 10,000 decoded objects; consensus and block sync go on. `memory: easing` and `load shedding over` follow once the heap falls 5 points below the threshold |
+| `memory: heap at the limit; stopping before the process aborts (raise --max-old-space-size or --heap)`, then exit code 3 | the heap is 95% full (`critical`); the node stopped cleanly rather than wait for V8 to abort it. Start it again with a larger `--heap`, or on a machine with more memory: the state did not fit, and nothing but the limit changes that |
+| `--heap takes a size in MiB, at least 256` | `--heap` was given something other than a whole number of MiB of 256 or more |
+| `gc: not exposed; collections run when V8 decides (start with --expose-gc to schedule them after commits)` | the node runs without `--expose-gc`: `start` found `--max-old-space-size` already set and did not wrap itself, or the node is embedded in a program. Nothing is wrong; collections are simply not scheduled after commits |
 | `operation 0 states a fee of X, the schedule requires Y` | the fee schedule changed after the transaction was built; rebuild it |
 | `missing active authority of ...` or `no required authority` | signed with a key that is not in the account's authorities |
 | `transaction expired` | built more than 60 seconds ago (or half of `maxTxExpirationMs`, when that is shorter), or the sender's clock is behind the chain's |

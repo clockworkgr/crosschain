@@ -7,7 +7,7 @@ by genesis: post-quantum ML-DSA-44 or secp256k1. Written in TypeScript so that e
 mechanism is readable in one sitting.
 
 `DESIGN.md` records every design decision and why it was made; `STAKING.md`,
-`RPC-SYNC-PROOFS.md` and `FEES.md` are the specifications it points to. The `docs/`
+`RPC-SYNC-PROOFS.md`, `FEES.md` and `STATE-PAGING.md` are the specifications it points to. The `docs/`
 directory holds the full documentation: [running and using the chain](docs/running.md),
 [the benchmarks and their analysis](docs/benchmarks.md), and a [part-by-part tutorial
 of the whole codebase](docs/tutorial/00-overview.md). This file is the short version.
@@ -18,7 +18,7 @@ Requires Node 24 (it runs TypeScript directly; there is no build step).
 
 ```sh
 npm install
-npm test                      # 137 tests, about a minute; CHAIN_SCHEME=secp256k1 runs them on secp256k1 keys
+npm test                      # 146 tests, about a minute; CHAIN_SCHEME=secp256k1 runs them on secp256k1 keys
 node scripts/localnet.ts 4 30 # 4 validators in one process for 30 seconds, driving the app from a faucet, RPC on :26657
 ```
 
@@ -27,7 +27,7 @@ A real testnet over TCP, one terminal per node:
 ```sh
 export CHAIN_PASSPHRASE=testnet               # the keystore passphrase init prints
 node src/cli.ts init ./testnet 4              # genesis, keystore, 4 node directories (p2p 26656, 26658, ...; RPC one port up); --scheme secp256k1 for that scheme
-node src/cli.ts start ./testnet/node0         # repeat for node1..node3
+node src/cli.ts start ./testnet/node0         # repeat for node1..node3; --heap <MiB> sets the heap limit (three quarters of memory otherwise)
 node src/cli.ts show ./testnet/node1          # status, validators and accounts over the node's RPC
 node src/cli.ts create ./testnet/node0 alice  # the faucet registers alice; her key goes into the keystore
 node src/cli.ts transfer ./testnet/node2 faucet alice 12.5   # whole tokens; waits for inclusion
@@ -49,6 +49,14 @@ the node directory, so it needs one.
 A genesis too large to inline (a token distribution with many accounts) goes in its
 own file named by `"appStateFile"` in `genesis.json`; the node streams it with
 `stream-json` at first start and never reads it again.
+
+`start` runs the node in a child process under a heap limit, three quarters of memory
+unless `--heap <MiB>` says otherwise, with a memory guard that caps the object database's
+cache of decoded objects and sheds load (the mempool, costly RPC calls, new event streams,
+the signature cache) as the heap fills and stops the node cleanly with exit code 3 before
+V8 would abort it, and with garbage collections scheduled in the idle moment after each
+commit. The five-second status line, `status`
+and `/health` report the heap, the guard's level and the collection pauses.
 
 Set `LOG=debug` to watch every proposal, vote and timeout. Node state is kept in an
 LMDB environment under each node's data directory; of the four runtime dependencies,
@@ -165,7 +173,7 @@ the code, from the bottom up:
 10. `src/p2p/network.ts` — handshake, peer exchange, duplicate connections.
 11. `src/sync/blocksync.ts` — how a lagging node catches up.
 12. `src/node/node.ts` — the wiring.
-13. `src/db/id.ts`, `src/db/keys.ts`, `src/db/index.ts` — typed objects, dense ids, and indices as ordered byte keys.
+13. `src/db/id.ts`, `src/db/keys.ts`, `src/db/arena.ts`, `src/db/index.ts` — typed objects, dense ids, objects kept as bytes in an arena behind a cache of decoded ones, and indices as ordered byte keys.
 14. `src/db/bptree.ts` — the B+ tree behind every index and the in-memory store.
 15. `src/db/merkle.ts`, `src/db/proof.ts` — the dense Merkle tree, its versions, and how an ICS23-shaped proof is checked.
 16. `src/db/smt.ts` — the sparse Merkle tree behind proofs by name, and why the B+ tree is not hashed.
@@ -196,8 +204,8 @@ src/consensus   Tendermint state machine and supporting pieces
 src/mempool.ts  transaction pool
 src/p2p         transports, messages, peer db, network
 src/sync        block sync
-src/node        executor and node
-src/db          object database: ids, B+ tree indices, versioned Merkle tree, proofs, sessions
+src/node        executor, memory guard and collection scheduler, node
+src/db          object database: ids, arena and hot cache, B+ tree indices, versioned Merkle tree, proofs, sessions
 src/store       key-value interface, LMDB, block store
 src/light       light client, providers (in-process and RPC), query verification
 src/rpc         JSON-RPC server, events, client

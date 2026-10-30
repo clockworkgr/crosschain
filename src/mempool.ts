@@ -24,7 +24,7 @@ export interface MempoolOptions {
 
 const DEFAULTS: MempoolOptions = { maxTxs: 10_000, maxTxBytes: 1024 * 1024, cacheSize: 100_000 };
 
-export type AddTxStatus = 'added' | 'seen' | 'invalid' | 'full' | 'too-large';
+export type AddTxStatus = 'added' | 'seen' | 'invalid' | 'full' | 'too-large' | 'paused';
 
 export interface AddTxResult {
   status: AddTxStatus;
@@ -39,6 +39,7 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
   private readonly txs = new Map<string, Uint8Array>();
   private readonly cache = new Set<string>();
   private readonly cacheOrder: string[] = [];
+  private pausedReason: string | null = null;
 
   constructor(app: Application, opts: Partial<MempoolOptions> = {}) {
     super();
@@ -48,6 +49,19 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
 
   get size(): number {
     return this.txs.size;
+  }
+
+  /** While paused nothing new is admitted (the node is shedding load); what is pooled stays and is still reaped. */
+  get paused(): boolean {
+    return this.pausedReason !== null;
+  }
+
+  pause(reason: string): void {
+    this.pausedReason = reason;
+  }
+
+  resume(): void {
+    this.pausedReason = null;
   }
 
   has(hash: Uint8Array): boolean {
@@ -73,6 +87,7 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
   async addTx(tx: Uint8Array, source: string | null = null): Promise<AddTxResult> {
     const hash = txHash(tx);
     const key = toHex(hash);
+    if (this.pausedReason !== null) return { status: 'paused', hash, error: this.pausedReason };
     if (tx.length > this.opts.maxTxBytes) return { status: 'too-large', hash };
     if (this.cache.has(key)) return { status: 'seen', hash };
     if (this.txs.size >= this.opts.maxTxs) return { status: 'full', hash };

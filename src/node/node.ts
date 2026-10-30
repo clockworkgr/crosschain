@@ -38,6 +38,7 @@ import { BlockSync } from '../sync/blocksync.ts';
 import type { Genesis } from '../types/genesis.ts';
 import { makeLogger, type Logger, type LogLevel } from '../util/log.ts';
 import { BlockExecutor } from './executor.ts';
+import { GcScheduler, MemoryGuard, type GcSchedulerOptions, type MemoryGuardOptions, type MemoryLevel, type MemoryStats } from './memory.ts';
 
 export interface NodeConfig {
   name: string;
@@ -68,6 +69,10 @@ export interface NodeConfig {
   lagGraceMs?: number;
   log?: Logger;
   logLevel?: LogLevel;
+  /** Heap thresholds and sampling for the memory guard (see memory.ts); tests inject their own `stats`. */
+  memory?: Partial<Omit<MemoryGuardOptions, 'log' | 'onLevel'>>;
+  /** Collection scheduling after commits; `gc: null` turns it off. */
+  gc?: Partial<Omit<GcSchedulerOptions, 'log'>>;
 }
 
 /**
@@ -118,6 +123,10 @@ export class Node {
   requester!: Requester;
   /** Set when the node joined from a snapshot. */
   joinedAt: bigint | null = null;
+  memoryGuard!: MemoryGuard;
+  gcScheduler!: GcScheduler;
+  private shedding = false;
+  private readonly memoryListeners: ((level: MemoryLevel, stats: MemoryStats) => void)[] = [];
   readonly privValidator: PrivValidator | null;
   readonly nodeKey: KeyPair;
   readonly verifier: Verifier;
@@ -256,6 +265,9 @@ export class Node {
     // The evidence age follows the unbonding period the application holds now, not the one genesis had.
     if (this.app instanceof CoreApp && this.cfg.limits?.maxEvidenceAgeMs === undefined) limits.maxEvidenceAgeMs = this.app.stakingParameters().unbondingPeriodMs;
 
+    this.gcScheduler = new GcScheduler({ log: this.log, ...this.cfg.gc });
+    this.memoryGuard = new MemoryGuard({ log: this.log, ...this.cfg.memory, onLevel: (level, stats) => this.onMemoryLevel(level, stats) });
+
     this.consensus = new Consensus({
       chainId: this.chainId,
       getState: () => this.executor.state,
@@ -332,7 +344,8 @@ export class Node {
       return out;
     };
     this.network.on('inv', (peer, m) => {
-      const want = m.kind === InvKind.Tx ? wanted(m.hashes, (h) => this.mempool.seen(h)) : m.kind === InvKind.Evidence ? wanted(m.hashes, (h) => this.evidencePool.hasHash(h)) : [];
+      // Under memory pressure the mempool admits nothing, so there is no point fetching what peers announce.
+      const want = m.kind === InvKind.Tx ? (this.mempool.paused ? [] : wanted(m.hashes, (h) => this.mempool.seen(h))) : m.kind === InvKind.Evidence ? wanted(m.hashes, (h) => this.evidencePool.hasHash(h)) : [];
       for (let i = 0; i < want.length; i += 256) peer.send({ type: 'fetch', kind: m.kind, hashes: want.slice(i, i + 256) });
     });
     this.network.on('fetch', (peer, m) => {
@@ -358,6 +371,8 @@ export class Node {
     // Every commit is announced so lagging peers know to sync, and the evidence age tracks the unbonding period.
     this.executor.onCommitted((block) => {
       this.network.broadcast({ type: 'status', height: block.header.height });
+      // The idle moment after a commit is where collections are least in the way.
+      setImmediate(() => this.gcScheduler.afterCommit());
       if (this.app instanceof CoreApp && this.cfg.limits?.maxEvidenceAgeMs === undefined) limits.maxEvidenceAgeMs = this.app.stakingParameters().unbondingPeriodMs;
     });
   }
@@ -389,6 +404,8 @@ export class Node {
     this.networkStarted = true;
     this.blockSync.start();
     this.consensus.start();
+    this.memoryGuard.start();
+    this.gcScheduler.start();
     this.log('info', 'node started', {
       height: this.executor.state.lastHeight,
       validator: this.privValidator ? this.privValidator.address : null,
@@ -401,6 +418,8 @@ export class Node {
     this.releaseLock = null;
     if (this.started) {
       this.started = false;
+      this.memoryGuard.stop();
+      this.gcScheduler.stop();
       this.consensus.stop();
       this.blockSync.stop();
     }
@@ -416,6 +435,40 @@ export class Node {
 
   get height(): bigint {
     return this.executor.state.lastHeight;
+  }
+
+  /** Called on every change of the memory guard's level; the CLI stops the node on `critical`. */
+  onMemory(fn: (level: MemoryLevel, stats: MemoryStats) => void): void {
+    this.memoryListeners.push(fn);
+  }
+
+  get memoryLevel(): MemoryLevel {
+    return this.memoryGuard.level;
+  }
+
+  /** True while load is shed: the mempool admits nothing, costly RPC methods and new streams are refused. */
+  get isShedding(): boolean {
+    return this.shedding;
+  }
+
+  /** The database's hot cache of decoded objects: unbounded while memory is fine, capped as it fills (STATE-PAGING.md section 7). */
+  static readonly HOT_OBJECTS = { ok: Infinity, warn: 100_000, pressure: 10_000, critical: 10_000 } as const;
+
+  private onMemoryLevel(level: MemoryLevel, stats: MemoryStats): void {
+    if (level === 'warn' || level === 'pressure') void this.gcScheduler.major();
+    if (this.app instanceof CoreApp) this.app.db.setHotLimit(Node.HOT_OBJECTS[level]);
+    this.shed(level === 'pressure' || level === 'critical');
+    for (const fn of this.memoryListeners) fn(level, stats);
+  }
+
+  private shed(on: boolean): void {
+    if (on === this.shedding) return;
+    this.shedding = on;
+    if (on) {
+      this.mempool.pause('node under memory pressure');
+      if (this.app instanceof CoreApp) this.app.dropSignatureCache();
+    } else this.mempool.resume();
+    this.log(on ? 'warn' : 'info', on ? 'shedding load: mempool paused, costly requests refused' : 'load shedding over', { mempool: this.mempool.size });
   }
 
   get genesis(): Genesis {

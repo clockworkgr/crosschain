@@ -1,6 +1,6 @@
 # 8. The node
 
-A node is the consensus engine, the mempool, the network, block sync, state sync, the block store and one application, wired together in one object. `src/node/node.ts` constructs each piece from the chapters before ([consensus](04-consensus.md), [mempool and executor](05-mempool-executor.md), [p2p](06-p2p.md), [sync](07-sync.md), the [store](10-store.md) and the [application](11-application.md)) and connects them with closures: consensus is given functions to apply a block and to broadcast a vote, block sync is given functions to read state and to restart consensus, and the network is given handlers for every message type. It also decides the gossip policy (what is pushed, what is announced by hash, what is sent to a peer that just connected) and exposes the queries the [RPC](12-rpc.md) serves. Validators and full nodes run the same code; a full node has no validator key. `scripts/localnet.ts` and `bench/network.bench.ts` show how to run a whole validator set in one process.
+A node is the consensus engine, the mempool, the network, block sync, state sync, the block store, one application, and a memory guard with a collection scheduler, wired together in one object. `src/node/node.ts` constructs each piece from the chapters before ([consensus](04-consensus.md), [mempool and executor](05-mempool-executor.md), [p2p](06-p2p.md), [sync](07-sync.md), the [store](10-store.md) and the [application](11-application.md)) and connects them with closures: consensus is given functions to apply a block and to broadcast a vote, block sync is given functions to read state and to restart consensus, and the network is given handlers for every message type. It also decides the gossip policy (what is pushed, what is announced by hash, what is sent to a peer that just connected), sheds load when the heap fills, and exposes the queries the [RPC](12-rpc.md) serves. Validators and full nodes run the same code; a full node has no validator key. `scripts/localnet.ts` and `bench/network.bench.ts` show how to run a whole validator set in one process.
 
 ## Concepts
 
@@ -8,7 +8,7 @@ A node is the consensus engine, the mempool, the network, block sync, state sync
 
 **Wiring by closures.** `Consensus` does not hold a `Node`; it holds a `ConsensusDeps` object of functions: `getState`, `applyBlock`, `broadcastVote`, `requestBlock`, `scorePeer`, and so on. `BlockSync` likewise. The node fills those with arrow functions that reach into its own fields. This keeps the modules free of cycles (consensus does not import the network, the network does not import consensus), makes each testable with fakes (`test/review.test.ts` builds a `BlockSync` on a fake network), and makes the wiring readable in one place: `Node.init`.
 
-**Order of construction.** The network is built first and its request handlers for headers, validator sets and snapshots are installed before anything else, because a node serves those "whether or not we are caught up ourselves". State sync, if configured and the store is empty, runs next, before the application exists, because it writes the application store directly. Then the application, the mempool on it, the executor (which initialises from genesis or replays whatever the application missed), consensus, block sync, and finally the gossip handlers.
+**Order of construction.** The network is built first and its request handlers for headers, validator sets and snapshots are installed before anything else, because a node serves those "whether or not we are caught up ourselves". State sync, if configured and the store is empty, runs next, before the application exists, because it writes the application store directly. Then the application, the mempool on it, the executor (which initialises from genesis or replays whatever the application missed), the collection scheduler and the memory guard, consensus, block sync, and finally the gossip handlers.
 
 **Three gossip policies in one node.** Consensus messages are pushed straight through to every peer (`broadcastProposal`, `broadcastVote`), with no inventory round trip; a peer that connects in the middle of a height is handed everything held for that height, plus an announcement of any evidence still waiting for a block. Transactions and evidence use announce and fetch (`inv`, `fetch`, `item`, `itemNotFound`), with a seen-cache on each side so nothing loops. Committed blocks are announced by height in a `status` message after every commit, and pulled through block sync. DESIGN.md section 3 explains the split: inventory for items where a round trip is cheap, push where it would delay a consensus phase.
 
@@ -21,6 +21,36 @@ A node is the consensus engine, the mempool, the network, block sync, state sync
 **Storage.** With a `dataDir` the node opens one LMDB environment under `<dataDir>/lmdb` with a `chain` store (blocks, commits, state, validator sets, and the headers a state-synced node keeps below its lowest block) and an `app` store, and keeps the signing guard's state in `<dataDir>/priv_validator_state.bin` and the peer database in `<dataDir>/peers.json`. With `dataDir: null` everything is in memory, which is what every test and the localnet use. A caller may also pass its own `env`, in which case the node does not close it on `stop`.
 
 **Queries for the RPC.** Because execution is deferred (the app hash of the state after block N is in header N+1), a proof about state at height N must be served with header N+1 and its commit. `queryState`, `queryTx` and `queryAccountName` package proofs that way so the light client can check them.
+
+**Memory: a guard and a scheduler.** The state lives in the V8 heap, so the ceiling that matters is the heap limit: past it the process aborts with no chance to stop cleanly, and V8's default is a few gigabytes whatever the machine has. `src/node/memory.ts` answers with two small objects whose header comment is their design:
+
+```ts
+ * The state lives in the heap, so the ceiling that matters is V8's heap
+ * limit: past it the process aborts with no chance to stop cleanly. The guard
+ * samples the heap and, by how full it is, moves through four levels:
+ *
+ *   ok         nothing
+ *   warn       logged, a major collection started
+ *   pressure   load is shed: the mempool stops admitting, costly RPC methods
+ *              and new event streams are refused, the signature cache is
+ *              dropped; consensus keeps running on whatever is pooled
+ *   critical   a clean stop with a reason, so a supervisor restarts the node
+ *              with a larger limit instead of finding a dead process
+ *
+ * Levels are hysteretic: one is left only a step below where it was entered,
+ * so a heap hovering at a threshold does not flap.
+ *
+ * The scheduler moves collections to known moments. Right after a block
+ * commits, when the node is idle until the next proposal, it runs a minor
+ * collection (the young generation, a few milliseconds) and, when the heap has
+ * grown enough since the last one, starts a major collection asynchronously,
+ * so V8 rarely has to pick its own moment inside a round. Both need
+ * --expose-gc; without it the scheduler does nothing and says so. Every
+ * collection V8 runs, scheduled or not, is observed through perf_hooks and
+ * counted, so an operator can see the pauses.
+```
+
+What is shed and what is not follows from what the node is for. The mempool, the costly RPC methods, new event streams and the signature cache are all memory held on behalf of clients and peers, and all of it can be refused or dropped without the chain noticing. Consensus and block sync are never shed: a validator that stopped voting under pressure would be counted absent and jailed, and a node that stopped following would only fall further behind, so both go on with whatever is pooled. Besides shedding, each level turns a dial: the object database's cache of decoded objects ([chapter 9](09-database.md)) is unbounded at `ok` and capped as the heap fills, which trades speed for room without refusing anything. The guard buys a clean stop and a reason, and through that cache a little room (decoded objects are about a sixth of the heap), not a home for a state larger than the heap: the fix for that is a larger heap, which the CLI's `start` sets ([chapter 14](14-wallet-cli.md)).
 
 ## The code, file by file
 
@@ -44,8 +74,10 @@ A node is the consensus engine, the mempool, the network, block sync, state sync
 - `network?`: the subset `desiredOutbound`, `maxInbound`, `connectIntervalMs`, `pingIntervalMs`, `idleTimeoutMs` of `NetworkConfig`.
 - `lagGraceMs?`: block sync's one-block grace.
 - `log?`, `logLevel?`: a `Logger`, or a level for `makeLogger(name, level)`.
+- `memory?`: the memory guard's thresholds and sampling (`warnAt`, `pressureAt`, `criticalAt`, `hysteresis`, `intervalMs`) and, for tests, a `stats` function that supplies the samples: everything of `MemoryGuardOptions` but the logger and the level callback, which the node provides.
+- `gc?`: the collection scheduler's options (`majorGrowthBytes`, `majorGrowthFraction`, `observe`, `stats`); `gc: null` turns scheduling off, and `gc` as a function injects a collector in place of the global one `--expose-gc` provides.
 
-**`Node`** fields: `name`, `chainId`, `app`, `store` (a `KvBlockStore` on the env's `chain` store), `env`, `mempool`, `evidencePool`, `requester`, `joinedAt` (the snapshot height when the node state-synced, else `null`), `privValidator`, `nodeKey`, `verifier`, `log`, `executor`, `consensus`, `network`, `blockSync`. The fields marked with `!` are assigned in `init`.
+**`Node`** fields: `name`, `chainId`, `app`, `store` (a `KvBlockStore` on the env's `chain` store), `env`, `mempool`, `evidencePool`, `requester`, `joinedAt` (the snapshot height when the node state-synced, else `null`), `memoryGuard`, `gcScheduler`, `privValidator`, `nodeKey`, `verifier`, `log`, `executor`, `consensus`, `network`, `blockSync`; private, `shedding` and the `memoryListeners` that `onMemory` collects. The fields marked with `!` are assigned in `init`.
 
 #### `Node.create`
 
@@ -115,7 +147,7 @@ Everything asynchronous happens in `init`.
 
 #### `init`, step by step
 
-**1. Limits.** `DEFAULT_LIMITS`, overridden by `genesis.consensus.maxEvidenceAgeMs` if present, overridden by `cfg.limits`. This object is shared by reference with consensus, block sync and the executor's pruning, and mutated as soon as the application is open (step 7) and after every commit (step 11).
+**1. Limits.** `DEFAULT_LIMITS`, overridden by `genesis.consensus.maxEvidenceAgeMs` if present, overridden by `cfg.limits`. This object is shared by reference with consensus, block sync and the executor's pruning, and mutated as soon as the application is open (step 7) and after every commit (step 12).
 
 **2. The network.**
 
@@ -161,7 +193,7 @@ Everything asynchronous happens in `init`.
     this.network.on('chunkRequest', (peer, m) => peer.send({ type: 'chunkResponse', height: m.height, objectType: m.objectType, index: m.index, chunk: this.app instanceof CoreApp ? this.app.chunkBytes(m.height, m.objectType, m.index) : null }));
 ```
 
-The headers handler walks downward from the height asked, taking a stored block's header or, below the lowest block of a node that itself joined by state sync, the header it kept alone, and stops at the first height it holds neither for, so the answer is always a consecutive run; `MAX_HEADERS` (1000) caps it whatever the asker's `count`. These headers go without commits: state sync binds each to the one above it by hash ([chapter 7](07-sync.md)), so a commit per header would be wasted bytes. The snapshot handlers check `this.app instanceof CoreApp` at call time, so a node on the key-value test app, or a node still state syncing (whose `app` is unset), answers with no snapshots rather than crashing. Block requests are served by `BlockSync`, constructed in step 9.
+The headers handler walks downward from the height asked, taking a stored block's header or, below the lowest block of a node that itself joined by state sync, the header it kept alone, and stops at the first height it holds neither for, so the answer is always a consecutive run; `MAX_HEADERS` (1000) caps it whatever the asker's `count`. These headers go without commits: state sync binds each to the one above it by hash ([chapter 7](07-sync.md)), so a commit per header would be wasted bytes. The snapshot handlers check `this.app instanceof CoreApp` at call time, so a node on the key-value test app, or a node still state syncing (whose `app` is unset), answers with no snapshots rather than crashing. Block requests are served by `BlockSync`, constructed in step 10.
 
 **4. State sync.** Only when configured and the chain store has no state (a fresh data directory):
 
@@ -219,7 +251,16 @@ The network is started early so peers can be found; `networkStarted` prevents `s
 
 `open` loads the chain state or initialises it from genesis through `app.initChain`, refuses a data directory from another chain, and replays to the application any blocks it has not committed (crash recovery, [executor](05-mempool-executor.md)). `protectedHeight` keeps pruning from deleting the newest snapshot's block, so a snapshot can always be joined and then block-synced from (RPC-SYNC-PROOFS.md section 4.7, "never below the newest snapshot height"). `evidenceAgeMs` is a function that reads the shared `limits` object, so pruning keeps the blocks of exactly the evidence window consensus is enforcing, however that window changes. The line after `open` is the first of the two evidence-age refreshes: with the application open, its staking parameters say what the unbonding period is *now*, which after a governance change is not what genesis said, and a node that only refreshed on commit would check evidence and prune against the genesis value from restart until its first commit.
 
-**8. Consensus.**
+**8. The memory guard and the collection scheduler.**
+
+```ts
+    this.gcScheduler = new GcScheduler({ log: this.log, ...this.cfg.gc });
+    this.memoryGuard = new MemoryGuard({ log: this.log, ...this.cfg.memory, onLevel: (level, stats) => this.onMemoryLevel(level, stats) });
+```
+
+Both take the node's logger and whatever `cfg.gc` and `cfg.memory` override; the guard's level callback is the node's own `onMemoryLevel`, described below with the rest of the shedding. Neither runs yet: the guard's timer and the scheduler's observer start in `start()`. The guard takes one sample in its constructor, so `memoryGuard.stats` reads before `start()`, and the scheduler records the heap in use now as the baseline its first major collection is measured from. The two classes themselves are described after this file.
+
+**9. Consensus.**
 
 ```ts
     this.consensus = new Consensus({
@@ -246,7 +287,7 @@ The network is started early so peers can be found; `networkStarted` prevents `s
 
 What is wired to what: state reads and block application go to the executor; `updateCommit` lets consensus store a fuller commit when late precommits arrive during the commit timeout (STAKING.md section 2.1); `blockTimeAt` serves evidence age checks; `requestBlock` broadcasts a `blockRequest` to every peer (the `hash` argument consensus passes is ignored; the response is matched by height, as RPC-SYNC-PROOFS.md section 4.5 puts it: "consensus broadcasts a request for the block by height"); `scorePeer` charges bad signatures; `reapTxs` takes transactions from the mempool when this node proposes; the two broadcasts push consensus messages, skipping the peer the message came from.
 
-**9. Block sync.**
+**10. Block sync.**
 
 ```ts
     this.blockSync = new BlockSync({
@@ -272,7 +313,7 @@ What is wired to what: state reads and block application go to the executor; `up
 
 The same executor and `limits`; `blockTimeAt` is the executor's, so a synced block's evidence is checked for age against a header kept alone as well as against a block; `isConsensusDeciding` and `restart` are the two hooks that keep sync and consensus from colliding (see [sync](07-sync.md)). `backfill` defaults to true, and `stateSync.backfill: false` turns it off; `retainBlocks` is the same setting the executor prunes by, so backfill stops at the retention floor instead of fetching blocks pruning will delete.
 
-**10. The gossip handlers.** The fetched-block path first:
+**11. The gossip handlers.** The fetched-block path first:
 
 ```ts
     // A block fetched for the height consensus is on: it stands in for the proposal.
@@ -321,14 +362,15 @@ Inventory gossip for transactions and evidence:
       return out;
     };
     this.network.on('inv', (peer, m) => {
-      const want = m.kind === InvKind.Tx ? wanted(m.hashes, (h) => this.mempool.seen(h)) : m.kind === InvKind.Evidence ? wanted(m.hashes, (h) => this.evidencePool.hasHash(h)) : [];
+      // Under memory pressure the mempool admits nothing, so there is no point fetching what peers announce.
+      const want = m.kind === InvKind.Tx ? (this.mempool.paused ? [] : wanted(m.hashes, (h) => this.mempool.seen(h))) : m.kind === InvKind.Evidence ? wanted(m.hashes, (h) => this.evidencePool.hasHash(h)) : [];
       for (let i = 0; i < want.length; i += 256) peer.send({ type: 'fetch', kind: m.kind, hashes: want.slice(i, i + 256) });
     });
 ```
 
 A transaction admitted to the mempool is announced to every peer but the one it came from (`source` is `null` for a local submission, so then it goes to all). Evidence is announced to everyone, including the peer that sent it, which costs one `inv` that the sender ignores (it has the hash).
 
-On the receiving side, `wanted` decides what to fetch. The mempool's `seen` cache and the evidence pool's `hasHash` cover what the node already holds or has already rejected, but a hash is only in them once the item has arrived and been checked; between the `fetch` and the `item` the node has nothing, and every peer that announces the same hash in that gap (several do, within milliseconds, for a transaction flooding through the network) would trigger another fetch. The `outstanding` map closes that gap: a hash is fetched at most once while a fetch for it is outstanding. The entry is removed when the `item` arrives (keyed by `txHash` of the data for a transaction and `sha256` of the data for evidence, which is `evidenceId`) or when the peer answers `itemNotFound`, and expires after 10 s regardless, so a peer that never answers only delays the fetch rather than blocking it for good: the next `inv` after the expiry fetches again. Expired entries are swept on every `inv`, so the map never grows past what was announced in the last ten seconds. Fetches go out in slices of 256 hashes because that is what the serving side accepts (below); an `inv` of a thousand hashes would otherwise produce one `fetch` that the server trims and charges for.
+On the receiving side, `wanted` decides what to fetch. The mempool's `seen` cache and the evidence pool's `hasHash` cover what the node already holds or has already rejected, but a hash is only in them once the item has arrived and been checked; between the `fetch` and the `item` the node has nothing, and every peer that announces the same hash in that gap (several do, within milliseconds, for a transaction flooding through the network) would trigger another fetch. The `outstanding` map closes that gap: a hash is fetched at most once while a fetch for it is outstanding. The entry is removed when the `item` arrives (keyed by `txHash` of the data for a transaction and `sha256` of the data for evidence, which is `evidenceId`) or when the peer answers `itemNotFound`, and expires after 10 s regardless, so a peer that never answers only delays the fetch rather than blocking it for good: the next `inv` after the expiry fetches again. Expired entries are swept on every `inv`, so the map never grows past what was announced in the last ten seconds. Fetches go out in slices of 256 hashes because that is what the serving side accepts (below); an `inv` of a thousand hashes would otherwise produce one `fetch` that the server trims and charges for. While the mempool is paused (the node is shedding load, below), announced transactions are not fetched at all: `addTx` would refuse them on arrival, so the fetch, the item and the check would be work for nothing; and since `wanted` is not called, nothing is marked outstanding, so the same hashes are fetched as usual once the pool resumes and a peer announces them again. Evidence is fetched regardless: it is small, and a validator under pressure should still see a double sign.
 
 Serving fetches, with the fix for finding 14:
 
@@ -350,16 +392,18 @@ Serving fetches, with the fix for finding 14:
 
 Hashes are deduplicated and capped at 256 per fetch; a peer whose fetch needed trimming is charged 5 points ("unsolicited or duplicate flood 5" in the tariff). Before this, a peer could ask for one 2.5 KB transaction ten thousand times per message and never read the replies. Received items clear their hash from `outstanding` and go to the mempool (`addTx` with the peer id as source) or to `acceptEvidence`; an `itemNotFound` only clears the hash.
 
-**11. After every commit.**
+**12. After every commit.**
 
 ```ts
     this.executor.onCommitted((block) => {
       this.network.broadcast({ type: 'status', height: block.header.height });
+      // The idle moment after a commit is where collections are least in the way.
+      setImmediate(() => this.gcScheduler.afterCommit());
       if (this.app instanceof CoreApp && this.cfg.limits?.maxEvidenceAgeMs === undefined) limits.maxEvidenceAgeMs = this.app.stakingParameters().unbondingPeriodMs;
     });
 ```
 
-The `status` broadcast is how every peer's block sync learns that this node moved; the limits update is the evidence-age coupling described in the concepts, skipped when the operator pinned `maxEvidenceAgeMs` explicitly.
+The `status` broadcast is how every peer's block sync learns that this node moved. The collection is scheduled through `setImmediate` rather than called: `afterCommit` runs a minor collection synchronously, and deferring it lets the rest of this commit's listeners (the RPC's event push among them) and whatever is already queued on the event loop finish first, so the pause lands in the gap before the next proposal arrives, where the previous version's garbage is fresh and nothing is waiting on the thread. The limits update is the evidence-age coupling described in the concepts, skipped when the operator pinned `maxEvidenceAgeMs` explicitly.
 
 #### Every handler on the network, in one place
 
@@ -376,7 +420,7 @@ Handlers registered by the node and by the two objects it constructs. The networ
 | `blockResponse`, `blocksResponse`, `headerResponse`, `headersResponse`, `validatorSetResponse`, `validatorsResponse`, `snapshotsResponse`, `manifestResponse`, `chunkResponse`, `addrResponse` | `Requester` | settle the first matching pending request |
 | `proposal` | `Node.init` | `consensus.handleProposal(proposal, peer.id)` |
 | `vote` | `Node.init` | `consensus.handleVote(vote, peer.id)` |
-| `inv` | `Node.init` | `fetch` the hashes the mempool or evidence pool lacks and no fetch is outstanding for, 256 per message |
+| `inv` | `Node.init` | `fetch` the hashes the mempool or evidence pool lacks and no fetch is outstanding for, 256 per message; no transaction fetches while the mempool is paused |
 | `fetch` | `Node.init` | `item` or `itemNotFound` per hash, at most 256, 5 points if trimmed |
 | `item` | `Node.init` | clear `outstanding`; `mempool.addTx(data, peer.id)` or `acceptEvidence` |
 | `itemNotFound` | `Node.init` | clear `outstanding` |
@@ -388,7 +432,7 @@ Handlers registered by the node and by the two objects it constructs. The networ
 
 #### The life of a transaction
 
-1. A client calls `submitTx` (or the RPC does). `mempool.addTx(tx, null)` runs `app.checkTx`; on success the mempool stores it and emits `tx` with `source = null`.
+1. A client calls `submitTx` (or the RPC does). `mempool.addTx(tx, null)` runs `app.checkTx`; on success the mempool stores it and emits `tx` with `source = null`. While the node sheds load the call answers `paused` instead and nothing else happens.
 2. The node broadcasts `inv { Tx, [hash] }` to every peer.
 3. A peer's `inv` handler sees a hash its mempool has not seen and it is not already fetching, and sends `fetch`; the node's `fetch` handler answers with `item`; the peer's `item` handler calls `mempool.addTx(data, peerId)`, which checks it again and emits `tx` with the sender as source, so the peer announces it to everyone but the sender. Within a few hops every node holds it.
 4. The proposer of the next height calls `reapTxs`, which takes transactions in FIFO order up to the block's byte budget, and pushes the proposal to all peers.
@@ -427,9 +471,52 @@ Handlers registered by the node and by the two objects it constructs. The networ
 
 Evidence for a height whose validator set is unknown (pruned, or below the headers a state-synced node fetched for the evidence window) is dropped silently rather than charged, since the peer may be right. Adding to the pool triggers `onAdded`, which announces it onward, so evidence created on one node reaches every validator and the next proposer includes it.
 
+#### `onMemory`, `memoryLevel`, `isShedding` and `shed`
+
+The guard reports every level change to `onMemoryLevel`, and the node decides what each level means:
+
+```ts
+  /** Called on every change of the memory guard's level; the CLI stops the node on `critical`. */
+  onMemory(fn: (level: MemoryLevel, stats: MemoryStats) => void): void {
+    this.memoryListeners.push(fn);
+  }
+
+  get memoryLevel(): MemoryLevel {
+    return this.memoryGuard.level;
+  }
+
+  /** True while load is shed: the mempool admits nothing, costly RPC methods and new streams are refused. */
+  get isShedding(): boolean {
+    return this.shedding;
+  }
+
+  /** The database's hot cache of decoded objects: unbounded while memory is fine, capped as it fills (STATE-PAGING.md section 7). */
+  static readonly HOT_OBJECTS = { ok: Infinity, warn: 100_000, pressure: 10_000, critical: 10_000 } as const;
+
+  private onMemoryLevel(level: MemoryLevel, stats: MemoryStats): void {
+    if (level === 'warn' || level === 'pressure') void this.gcScheduler.major();
+    if (this.app instanceof CoreApp) this.app.db.setHotLimit(Node.HOT_OBJECTS[level]);
+    this.shed(level === 'pressure' || level === 'critical');
+    for (const fn of this.memoryListeners) fn(level, stats);
+  }
+
+  private shed(on: boolean): void {
+    if (on === this.shedding) return;
+    this.shedding = on;
+    if (on) {
+      this.mempool.pause('node under memory pressure');
+      if (this.app instanceof CoreApp) this.app.dropSignatureCache();
+    } else this.mempool.resume();
+    this.log(on ? 'warn' : 'info', on ? 'shedding load: mempool paused, costly requests refused' : 'load shedding over', { mempool: this.mempool.size });
+  }
+
+```
+
+`warn` and `pressure` each start a major collection (the scheduler runs one at a time, so a request while one is running is dropped); every level sets the object database's cache of decoded objects from `Node.HOT_OBJECTS`, through `setHotLimit` ([chapter 9](09-database.md)), on a core application (the key-value test app has no such database); `pressure` and `critical` shed, `warn` and `ok` stop shedding; and every listener hears the change with the sample that caused it. `shed` is idempotent, so a guard that moves from `pressure` to `critical` does not pause the pool twice, and one that eases from `critical` to `pressure` does not resume it. Shedding is three things. The mempool is paused with the reason the RPC will quote ([chapter 5](05-mempool-executor.md)), and the inventory handler above stops fetching what peers announce. The core application's signature cache is dropped: `dropSignatureCache` clears the verify cache of [chapter 11](11-application.md), 20,000 bodies at most, and the signatures of the transactions still pooled are then verified again when they reach a block, CPU spent to free heap. And `isShedding` turns true, which the RPC server reads to refuse costly methods and new event streams ([chapter 12](12-rpc.md)). The cache limit is the first of the dials STATE-PAGING.md plans for the guard: unbounded at `ok`, so a node with memory to spare keeps every object it has decoded and runs at full speed; 100,000 objects at `warn`; 10,000 at `pressure`, and `critical` keeps that. `setHotLimit` evicts the excess at once, and nothing else changes: an evicted object is decoded again from the database's arena of encoded bytes the next time it is read, about a microsecond for an account, so a capped node computes the same roots, only slower (a block of transfers among random accounts takes about twice as long, [benchmarks.md](../benchmarks.md) section 4.10). The `critical` level is reported and nothing more: what to do then is the owner's decision. The CLI's `start` registers an `onMemory` listener that stops the node and exits with code 3 ([chapter 14](14-wallet-cli.md)); a test registers one that records the sequence.
+
 #### `start`, `stop` and the accessors
 
-`start()` starts the network (unless state sync already did), then block sync, then consensus, and logs the height, the validator address if any, and the node id. The order matters: block sync must be listening for `status` before consensus starts, and consensus must start after the executor has replayed. `stop()` releases the data directory lock first, then, if `start()` ran, stops consensus and block sync; then, if the network is up, stops it, which covers a node whose `init` started the network for a state-sync join and that was never started; then awaits `executor.idle()`, the tail of the executor's apply chain, so a block in the middle of its store batch or `app.commit` finishes its writes before the stores go away; and only then closes the environment if the node owns it. The wait matters for a node stopped while syncing: block sync hands the executor one block after another, and closing LMDB under a half-written one would leave the chain store and the application store at different heights, which `open` would then have to repair by replay on the next start. Neither `start` nor `stop` closes the verifier, which the caller owns because it is shared.
+`start()` starts the network (unless state sync already did), then block sync, then consensus, then the memory guard's sampling timer (unreferenced, so it never keeps the process alive on its own) and the scheduler's collection observer, and logs the height, the validator address if any, and the node id. The order matters: block sync must be listening for `status` before consensus starts, and consensus must start after the executor has replayed. `stop()` releases the data directory lock first, then, if `start()` ran, stops the guard and the scheduler, then consensus and block sync; then, if the network is up, stops it, which covers a node whose `init` started the network for a state-sync join and that was never started; then awaits `executor.idle()`, the tail of the executor's apply chain, so a block in the middle of its store batch or `app.commit` finishes its writes before the stores go away; and only then closes the environment if the node owns it. The wait matters for a node stopped while syncing: block sync hands the executor one block after another, and closing LMDB under a half-written one would leave the chain store and the application store at different heights, which `open` would then have to repair by replay on the next start. Neither `start` nor `stop` closes the verifier, which the caller owns because it is shared.
 
 `height` is the executor's `lastHeight`; `genesis` returns the config's document; `submitTx(tx)` is `mempool.addTx(tx, null)`, "as an RPC endpoint would".
 
@@ -449,6 +536,71 @@ The three query methods package proofs for a light client:
 ```
 
 The default height is `lastHeight - 1`, the latest height whose next header exists. The result carries header `h + 1`, whose `appHash` commits to the proven state, and that header's commit, so a verifier needs nothing from this node that it cannot check. `queryAccountName` is the same shape with a `KeyProof` from `proveAccountName`. `queryTx(hash)` looks the transaction up in the store's index, returns its inclusion proof against its own block's `dataHash` and, once the next block exists, its result proof against that header's `lastResultsHash` (RPC-SYNC-PROOFS.md section 2.2). Both state queries duck-type the application (`typeof app.proofAt !== 'function'`) so a node on an application without proofs returns `null` instead of throwing.
+
+### src/node/memory.ts
+
+Purpose: the two objects the node wires in step 8, with no dependency on the node. **`MemoryStats`** is one sample: `heapUsed`, `heapLimit` and `heapTotal` from `v8.getHeapStatistics` (the limit is the figure past which the process aborts, and it includes the young generation, so a node started with `--heap 512` reports about 704 MiB: 512 plus three 64 MiB semi-spaces), and `arrayBuffers`, `external` and `rss` from `process.memoryUsage`, the memory outside the heap, where ML-DSA keys and stored bytes live. **`memoryStats()`** takes one. **`MemoryLevel`** is `'ok' | 'warn' | 'pressure' | 'critical'`.
+
+**`MemoryGuard`** takes `MemoryGuardOptions`: `intervalMs` (1000), the three thresholds as fractions of the limit (`warnAt` 0.7, `pressureAt` 0.85, `criticalAt` 0.95), `hysteresis` (0.05), a `stats` source (`memoryStats` unless a test injects a function), the logger and an `onLevel` callback. The constructor refuses thresholds that do not rise or exceed 1 and takes a first sample; `start()` takes another at once and then one per interval on an unreferenced timer; `level` and `stats` read the current level and the last sample. `check()` is the whole mechanism:
+
+```ts
+  /** Take a sample and move the level; returns the level afterwards. */
+  check(): MemoryLevel {
+    const s = (this.last = this.o.stats());
+    const fraction = s.heapUsed / s.heapLimit;
+    const thresholds = [this.o.warnAt, this.o.pressureAt, this.o.criticalAt];
+    let idx = this.levelIndex;
+    while (idx < thresholds.length && fraction >= thresholds[idx]!) idx++;
+    while (idx > 0 && fraction < thresholds[idx - 1]! - this.o.hysteresis) idx--;
+    if (idx !== this.levelIndex) {
+      const rising = idx > this.levelIndex;
+      this.levelIndex = idx;
+      const level = this.level;
+      const fields = { level, heap: `${MiB(s.heapUsed)}/${MiB(s.heapLimit)} MiB`, arrayBuffers: `${MiB(s.arrayBuffers)} MiB`, rss: `${MiB(s.rss)} MiB` };
+      if (level === 'critical') this.o.log('error', 'memory: heap at the limit; stopping before the process aborts (raise --max-old-space-size or --heap)', fields);
+      else if (rising) this.o.log('warn', level === 'pressure' ? 'memory: shedding load' : 'memory: heap filling', fields);
+      else this.o.log('info', 'memory: easing', fields);
+      this.o.onLevel?.(level, s);
+    }
+    return this.level;
+  }
+```
+
+The two `while` loops are the hysteresis. Rising, the level climbs while the fraction is at or above the next threshold, so one sample can cross several levels (10% to 90% is straight to `pressure`); falling, it drops while the fraction is below the threshold of the level it is in, less the hysteresis, so a level entered at 85% is left at 80%, and a heap that hovers at 85% does not log, shed and resume on every sample. A change is logged once, with the heap used and limit, the array buffers and the resident set in MiB, at `error` for `critical` (with the remedy in the message), `warn` on the way up and `info` on the way down, and then reported to `onLevel` with the sample. Nothing else happens here: what a level means is the node's business.
+
+**`GcScheduler`** takes `GcSchedulerOptions`: a `gc` function (the global one `--expose-gc` provides when the option is absent; `null` disables scheduling), a `stats` source, `majorGrowthBytes` (256 MiB) and `majorGrowthFraction` (0.1), `observe` (true) and the logger. `available` says whether anything can be scheduled. `start()` installs a `PerformanceObserver` on `gc` entries that counts every collection V8 runs by kind (minor, major or incremental, from the entry's `detail.kind` flags) with the total, longest and last pause, and logs once, without `--expose-gc`, that collections will run when V8 decides; `stop()` disconnects it; `stats()` returns a copy of the counts as `GcStats`, the object `status` serves ([chapter 12](12-rpc.md)). The two scheduling calls:
+
+```ts
+  afterCommit(): void {
+    if (!this.gc) return;
+    try {
+      this.gc({ type: 'minor', execution: 'sync' });
+      this.counts.scheduledMinor++;
+    } catch (e) {
+      this.log('warn', 'gc: minor collection failed', { err: (e as Error).message });
+    }
+    const s = this.stats_();
+    const due = Math.min(this.growthBytes, this.growthFraction * s.heapLimit);
+    if (s.heapUsed - this.heapAtLastMajor >= due) void this.major();
+  }
+
+  /** Start a major collection now, without blocking the caller on it; one at a time. */
+  async major(): Promise<void> {
+    if (!this.gc || this.majorRunning) return;
+    this.majorRunning = true;
+    try {
+      await this.gc({ type: 'major', execution: 'async' });
+      this.counts.scheduledMajor++;
+    } catch (e) {
+      this.log('warn', 'gc: major collection failed', { err: (e as Error).message });
+    } finally {
+      this.majorRunning = false;
+      this.heapAtLastMajor = this.stats_().heapUsed;
+    }
+  }
+```
+
+`afterCommit` runs a minor collection synchronously (the young generation: a few milliseconds, and the block just committed left plenty of short-lived garbage behind) and then, if the heap has grown since the last major collection by the growth step, starts a major one. The step is the smaller of 256 MiB and a tenth of the limit, so a node with a small heap collects proportionally sooner. `major` asks for an asynchronous collection (`execution: 'async'`, so the caller is not blocked on it), runs one at a time, and measures the next growth from the heap as it stands after the collection finished, not from before it, so a collection that freed little does not postpone the next one by what it failed to free. Both count what they scheduled; the observer counts what V8 ran, which includes these and everything V8 decided on its own.
 
 ### scripts/localnet.ts
 
@@ -527,7 +679,7 @@ For comparison, the same constructor on disk and over TCP is in `src/cli.ts` (`s
   });
 ```
 
-The only differences from the localnet are the transport, the storage (an `LmdbEnv` passed in, so the CLI owns it), and the state sync and retention options read from `config.json`. The [wallet and CLI](14-wallet-cli.md) chapter covers the rest of that file.
+The only differences from the localnet are the transport, the storage (an `LmdbEnv` passed in, so the CLI owns it), the state sync and retention options read from `config.json`, and what surrounds the constructor: the CLI runs it in a child process under a heap limit of its choosing, reports the guard's level and the collection pauses in its status line, and stops the node with exit code 3 when the guard reports `critical`. The [wallet and CLI](14-wallet-cli.md) chapter covers the rest of that file.
 
 ### bench/network.bench.ts
 
@@ -564,7 +716,7 @@ The late node is a full node (`validatorSeed: null`) seeded with the validators'
 
 ## How it is tested
 
-Every network test in the repository builds nodes through `makeTestnet` in `test/helpers.ts`, which is a compact version of the localnet: one `MemoryHub`, N validators plus optional full nodes, each seeded with every other address, the fast timeouts and network intervals, `lagGraceMs: 500`, the key-value test app by default or an `appFor` factory, and `makeNode(i, overrides)` to create extra or replacement nodes with the same seeds and genesis. The suites that use it are `consensus`, `engine`, `recovery`, `chain`, `light`, `staking-net`, `rpc`, `sync` and `review`.
+Every network test in the repository builds nodes through `makeTestnet` in `test/helpers.ts`, which is a compact version of the localnet: one `MemoryHub`, N validators plus optional full nodes, each seeded with every other address, the fast timeouts and network intervals, `lagGraceMs: 500`, the key-value test app by default or an `appFor` factory, and `makeNode(i, overrides)` to create extra or replacement nodes with the same seeds and genesis. The suites that use it are `consensus`, `engine`, `recovery`, `chain`, `light`, `staking-net`, `rpc`, `sync`, `review` and `memory`.
 
 The cases that exercise the node's own wiring:
 
@@ -576,6 +728,7 @@ The cases that exercise the node's own wiring:
 - `test/review.test.ts`, `resumes after a restart that left a signature at the current height`: a one-validator node on a temporary data directory is stopped, its `priv_validator_state.bin` is overwritten to claim a signed proposal at the next height, and a new `Node` on the same directory must make progress in a later round, proving the on-disk pieces (LMDB chain store, application store, signing guard) are reopened consistently.
 - `test/review.test.ts`, `survives an aborted request body on the RPC`: an `RpcServer` on a node stays up after a client disconnects mid-body.
 - `test/review.test.ts`, `refuses a second node on a data directory that is in use`: described under the constructor; the lock is released by `stop()` and the directory can be reopened.
+- `test/memory.test.ts`, `sheds load, keeps following the chain, and resumes when the heap eases`: on a testnet of the core application, a full node made with `makeNode(2, { memory: { stats, intervalMs: 20 } })` has its guard fed invented samples. At first the database's `hotLimit` is `Infinity`. At 90% of the limit `isShedding` is true, the `hotLimit` is 10,000 with no more than that cached, `mempool.paused` is true, `submitTx` answers `paused`, the RPC refuses `broadcastTx`, `block` and `/events`, and the node still advances two heights behind the validators; at 50% shedding ends, the `hotLimit` is `Infinity` again, and `submitTx` is no longer `paused` (the transaction is refused by the application, not by the pause); at 99% the `critical` level is reported through `onMemory`, and the sequence seen is `pressure`, `ok`, `critical`, one sample crossing several thresholds each time. The guard and the scheduler have their own unit cases in the same file ([chapter 15](15-tests.md)).
 
 ## Limitations and ideas
 
@@ -586,6 +739,8 @@ The cases that exercise the node's own wiring:
 - The RPC has no authentication (DESIGN.md section 10).
 - Evidence items are re-encoded on every fetch.
 - The data directory lock trusts the PID in the `LOCK` file: a PID recycled by an unrelated process makes a stale claim look live until that process exits.
+- The version history window is not trimmed under memory pressure: shedding touches the mempool, the RPC and the signature cache, and the dial the database's cache of decoded objects, while the trees keep their own retention (`retain.versions`), so a node whose history is what fills the heap needs a smaller window or a larger heap.
+- ArrayBuffers (ML-DSA keys, stored bytes, the database's arena) sit outside the V8 heap and outside the guard's fraction; a machine that runs out of physical memory for them meets the operating system's killer, not V8's limit. The guard reports `arrayBuffers` and `rss` beside the heap figures, but acts on the heap alone.
 
 Exercises:
 
@@ -595,6 +750,7 @@ Exercises:
 4. Run the localnet over TCP: replace `hub.transport(...)` with a `TcpTransport` per node and `127.0.0.1:<port>` addresses, and compare the status lines.
 5. Add a per-peer transaction rate limit in the `item` handler, charging points above it.
 6. Replace the PID in the `LOCK` file with an advisory file lock that the operating system releases when the process dies, and write a test that kills a node without `stop()` and restarts it on the same directory.
+7. Trim the version history on `pressure`: have `shed` ask the application to drop the oldest provable versions down to a floor, and show with injected samples that the heap the guard reports falls and that `lowestProvableHeight` moves up.
 
 ## Where to next
 

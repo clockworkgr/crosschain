@@ -128,6 +128,8 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
           joinedAt: node.joinedAt === null ? null : node.joinedAt.toString(),
           peers: node.network.peers.size,
           validatorAddress: node.privValidator ? toHex(node.privValidator.address) : null,
+          memory: { level: node.memoryLevel, shedding: node.isShedding, ...node.memoryGuard.stats, database: node.app instanceof CoreApp ? jsonify(node.app.db.memory()) : null },
+          gc: node.gcScheduler.stats(),
           rpcVersion: 1,
         };
       },
@@ -334,6 +336,7 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
         if (mode === 'commit' && !waiter) throw new RpcError(RATE_LIMITED, 'too many transactions awaiting inclusion; broadcast in sync mode and poll tx');
         try {
           const r = await node.submitTx(raw);
+          if (r.status === 'paused') throw new RpcError(RATE_LIMITED, r.error ?? 'node under memory pressure');
           if (r.status === 'invalid' || r.status === 'too-large' || r.status === 'full') throw new RpcError(CHECK_FAILED, `${r.status}${r.error ? `: ${r.error}` : ''}`);
           if (!waiter) return { hash: toHex(hash), status: r.status };
           const seen = node.store.txLocation(hash);

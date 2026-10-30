@@ -496,6 +496,11 @@ export class CoreApp implements Application {
     }
   }
 
+  /** Forget every verified signature (load shedding); each is verified again when next seen. */
+  dropSignatureCache(): void {
+    this.sigCache.clear();
+  }
+
   private trimCache(): void {
     while (this.sigCache.size > SIG_CACHE_MAX) this.sigCache.delete(this.sigCache.keys().next().value!);
   }

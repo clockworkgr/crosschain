@@ -10,10 +10,11 @@ ICS23 conventions for Merkle proofs, and writes them down as simply as possible.
 
 If you want to run the chain first, read [running.md](../running.md). If you want the reasons
 behind the design, [DESIGN.md](../../DESIGN.md) records every decision in the order it was
-made, with [STAKING.md](../../STAKING.md), [FEES.md](../../FEES.md) and
-[RPC-SYNC-PROOFS.md](../../RPC-SYNC-PROOFS.md) as the detailed specifications it points to.
+made, with [STAKING.md](../../STAKING.md), [FEES.md](../../FEES.md),
+[RPC-SYNC-PROOFS.md](../../RPC-SYNC-PROOFS.md) and [STATE-PAGING.md](../../STATE-PAGING.md) as
+the detailed specifications it points to.
 [REVIEW-2026-10-28.md](../../REVIEW-2026-10-28.md) records an external review and what each
-finding changed; the tutorial refers to findings by number. The test suite is 20 files and 137
+finding changed; the tutorial refers to findings by number. The test suite is 22 files and 146
 tests; `npm test` runs it under ML-DSA-44 and `CHAIN_SCHEME=secp256k1 npm test` runs it again
 under secp256k1, the other signature scheme a genesis may choose.
 
@@ -159,14 +160,15 @@ the concepts of the ones before it.
    scoring, requests.
 7. [Sync](07-sync.md): catching up by blocks; joining by state sync.
 8. [Node](08-node.md): wiring it all together, and running a network in one process.
-9. [Object database](09-database.md): ids, indices, Merkle trees, proofs, versions, snapshots.
+9. [Object database](09-database.md): ids, objects as bytes in an arena behind a cache of
+   decoded ones, indices, Merkle trees, proofs, versions, snapshots.
 10. [Store](10-store.md): the key-value interface, LMDB, the block store.
 11. [Application](11-application.md): accounts, assets, balances, fees, staking, history,
     genesis, snapshots, and the block procedure.
 12. [RPC](12-rpc.md): JSON-RPC methods, event streams, limits, the client.
 13. [Light client](13-light-client.md): verifying headers and queries with proofs.
 14. [Wallet and CLI](14-wallet-cli.md): the keystore and the command line.
-15. [Tests](15-tests.md): the harness, every suite (20 files, 137 tests, run under either
+15. [Tests](15-tests.md): the harness, every suite (22 files, 146 tests, run under either
     signature scheme), and how to write a new test.
 
 Then [benchmarks.md](../benchmarks.md) for what it all costs.

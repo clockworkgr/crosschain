@@ -137,7 +137,7 @@ export class RpcServer {
       return;
     }
     if (req.method === 'GET' && url.pathname === '/health') {
-      res.writeHead(200, { ...CORS, 'Content-Type': 'application/json' }).end(JSON.stringify({ height: this.node.height.toString(), peers: this.node.network.peers.size }));
+      res.writeHead(200, { ...CORS, 'Content-Type': 'application/json' }).end(JSON.stringify({ height: this.node.height.toString(), peers: this.node.network.peers.size, memory: this.node.memoryLevel }));
       return;
     }
     if (req.method === 'GET' && url.pathname === '/events') {
@@ -215,6 +215,7 @@ export class RpcServer {
     const m = this.methods[method];
     if (!m) return answer({ code: -32601, message: `unknown method ${method}` });
     if (params !== undefined && (typeof params !== 'object' || params === null || Array.isArray(params))) return answer({ code: INVALID_PARAMS, message: 'params must be an object' });
+    if (m.costly && this.node.isShedding) return answer({ code: RATE_LIMITED, message: 'node under memory pressure' });
     if (m.costly && !this.allow(remote, this.limits.costlyCost - 1)) return answer({ code: RATE_LIMITED, message: 'rate limited' });
     try {
       return answer(null, await m.fn((params as Record<string, unknown>) ?? {}));
@@ -234,6 +235,11 @@ export class RpcServer {
     for (const s of this.streams) if (s.remote === remote) streams++;
     if (streams >= this.limits.maxStreams) {
       res.writeHead(429, CORS).end();
+      return;
+    }
+    // A stream is memory held for the client; none are opened while the node sheds load.
+    if (this.node.isShedding) {
+      res.writeHead(503, CORS).end();
       return;
     }
     const types = new Set((url.searchParams.get('types') ?? 'block').split(',').map((t) => t.trim()));

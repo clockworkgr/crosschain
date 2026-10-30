@@ -1,21 +1,23 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty files, 137 cases, about 4,130 lines counting the shared harness
+`test/**/*.test.ts`: twenty-two files, 146 cases, about 4,440 lines counting the shared harness
 in `test/helpers.ts`. The whole suite takes about a minute (70.9 s, all passing, on the run
 this chapter was checked against, under the default ML-DSA-44 keys); nearly all of that time is
 the network scenarios, which run real consensus timers. The same suite runs on the chain's other
-signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (53.7 s on that run, 136 passing and
-one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
+signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (145 passing and one skipped, the case
+that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. One file: `npx vitest run test/staking.test.ts`. One case, by a
 substring of its title: `npx vitest run test/consensus.test.ts -t partition`. The nodes are
 silent unless you ask: `LOG=debug npm test` (or `info`, `warn`) turns on the per-node logger
 through `testLogger`. The files are organised by layer, in the order of this tutorial: `units`,
-`store` and `db` cover what sits under the engine, and `schemes` the two signature schemes from
-a key pair up to a chain running on the second one; `network`, `consensus`, `recovery` and
-`engine` run the engine on the toy key-value application; `chain`, `app`, `staking`,
-`staking-net`, `fees` and `genesis` cover the core application; `txproof`, `light`, `rpc` and
+`store`, `arena` and `db` cover what sits under the engine, and `schemes` the two signature
+schemes from a key pair up to a chain running on the second one; `network`, `consensus`,
+`recovery` and `engine` run the engine on the toy key-value application, and `memory` covers the
+memory guard and the collection scheduler, its node case on the core application so that the
+guard's dial on the object database shows; `chain`, `app`, `staking`, `staking-net`, `fees` and
+`genesis` cover the core application; `txproof`, `light`, `rpc` and
 `sync` cover proofs, clients and catching up; `review` holds one regression test per finding of
 the external review and the later cases of the same kind, and `review2` five more that each
 span several layers. Files run one after another, never in parallel, for a reason explained
@@ -466,13 +468,64 @@ and check the commit's `blockHash` equals `blockHash(block)`, resolve the hash o
 height 4, resolve an unknown hash to `null`, find height 9 `null`, and find no saved chain state
 (`loadState()` is `null`).
 
+### test/arena.test.ts
+
+Two tests on `src/db/arena.ts` ([the database chapter](09-database.md)), the slabs of encoded
+bytes under the object database, with no database at all: an `owner()` helper plays the
+database's part, holding one reference per `type/instance` in a `Map` and taking relocations
+into it, and `bytesOf(n, fill)` makes an encoding of `n` bytes all equal to `fill`.
+
+**`it('stores encodings across growing slabs and reads them back')`**. Six entries of 1, 100,
+1,000, 100,000, 300,000 and 5 bytes, each filled with its own byte, read back with their length
+and their first and last byte. The first slab is 256 KiB and the second 512 KiB, so the
+300,000-byte entry opened a second slab: `stats` shows two slabs, `used` is the sizes plus a
+`HEADER` of 10 bytes each, nothing is dead, and that entry's reference names slab 1. An
+encoding of `MAX_ENTRY + 1` bytes throws `/does not fit/`, and a reference into slab 7, which
+was never made, throws `/released/`.
+
+**`it('counts freed entries dead and compacts a slab that is more than half dead, moving the live ones')`**.
+The first slab is filled with as many 100-byte entries as fit, 110 bytes each with the header,
+and three of every four are freed and dropped from the owner; `stats.dead` counts exactly their
+bytes. `maintain()` releases nothing while that slab is still the current one, the one new
+entries go to. A 256 KiB entry forces a second slab, and then `maintain()` returns 262,144, the
+bytes released: every live entry was copied into slab 1 beside the big one, the owner was given
+its new reference, and it reads back byte for byte as before, while slab 0 is gone (`stats.slabs`
+is 1, and a read at slab 0 throws `/released/`). A new entry then gets a reference above slab 0:
+slab numbers are never reused, so a stale reference into a released slab fails rather than
+reading a newer entry.
+
 ### test/db.test.ts
 
-Eighteen tests on the object database and the trees beneath it ([the database
+Twenty-one tests on the object database and the trees beneath it ([the database
 chapter](09-database.md)). The fixture defines two object types: `ItemType` (type id 7) with
 a unique, authenticated index `byName` and a non-unique `byGroup`, and `CounterType` (type id
 3) with no indices. `fresh()` makes a database over both, `mk` creates an item, `byName` and
 `inGroup` query the two indices.
+
+**`it('serves reads from the arena once decoded objects are evicted, and never evicts what is dirty')`**
+(describe `object database: arena and hot cache`). A database with `hotObjects: 2`. Five items
+created before any root are five dirty objects pinned in a cache of two: `memory().hotObjects`
+is 5, the budget exceeded rather than enforced. After `root()` they are in the arena
+(`arena.used` above zero) and unpinned, and the cache is back to at most two; every item still
+reads its name, an object read back is frozen, the name index finds `c`, and the cache stays
+within two after all those reads. Removing `b` makes it unreadable at once, by id and by name,
+and leaves it out of `exportObjects`, before the root frees its bytes; after the root it is
+still `null` and four objects export. Then `setHotLimit(0)`: a modify of `a` stays readable with
+its new value and is the one object cached, pinned; after the root the cache is empty and `a`
+still reads 7, decoded from the arena.
+
+**`it('keeps history as bytes, agrees between getAt and bytesAt, and exports after churn what it holds')`**.
+`hotObjects: 1` and `retainVersions: 10`. One item is modified at each of versions 2 to 6 while
+another item is created each time. At every version 1 to 6, `getAt` returns the value it had
+then and `bytesAt` exactly that value's encoding, and `historyBytes` is above zero. Each of the
+six exported objects is the encoding of what `get` returns, and the item reads its latest value
+after the churn. Ten more roots close the window behind version 1, and `getAt` there throws
+`RangeError`.
+
+**`it('computes the same roots whatever the cache budget')`**. The same five versions, twenty
+creates each and from version 2 on a modify and a remove, are run with `hotObjects: 0` and with a
+million: the two lists of roots are equal. Eviction changes where an object is read from, never
+what is hashed.
 
 **`it('assigns dense ids and serves unique and range lookups')`** (describe `object database`).
 Three items get ids `objectId(7, 0)`, `(7, 1)`, `(7, 2)`; `instanceOf(c.id)` is 2. The unique
@@ -735,6 +788,71 @@ does reach every app.
 **`it('refuses a genesis with no validators from either side')`**. `genesisState` with no
 engine validators and no application-supplied set throws `/no validators/`, and so does an
 empty application set.
+
+### test/memory.test.ts
+
+Four tests on the memory guard and the collection scheduler of `src/node/memory.ts`
+([08](08-node.md)): three unit tests under `describe('memory guard')`, where the heap is
+whatever the test says it is, and one network test under `describe('a node under memory
+pressure')`, on the core application so that the guard's dial on the object database can be
+checked, with an `RpcServer` stopped before the testnet in `afterEach`. The `stats`
+helper makes a sample from a heap-used figure against a limit of 1,000:
+
+```ts
+const stats = (heapUsed: number, heapLimit = 1000): MemoryStats => ({ heapUsed, heapLimit, heapTotal: heapLimit, arrayBuffers: 0, external: 0, rss: heapUsed });
+```
+
+**`it('moves through its levels with hysteresis and reports every change')`**. A `MemoryGuard`
+whose `stats` reads a variable and whose `onLevel` records each level. `check()` at 699 is
+`ok` and at 700 `warn`; 849 is `warn` and 850 `pressure`; 960 is `critical`. Down again: 900
+is still `critical` and 899 `pressure`; 800 still `pressure` and 799 `warn`; 650 still `warn`
+and 649 `ok`. Every level is left 50 below the threshold it was entered at, the 5%
+hysteresis, so a heap hovering at a threshold does not flap. Then 999 goes straight to
+`critical` and 0 straight to `ok`: several levels in one sample, both ways. The reported
+sequence is exactly `['warn', 'pressure', 'critical', 'pressure', 'warn', 'ok', 'critical', 'ok']`
+and the guard's `stats` is the last sample. Thresholds that do not rise (`warnAt: 0.9,
+pressureAt: 0.8`) throw `/thresholds/`, and a real `memoryStats()` reports a limit above the
+heap in use.
+
+**`it('schedules a minor collection after every commit and a major one once the heap has grown enough')`**.
+A `GcScheduler` with an injected `gc` that records `type/execution` and returns a promise for
+an asynchronous call, `majorGrowthBytes: 50` and no observer. `afterCommit()` is one
+`minor/sync`; at a heap of 149, 49 above the start, a second commit is another minor and no
+major; at 150 the third commit adds `major/async`. The growth is measured from the heap after
+the last major collection: 199 gives no second major and 200 does. A second scheduler with
+`majorGrowthBytes: 500` on a limit of 1,000 runs a major at a heap of 300, because a tenth of
+the limit, 100, caps the step. `stats()` of the first reports `scheduledMinor: 5` and
+`scheduledMajor: 2`. With `gc: null`, `afterCommit()` and `major()` do nothing and `stats()`
+says `available: false`: a node without `--expose-gc` is reported, not broken.
+
+**`it('counts the collections V8 runs, scheduled or not')`**. A scheduler with `gc: null` and
+the observer on; 300,000 small objects are allocated and dropped, enough garbage for several
+young-generation collections, and the test waits up to 5 s for `stats().collections` to pass
+zero. The kinds counted (`minor + major + incremental`) and `totalMs` are above zero, and
+`maxMs` is at least `lastMs`. This is the `PerformanceObserver` on `gc` entries, which counts
+what V8 does on its own as well as what the scheduler asks for.
+
+**`it('sheds load, keeps following the chain, and resumes when the heap eases')`**. A testnet
+of the core application (`appFor` makes a `CoreApp`, and the application genesis holds one
+faucet account and no inflation): two validators and a full node that is created but not
+started, then made again with
+`net.makeNode(2, { memory: { stats: () => stats(heap), intervalMs: 20 } })`, so its guard
+samples an invented heap fifty times a second; an `onMemory` listener records the levels and
+an `RpcServer` is opened on it. At height 2 the level is `ok`, the database's `hotLimit` is
+`Infinity`, and `status.memory` is `{ level: 'ok', shedding: false }`. The heap is set to 900,
+90% of the limit: within 5 s `isShedding` is true, the level is `pressure`, the `hotLimit` is
+10,000 and the cache holds no more than that (the first dial: the cache of decoded objects
+capped, the excess evicted at once), `mempool.paused` is true, `submitTx` answers
+`paused`, `broadcastTx` and `block` over the RPC reject with `-32004`, `GET /events` is 503,
+`/health` reports `memory: 'pressure'`, and `status.memory` is
+`{ level: 'pressure', shedding: true, heapUsed: 900 }`. Then the claim that matters: the node
+advances two more heights while shedding, because consensus and block sync are not what is
+shed. At 500 shedding ends within 5 s, the pool is resumed, the `hotLimit` is `Infinity` again,
+`submitTx` answers something other than `paused` (the test's key-value transaction is refused
+by the core application, not by the pause), and `block` answers. At 990 the `critical` level
+is reported; what to do then (the CLI stops the node) is the caller's, not the node's. The sequence seen is exactly `['pressure', 'ok', 'critical']`:
+10% to 90% is straight to `pressure` and 90% to 50% straight to `ok`, one sample crossing
+several thresholds each way.
 
 ### test/chain.test.ts
 

@@ -165,9 +165,9 @@ The working copy starts as a copy of the committed map, so a block's effects are
 
 ### src/mempool.ts
 
-**`MempoolOptions`**: `maxTxs` (10 000), `maxTxBytes` (1 MiB), `cacheSize` (100 000 hashes). **`AddTxStatus`** is `'added' | 'seen' | 'invalid' | 'full' | 'too-large'` and **`AddTxResult`** carries the status, the hash, and the application's error for `invalid`. The RPC's `broadcast` methods and `Node.submitTx` return this result to the client.
+**`MempoolOptions`**: `maxTxs` (10 000), `maxTxBytes` (1 MiB), `cacheSize` (100 000 hashes). **`AddTxStatus`** is `'added' | 'seen' | 'invalid' | 'full' | 'too-large' | 'paused'` and **`AddTxResult`** carries the status, the hash, and the application's error for `invalid` or, for `paused`, the reason the pool is not admitting. The RPC's `broadcast` methods and `Node.submitTx` return this result to the client.
 
-**`Mempool`** extends `EventEmitter` with one typed event, `tx: [hash, tx, source]`, emitted on every admission; `Node.init` listens and broadcasts an inventory announcement to every peer except `source`, the peer the transaction came from. State: `txs`, a `Map` from hex hash to bytes whose insertion order is the FIFO order; `cache`, a `Set` of hex hashes; `cacheOrder`, the array that lets the cache evict its oldest entry.
+**`Mempool`** extends `EventEmitter` with one typed event, `tx: [hash, tx, source]`, emitted on every admission; `Node.init` listens and broadcasts an inventory announcement to every peer except `source`, the peer the transaction came from. State: `txs`, a `Map` from hex hash to bytes whose insertion order is the FIFO order; `cache`, a `Set` of hex hashes; `cacheOrder`, the array that lets the cache evict its oldest entry; `pausedReason`, null while the pool admits and otherwise the reason it does not.
 
 - `size`: pending count.
 - `has(hash)`: in the pool.
@@ -175,10 +175,28 @@ The working copy starts as a copy of the committed map, so a block's effects are
 - `get(hash)`: the bytes, for serving a peer's fetch.
 - `remember(key)` (private): add to the cache and evict from the front past `cacheSize`.
 
+Admission can be suspended as a whole. The node pauses the pool while it sheds load under memory pressure ([chapter 8](08-node.md)) and resumes it when the heap eases; what is pooled stays, is still reaped by the proposer and still rechecked after each commit, so a validator keeps producing blocks from what it already holds, and only new admissions are refused:
+
+```ts
+  /** While paused nothing new is admitted (the node is shedding load); what is pooled stays and is still reaped. */
+  get paused(): boolean {
+    return this.pausedReason !== null;
+  }
+
+  pause(reason: string): void {
+    this.pausedReason = reason;
+  }
+
+  resume(): void {
+    this.pausedReason = null;
+  }
+```
+
 ```ts
   async addTx(tx: Uint8Array, source: string | null = null): Promise<AddTxResult> {
     const hash = txHash(tx);
     const key = toHex(hash);
+    if (this.pausedReason !== null) return { status: 'paused', hash, error: this.pausedReason };
     if (tx.length > this.opts.maxTxBytes) return { status: 'too-large', hash };
     if (this.cache.has(key)) return { status: 'seen', hash };
     if (this.txs.size >= this.opts.maxTxs) return { status: 'full', hash };
@@ -202,7 +220,7 @@ The working copy starts as a copy of the committed map, so a block's effects are
   }
 ```
 
-Order of the checks: size (cheapest, and a huge transaction must not even be hashed into the cache), seen, full, then the application. The hash is cached *before* the await so that a second copy arriving while `checkTx` runs is answered `seen` rather than checked again; that also means an `invalid` transaction stays in the cache and is not re-checked when a peer announces it again. A `checkTx` that *throws* (the verifier pool closed underneath it, say) decided nothing, so the `catch` removes the hash from the cache before rethrowing; otherwise the transaction would be `seen` on this node for as long as the cache remembered it without ever having been judged, and a client resubmitting a perfectly good transaction would be told it was already known. The second `full` check, after the await, covers the pool filling while this transaction was being checked; because the hash was already cached, that refusal deletes it again, so a resubmission hears `full` (and `added` once there is room) rather than `seen` (review finding 38).
+Order of the checks: paused first, before anything else, so a pool that is not admitting does no work at all and leaves no trace in the cache, and the reason travels back in `error` (the RPC turns it into `-32004`, [chapter 12](12-rpc.md)); then size (cheapest, and a huge transaction must not even be hashed into the cache), seen, full, then the application. The hash is cached *before* the await so that a second copy arriving while `checkTx` runs is answered `seen` rather than checked again; that also means an `invalid` transaction stays in the cache and is not re-checked when a peer announces it again. A `checkTx` that *throws* (the verifier pool closed underneath it, say) decided nothing, so the `catch` removes the hash from the cache before rethrowing; otherwise the transaction would be `seen` on this node for as long as the cache remembered it without ever having been judged, and a client resubmitting a perfectly good transaction would be told it was already known. The second `full` check, after the await, covers the pool filling while this transaction was being checked; because the hash was already cached, that refusal deletes it again, so a resubmission hears `full` (and `added` once there is room) rather than `seen` (review finding 38).
 
 ```ts
   /** Take transactions in FIFO order up to a byte budget. They stay in the pool until committed. */
@@ -473,6 +491,8 @@ Three cases. The application ahead of the chain is impossible under the persiste
 
 `test/review.test.ts`, "keeps per-block results so a repeated transaction proves its real outcome at each position": the `results` array the executor passes to `saveBlock` is stored per block, and a transaction repeated within a block owns its index entry at its first position (review finding 18). "does not remember a transaction it refused because the pool filled while checking it": with `maxTxs: 1` and a `checkTx` held open by a gate, two transactions are admitted concurrently; the first is `added`, the second `full`, resubmitting the second is `full` again rather than `seen`, and after `update` removes the first it is `added` (finding 38). "saves everything a height needs to the block store in one transaction": a counting `MemoryKv` sees one `write` for a `batch` of three saves and a second for a save outside it (finding 39; `doApply` is the batch's caller). "checks a transaction again after a check that threw, instead of calling it seen": an application whose first `checkTx` throws makes `addTx` reject, and the same bytes submitted again are checked and `added` rather than answered `seen`.
 
+`test/memory.test.ts`, "sheds load, keeps following the chain, and resumes when the heap eases": a node whose memory guard is fed a heap at 90% of its limit has `mempool.paused` true and `submitTx` answering `paused`; at 50% the pool is resumed and the same transaction is `added`. The pause is the node's doing (chapter 8); the pool only honours it.
+
 ## Limitations and ideas
 
 - FIFO only: no fee priority, no per-sender ordering, no replacement of a pending transaction by a better-paid one. A large transaction at the head of the queue that does not fit the remaining budget stops the reap.
@@ -480,6 +500,7 @@ Three cases. The application ahead of the chain is impossible under the persiste
 - The post-commit recheck is sequential and runs inside `doApply`, so a 10 000-transaction pool adds 10 000 `checkTx` calls to the commit path before the listeners (and the `status` broadcast) run.
 - No `PrepareProposal` or `ProcessProposal`: the application cannot reorder, drop or veto transactions in a proposal; it sees them when decided and can only mark them failed.
 - Validator sets by hash are kept forever; pruning covers blocks, results, the transaction index and the headers kept alone below the lowest block.
+- The pool is bounded by count, not bytes: 10 000 transactions of up to 1 MiB each is the ceiling, and under memory pressure the node pauses admission rather than trimming what is pooled.
 
 Exercises:
 

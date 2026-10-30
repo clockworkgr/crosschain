@@ -1,6 +1,6 @@
 # 14. Wallet and CLI
 
-This chapter is where a person meets the chain. `src/wallet/keystore.ts` keeps signing keys encrypted on disk, and `src/cli.ts` is the command line that creates a testnet, runs a node, and otherwise acts as a wallet and query tool over the [RPC](12-rpc.md). The CLI builds transactions with the signing client from the [application](11-application.md) chapter (`src/app/core/client.ts`), prices them from the fee schedule the node reports, signs them with keys from the keystore, and verifies what the node tells it with the [light client](13-light-client.md). Its `start` command is also the only place in the repository that assembles a complete [node](08-node.md) over TCP with LMDB storage and an RPC server. Nothing in the chain depends on these two files; everything a user does goes through them.
+This chapter is where a person meets the chain. `src/wallet/keystore.ts` keeps signing keys encrypted on disk, and `src/cli.ts` is the command line that creates a testnet, runs a node, and otherwise acts as a wallet and query tool over the [RPC](12-rpc.md). The CLI builds transactions with the signing client from the [application](11-application.md) chapter (`src/app/core/client.ts`), prices them from the fee schedule the node reports, signs them with keys from the keystore, and verifies what the node tells it with the [light client](13-light-client.md). Its `start` command is also the only place in the repository that assembles a complete [node](08-node.md) over TCP with LMDB storage and an RPC server, under a heap limit it sets itself. Nothing in the chain depends on these two files; everything a user does goes through them.
 
 ## Concepts
 
@@ -203,7 +203,70 @@ const genesis: Genesis = {
 
 `scheme` is what `--scheme ml-dsa-44|secp256k1` named on the command line, ML-DSA-44 when absent (`main` turns the name into a tag with `schemeTag`, which refuses a name it does not know). It is written into the genesis as `signatureScheme` and every key the testnet starts with is made for it: the faucet and operator keys in the keystore, each node's p2p key seed and consensus key seed. The keystore gets a `faucet` key and one operator key `op0..opN-1`; each node gets a p2p key seed and a consensus key seed, which go into its `config.json` in the clear (node keys are not wallet keys; the validator's consensus seed has to be readable by the node process). The node derives both keys from those seeds with the genesis scheme when it starts (chapter 8), which is why the seeds alone are enough. The genesis funds the faucet with 10^12 base units, each operator with 5x10^9, and registers each node's consensus key as a validator operated by `opN` with a self-bond of 20,000 whole tokens; the application-owned validator set is chapter 11's territory. Ports: p2p at `basePort + 2i`, RPC at `basePort + 2i + 1`, and each node's `seeds` are all the others. The passphrase is `CHAIN_PASSPHRASE` or the word `testnet`, and the command prints it, as the spec requires.
 
-**`start(nodeDir)`** assembles a node: the config and the genesis one directory up, a `WorkerVerifier` (chapter 2's thread pool), a logger at `LOG` level, an `LmdbEnv` under `data/lmdb`, then `Node.create` with the TCP transport, seeds, state-sync anchor and retention from the config. After `node.start()` it opens an `RpcServer` on `rpcListen`, logs a status line every five seconds (height, peers, mempool size, round, active validators, community pool) and shuts everything down in order on `SIGINT` or `SIGTERM`: RPC, node, LMDB, verifier.
+**`startUnderHeapLimit()`** runs first. The state lives in the V8 heap, whose default limit is a few gigabytes whatever the machine has, and a state that outgrows it aborts the process; the node's memory guard ([chapter 8](08-node.md)) can only act below the limit, and can only schedule collections when `--expose-gc` is on. So `start` runs itself again as a child process with the flags it needs:
+
+```ts
+function startUnderHeapLimit(): boolean {
+  const configured = process.execArgv.some((a) => a.startsWith('--max-old-space-size')) || /max-old-space-size/.test(process.env.NODE_OPTIONS ?? '');
+  if (configured || process.env.CROSSCHAIN_CHILD) return false;
+  const heapMb = flags.has('heap') ? Number(flags.get('heap')) : Math.floor((totalmem() / 2 ** 20) * 0.75);
+  if (!Number.isInteger(heapMb) || heapMb < 256) throw new Error('--heap takes a size in MiB, at least 256');
+  console.log(`start: running the node under a ${heapMb} MiB heap limit (--heap <MiB> changes it), collections scheduled after commits`);
+  const args = [`--max-old-space-size=${heapMb}`, '--max-semi-space-size=64', '--expose-gc', ...process.execArgv, process.argv[1]!, ...process.argv.slice(2)];
+  const child = spawn(process.execPath, args, { stdio: 'inherit', env: { ...process.env, CROSSCHAIN_CHILD: '1' } });
+  // A signal addressed to this process is passed on; a terminal's interrupt reaches the child by itself as well,
+  // and the child's shutdown runs once however many it gets.
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => child.kill(sig));
+  child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
+  return true;
+}
+```
+
+The heap limit is three quarters of physical memory (`os.totalmem`) unless `--heap <MiB>` names another, and a figure that is not a whole number of at least 256 is refused before anything starts. The child gets `--max-old-space-size` for the limit, `--max-semi-space-size=64` for a larger young generation (fewer minor collections, each of which pauses the thread), `--expose-gc` so the scheduler can ask for collections after commits, then whatever flags the parent itself ran with, the script and its arguments, with `CROSSCHAIN_CHILD` in its environment so that it does not wrap itself again. The other escape is a `--max-old-space-size` already in `node`'s own arguments or in `NODE_OPTIONS`: the operator chose a limit, and the wrapper steps aside (then `--expose-gc` is the operator's to add; without it the scheduler logs once that collections run when V8 decides). The parent's only jobs afterwards are to pass `SIGINT` and `SIGTERM` to the child (a terminal's interrupt reaches both processes anyway, and the child's `shutdown` runs once however many signals it gets) and to exit with the child's code, or 1 when a signal killed it. The printed line is all an operator sees of this.
+
+**`start(nodeDir)`** returns at once in the parent (`if (startUnderHeapLimit()) return`) and otherwise assembles a node: the config and the genesis one directory up, a `WorkerVerifier` (chapter 2's thread pool), a logger at `LOG` level, an `LmdbEnv` under `data/lmdb`, then `Node.create` with the TCP transport, seeds, state-sync anchor and retention from the config. After `node.start()` it opens an `RpcServer` on `rpcListen` and logs a status line every five seconds:
+
+```ts
+  setInterval(() => {
+    const m = node.memoryGuard.stats;
+    const gc = node.gcScheduler.stats();
+    log('info', 'status', {
+      height: node.height,
+      peers: node.network.peers.size,
+      mempool: node.mempool.size,
+      round: node.consensus.round,
+      validators: app.dynamic().active.length,
+      pool: app.dynamic().communityPool,
+      heap: `${Math.round(m.heapUsed / 2 ** 20)}/${Math.round(m.heapLimit / 2 ** 20)} MiB`,
+      memory: node.memoryLevel,
+      gc: `${gc.collections} pauses, ${gc.totalMs.toFixed(0)} ms, longest ${gc.maxMs.toFixed(1)} ms`,
+    });
+  }, 5000).unref();
+```
+
+Height, peers, mempool size, round, active validators and the community pool as before, then the guard's last sample as `heap=<used>/<limit> MiB` (the limit V8 reports includes the young generation, so `--heap 512` shows as about 704), the guard's level as `memory=`, and the collections V8 has run since start with their total and longest pause as `gc=`. On a one-node testnet under `--heap 512` the line read `heap=17/704 MiB memory=ok gc=5 pauses, 1 ms, longest 0.3 ms` after five blocks: one scheduled minor collection per commit. Shutdown is one function with an exit code:
+
+```ts
+  let stopping = false;
+  const shutdown = async (code = 0) => {
+    if (stopping) return;
+    stopping = true;
+    await rpc.stop();
+    await node.stop();
+    await env.close();
+    await verifier.close();
+    process.exit(code);
+  };
+  process.on('SIGINT', () => void shutdown());
+  process.on('SIGTERM', () => void shutdown());
+  // Past the critical level the next step is V8 aborting the process; stopping cleanly first keeps the stores
+  // consistent and tells the supervisor, through the exit code, that the node needs a larger heap.
+  node.onMemory((level) => {
+    if (level === 'critical') void shutdown(3);
+  });
+```
+
+`SIGINT` and `SIGTERM` stop everything in order, RPC, node, LMDB, verifier, and exit 0; the `stopping` flag makes a second signal harmless, and two do arrive under the wrapper, the terminal's and the one the parent passes on. The guard's `critical` level, 95% of the heap limit, takes the same path with exit code 3: the alternative is V8 aborting the process at the limit with the stores wherever the last write left them, and a distinct code lets a supervisor tell "restart me with a larger `--heap`" from a crash. The guard has already logged the reason and the remedy by then (`memory: heap at the limit; stopping before the process aborts (raise --max-old-space-size or --heap)`), and the node has already shed what it could at the `pressure` level; what remains is a state that does not fit, which no amount of shedding changes.
 
 **Client helpers.**
 
@@ -290,7 +353,7 @@ It asks for the proof at `latest - 1` because the header that commits to height 
 | command | arguments | what it does | RPC calls |
 |---|---|---|---|
 | `init` | `<dir> [validators=4] [basePort=26656] [--scheme ml-dsa-44\|secp256k1]` | writes `genesis.json` naming the scheme, `keystore.json` (faucet and `opN` keys made for it, passphrase printed) and `nodeN/config.json` for each validator | none |
-| `start` | `<nodeDir>` | runs the node over TCP with LMDB and its RPC on `rpcListen`; `LOG` sets the level | serves them |
+| `start` | `<nodeDir> [--heap <MiB>]` | runs the node, in a child process under a heap limit of three quarters of memory or the given size, over TCP with LMDB and its RPC on `rpcListen`; `LOG` sets the level; exits 3 when the heap nears the limit | serves them |
 | `keys list` | `[--keystore path]` | one line per key: name, scheme and address; fails if the file does not exist | none |
 | `keys add` | `<name> [--scheme s]` | generates a seed for the scheme (ML-DSA-44 when absent), seals it, prints the address | none |
 | `keys import` | `<name> <seedHex> [--scheme s]` | seals a given 32-byte seed as a key of the scheme (ML-DSA-44 when absent) | none |
@@ -337,7 +400,7 @@ Chapter 11's staking rules keep delegations in shares whose value changes with r
 
 Seven RPC calls before the broadcast (`status` and `object` twice each, `account` twice, `parameters` once), of which the two `object` and two `account` calls are costly: with the broadcast that is 28 tokens of the default burst of 100.
 
-**Error handling.** `main` is wrapped once: any thrown error prints its message and exits with status 1. An unknown command prints the usage pointer and exits 1. Three commands also set `process.exitCode = 1` on an outcome they report rather than throw: `send` when the transaction was included but failed, `account` when the proof did not verify or was not about what was asked, and `verify-tx` when verification failed. The output is the same as before in those cases; the exit code is for scripts. There is no retry, no partial output on failure, and nothing is written to disk by a client command except `light.json`, the keystore and the lock file the keystore holds while it writes.
+**Error handling.** `main` is wrapped once: any thrown error prints its message and exits with status 1. An unknown command prints the usage pointer and exits 1. Three commands also set `process.exitCode = 1` on an outcome they report rather than throw: `send` when the transaction was included but failed, `account` when the proof did not verify or was not about what was asked, and `verify-tx` when verification failed. The output is the same as before in those cases; the exit code is for scripts. `start` has one more code: 3 when the memory guard reached `critical` and the node was stopped cleanly for it, which the wrapper passes through, so a supervisor can restart with a larger `--heap` rather than treat it as a crash. There is no retry, no partial output on failure, and nothing is written to disk by a client command except `light.json`, the keystore and the lock file the keystore holds while it writes.
 
 ## How it is tested
 
@@ -357,6 +420,7 @@ The CLI has no automated test. `RPC-SYNC-PROOFS.md` section 6 lists "every CLI c
 - The passphrase prompt hides echo by patching `stdout.write`, which works for a plain terminal and not necessarily elsewhere.
 - `light.json` is per keystore directory, not per chain: pointing the same keystore at a different chain would fail at `LightClient.trust` with a chain id error, which is the right outcome but an unhelpful message.
 - The keystore lock waits five seconds and treats a lock older than thirty as abandoned. Those are generous for a write that takes milliseconds, but a machine suspended with the lock held could have it removed from under it; the atomic write still leaves a whole file either way.
+- `start` always wraps itself unless `--max-old-space-size` is already set or `CROSSCHAIN_CHILD` is in the environment; there is no flag to run in place, and a `--heap` below 256 MiB is refused rather than clamped.
 
 Exercises:
 

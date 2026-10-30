@@ -8,7 +8,8 @@
 
 The design record and the specifications it points to live at the repository root:
 [DESIGN.md](../DESIGN.md) (every decision, in order), [STAKING.md](../STAKING.md),
-[FEES.md](../FEES.md), [RPC-SYNC-PROOFS.md](../RPC-SYNC-PROOFS.md), and
+[FEES.md](../FEES.md), [RPC-SYNC-PROOFS.md](../RPC-SYNC-PROOFS.md),
+[STATE-PAGING.md](../STATE-PAGING.md), and
 [REVIEW-2026-10-28.md](../REVIEW-2026-10-28.md) (an external review and what each finding changed).
 
 ## Tutorial chapters

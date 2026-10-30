@@ -5,7 +5,10 @@
  *       Writes genesis.json with a funded faucet and one validator per node,
  *       a keystore with the faucet and operator keys, and a directory per
  *       node with its consensus key and config. Prints the keystore passphrase.
- *   node src/cli.ts start <dir>/<nodeN>
+ *   node src/cli.ts start <dir>/<nodeN> [--heap <MiB>]
+ *       Runs the node under a heap limit (three quarters of memory unless --heap says
+ *       otherwise) with collections scheduled after commits; stops cleanly when the
+ *       heap nears the limit, with exit code 3.
  *       Runs that node with its RPC on the p2p port plus one.
  *
  * Every other command takes a target: a node directory (its RPC URL and the
@@ -37,6 +40,8 @@
  * Amounts are whole tokens; validators are named by their operator account.
  * Operation fees are filled in from the chain's schedule (FEES.md) before signing.
  */
+import { spawn } from 'node:child_process';
+import { totalmem } from 'node:os';
 import { schemeName, schemeTag, type SchemeTag } from './crypto/keys.ts';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -174,7 +179,28 @@ function init(dir: string, count: number, basePort: number, scheme: SchemeTag): 
   console.log(`wrote ${dir}/genesis.json, keystore.json (passphrase "${pass}") and ${count} node directories; p2p ports ${basePort}.. in steps of two, RPC on each p2p port plus one`);
 }
 
+/**
+ * The node is run in a child process with the heap limit it needs: V8's default is a few gigabytes
+ * whatever the machine has, and a state that outgrows it aborts the process. --expose-gc lets the
+ * node schedule collections after commits, and a larger young generation means fewer of the small ones.
+ */
+function startUnderHeapLimit(): boolean {
+  const configured = process.execArgv.some((a) => a.startsWith('--max-old-space-size')) || /max-old-space-size/.test(process.env.NODE_OPTIONS ?? '');
+  if (configured || process.env.CROSSCHAIN_CHILD) return false;
+  const heapMb = flags.has('heap') ? Number(flags.get('heap')) : Math.floor((totalmem() / 2 ** 20) * 0.75);
+  if (!Number.isInteger(heapMb) || heapMb < 256) throw new Error('--heap takes a size in MiB, at least 256');
+  console.log(`start: running the node under a ${heapMb} MiB heap limit (--heap <MiB> changes it), collections scheduled after commits`);
+  const args = [`--max-old-space-size=${heapMb}`, '--max-semi-space-size=64', '--expose-gc', ...process.execArgv, process.argv[1]!, ...process.argv.slice(2)];
+  const child = spawn(process.execPath, args, { stdio: 'inherit', env: { ...process.env, CROSSCHAIN_CHILD: '1' } });
+  // A signal addressed to this process is passed on; a terminal's interrupt reaches the child by itself as well,
+  // and the child's shutdown runs once however many it gets.
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => child.kill(sig));
+  child.on('exit', (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
+  return true;
+}
+
 async function start(nodeDir: string): Promise<void> {
+  if (startUnderHeapLimit()) return;
   const cfg = JSON.parse(readFileSync(join(nodeDir, 'config.json'), 'utf8')) as NodeFiles;
   const genesis = loadGenesisFile(join(nodeDir, '..', 'genesis.json'));
   const verifier = new WorkerVerifier();
@@ -203,18 +229,38 @@ async function start(nodeDir: string): Promise<void> {
   await rpc.start();
 
   setInterval(() => {
-    log('info', 'status', { height: node.height, peers: node.network.peers.size, mempool: node.mempool.size, round: node.consensus.round, validators: app.dynamic().active.length, pool: app.dynamic().communityPool });
+    const m = node.memoryGuard.stats;
+    const gc = node.gcScheduler.stats();
+    log('info', 'status', {
+      height: node.height,
+      peers: node.network.peers.size,
+      mempool: node.mempool.size,
+      round: node.consensus.round,
+      validators: app.dynamic().active.length,
+      pool: app.dynamic().communityPool,
+      heap: `${Math.round(m.heapUsed / 2 ** 20)}/${Math.round(m.heapLimit / 2 ** 20)} MiB`,
+      memory: node.memoryLevel,
+      gc: `${gc.collections} pauses, ${gc.totalMs.toFixed(0)} ms, longest ${gc.maxMs.toFixed(1)} ms`,
+    });
   }, 5000).unref();
 
-  const shutdown = async () => {
+  let stopping = false;
+  const shutdown = async (code = 0) => {
+    if (stopping) return;
+    stopping = true;
     await rpc.stop();
     await node.stop();
     await env.close();
     await verifier.close();
-    process.exit(0);
+    process.exit(code);
   };
   process.on('SIGINT', () => void shutdown());
   process.on('SIGTERM', () => void shutdown());
+  // Past the critical level the next step is V8 aborting the process; stopping cleanly first keeps the stores
+  // consistent and tells the supervisor, through the exit code, that the node needs a larger heap.
+  node.onMemory((level) => {
+    if (level === 'critical') void shutdown(3);
+  });
 }
 
 // ---- client helpers ----

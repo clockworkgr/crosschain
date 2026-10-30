@@ -36,7 +36,7 @@ export interface FinalizeBlockRequest {
 
 ### Objects instead of a key-value map
 
-Most chains model state as a map from keys to byte strings. This one follows Graphene (the engine behind BitShares) and models state as typed objects. An object has a numeric type (account is 3, asset is 4) and an instance number assigned from a per-type counter, and the pair is its id: `3.0` is the first account, `4.0` the first asset. [Chapter 09](09-database.md) explains how dense instance numbers let the database keep each type in a plain array and hash it into a complete binary Merkle tree. For this chapter the consequence is that every reference inside the state is an 8-byte id, not a name and not a public key (1,313 bytes with ML-DSA-44, 34 with secp256k1, scheme tag included). A transfer names its two accounts and its asset in 24 bytes.
+Most chains model state as a map from keys to byte strings. This one follows Graphene (the engine behind BitShares) and models state as typed objects. An object has a numeric type (account is 3, asset is 4) and an instance number assigned from a per-type counter, and the pair is its id: `3.0` is the first account, `4.0` the first asset. [Chapter 09](09-database.md) explains how dense instance numbers let the database find each object of a type by a plain array index and hash the type into a complete binary Merkle tree. For this chapter the consequence is that every reference inside the state is an 8-byte id, not a name and not a public key (1,313 bytes with ML-DSA-44, 34 with secp256k1, scheme tag included). A transfer names its two accounts and its asset in 24 bytes.
 
 `src/app/core/types.ts` declares the object types. Graphene distinguishes "protocol" objects, which transactions reference (accounts, assets, balances, validators, delegations), from "implementation" objects that only the chain maintains (the global and dynamic properties, the recent-transaction records, signing records). The split matters for one thing: the static chain parameters sit in one `global` object and the values that change every block in one `dynamic` object, so a block rehashes one small leaf instead of the whole parameter set.
 
@@ -1058,7 +1058,17 @@ export interface SnapshotTypeInfo {
 
 **`SnapshotManifest`** is `{ format, height, appHash, chunkObjects, types }`. **`SnapshotChunk`** is `{ height, type, index, from, to, objects, siblings }` where `objects` are the present instances in `[from, to)` with their encodings and `siblings` the range proof. **`encodeManifest`** / **`decodeManifest`** and **`encodeChunk`** / **`decodeChunk`**, with the byte helpers **`manifestToBytes`**, **`manifestFromBytes`**, **`chunkToBytes`**, **`chunkFromBytes`**, give both a wire form; the decoders bound index roots at 16, top siblings at 64, chunk hashes at a million and chunk siblings at 128.
 
-**`exportSnapshot(db, types, height, chunkObjects)`** walks `db.typeOrder`, asks the database for each type's leaf at that height (`typeLeafProofAt`), and for every range of `chunkObjects` instances collects the objects present at that height (`getAt`), encodes them, and attaches `rangeProofAt(type, from, to, height)`. Each chunk's sha256 goes into the manifest. The height must be inside the database's retention window, which it always is right after commit.
+**`exportSnapshot(db, types, height, chunkObjects)`** walks `db.typeOrder`, asks the database for each type's leaf at that height (`typeLeafProofAt`), and for every range of `chunkObjects` instances collects the encodings of the objects present at that height and attaches `rangeProofAt(type, from, to, height)`. The encodings come from `bytesAt`, straight from the database's arena or its history of past values, so nothing is decoded and encoded again:
+
+```ts
+      for (let i = from; i < to; i++) {
+        // The bytes as of the height, straight from the arena or the history: no decode and re-encode.
+        const bytes = db.bytesAt(objectId(type, i), height);
+        if (bytes) objects.push([i, bytes]);
+      }
+```
+
+Each chunk's sha256 goes into the manifest. The height must be inside the database's retention window, which it always is right after commit.
 
 **`verifyManifest(appHash, m, types?)`** checks the format, that the manifest's app hash equals the trusted header's, that every type leaf folds to it (`typeLegMatches`), and that each type lists exactly `ceil(nextInstance / chunkObjects)` chunks. With the registered `types` given, it also requires the manifest to name every one of them exactly once, in id order, each with the right `typeIndex` and `typeCount`. The leaf checks alone cannot catch an omission: a manifest that leaves a type out folds just as well, since each remaining leaf's path to the app hash is genuine, and the joiner would only discover the gap after fetching every chunk, when `importSnapshot` computed a root with an empty type leaf and found it did not match.
 

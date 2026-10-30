@@ -27,30 +27,31 @@ import { decode, type Reader } from '../codec/reader.ts';
 import { encode, type Writer } from '../codec/writer.ts';
 import { bytesEqual, HASH_SIZE } from '../crypto/hash.ts';
 import { instanceOf, objectId, typeOf, type ObjectId } from './id.ts';
-import { DbError, TypeIndex, type ObjectType } from './index.ts';
+import { Arena, type ArenaStats } from './arena.ts';
+import { deepFreeze } from './freeze.ts';
+import { DbError, TypeIndex, type HotBudget, type ObjectType } from './index.ts';
 import { DenseMerkleTree, EMPTY, type TreeRecords } from './merkle.ts';
 import { objectLeaf, typeLeaf, type KeyProof, type ObjectProof } from './proof.ts';
 import { SparseMerkleTree } from './smt.ts';
 
-/**
- * A record is immutable once stored: the live index, the undo log and the
- * value history all point at the same object, so a change in place would
- * corrupt every one of them. Freezing reaches every nested object and
- * array. Byte arrays cannot be frozen in JavaScript, so a record's hashes
- * and keys remain the one thing a caller must not write into.
- */
-export function deepFreeze<T>(value: T): T {
-  if (typeof value !== 'object' || value === null || ArrayBuffer.isView(value)) return value;
-  Object.freeze(value);
-  for (const v of Array.isArray(value) ? value : Object.values(value)) deepFreeze(v);
-  return value;
-}
+export { deepFreeze } from './freeze.ts';
 
 type AnyObject = { id: ObjectId };
 
 export interface DatabaseOptions {
   /** How many past versions stay provable. 0 keeps only the current one. */
   retainVersions?: number;
+  /** How many decoded objects the hot caches may hold together (STATE-PAGING.md section 3); unbounded by default. */
+  hotObjects?: number;
+}
+
+/** What the database holds in memory besides the trees and indices, for the memory guard and status. */
+export interface DatabaseMemory {
+  arena: ArenaStats;
+  hotObjects: number;
+  hotLimit: number;
+  /** Bytes of past values kept for the retention window. */
+  historyBytes: number;
 }
 
 export interface ObjectChange {
@@ -137,6 +138,8 @@ export class UndoSession {
 
 const SNAPSHOT_VERSION = 2;
 const DEFAULT_RETAIN = 100;
+/** Unbounded: with memory to spare every decoded object stays, and the node runs as it did before the arena. The memory guard caps it. */
+const DEFAULT_HOT = Infinity;
 
 export class ObjectDatabase {
   private readonly types = new Map<number, TypeIndex<AnyObject>>();
@@ -153,8 +156,12 @@ export class ObjectDatabase {
   /** For every object written since the last root(): its value at that root. */
   private readonly shadow = new Map<ObjectId, AnyObject | null>();
   private readonly counterShadow = new Map<number, number>();
-  /** Before version v, the object was obj. */
-  private readonly valueHistory = new Map<ObjectId, { v: number; obj: AnyObject | null }[]>();
+  /** Before version v, the object was these bytes (null: did not exist). Bytes, not records: the window costs what it stores. */
+  private readonly valueHistory = new Map<ObjectId, { v: number; bytes: Uint8Array | null }[]>();
+  private historyBytes = 0;
+  /** The committed encodings of every object, and the budget the types' hot caches share. */
+  private readonly arena: Arena;
+  private readonly hotBudget: HotBudget;
   private readonly valueHistoryByVersion = new Map<number, ObjectId[]>();
   private readonly counterHistory = new Map<number, { v: number; count: number }[]>();
   private readonly lastIndexRoots = new Map<number, Uint8Array[]>();
@@ -162,9 +169,14 @@ export class ObjectDatabase {
 
   constructor(types: ObjectType<any>[], opts: DatabaseOptions = {}) {
     this.retain = Math.max(0, opts.retainVersions ?? DEFAULT_RETAIN);
+    this.hotBudget = { limit: Math.max(0, opts.hotObjects ?? DEFAULT_HOT), size: 0 };
+    this.arena = new Arena({
+      refOf: (type, instance) => this.types.get(type)?.refAt(instance) ?? -1,
+      relocate: (type, instance, ref) => this.types.get(type)!.relocate(instance, ref),
+    });
     for (const t of types) {
       if (this.types.has(t.id)) throw new Error(`duplicate object type ${t.id}`);
-      this.types.set(t.id, new TypeIndex(t, this.retain));
+      this.types.set(t.id, new TypeIndex(t, this.retain, this.arena, this.hotBudget));
       this.trees.set(t.id, new DenseMerkleTree(this.retain));
     }
     this.order = [...this.types.keys()].sort((a, b) => a - b);
@@ -205,6 +217,16 @@ export class ObjectDatabase {
   /** Forget the last change list once a store has written it; it holds the encoded bytes of every changed object. */
   dropChanges(): void {
     this.changes = null;
+  }
+
+  /** Change the hot caches' shared budget at run time (the memory guard's first dial); the excess is evicted at once. */
+  setHotLimit(limit: number): void {
+    this.hotBudget.limit = Math.max(0, limit);
+    for (const ti of this.types.values()) ti.evict();
+  }
+
+  memory(): DatabaseMemory {
+    return { arena: this.arena.stats, hotObjects: this.hotBudget.size, hotLimit: this.hotBudget.limit, historyBytes: this.historyBytes };
   }
 
   // ---- reads ----
@@ -334,11 +356,7 @@ export class ObjectDatabase {
       this.typeIndexById(typeOf(id)).insert(old);
       this.dirty.add(id);
     }
-    for (const [type, before] of s.counters) {
-      const ti = this.typeIndexById(type);
-      ti.nextInstance = before;
-      ti.objects.length = before;
-    }
+    for (const [type, before] of s.counters) this.typeIndexById(type).truncate(before);
   }
 
   /** @internal */
@@ -392,8 +410,22 @@ export class ObjectDatabase {
   getAt<T extends AnyObject>(type: ObjectType<T>, id: ObjectId, version: number): T | null {
     this.checkVersion(version);
     const entries = this.valueHistory.get(id);
-    if (entries) for (const e of entries) if (e.v > version) return e.obj as T | null;
+    if (entries) for (const e of entries) if (e.v > version) return e.bytes ? deepFreeze(decode(e.bytes, (r) => type.decode(r, id))) : null;
     return this.getCommitted(type, id);
+  }
+
+  /** The encoding of an object as of a past version inside the window, without decoding it: for snapshots and proofs. */
+  bytesAt(id: ObjectId, version: number): Uint8Array | null {
+    this.checkVersion(version);
+    const entries = this.valueHistory.get(id);
+    if (entries) for (const e of entries) if (e.v > version) return e.bytes;
+    const ti = this.typeIndexById(typeOf(id));
+    for (const s of this.sessions) {
+      if (s.created.has(id)) return null;
+      const old = s.modified.get(id) ?? s.removed.get(id);
+      if (old) return encode((w) => ti.type.encode(w, old));
+    }
+    return ti.bytesFor(instanceOf(id)) ?? null;
   }
 
   countAt(type: number, version: number): number {
@@ -426,23 +458,39 @@ export class ObjectDatabase {
       const tree = this.trees.get(type)!;
       tree.resize(ti.nextInstance);
       const instance = instanceOf(id);
-      const obj = instance < ti.nextInstance ? ti.get(instance) : undefined; // created and undone: it never existed
-      const before = this.shadow.get(id);
-      if (before !== undefined && before === (obj ?? null)) continue; // written and written back
-      const bytes = obj ? encode((w) => ti.type.encode(w, obj)) : null;
+      if (instance >= ti.nextInstance) continue; // created and undone: it never existed
+      const pending = ti.pending(instance);
+      let bytes: Uint8Array | null;
+      if (pending === undefined) {
+        // Imported straight into the arena (the first root after an import): hash the bytes as they are.
+        bytes = ti.bytesOf(instance)?.slice() ?? null;
+      } else {
+        const before = this.shadow.get(id);
+        if (before !== undefined && before === pending) {
+          ti.settle(instance); // written and written back
+          continue;
+        }
+        // Encoded once here, however many times it was modified since the last root.
+        bytes = pending ? encode((w) => ti.type.encode(w, pending)) : null;
+        ti.flush(instance, bytes);
+        if (keepHistory && before !== undefined) {
+          const beforeBytes = before ? encode((w) => ti.type.encode(w, before)) : null;
+          let entries = this.valueHistory.get(id);
+          if (!entries) this.valueHistory.set(id, (entries = []));
+          entries.push({ v: version, bytes: beforeBytes });
+          this.historyBytes += beforeBytes?.length ?? 0;
+          historyIds.push(id);
+          record.objects.push([id, beforeBytes]);
+        }
+      }
       tree.setLeaf(instance, bytes ? objectLeaf(id, bytes) : EMPTY);
       objects.push({ id, bytes });
       touched.add(type);
-      if (keepHistory && before !== undefined) {
-        let entries = this.valueHistory.get(id);
-        if (!entries) this.valueHistory.set(id, (entries = []));
-        entries.push({ v: version, obj: before });
-        historyIds.push(id);
-        record.objects.push([id, before ? encode((w) => ti.type.encode(w, before)) : null]);
-      }
     }
     this.dirty.clear();
     this.shadow.clear();
+    // Pins are off; each type's hot cache comes back under the budget in one pass.
+    for (const ti of this.types.values()) ti.afterRoot();
     if (historyIds.length > 0) this.valueHistoryByVersion.set(version, historyIds);
 
     const counters = new Map<number, number>();
@@ -479,6 +527,8 @@ export class ObjectDatabase {
     this.version = version;
     this.changes = { version, objects, counters, history: keepHistory ? record : null };
     if (this.retain > 0) this.pruneHistory(version - this.retain);
+    // Slabs the block left more than half dead are compacted now, while the node idles.
+    this.arena.maintain();
     return root;
   }
 
@@ -487,7 +537,7 @@ export class ObjectDatabase {
       if (v > minVersion) continue;
       for (const id of ids) {
         const entries = this.valueHistory.get(id)!;
-        while (entries.length > 0 && entries[0]!.v <= minVersion) entries.shift();
+        while (entries.length > 0 && entries[0]!.v <= minVersion) this.historyBytes -= entries.shift()!.bytes?.length ?? 0;
         if (entries.length === 0) this.valueHistory.delete(id);
       }
       this.valueHistoryByVersion.delete(v);
@@ -510,11 +560,11 @@ export class ObjectDatabase {
     for (const t of rec.trees) (t.tree === TOP_TREE ? this.top : this.trees.get(t.tree))?.loadRecords(version, t.records);
     const ids: ObjectId[] = [];
     for (const [id, bytes] of rec.objects) {
-      const ti = this.typeIndexById(typeOf(id));
-      const obj = bytes ? deepFreeze(decode(bytes, (r) => ti.type.decode(r, id))) : null;
+      // Kept as the bytes the store gave back; decoded only if a past version is asked for.
       let entries = this.valueHistory.get(id);
       if (!entries) this.valueHistory.set(id, (entries = []));
-      entries.push({ v: version, obj });
+      entries.push({ v: version, bytes });
+      this.historyBytes += bytes?.length ?? 0;
       ids.push(id);
     }
     if (ids.length > 0) this.valueHistoryByVersion.set(version, ids);
@@ -533,12 +583,11 @@ export class ObjectDatabase {
     const tree = this.trees.get(type)!;
     const instance = instanceOf(id);
     const count = this.countAt(type, version);
-    const obj = this.getAt(ti.type, id, version);
     const idx = this.order.indexOf(type);
     return {
       height: BigInt(version),
       id,
-      value: obj ? encode((w) => ti.type.encode(w, obj)) : null,
+      value: this.bytesAt(id, version)?.slice() ?? null,
       nextInstance: BigInt(count),
       typeRoot: tree.rootAt(version),
       typeSiblings: instance < count ? tree.pathAt(instance, version) : [],
@@ -621,7 +670,7 @@ export class ObjectDatabase {
       const ti = this.typeIndexById(type);
       if (ti.authenticated.length === 0) continue;
       const candidates = new Set<ObjectId>();
-      for (const o of ti.objects) if (o) candidates.add(o.id);
+      for (const instance of ti.instances()) candidates.add(objectId(type, instance));
       for (const id of this.valueHistory.keys()) if (typeOf(id) === type) candidates.add(id);
       for (const name of ti.authenticated) {
         const rebuilt = new SparseMerkleTree(this.retain);
@@ -632,7 +681,10 @@ export class ObjectDatabase {
         for (let v = lowest + 1; v <= this.version; v++) {
           // Every key a version released is dropped before any it took, or a swap of keys between two objects would erase one.
           const changed = (this.valueHistoryByVersion.get(v) ?? []).filter((id) => typeOf(id) === type);
-          for (const id of changed) drop(this.valueHistory.get(id)!.find((e) => e.v === v)!.obj);
+          for (const id of changed) {
+            const e = this.valueHistory.get(id)!.find((e) => e.v === v)!;
+            drop(e.bytes ? decode(e.bytes, (r) => ti.type.decode(r, id)) : null);
+          }
           for (const id of changed) put(this.getAt(ti.type, id, v));
           rebuilt.commit(v);
         }
@@ -653,8 +705,8 @@ export class ObjectDatabase {
   importObject(id: ObjectId, bytes: Uint8Array): void {
     if (this.version >= 0 || this.sessions.length > 0) throw new DbError('import only into a fresh database');
     const ti = this.typeIndexById(typeOf(id));
-    const obj = deepFreeze(decode(bytes, (r) => ti.type.decode(r, id)));
-    ti.insert(obj);
+    // Decoded once for its index keys and not kept: the arena holds the bytes, the first root hashes them as they are.
+    ti.importCommitted(decode(bytes, (r) => ti.type.decode(r, id)), bytes);
     if (instanceOf(id) >= ti.nextInstance) ti.nextInstance = instanceOf(id) + 1;
     this.dirty.add(id);
   }
@@ -670,7 +722,7 @@ export class ObjectDatabase {
   *exportObjects(): IterableIterator<[ObjectId, Uint8Array]> {
     for (const type of this.order) {
       const ti = this.typeIndexById(type);
-      for (const o of ti.objects) if (o) yield [o.id, encode((w) => ti.type.encode(w, o))];
+      for (const instance of ti.instances()) yield [objectId(type, instance), ti.bytesFor(instance)!];
     }
   }
 
@@ -685,12 +737,11 @@ export class ObjectDatabase {
       w.u32(SNAPSHOT_VERSION).u64(height).fixed(appHash);
       w.array(this.order, (w, type) => {
         const ti = this.typeIndexById(type);
-        const present: AnyObject[] = [];
-        for (const o of ti.objects) if (o) present.push(o);
+        const present = [...ti.instances()];
         w.u16(type).u64(BigInt(ti.nextInstance));
-        w.array(present, (w, o) => {
-          w.u64(o.id);
-          w.bytes(encode((w) => ti.type.encode(w, o)));
+        w.array(present, (w, instance) => {
+          w.u64(objectId(type, instance));
+          w.bytes(ti.bytesFor(instance)!);
         });
       });
     });

@@ -114,8 +114,9 @@ export function exportSnapshot(db: ObjectDatabase, types: ObjectType<any>[], hei
       const to = Math.min(from + chunkObjects, count);
       const objects: [number, Uint8Array][] = [];
       for (let i = from; i < to; i++) {
-        const obj = db.getAt(t, objectId(type, i), height);
-        if (obj) objects.push([i, encode((w) => t.encode(w, obj))]);
+        // The bytes as of the height, straight from the arena or the history: no decode and re-encode.
+        const bytes = db.bytesAt(objectId(type, i), height);
+        if (bytes) objects.push([i, bytes]);
       }
       const bytes = chunkToBytes({ height: BigInt(height), type, index, from, to, objects, siblings: db.rangeProofAt(type, from, to, height) });
       encodedChunks.push(bytes);

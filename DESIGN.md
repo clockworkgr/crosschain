@@ -193,6 +193,35 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   app.commit (one transaction with the objects that changed, the version's history
   and the account history entries), then pruning. On startup the node asks the app
   its height and replays any blocks the app missed, checking the app hash matches.
+- **Memory guard and collection scheduling** (`src/node/memory.ts`): the state lives
+  in the V8 heap, so the ceiling that matters is the heap limit, past which the process
+  aborts with no chance to stop cleanly, and V8's default is a few gigabytes whatever
+  the machine has. The node samples the heap every second and holds one of four levels
+  by how full it is: `ok`; `warn` at 70% of the limit, which starts a major collection;
+  `pressure` at 85%, which sheds load: the mempool is paused (nothing new admitted,
+  announced transactions not fetched, what is pooled stays and is still reaped), costly
+  RPC methods and new event streams are refused, the signature cache is dropped, while
+  consensus and block sync keep running on whatever is pooled, since a validator that
+  stopped voting would be jailed; `critical` at 95%, on which the CLI stops the node
+  cleanly and exits with code 3, so a supervisor restarts it with a larger limit instead
+  of finding a dead process. Levels are hysteretic, left 5 points below the threshold
+  they were entered at, so a heap hovering at a threshold does not flap, and one sample
+  may cross several. Each level also sets the first of the dials `STATE-PAGING.md` plans,
+  the object database's cache of decoded objects (section 6): unbounded at `ok`, 100,000
+  objects at `warn`, 10,000 at `pressure` and `critical`, the excess evicted at once, so a
+  filling heap trades speed for room before anything is refused (a block of transfers
+  among random accounts takes about twice as long with the cache capped). The scheduler
+  moves collections to known moments: right after each
+  commit, when the node idles until the next proposal, a minor collection runs
+  synchronously and, once the heap has grown since the last major collection by 256 MiB
+  or a tenth of the limit, whichever is less, a major one starts asynchronously, so V8
+  rarely picks its own moment inside a round; both need `--expose-gc`, without which
+  the scheduler says so once and schedules nothing. Every collection V8 runs, scheduled
+  or not, is observed through `perf_hooks` and counted, so an operator sees the pauses
+  in the status line and in `status`. The CLI's `start` runs the node as a child
+  process under `--max-old-space-size` of three quarters of physical memory (`--heap
+  <MiB>` otherwise, at least 256), a 64 MiB semi-space and `--expose-gc`, passing
+  signals on and exiting with the child's code.
 
 ## 5. Signatures: ML-DSA-44 or secp256k1, chosen by genesis
 
@@ -303,9 +332,11 @@ ids make adding one unusually easy.
   restart reloads rather than replays), the history of the provable window, account
   history and snapshots in the `app` store, next to the blocks the engine keeps.
   State is bounded by RAM, which is the Graphene trade-off made explicit. Encodings
-  are binary and compact for that reason.
-- **Indices.** The primary index of a type is an array: instance i is `objects[i]`, no
-  hashing at all. A secondary index is a key encoder plus one ordered byte map. Keys are
+  are binary and compact for that reason. `STATE-PAGING.md` specifies how memory
+  becomes a cache over LMDB, tier by tier, so that a node near its heap limit keeps
+  working, slower; its first phase, the objects kept as bytes, is built (below).
+- **Indices.** The primary index of a type is a table by instance: slot i describes
+  instance i, no hashing at all (what a slot holds is the next item). A secondary index is a key encoder plus one ordered byte map. Keys are
   byte strings whose lexicographic order is the scan order: big-endian integers, strings
   with a zero terminator, compound keys by concatenation. A non-unique index appends
   the object id to the key, so a range query is a prefix scan. The ordered map is a B+
@@ -316,6 +347,37 @@ ids make adding one unusually easy.
   are rebuilt on load; the B+ trees are not part of the root, while the unique indices
   that need proofs are authenticated by sparse Merkle trees whose roots are in the
   type leg (see "Authenticated indices" below).
+- **Objects as bytes: the arena and the hot cache.** Specified in `STATE-PAGING.md`,
+  whose phase one is implemented in `src/db/arena.ts` and `src/db/index.ts`. The
+  committed encoding of every object lives in an arena: slabs of bytes, 256 KiB first and
+  doubling to 16 MiB, filled by a bump allocator, each entry a 10-byte header (type u16,
+  instance u32, length u32) followed by the encoding. A type's primary index is a table
+  of references into it (slab and offset packed into one number, -1 for absent) and of
+  lengths. Slabs are never written in place: a new encoding is a new entry and the old
+  one is counted dead; after a root, a slab more than half dead is compacted, its live
+  entries copied into the current slab (the header names the owner, which says whether
+  an entry is still current) and its buffer released, at most two slabs per root. Over
+  the arena sits a hot cache of decoded, frozen objects per type, under one budget all
+  types share: a read answers from it or decodes from the arena (about a microsecond for
+  an account) and caches the result. Eviction is CLOCK: a hit sets the instance's
+  touched bit, a fresh decode enters with it clear, and a hand sweeping the instances
+  clears the bits it finds set and evicts the first clean entry whose bit is clear, so a
+  one-time read goes first and a scan does not wash out a block's working set. Objects
+  written since the last root are pinned in the cache, decoded, and never evicted; a
+  removal is a tombstone there. root() encodes each dirty object once, hashes the bytes,
+  writes them to the arena and unpins the object, so a transaction that fails and is
+  undone costs no arena traffic. The budget is unbounded by default, so a node with
+  memory to spare keeps every object decoded and runs nearly as before; the memory guard caps
+  it (section 4). History keeps past values as bytes, decoded only when a past version
+  is read, and proofs, snapshots and export take their bytes from the arena or the
+  history without a decode and re-encode. Measured at 191,896 accounts under secp256k1
+  (`docs/benchmarks.md` section 4.10): resident, about 6% more memory and 5 to 15% less
+  speed; capped at 100,000 objects, 17% less heap with an empty cache and a block of
+  random transfers twice as slow. The budget it revealed: decoded objects are about a
+  sixth of the heap, 0.55 KB of the 3.2 KB per account, and the secondary indices, the
+  name tree and the Merkle trees the other 2.65 KB, which is where the later phases
+  (index entries and tree chunks on disk, the in-memory structures kept as droppable
+  accelerators) aim.
 - **Undo sessions.** Nested, Graphene style, with two uses: one session per transaction,
   undone on failure, and one pending session holding the mempool's speculative state,
   undone before every block and rebuilt by the engine's post-commit recheck. There is no
@@ -346,7 +408,7 @@ ids make adding one unusually easy.
   recomputed in one pass at the end of each block, shared ancestors once.
 - **Versions.** root(v) is called once per block with the height as the version. With a
   retention window (default 100 heights), every overwritten node hash is remembered as
-  "before version v it was x", every overwritten object as "before v it was o", and
+  "before version v it was x", every overwritten object as its encoding before v, and
   every moved counter likewise. A proof at an older height reads each node, the
   object and the counter through those records; records that only serve heights
   older than the window are dropped after each root. Node positions never change, so
@@ -401,8 +463,8 @@ ids make adding one unusually easy.
   trees, checks the root against the stored app hash, and the engine replays the
   blocks after it through the existing info() handshake. Nothing speculative is ever
   written: the pending session is undone before the block runs.
-- **Reads.** With ids, a read by id is one map lookup for the type and one array
-  access for the instance; nothing is hashed. Name and symbol lookups go through the
+- **Reads.** With ids, a read by id is one map lookup for the type and one for the
+  instance in the hot cache, or on a miss a decode from the arena; nothing is hashed. Name and symbol lookups go through the
   B+ tree of their index, and a proof's length grows with the height of the type's
   dense tree (the log of its counter), so those paths do depend on state size, though
   the measured throughput was flat at the sizes tried (`docs/benchmarks.md`). The
@@ -554,7 +616,7 @@ node must continue consensus with the exact proposer priorities.
 
 ## 10. Implementation status (2026-10-30)
 
-Everything above is implemented in TypeScript under `src/`. 137 tests in 20 files
+Everything above is implemented in TypeScript under `src/`. 146 tests in 22 files
 pass, and the whole suite passes under either signature scheme
 (`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there). The engine
 tests (consensus, recovery, network, units) run on the key-value test app; the
@@ -572,7 +634,16 @@ and adopts a schedule change by proposal, after which a transaction priced under
 old schedule fails instead of paying more. The schemes suite signs, verifies and
 round-trips tagged keys under each scheme, refuses cross-scheme keys and signatures,
 unknown tags and the high-S twin, keeps each key's scheme in the keystore, and runs a
-four-validator chain on secp256k1 end to end.
+four-validator chain on secp256k1 end to end. The memory suite moves the guard through
+its levels on injected samples, checks the scheduler's decisions against an injected
+collector and its observer against real collections, and runs a full node of the core
+application in a two-validator testnet through load shedding and back while it keeps
+following the chain, its database's cache capped at `pressure` and unbounded again at
+`ok`. Phase one of state paging (`STATE-PAGING.md`) has cases of its own: the arena suite
+grows slabs, counts dead bytes and compacts, and the database suite evicts clean objects
+and never dirty ones, keeps history as bytes, and computes the same roots whatever the
+cache budget. Phases two to four of that specification are designed and not built, and of
+phase five only the first dial, the cache cap, is.
 
 | module | what it is |
 |---|---|
@@ -582,8 +653,8 @@ four-validator chain on secp256k1 end to end.
 | `src/consensus/` | the Tendermint state machine, vote sets, evidence pool, private validator with double-sign guard, block validation |
 | `src/mempool.ts` | FIFO pool with checkTx admission and post-commit recheck |
 | `src/p2p/` | transport interface, in-memory and TCP transports, wire messages, peer database, network with handshake and peer exchange |
-| `src/node/` | block executor with crash recovery, and the node that wires everything |
-| `src/db/` | object ids, index keys, B+ tree, sparse Merkle tree, per-type indices, dense Merkle tree with chunks and versions, ICS23-shaped object and key proofs, the database with undo sessions and persisted history |
+| `src/node/` | block executor with crash recovery, the memory guard with load shedding and the collection scheduler, and the node that wires everything |
+| `src/db/` | object ids, index keys, B+ tree, sparse Merkle tree, the arena of encoded objects (`arena.ts`), per-type indices with a bounded cache of decoded objects, deep freezing of records (`freeze.ts`), dense Merkle tree with chunks and versions, ICS23-shaped object and key proofs, the database with undo sessions and persisted history |
 | `src/store/` | key-value interface with environment-wide transactions, in-memory and LMDB stores, block store on top with headers kept alone |
 | `bench/` | benchmarks (`npm run bench`): crypto, codec, database, store, application, a four-validator network with block sync, and (`npm run bench:genesis`) a gigabyte genesis: load time, memory, disk, reads at that size, restart, then at that scale a live node serving RPC under load, scattered batch transfers, proofs at past heights, history, and a state-sync import |
 | `src/light/` | light client with bisection forward and the hash chain walked backward, node-backed and RPC providers, and the checks on state, key and transaction queries |
@@ -594,7 +665,7 @@ four-validator chain on secp256k1 end to end.
 | `src/app/core/` | authorities, names, object types, transaction format, evaluators, staking rules, genesis, the core application, a signing client |
 | `src/app/` | application interface and the key-value test app used by the engine tests |
 | `scripts/localnet.ts` | N validators in one process driving the core app from a faucet |
-| `src/cli.ts` | init a TCP testnet, start a node with its RPC, keys, accounts, transfers, staking, history, proofs and light-client verification over the RPC |
+| `src/cli.ts` | init a TCP testnet, start a node with its RPC under a heap limit (stopping with exit code 3 when the heap nears it), keys, accounts, transfers, staking, history, proofs and light-client verification over the RPC |
 
 Known simplifications, all deliberate and all revisitable:
 
@@ -632,3 +703,19 @@ done about each finding.
 - The node defaults to the inline verifier; the CLI, the local network script and the
   benchmarks pass the worker pool. A node built from code should do the same.
 - Index roots inside a type leaf are the SMT roots at that height; the B+ tree indices used for lookups are not authenticated.
+- The version history window is not trimmed under memory pressure: shedding touches the
+  mempool, the RPC and the signature cache, and the guard caps the database's cache of
+  decoded objects, while the trees keep their own retention
+  (`retain.versions`), so a node whose history is what fills the heap needs a smaller
+  window or a larger heap. Trimming it on `pressure` is further work.
+- The mempool is bounded by count, 10,000 transactions, not by bytes; each may be up to
+  1 MiB. Under pressure the node pauses admission rather than trimming the pool.
+- ArrayBuffers (ML-DSA keys, stored bytes, the arena's slabs) live outside the V8 heap and
+  outside the memory guard's fraction; a machine that runs out of physical memory for them
+  meets the operating system's killer, not V8's limit. The guard reports `arrayBuffers` and
+  `rss` beside the heap figures but acts on the heap alone.
+- Phase one of state paging alone does not reduce memory much: decoded objects are about
+  a sixth of the heap per account, and the secondary indices, the name tree and the
+  Merkle trees, all still resident, are the bulk. Phases two to four of `STATE-PAGING.md`
+  (index entries and tree chunks in LMDB, the in-memory structures dropped under
+  pressure) are what would let a state larger than the heap keep committing.

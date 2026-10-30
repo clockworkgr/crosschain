@@ -54,6 +54,82 @@ const mk = (db: ObjectDatabase, name: string, group: number, value = 0n) => db.c
 const byName = (db: ObjectDatabase, name: string) => db.lookup(ItemType, 'byName', key((k) => k.str(name)));
 const inGroup = (db: ObjectDatabase, g: number) => db.range(ItemType, 'byGroup', key((k) => k.u32(g))).map((o) => o.name);
 
+describe('object database: arena and hot cache', () => {
+  it('serves reads from the arena once decoded objects are evicted, and never evicts what is dirty', () => {
+    const db = new ObjectDatabase([ItemType, CounterType], { hotObjects: 2 });
+    const ids = ['a', 'b', 'c', 'd', 'e'].map((n, i) => mk(db, n, i).id);
+    // Five dirty objects pinned in a cache of two: the budget is exceeded, not enforced, until the root.
+    expect(db.memory().hotObjects).toBe(5);
+    db.root();
+    // The root wrote them to the arena and unpinned them; the cache keeps the budget.
+    expect(db.memory().hotObjects).toBeLessThanOrEqual(2);
+    expect(db.memory().arena.used).toBeGreaterThan(0);
+    for (const [i, id] of ids.entries()) expect(db.get(ItemType, id)?.name).toBe('abcde'[i]);
+    expect(Object.isFrozen(db.get(ItemType, ids[0]!))).toBe(true);
+    expect(byName(db, 'c')?.id).toBe(ids[2]);
+    expect(db.memory().hotObjects).toBeLessThanOrEqual(2);
+    // A removal is a tombstone until the root: unreadable at once, the arena bytes gone after.
+    db.remove(ItemType, ids[1]!);
+    expect(db.get(ItemType, ids[1]!)).toBeNull();
+    expect(byName(db, 'b')).toBeNull();
+    expect([...db.exportObjects()].map(([id]) => id)).toEqual(ids.filter((id) => id !== ids[1]));
+    db.root();
+    expect(db.get(ItemType, ids[1]!)).toBeNull();
+    expect([...db.exportObjects()].length).toBe(4);
+    // Dirty objects never leave the cache whatever the budget; a modify keeps the latest value readable.
+    db.setHotLimit(0);
+    db.modify(ItemType, ids[0]!, (o) => ({ ...o, value: 7n }));
+    expect(db.get(ItemType, ids[0]!)?.value).toBe(7n);
+    expect(db.memory().hotObjects).toBe(1);
+    db.root();
+    expect(db.memory().hotObjects).toBe(0);
+    expect(db.get(ItemType, ids[0]!)?.value).toBe(7n);
+  });
+
+  it('keeps history as bytes, agrees between getAt and bytesAt, and exports after churn what it holds', () => {
+    const db = new ObjectDatabase([ItemType, CounterType], { hotObjects: 1, retainVersions: 10 });
+    const id = mk(db, 'x', 1, 1n).id;
+    db.root(1);
+    for (let v = 2; v <= 6; v++) {
+      db.modify(ItemType, id, (o) => ({ ...o, value: BigInt(v) }));
+      mk(db, `churn${v}`, v);
+      db.root(v);
+    }
+    for (let v = 1; v <= 6; v++) {
+      expect(db.getAt(ItemType, id, v)?.value).toBe(BigInt(v));
+      expect(db.bytesAt(id, v)).toEqual(encode((w) => ItemType.encode(w, db.getAt(ItemType, id, v)!)));
+    }
+    expect(db.memory().historyBytes).toBeGreaterThan(0);
+    const exported = [...db.exportObjects()];
+    expect(exported.length).toBe(6);
+    for (const [eid, bytes] of exported) expect(bytes).toEqual(encode((w) => ItemType.encode(w, db.get(ItemType, eid)!)));
+    // Compaction after churn has not changed a single byte of what is read back.
+    const stats = db.memory().arena;
+    expect(stats.used).toBeGreaterThan(0);
+    expect(db.get(ItemType, id)?.value).toBe(6n);
+    // The window closes behind: version 1 falls out after ten more roots and its bytes are released.
+    for (let v = 7; v <= 16; v++) db.root(v);
+    expect(() => db.getAt(ItemType, id, 1)).toThrow(RangeError);
+  });
+
+  it('computes the same roots whatever the cache budget', () => {
+    const run = (hotObjects: number) => {
+      const db = new ObjectDatabase([ItemType, CounterType], { hotObjects });
+      const roots: string[] = [];
+      for (let v = 1; v <= 5; v++) {
+        for (let i = 0; i < 20; i++) mk(db, `v${v}-${i}`, i % 3, BigInt(i));
+        if (v > 1) {
+          db.modify(ItemType, objectId(7, 3 * v), (o) => ({ ...o, value: 99n }));
+          db.remove(ItemType, objectId(7, 3 * v + 1));
+        }
+        roots.push(toHex(db.root(v)));
+      }
+      return roots;
+    };
+    expect(run(0)).toEqual(run(1_000_000));
+  });
+});
+
 describe('object database', () => {
   it('assigns dense ids and serves unique and range lookups', () => {
     const db = fresh();

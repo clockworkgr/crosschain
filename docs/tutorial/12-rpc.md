@@ -205,7 +205,7 @@ The complete reference follows. "Costly" means the method spends `costlyCost` (d
 
 | method | parameters | result | errors | costly |
 |---|---|---|---|---|
-| `status` | none | `{ chainId, version (number), signatureScheme ('ml-dsa-44' or 'secp256k1'), latestHeight, latestHash (hex or null), latestTime, appHash, catchingUp (bool), lowestHeight, joinedAt (string or null), peers (number), validatorAddress (hex or null), rpcVersion: 1 }` | none | no |
+| `status` | none | `{ chainId, version (number), signatureScheme ('ml-dsa-44' or 'secp256k1'), latestHeight, latestHash (hex or null), latestTime, appHash, catchingUp (bool), lowestHeight, joinedAt (string or null), peers (number), validatorAddress (hex or null), memory: { level, shedding (bool), heapUsed, heapLimit, heapTotal, arrayBuffers, external, rss (numbers, bytes), database: { arena: { slabs, capacity, used, dead }, hotObjects, hotLimit (number, or null when unbounded), historyBytes } or null }, gc: { available (bool), collections, minor, major, incremental, totalMs, maxMs, lastMs, scheduledMinor, scheduledMajor (numbers) }, rpcVersion: 1 }` | none | no |
 | `genesis` | none | the genesis document as `genesisToJson` writes it, with `appStateFile` removed | none | no |
 | `header` | `height?` (default latest) | the header: `chainId, version, height, time, lastBlockHash, lastCommitHash, dataHash, lastResultsHash, validatorsHash, nextValidatorsHash, appHash, evidenceHash, proposerAddress`; below a state-synced node's lowest block, a header it keeps alone | `-32001` no block and no header | no |
 | `block` | `height?` | `{ header, txs: hex[], lastCommit (or null), evidence, commit }` | `-32001` | yes |
@@ -220,7 +220,7 @@ The complete reference follows. "Costly" means the method spends `costlyCost` (d
 | `balance` | `account`, `asset?` (default the core asset) | `{ account, asset, amount }` | `-32001` no such account | no |
 | `accountHistory` | `account`, `from?` (sequence, default 0), `limit?` (default 20, at most 100), `reverse?` | `{ account, total, entries: [{ sequence, height, position (number or null), opIndex, kind, txHash (or null), data }] }` | `-32001`; `-32602` bad limit | yes |
 | `tx` | `hash`, `prove?` | `{ hash, height, index, ok, error, tx (hex), decoded (or null), proof? }` where `proof` is `txQueryToJson` or null | `-32001` unknown transaction | yes |
-| `broadcastTx` | `tx` (hex), `mode?` (`sync` default, or `commit`), `timeoutMs?` (default 30000, capped at 120000) | sync: `{ hash, status }` with status `added` or `seen`; commit: `{ hash, height, index, ok, error }` | `-32002` check failed (`invalid`, `too-large`, `full`, with the application's reason), or seen before but neither pending nor committed; `-32003` timeout; `-32004` too many commit waits outstanding; `-32602` bad mode | yes |
+| `broadcastTx` | `tx` (hex), `mode?` (`sync` default, or `commit`), `timeoutMs?` (default 30000, capped at 120000) | sync: `{ hash, status }` with status `added` or `seen`; commit: `{ hash, height, index, ok, error }` | `-32002` check failed (`invalid`, `too-large`, `full`, with the application's reason), or seen before but neither pending nor committed; `-32003` timeout; `-32004` too many commit waits outstanding, or, with the mempool's reason, while the node sheds load under memory pressure; `-32602` bad mode | yes |
 | `accounts` | `limit?` (default 50, at most 200; 0 returns an empty page), `after?` (name) | `[{ name, id, balance }]` in name order, resuming just past `after` | none | yes |
 | `parameters` | none | `{ height, coreAsset: { id, symbol, precision (number) }, maxTxExpirationMs, fees, staking }` | `-32001` not core app | no |
 | `proposals` | none | the open proposals, soonest to expire first, each with its full `parameters` | `-32001` not core app | yes |
@@ -228,7 +228,7 @@ The complete reference follows. "Costly" means the method spends `costlyCost` (d
 | `peers` | none | `[{ id, addr, direction, height, latencyMs }]` | none | no |
 | `snapshots` | none | `[]`, always | none | no |
 
-Errors that any method can produce: `-32600` for a request whose `id` is not a string, a number or null, `-32601` for an unknown method, `-32602` when `params` is present but not an object or when a parameter has the wrong JSON type, and `-32004` when the bucket cannot pay for a costly call. The first three are produced by the server, not by the table. `block` is costly for the reason the code gives in a comment: a full block of transactions is as much work to serve as any query.
+Errors that any method can produce: `-32600` for a request whose `id` is not a string, a number or null, `-32601` for an unknown method, `-32602` when `params` is present but not an object or when a parameter has the wrong JSON type, and `-32004` when the bucket cannot pay for a costly call or, with the message `node under memory pressure`, for any costly call while the node sheds load. The first three and the last are produced by the server, not by the table. `block` is costly for the reason the code gives in a comment: a full block of transactions is as much work to serve as any query.
 
 Some methods deserve a closer look.
 
@@ -248,7 +248,7 @@ Some methods deserve a closer look.
 
 A node that joined by state sync holds no blocks below its snapshot height until backfill has fetched them, but it does hold the headers of those heights as far back as evidence may reach (chapter 10's header records, written by state sync in chapter 7), and `header` serves them. That is what lets a light client walk backwards from a trusted header through such a node (chapter 13): each step needs only the header below, not its commit. `block` and `commit` need the block itself and stay `-32001` for those heights.
 
-`status` computes `catchingUp` from the peers' reported heights: true when some peer is more than one block ahead. `lowestHeight` is the oldest block the store still has (retention, chapter 10), and `joinedAt` is the height a state-synced node started from, or null for one that replayed from genesis. `signatureScheme` is the name of the scheme the chain state carries (`schemeName(state.scheme)`), the one genesis fixed: a wallet must know it before it makes a key for the chain, and the CLI's `create` and `create-validator` ask `status` for it (chapter 14). `rpcVersion: 1` lets a client detect the contract.
+`status` computes `catchingUp` from the peers' reported heights: true when some peer is more than one block ahead. `lowestHeight` is the oldest block the store still has (retention, chapter 10), and `joinedAt` is the height a state-synced node started from, or null for one that replayed from genesis. `signatureScheme` is the name of the scheme the chain state carries (`schemeName(state.scheme)`), the one genesis fixed: a wallet must know it before it makes a key for the chain, and the CLI's `create` and `create-validator` ask `status` for it (chapter 14). `memory` is the memory guard's last sample with its level and whether the node is shedding load, the sizes in bytes, and under `database` what the core application's object database reports through `memory()` ([chapter 9](09-database.md)): its arena's slab count, the bytes those slabs can hold, the bytes written into them and how many of those are dead, awaiting compaction; the decoded objects in its hot cache and their limit, which the guard sets (`hotLimit` is `Infinity` while unbounded, and JSON writes that as `null`); and the bytes of past values the provable window keeps. It is `null` on an application other than the core one. `gc` is the scheduler's counts: whether collections can be scheduled at all (`--expose-gc`), every collection V8 ran since start by kind with the total, longest and last pause in milliseconds, and the minor and major ones the node itself asked for ([chapter 8](08-node.md)); all of them are JSON numbers, none being a 64-bit quantity a double cannot hold. `rpcVersion: 1` lets a client detect the contract.
 
 `object` is the only method whose `height` selects the object read:
 
@@ -301,6 +301,7 @@ if (bool(p, 'prove')) out.proof = toHex(keyProofToBytes(app.proveAccountName(nam
         if (mode === 'commit' && !waiter) throw new RpcError(RATE_LIMITED, 'too many transactions awaiting inclusion; broadcast in sync mode and poll tx');
         try {
           const r = await node.submitTx(raw);
+          if (r.status === 'paused') throw new RpcError(RATE_LIMITED, r.error ?? 'node under memory pressure');
           if (r.status === 'invalid' || r.status === 'too-large' || r.status === 'full') throw new RpcError(CHECK_FAILED, `${r.status}${r.error ? `: ${r.error}` : ''}`);
           if (!waiter) return { hash: toHex(hash), status: r.status };
           const seen = node.store.txLocation(hash);
@@ -317,7 +318,7 @@ if (bool(p, 'prove')) out.proof = toHex(keyProofToBytes(app.proveAccountName(nam
     },
 ```
 
-The order is the point. The waiter is registered before `submitTx`, so a transaction that is admitted and committed between the two lines is still caught. `submitTx` is the node's `mempool.addTx` (chapter 5), whose statuses are `added`, `seen` (already in the pool or its cache), `invalid` (checkTx failed, with the application's message), `full` and `too-large`. A `seen` transaction in commit mode may already be in a block, which is why the store's index is consulted before waiting: re-broadcasting an included transaction answers at once with where it landed, as the test does. The failure message carries the application's reason, so a wallet that priced a transaction under an old fee schedule sees "states a fee of 100, the schedule requires 250".
+The order is the point. The waiter is registered before `submitTx`, so a transaction that is admitted and committed between the two lines is still caught. `submitTx` is the node's `mempool.addTx` (chapter 5), whose statuses are `added`, `seen` (already in the pool or its cache), `invalid` (checkTx failed, with the application's message), `full`, `too-large` and `paused`, the last while the node sheds load under memory pressure (chapter 8), which becomes `-32004` with the mempool's reason: the transaction is fine, and the client should wait and try again as it would for a rate limit rather than rebuild it. A `seen` transaction in commit mode may already be in a block, which is why the store's index is consulted before waiting: re-broadcasting an included transaction answers at once with where it landed, as the test does. The failure message carries the application's reason, so a wallet that priced a transaction under an old fee schedule sees "states a fee of 100, the schedule requires 250".
 
 Three guards keep commit mode from becoming a way to tie up the node. The timeout the caller asks for is capped at `MAX_COMMIT_WAIT_MS`, two minutes, so a request cannot hold a connection and a waiter slot for an hour. When `waitForTx` returns null because 1000 waiters are already outstanding, the method answers `-32004` at once with advice to use sync mode and poll `tx`; the transaction is not even submitted, since the caller asked to be told where it landed and the node cannot promise that. And a transaction the mempool reports as `seen` that is neither in the store's index nor still in the pool was rejected or dropped after an earlier submission, so a waiter for it would only ever time out; it is refused with `-32002` immediately instead of after the full timeout. The `finally` cancels the waiter on every exit, including the throws, so a slot is never held by a request that already answered.
 
@@ -425,8 +426,8 @@ A new address starts full. Refill is computed lazily from the elapsed time, capp
 | endpoint | what it does | status codes |
 |---|---|---|
 | `OPTIONS *` | CORS preflight | 204 |
-| `GET /health` | `{ height, peers }` as JSON, no rate limit | 200 |
-| `GET /events` | opens an SSE stream (below) | 200, 400 unknown event type, 404 unknown account, 429 too many streams or unaffordable replay |
+| `GET /health` | `{ height, peers, memory }` as JSON (`memory` the guard's level), no rate limit | 200 |
+| `GET /events` | opens an SSE stream (below) | 200, 400 unknown event type, 404 unknown account, 429 too many streams or unaffordable replay, 503 while the node sheds load |
 | `POST /` | one JSON-RPC request or a batch of 1 to 20 | 200 with the response(s); 204 with no body when nothing is to be answered (a lone notification, or a batch of them); 400 parse error (`-32700`) or bad batch size (`-32600`); 413 body too large; 429 rate limited (`-32004`) |
 | anything else | | 404 |
 
@@ -481,6 +482,7 @@ All the limits, in one place:
 | replay on reconnect | the last `MAX_REPLAY` = 1000 blocks, charged `costlyCost`, stops when `writableLength` > 1 MiB | when a stream is opened |
 | event stream backlog | `MAX_STREAM_BACKLOG` = 1 MiB queued unread; the stream is ended | in `send`, before every record |
 | commit waiters | `MAX_WAITERS` = 1000 across all callers; `-32004` beyond it | in `waitForTx` and `broadcastTx` |
+| memory pressure | the guard's `pressure` level ([chapter 8](08-node.md)); costly methods `-32004`, `/events` 503 | in `one` and `openStream` |
 | accountHistory page | 100 | in the method |
 | accounts page | 200 | in the method |
 | broadcast commit timeout | 30 s (caller may set, capped at `MAX_COMMIT_WAIT_MS` = 120 s) | in the method |
@@ -502,6 +504,7 @@ All the limits, in one place:
     const m = this.methods[method];
     if (!m) return answer({ code: -32601, message: `unknown method ${method}` });
     if (params !== undefined && (typeof params !== 'object' || params === null || Array.isArray(params))) return answer({ code: INVALID_PARAMS, message: 'params must be an object' });
+    if (m.costly && this.node.isShedding) return answer({ code: RATE_LIMITED, message: 'node under memory pressure' });
     if (m.costly && !this.allow(remote, this.limits.costlyCost - 1)) return answer({ code: RATE_LIMITED, message: 'rate limited' });
     try {
       return answer(null, await m.fn((params as Record<string, unknown>) ?? {}));
@@ -515,7 +518,7 @@ All the limits, in one place:
   }
 ```
 
-Five things to see. The request `id`, when present, must be a string, a number or null, as JSON-RPC 2.0 requires; an object or an array there makes the whole request invalid (`-32600`, answered with `id: null`), because the server echoes the id back and should not reflect arbitrary JSON a client chose. A well-formed request with no `id` member at all is a notification: `answer` becomes a function that returns `undefined`, so the method is carried out and nothing is answered, not even an error, whether the method is unknown, the parameters are bad, the bucket cannot pay or the call fails; the specification says a notification's sender "is not interested in any response", and that includes the bad news. The distinction between the two cases is `hasId`: an object that is not a request at all (no `jsonrpc: '2.0'`, no string `method`, an id of the wrong type) is still refused with `-32600` and `id: null` through `reply`, since the server cannot know whether the sender wanted an answer and the specification asks for one. Positional parameters (a JSON array) are refused; every method takes a named-parameter object. A costly method is charged `costlyCost - 1` here because the HTTP request already paid one. And the catch clause is the error contract: an `RpcError` keeps its code, an application `TxError` (thrown by state helpers in chapter 11 when something is missing) becomes not-found, and any other exception, including the plain `Error`s from `parseHex` and `parseBigint` and a `RangeError` from the database, becomes invalid params with its message. Those are logged at `warn` because an unexpected exception may be a bug rather than a bad call.
+Six things to see. The request `id`, when present, must be a string, a number or null, as JSON-RPC 2.0 requires; an object or an array there makes the whole request invalid (`-32600`, answered with `id: null`), because the server echoes the id back and should not reflect arbitrary JSON a client chose. A well-formed request with no `id` member at all is a notification: `answer` becomes a function that returns `undefined`, so the method is carried out and nothing is answered, not even an error, whether the method is unknown, the parameters are bad, the bucket cannot pay or the call fails; the specification says a notification's sender "is not interested in any response", and that includes the bad news. The distinction between the two cases is `hasId`: an object that is not a request at all (no `jsonrpc: '2.0'`, no string `method`, an id of the wrong type) is still refused with `-32600` and `id: null` through `reply`, since the server cannot know whether the sender wanted an answer and the specification asks for one. Positional parameters (a JSON array) are refused; every method takes a named-parameter object. A costly method is refused outright, with `-32004` and `node under memory pressure`, while the node sheds load (`isShedding`, chapter 8): the costly methods are the ones that serve whole blocks, proofs, listings and history, or hold a commit waiter, all of it memory on the client's behalf, and the check comes before the bucket so the refusal costs the caller nothing; cheap methods, `status` among them, keep answering so a client can see why. A costly method is charged `costlyCost - 1` here because the HTTP request already paid one. And the catch clause is the error contract: an `RpcError` keeps its code, an application `TxError` (thrown by state helpers in chapter 11 when something is missing) becomes not-found, and any other exception, including the plain `Error`s from `parseHex` and `parseBigint` and a `RangeError` from the database, becomes invalid params with its message. Those are logged at `warn` because an unexpected exception may be a bug rather than a bad call.
 
 **`openStream(req, res, url, remote)`** is `GET /events`. Query parameters: `types`, a comma-separated subset of `block`, `tx`, `account`, `validatorSet` (default `block`); `tx=<hash>` to restrict `tx` events to one transaction; `account=<name|id>` to choose the account for `account` events (required for any to be sent; an unknown name is 404). A name outside `EVENT_TYPES` is refused with a plain-text 400 rather than accepted and never matched, so a misspelt `validatorset` fails loudly instead of producing a silent stream:
 
@@ -529,7 +532,17 @@ for (const t of types) {
 }
 ```
 
-The checks run in this order: streams open from this address (429 at `maxStreams`), the event types (400), the account (404), and the replay charge:
+A stream is memory held for the client for as long as it stays open, so none is opened while the node sheds load:
+
+```ts
+    // A stream is memory held for the client; none are opened while the node sheds load.
+    if (this.node.isShedding) {
+      res.writeHead(503, CORS).end();
+      return;
+    }
+```
+
+The 503 is a plain "try again later"; the client retries once `/health` reports `ok` or `warn`, and the streams already open are left alone, since cutting them would only make their clients reconnect and replay. The checks run in this order: streams open from this address (429 at `maxStreams`), load shedding (503), the event types (400), the account (404), and the replay charge:
 
 ```ts
     // Replaying the blocks after the one the client last saw costs as much as a
@@ -657,6 +670,8 @@ The server is started in three places: `src/cli.ts` (`start`, on the node's p2p 
 - "json-rpc parameters": `parameters` reports the core asset `{ id: '4.0', symbol: 'CORE', precision: 5 }`, the genesis fee overrides (`transfer.fee` 250, `accountCreate.premiumFee` 20000) and the staking parameters, and `chainParametersFromJson` of the result equals the application's own `chainParameters()`; `proposals` is empty; a transaction priced from the served schedule is included while one priced from `DEFAULT_FEES` is refused with "states a fee of 100, the schedule requires 250" (the `-32002` message carries the application's reason).
 
 `test/review.test.ts`, "survives an aborted request body on the RPC": a raw TCP client sends a POST with `Content-Length: 500`, ten bytes of body and then destroys the socket; 100 ms later a normal `status` call still succeeds. This is the regression test for finding 13.
+
+`test/memory.test.ts`, "sheds load, keeps following the chain, and resumes when the heap eases": with the node's memory guard fed a heap at 90% of its limit, `broadcastTx` in sync mode and `block` both reject with `-32004`, `GET /events` is 503, `/health` reports `memory: 'pressure'`, and `status.memory` is `{ level: 'pressure', shedding: true, heapUsed: 900 }`; before the pressure `status.memory` was `{ level: 'ok', shedding: false }`, and at 50% `block` answers again.
 
 `test/review2.test.ts` adds two cases for this chapter. "holds the RPC to its parameter types, seeks listing cursors, and does not wait for a transaction it has already refused" sends `prove` as a string and `limit` as a string and expects `-32602` for each, lists accounts page by page with `after` and checks the pages join up with nothing repeated and nothing skipped, broadcasts a transaction the mempool refuses and then re-broadcasts it in commit mode, which must answer `-32002` at once rather than wait for the timeout, sends a request whose `id` is an object to get `-32600`, and then the notification cases: a `status` request without an `id` is answered 204 with an empty body, and a batch of a notification, a request with `id: 7` and a notification for an unknown method is answered with an array whose only member carries id 7. "refuses a header whose bytes moved between hash fields, and integers a double cannot hold" is about `json.ts`: a header JSON with a 31-byte `appHash` and a 33-byte `evidenceHash` is refused by `headerFromJson`, and `parseBigint` refuses `2 ** 53` as a number while accepting the same value as a string.
 

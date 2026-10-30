@@ -141,7 +141,7 @@ accounts whose names live in a sparse Merkle tree.
 | modify 100 balances + root | 436 | 2.3 ms |
 | modify 1,000 balances + root | 51.5 | 19 ms |
 | modify 10,000 balances + root | 6.5 | 155 ms |
-| get by id | 23,800,000 | 42 ns |
+| get by id | 13,800,000 | 72 ns |
 | lookup by unique index (byOwnerAsset) | 1,040,000 | 1 µs |
 | scan 100 entries of a non-unique index | 14,500,000 | 70 ns per entry |
 | object proof (current version) | 88,000 | 11 µs |
@@ -159,10 +159,11 @@ the heap holds 782 MiB.
 
 Analysis. The root after a block costs about 15 µs per changed object plus the hashing of each
 changed object's bytes, and it scales linearly with the number of changes: 100 changes in 2 ms,
-1,000 in 19, 10,000 in 155. A lookup by id is a map and an array access; a lookup by index walks
-a B+ tree, whose depth grows with the log of the state, and at the sizes measured neither showed
-it. The sparse Merkle tree for names costs about 30 µs per insert, five times a dense
-leaf, which is why only unique indices that need proofs are authenticated. The last line is the
+1,000 in 19, 10,000 in 155. A lookup by id is two map lookups, the type and then the instance in
+the cache of decoded objects (42 ns when the primary index was an array of objects, 72 ns since
+the arena of section 4.10); a lookup by index walks a B+ tree, whose depth grows with the log of
+the state, and at the sizes measured neither showed it. The sparse Merkle tree for names costs
+about 30 µs per insert, five times a dense leaf, which is why only unique indices that need proofs are authenticated. The last line is the
 one to remember: version history is retained objects times retained versions, and a benchmark
 that modifies 10,000 objects per version for 100 versions keeps a million prior values. At
 realistic block sizes that is tens of megabytes; the retention window is the knob.
@@ -344,7 +345,36 @@ there is the commit cadence, not the limit. The one number that does not shrink 
 are array buffers, 536 MiB against 41) and what the heap holds is the object database itself,
 the account, balance and authority objects, the index entries, the tree chunks and the name
 tree. That is about 3.2 KB per account under either scheme, and it is the floor the next
-section sizes from.
+section sizes from; section 4.10 measures how it divides.
+
+### 4.10 The arena
+
+Phase one of [STATE-PAGING.md](../STATE-PAGING.md) keeps every object of the database as its
+encoded bytes in an arena of slabs, with a bounded cache of decoded objects over it
+([DESIGN.md](../DESIGN.md) section 6). The genesis run of section 4.9 (191,896 accounts with two
+keys each under secp256k1, 56 MB) before the arena, with the cache unbounded (the default), and
+with it capped at 100,000 objects (what the memory guard sets at `warn`):
+
+| | before | resident (cache unbounded) | capped at 100,000 objects |
+|---|---:|---:|---:|
+| heap after building | 597 MiB | 607 MiB | 583 MiB |
+| heap after a restart | 601 MiB | 585 MiB | 489 MiB |
+| array buffers (keys, and now the arena) | 41 MiB | 79 MiB | 79 MiB |
+| build (apply, root, persist) | 5.7 s | 5.9 s | 5.9 s |
+| block of 500 transfers among random accounts | 21.5 ms | 24.8 ms | 41 ms |
+| restart from LMDB | 8.7 s | 8.5 s | 8.5 s |
+
+On the small-scale suites under ML-DSA-44 a warm block of 500 transfers went from 27,400 to
+25,000 transfers a second, a cold one from 6,290 to 6,040, admission from 6,680 to 6,420, and
+`get by id` from 42 to 72 ns (a map lookup instead of an array index).
+
+Analysis. Resident, the arena costs about 6% more memory (the encoded copy beside the decoded
+one) and 5 to 15% of speed, while capped it saves 17% of the heap with an empty cache at the price
+of a block of random transfers taking twice as long, which is the degraded mode the memory guard
+turns on rather than a mode to run in. By itself it does not move memory much, because decoded
+objects were only about a sixth of the heap, 0.55 KB of the 3.2 KB per account, and the rest is
+the secondary indices, the name tree and the Merkle trees, which is what the later phases of the
+specification put on disk.
 
 ## 5. What bounds what
 
@@ -410,7 +440,8 @@ Per account, from the genesis suite at 192,000 accounts with two keys and one ba
 | the two public keys, tags included | 2,626 B | 68 B |
 | LMDB on disk | 3,330 B | 189 B |
 | memory at rest, heap and array buffers | 6,070 B | 3,490 B |
-| of which the object database's own objects, indices and trees | about 3.2 KB | about 3.2 KB |
+| of which decoded objects (section 4.10) | about 0.55 KB | about 0.55 KB |
+| of which indices, name tree and Merkle trees | about 2.65 KB | about 2.65 KB |
 
 A worked example: ten million accounts with two keys each, a hundred validators, one-second
 blocks, the default seven-day unbonding period. The figures are a linear extrapolation from a
@@ -432,30 +463,36 @@ figures and a little more off memory; it changes the ML-DSA-44 column by a third
 secp256k1 column hardly at all. Two conclusions. On disk and in commits secp256k1 removes the
 cost of the chain almost entirely: the state of ten million accounts fits a small SSD and the
 evidence window a few gigabytes, where ML-DSA-44 needs a hundred and fifty. In memory it does
-not: the floor is the object database's own representation, 3.2 KB per account, so ten million
-accounts need tens of gigabytes of JavaScript heap under either scheme, above Node's default
-old-space limit (`--max-old-space-size`) and beyond a laptop. Signature scheme is the right
+not: the floor is the object database's own representation, 3.2 KB per account, five sixths of it
+indices and trees, so ten million accounts need tens of gigabytes of JavaScript heap under either
+scheme, above Node's default old-space limit (`--max-old-space-size`) and beyond a laptop. Signature scheme is the right
 knob for disk and bandwidth; for memory at that scale the knob is the in-memory representation
 of state, which is item 6 below.
 
 ## 8. Further work the numbers point to
 
 1. **Restart.** Build the name tree once on reopen, or persist the sparse tree's node history, to
-   remove the 3.7 s rebuild per gigabyte; hash stored bytes directly on import instead of
-   re-encoding every object.
+   remove the 3.7 s rebuild per gigabyte. Hashing stored bytes directly on import instead of
+   re-encoding every object is done: the arena keeps the imported bytes and the first root
+   hashes them as they are (section 4.10).
 2. **State sync.** Stream chunks into the store instead of holding them all, then rebuild from
    the store; that removes one of the three copies and most of the peak.
 3. **Signatures per block.** A per-signature or per-kilobyte transaction fee would price the
    96% of block space that ML-DSA-44 signatures take; FEES.md leaves it open.
 4. **Block space.** Larger blocks or a shorter commit timeout raise the network's rate directly
    until admission (6,700/s per node) binds.
-5. **History memory.** Store prior values compactly (bytes, not decoded objects) or drop them to
-   the store, keeping only the roots in memory.
+5. **History memory.** Prior values are kept as bytes, not decoded objects, since the arena
+   (section 4.10); what remains is to drop them to the store, keeping only the roots in memory.
 6. **State memory.** The object database costs about 3.2 KB of heap per account whatever the
    key size (section 4.9): decoded objects, index entries, tree chunks and name-tree nodes.
-   Keeping objects as their encoded bytes and decoding on access, or holding cold objects in the
-   store behind a bounded cache, would cut that by most of its size and is what ten million
-   accounts would need.
+   Phase one of STATE-PAGING.md is built: objects live as encoded bytes in an arena, decoded on
+   access through a bounded cache. Its measured effect is small (section 4.10): 6% more memory
+   with the cache unbounded and 17% less with it capped, because the decoded objects were only
+   0.55 KB of the 3.2 KB. The next lever is the indices and the name tree, which with the Merkle
+   trees are the other 2.65 KB: compact in-memory forms of them, or the disk forms of
+   STATE-PAGING.md tiers two and three (one LMDB key per index entry, tree chunks written at
+   every commit, the in-memory structures kept only as accelerators that can be dropped), are
+   what ten million accounts would need.
 
 ## 9. Adding a benchmark
 

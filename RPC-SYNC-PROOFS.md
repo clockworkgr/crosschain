@@ -20,7 +20,7 @@ out of this round; proofs stay ICS23-shaped for the latter.
 | wire protocol | JSON-RPC 2.0 over HTTP, decoded objects as JSON, proofs and raw transactions as hex of the binary encoding |
 | broadcast | `sync` (after checkTx) and `commit` (after inclusion, with the result) |
 | push | Server-Sent Events: blocks, transaction results, account history, validator set changes |
-| exposure | loopback by default, configurable bind, CORS open, body and per-address rate limits |
+| exposure | loopback by default, configurable bind, CORS open, body and per-address rate limits; costly calls and new streams refused while the node sheds load under memory pressure |
 | keys | encrypted keystore, scrypt and AES-256-GCM, each key recorded with its signature scheme, passphrase on signing, a lock file around every write |
 | CLI | an RPC client; the inbox file and read-only store access are removed; the light client gets an RPC provider |
 | state sync | periodic snapshots every K blocks, last two kept, chunks with range proofs baked in, served over p2p; the headers of the evidence window below the join, installed with the state in one transaction |
@@ -117,7 +117,8 @@ single notification, or a batch holding only notifications, gets HTTP 204 with a
 empty body, and a mixed batch an array holding only the answers to the requests
 that carried an id. An object that is not a request at all (no `jsonrpc: '2.0'`, no
 string `method`, an id of another type) is answered `-32600` with `id: null`.
-`GET /events` is the Server-Sent Events stream. `GET /health` returns height and peer count. Default bind `127.0.0.1`
+`GET /events` is the Server-Sent Events stream. `GET /health` returns height, peer count and
+the memory guard's level (`memory`). Default bind `127.0.0.1`
 on the p2p port plus one; config `rpcListen` sets host and port. Responses carry
 `Access-Control-Allow-Origin: *`. Bodies over 1 MB are rejected with HTTP 413. Each
 remote address has a token bucket of 50 tokens per second with a burst of 100: every
@@ -128,7 +129,11 @@ dispatched, so a batch of cheap methods costs one token in all. An empty bucket 
 the request stage returns HTTP 429 with a `-32004` error body; at the dispatch stage
 it returns the `-32004` error for that method inside an HTTP 200 response. At most 8
 event streams per address, and a reconnect that asks for replay pays the costly
-price; over either limit the stream request gets HTTP 429.
+price; over either limit the stream request gets HTTP 429. While the node sheds load
+under memory pressure (DESIGN.md section 4), a costly method is answered `-32004` with
+`node under memory pressure` before its bucket is consulted, so the refusal costs the
+caller nothing, and a `GET /events` request gets HTTP 503; cheap methods, `/health` and
+the streams already open are unaffected.
 
 ### 3.2 Encoding
 
@@ -156,7 +161,7 @@ price; over either limit the stream request gets HTTP 429.
 
 | method | parameters | returns |
 |---|---|---|
-| status | | chain id, protocol version, `signatureScheme` (`ml-dsa-44` or `secp256k1`), latest height, hash and time, app hash, catching-up flag, lowest retained height, the height joined at by state sync (or null), peer count, validator address if any, `rpcVersion` 1 |
+| status | | chain id, protocol version, `signatureScheme` (`ml-dsa-44` or `secp256k1`), latest height, hash and time, app hash, catching-up flag, lowest retained height, the height joined at by state sync (or null), peer count, validator address if any, `memory` (the guard's `level`, whether the node is `shedding`, and in bytes `heapUsed`, `heapLimit`, `heapTotal`, `arrayBuffers`, `external`, `rss`), `gc` (`available`, that is whether collections can be scheduled; the collections V8 ran since start as `collections`, `minor`, `major`, `incremental` with their pauses `totalMs`, `maxMs`, `lastMs`; and the `scheduledMinor` and `scheduledMajor` ones the node asked for), `rpcVersion` 1 |
 | genesis | | the genesis document, `signatureScheme` included when the file names one (absent means `ml-dsa-44`), without `appStateFile`: an application genesis kept in a file is not served |
 | header | height? | header; below the lowest retained block, a header the node keeps alone (section 4.2), where `block` and `commit` answer `-32001` |
 | block | height? | header, transactions (hex), lastCommit, evidence, and the block's own commit |
@@ -171,7 +176,7 @@ price; over either limit the stream request gets HTTP 429.
 | balance | account, asset? | account id, asset id, amount; current state only |
 | accountHistory | account, from?, limit?, reverse? | entries with sequence numbers, and the total; pagination below |
 | tx | hash, prove? | `{ hash, height, index, ok, error, tx, decoded, proof? }`; `proof` holds `txProof`, the signed header, and `resultProof` with the next signed header, or nulls for those while the next block does not exist |
-| broadcastTx | tx hex, mode? (`sync` default, or `commit`), timeoutMs? (default 30 000, at most 120 000) | `sync`: `{ hash, status }`; `commit`: `{ hash, height, index, ok, error }` once included |
+| broadcastTx | tx hex, mode? (`sync` default, or `commit`), timeoutMs? (default 30 000, at most 120 000) | `sync`: `{ hash, status }`; `commit`: `{ hash, height, index, ok, error }` once included; `-32004` while the mempool is paused under memory pressure |
 | accounts | after? (name cursor, exclusive), limit? | accounts by name with id and core balance |
 | parameters | | height, core asset (id, symbol, precision), maximum transaction expiration, the fee schedule and the staking parameters in force |
 | proposals | | open proposals, soonest to expire first, each with the full parameters it would adopt |
@@ -195,7 +200,9 @@ after the name in `after` and returns at most `limit` (default 50, at most 200),
 Broadcast: `sync` answers after checkTx with status `added` or `seen`. `seen` means
 the hash is in the mempool's recently-seen cache, which includes transactions it
 rejected earlier and ones already committed; it is not inclusion. Admission failures
-(`invalid`, `too-large`, `full`) are `-32002`. `commit` waits for inclusion: a
+(`invalid`, `too-large`, `full`) are `-32002`; a mempool paused under memory pressure
+answers `paused` inside the node and `-32004` with the reason, `node under memory
+pressure`, over the RPC. `commit` waits for inclusion: a
 transaction seen before that is neither pending nor committed is refused at once
 (`-32002`) rather than waited for; a timeout answers `-32003` and leaves the
 transaction in the mempool, where a later `tx` call can still find it once included;
@@ -214,6 +221,8 @@ client should broadcast in `sync` mode and poll `tx`.
 Event ids are heights; a reconnect with `Last-Event-ID` replays `block` events from
 the store, at most the last 1000 blocks, and stops at a missing block. A stream whose
 client has more than 1 MiB queued unread is ended; it resumes with `Last-Event-ID`.
+No stream is opened while the node sheds load: the request is answered HTTP 503, and the
+client retries once `/health` reports `ok` or `warn`.
 `broadcastTx` in `commit` mode is implemented on the same internal listener, with at
 most 1000 waiters at once.
 
@@ -458,6 +467,9 @@ node `{ versions: 10000, snapshots: 2 }`, archive: no `blocks` and as many
 | sync window | 32 heights, 8 per request, 4 peers; 64 blocks or 16 MiB per response |
 | headers per response | 1000, downward from the height asked |
 | ban threshold | 100 points, 1 hour, doubling per repeat |
+| memory guard | sampled every second; `warn` at 70% of the heap limit, `pressure` at 85%, `critical` at 95%, each left 5 points below its threshold |
+| scheduled major collection | once the heap has grown 256 MiB, or a tenth of the limit, since the last one |
+| heap limit (`start`) | three quarters of physical memory, `--heap <MiB>` otherwise, at least 256; a 64 MiB semi-space |
 
 ## 6. Tests
 
@@ -505,3 +517,14 @@ signatures, `status.signatureScheme`, an account created with a secp256k1 key, a
 refusals of an ML-DSA authority key, an ML-DSA consensus key and an ML-DSA signature
 under a secp256k1 address. The whole suite runs under either scheme with
 `CHAIN_SCHEME`.
+
+Memory (`test/memory.test.ts`, four cases): the guard moving through its levels with
+hysteresis on injected samples, several levels in one sample, the reported sequence and
+the threshold check; the scheduler's decisions with an injected collector (a minor
+collection per commit, a major one on growth measured from the last, the fraction cap,
+nothing without a collector); the observer counting real collections after garbage is
+allocated; and a full node in a two-validator testnet whose guard is fed invented
+samples: at 90% of the limit it sheds (the mempool paused, `submitTx` `paused`,
+`broadcastTx` and `block` `-32004`, `/events` 503, `/health` and `status` reporting
+`pressure`) while still following the chain, at 50% it resumes, and at 99% it reports
+`critical`.
