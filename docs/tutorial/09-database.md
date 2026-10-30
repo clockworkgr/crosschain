@@ -1,6 +1,6 @@
 # 9. The object database
 
-This chapter covers `src/db/`: the in-memory object database that holds every piece of consensus state the application owns (as encoded bytes in an arena, with a bounded cache of decoded objects over them), the indices that make it queryable, the Merkle trees that turn it into one 32-byte app hash, the proofs that let an outsider check a single object or a single name against that hash, and the undo sessions and version history that let the same structure serve transactions, blocks and queries at past heights. It builds on the deterministic binary codec of [chapter 1](01-codec.md) (every object has exactly one encoding, which is what gets hashed) and the SHA-256 and byte helpers of [chapter 2](02-crypto.md). It is used by [the application](11-application.md), which defines the object types and drives sessions and roots; by [sync](07-sync.md), which exports and imports snapshots with range proofs; by [the RPC](12-rpc.md), which serves objects, keys and proofs; and by [the light client](13-light-client.md), which verifies those proofs with `src/db/proof.ts` and nothing else. `src/types/txproof.ts` from [chapter 3](03-types.md) reuses the dense tree for the block's data hash and results hash. The database itself never touches a disk: what it changed at each root is handed to [the store](10-store.md) as a change list, and the store gives it back on restart.
+This chapter covers `src/db/`: the in-memory object database that holds every piece of consensus state the application owns (as encoded bytes in an arena, with a bounded cache of decoded objects over them), the indices that make it queryable, the Merkle trees that turn it into one 32-byte app hash, the proofs that let an outsider check a single object or a single name against that hash, and the undo sessions and version history that let the same structure serve transactions, blocks and queries at past heights. It builds on the deterministic binary codec of [chapter 1](01-codec.md) (every object has exactly one encoding, which is what gets hashed) and the SHA-256 and byte helpers of [chapter 2](02-crypto.md). It is used by [the application](11-application.md), which defines the object types and drives sessions and roots; by [sync](07-sync.md), which exports and imports snapshots with range proofs; by [the RPC](12-rpc.md), which serves objects, keys and proofs; and by [the light client](13-light-client.md), which verifies those proofs with `src/db/proof.ts` and nothing else. `src/types/txproof.ts` from [chapter 3](03-types.md) reuses the dense tree for the block's data hash and results hash. The database writes nothing to disk itself: what it changed at each root, the objects, the index entries, the Merkle trees' chunks and nodes, is handed to [the store](10-store.md) as a change list, and the store gives it all back on restart. The one thing it reads from the store is what the memory guard has told it to let go of, through a read-only view the application lends it: since phases two to four of STATE-PAGING.md the secondary indices' B+ trees and the Merkle trees are caches over the store that can be dropped and rebuilt while the node runs, and this chapter describes them as such.
 
 ## Concepts
 
@@ -24,7 +24,7 @@ Objects are immutable records. A modification does not mutate; it replaces the o
 
 ### Why everything is in memory, and what it costs
 
-Graphene keeps all consensus state in RAM and this chain makes the same trade-off explicit (DESIGN.md section 6: "State is bounded by RAM"). The disk holds a copy of every object and the history records, nothing the hot path reads. README.md's figures give the shape of the cost: 100,000 objects take 91 MiB; a 1 GB genesis of 193,536 accounts with two ML-DSA keys each sits at 584 MiB of heap plus 536 MiB of key buffers, "roughly its size, since the state stays in memory by design and hex halves to binary while objects and trees add it back". What that buys is reads that do not depend on size: an account by id is 16,000,000 lookups per second at that scale, by name 780,000, and a proof with verification about 40,000 per second. What grows with size is anything that walks every object: genesis, restart, snapshot export and import. Those figures were taken before the arena of the next section, which changed how the objects are held more than how much memory they take.
+Graphene keeps all consensus state in RAM and this chain makes the same trade-off explicit (DESIGN.md section 6: "State is bounded by RAM"). The disk holds a copy of every object, every index entry, every tree chunk and node, and the history records; with memory to spare nothing on the hot path reads it, and under memory pressure the tiers the guard has dropped do, which the section after the next describes. README.md's figures give the shape of the cost: 100,000 objects take 91 MiB; a 1 GB genesis of 193,536 accounts with two ML-DSA keys each sits at 584 MiB of heap plus 536 MiB of key buffers, "roughly its size, since the state stays in memory by design and hex halves to binary while objects and trees add it back". What that buys is reads that do not depend on size: an account by id is 16,000,000 lookups per second at that scale, by name 780,000, and a proof with verification about 40,000 per second. What grows with size is anything that walks every object: genesis, restart, snapshot export and import. Those figures were taken before the arena of the next section, which changed how the objects are held more than how much memory they take.
 
 ### Objects as bytes: the arena and the hot cache
 
@@ -51,9 +51,30 @@ Writes never leave the cache before a root. An object created or modified since 
 
 The budget is unbounded by default, so a node with memory to spare decodes each object once, keeps it, and runs nearly as it did before the arena. The memory guard of [chapter 8](08-node.md) caps it as the heap fills: 100,000 objects at `warn`, 10,000 at `pressure`. Measured at 191,896 accounts with two keys each under secp256k1 ([benchmarks.md](../benchmarks.md) section 4.10), against the same run before the arena, the resident mode costs about 6% more memory, the encoded copy beside the decoded one (607 MiB of heap after building against 597, and the array buffers, where the slabs live, at 79 MiB against 41), and 5 to 15% of speed (a block of 500 transfers among random accounts in 24.8 ms against 21.5; `get by id` on the small suite in 72 ns against 42, a map lookup instead of an array index). The capped mode saves 17% of the heap with an empty cache (489 MiB after a restart against 601) at the price of the same block taking twice as long, 41 ms; that is the degraded mode the guard turns on. The arena by itself did not move memory much, because decoded objects were never the bulk: they are about a sixth of the heap, 0.55 KB of the 3.2 KB an account costs, and the secondary indices, the name tree and the Merkle trees are the rest, which is what the later phases of STATE-PAGING.md put on disk.
 
+### The indices and the trees as caches over the store
+
+Phases two to four of STATE-PAGING.md do for the other five sixths what the arena did for the objects: LMDB holds every tier's complete state at every committed height, and what memory holds are accelerators. Three things follow, and the file sections below keep coming back to them.
+
+**Every tier is written at every commit.** Besides the objects, a root reports the secondary index entries it added and removed and the Merkle tree chunks and nodes it changed, and the application writes them in the same transaction as the objects ([chapter 11](11-application.md)). The disk forms are three key prefixes in the application store, each defined by the database file that owns it:
+
+```
+'i' type u16, index position u8, key bytes           -> id u64                  (unique index)
+'i' type u16, index position u8, key bytes, id u64   -> empty                   (non-unique index)
+'t' tree u16, level u8, chunk u48                    -> up to 1024 hashes, trailing empties cut off
+'n' type u16, index position u8, path bits, depth u8 -> 0x00 left right, or 0x01 keyHash value
+```
+
+The index position is the index's place in its type's definition, so the layout is fixed by the type registry; a non-unique key already ends with the id (the B+ tree appends it), so an entry is the tree's key with a four-byte header in front, and bytewise order in the store is the order the tree keeps: a prefix scan is an LMDB range and a cursor from a start key is `scanFrom`. The tree of a chunk key is the type id, or 0 for the tree over the types (`TOP_TREE`), and the chunk index is big-endian, so one tree's chunks are one range; a chunk is stored without its trailing empty hashes, so the one-chunk upper levels cost what they hold (a tree's root level is one 32-byte value) and a chunk that becomes all empty is deleted. A sparse node's key is the first `depth` bits of its path, packed and zero-padded, then the depth as one byte, so every node has one key; an inner node carries both children's hashes, so a walk down one key's path reads one node per level and finds every sibling hash on the way, and a proof never reads a sibling node. Writing all of this is not a mode a node turns on under pressure: a node that never pages pays for it anyway, so that the fallback exists the moment it is needed, and it costs a few percent of a commit (the numbers at the end of this section).
+
+**A dropped tier reads the store.** `dropIndexTrees()` lets a type's B+ trees go (one type or all), and `dropTrees()` lets every dense and sparse tree go at once, one dial for the tier, since the guard has one decision to make and the sparse trees are where the heap goes. While the B+ trees are dropped a lookup is one LMDB get and a scan is an LMDB cursor merged with an overlay: per index, what the writes since the last root made of each key, an id or null for a key released. The merge is the one the Cosmos SDK's cache-KV iterator does, one step of each cursor at a time with nothing materialised, and what a dropped index reads is three such layers laid over each other: the store as the application last wrote it; the change lists of roots the application has not written yet, since `commit()` comes a moment after `finalizeBlock` and the store is a block behind in between; and the overlay. A root empties the overlay, since the store with the root's changes then says the same. While the Merkle trees are dropped, a root reads each changed leaf's path from the store, a chunk per level, through a small LRU of chunks that all the database's trees share (256 by default, at most 8 MiB), works on private copies of the chunks it changes and reports those as the change list, so nothing read from the store or handed out is ever written in place; a sparse tree only remembers its writes per key and applies them at the commit by walking each key's path through the store with the shape rules of the tree in memory, so the root is the same whatever the order. Proofs at the current version read the same way; past versions still come from the history records, which stay in memory for the window. Rebuilding reads a type's prefix, or every tree's chunks and nodes, back into fresh structures. Both dials may be turned with sessions open, in the middle of a block: the drop builds the overlay from what is dirty (every committed key of a dirty object released, then every current key taken, so a key that changed hands ends with its new owner and a key an object kept ends as it was) and turns the sparse trees' uncommitted writes into pending ones, and the rebuild walks the merged view, so neither changes a lookup or a root. `test/db.test.ts` plays a database that drops and rebuilds at random moments against one that never does and requires the same lookups, scans, roots and proofs after every step.
+
+**Determinism is untouched.** Roots are computed from the same leaves and the same bytes wherever they are read from, and a restart takes the trees from the store instead of hashing every object, about twice as fast, hashing every object against its leaf on the way by default so that a corrupt object store still fails at startup and not when something reads the object.
+
+What it costs, from STATE-PAGING.md sections 4.4, 5.3 and 7.1, at 191,896 accounts under secp256k1 unless said otherwise. The index entries: `commit to LMDB` after a 500-transfer block went from a mean of 8.95 to 9.63 ms, 7%, for about a thousand entries a block (each transfer leaves a recent transaction id with two entries; the balances change no key); the genesis writes 576,000 entries and the store grows from 34.6 to 92.7 MiB. The trees: another 120 MiB of store, to 213 MiB, for about 600,000 sparse nodes and 25 MiB of chunks; a block whose writes are local costs nothing measurable, a block of 2,400 transfers scattered over the whole state about 12 MiB of chunks and a fifth more commit, 45.7 to 55.1 ms; the restart went from 8.41 to 5.2 s (4.6 without the leaf check). Dropped, on the db suite at 100,000 balances and 21,000 accounts: a lookup through LMDB costs about what a resident one does (both are dominated by building the key and fetching the object), a scan four to six times as much (50 to 57 µs per hundred entries against 9 to 13), still under a microsecond an entry; a root over 1,000 modified balances 53.7 ms against 20.2, with a median of 23.8 once the upper levels are cached (215 of the 256 chunks after these runs), over 10,000 of them 207 ms against 170; an object proof a fifth more, a name proof four times as much (1.87 ms per hundred against 428 µs, about twenty nodes read from LMDB); dropping the trees 0.3 ms, rebuilding them 180 ms, rebuilding every index tree 182 to 212 ms over LMDB. On the whole state, with everything dropped the database runs on 40 to 50% of its resident heap and a block of random transfers takes 5 to 20% longer, all of it in the commit ([chapter 8](08-node.md) has the guard's side).
+
 ### Indices as ordered byte keys
 
-A primary index is the table of arena references of the previous section, indexed by instance. A secondary index ("accounts by name", "balances by owner and asset") is a key encoder plus one ordered map from byte strings to ids. The rule that makes every index the same shape, from `src/db/keys.ts`: a key is a byte string whose lexicographic order is the order you want to scan in. Integers are written big-endian so they sort numerically; strings end with a zero byte instead of carrying a length prefix, so `"ab"` sorts before `"abc"` and a prefix scan on `"ab"` finds both; a compound key is the parts written one after another.
+A primary index is the table of arena references of the arena section above, indexed by instance. A secondary index ("accounts by name", "balances by owner and asset") is a key encoder plus one ordered map from byte strings to ids. The rule that makes every index the same shape, from `src/db/keys.ts`: a key is a byte string whose lexicographic order is the order you want to scan in. Integers are written big-endian so they sort numerically; strings end with a zero byte instead of carrying a length prefix, so `"ab"` sorts before `"abc"` and a prefix scan on `"ab"` finds both; a compound key is the parts written one after another.
 
 Worked examples, using the codec's big-endian integers:
 
@@ -61,7 +82,7 @@ Worked examples, using the codec's big-endian integers:
 - `k.id(owner).id(asset)` produces sixteen bytes: two big-endian u64 ids. The application's `byOwnerAsset` balance index uses exactly this (`test/app.test.ts` looks a balance up with `key((k) => k.id(aliceId).id(app.coreAsset))`).
 - A non-unique index appends the object's own id to the key. The test type in `test/db.test.ts` has `byGroup` keyed by a u32 group; its stored keys are 4 bytes of group followed by 8 bytes of id, so every entry is distinct and all entries of one group are adjacent. "Everything in group 1" is then a prefix scan on the 4-byte prefix, and the results come out in id order within the group.
 
-A unique index maps a key to one id and refuses a second object with the same key. A non-unique index is a prefix scan. Both are derived data: they are rebuilt from the objects when a store is loaded, and they are not hashed. The exception is an index marked authenticated, covered below.
+A unique index maps a key to one id and refuses a second object with the same key. A non-unique index is a prefix scan. Both are derived data: the store keeps their entries beside the objects and a restart reads them back from there (a store written before phase two of STATE-PAGING.md has none, and the indices are then rebuilt from the objects as they always were), and they are not hashed. The exception is an index marked authenticated, covered below.
 
 ### The B+ tree
 
@@ -131,7 +152,7 @@ Storage is per level in chunks of 1024 hashes, allocated when a node in the chun
 
 The dense tree proves things about ids. Users ask about names: "is there an account called alice", "what id does the symbol CORE have". A unique index can be marked `authenticated`, and such an index keeps a second structure beside its B+ tree: a sparse Merkle tree over `sha256(key)`, in `src/db/smt.ts`. Its root goes into the type leaf after the counter and the type root, so a proof by key is a sparse-tree path to one of those roots followed by the same type leg.
 
-Why not hash the B+ tree itself, which would avoid a second structure: the header of `src/db/smt.ts` answers that its root would depend on node layout, which depends on the order of inserts and deletes, and a node that restarts rebuilds its indices from the objects in id order. Two nodes with the same key set but different histories would disagree on the root. A sparse tree keyed by the hash of the key has one shape per key set, so any node, after any history, hashes identically. That property is also what lets past index versions be rebuilt from the object history after a restart instead of persisting tree nodes. DESIGN.md section 6 draws the line the same way: indices are rebuilt on load, the B+ trees are not part of the root, and the unique indices that need proofs are authenticated by sparse Merkle trees whose roots are in the type leg.
+Why not hash the B+ tree itself, which would avoid a second structure: the header of `src/db/smt.ts` answers that its root would depend on node layout, which depends on the order of inserts and deletes, and a node that restarts rebuilds its indices from the objects in id order. Two nodes with the same key set but different histories would disagree on the root. A sparse tree keyed by the hash of the key has one shape per key set, so any node, after any history, hashes identically. That property is also what lets a dropped tree apply its pending writes to the store in any order, and what lets past index versions be rebuilt from the object history after a restart: the store keeps the current tree's nodes since phase four of STATE-PAGING.md and a restart loads them, but the versions inside the window are still replayed from the objects. DESIGN.md section 6 draws the line the same way: the B+ trees are not part of the root, and the unique indices that need proofs are authenticated by sparse Merkle trees whose roots are in the type leg.
 
 A sparse Merkle tree in its textbook form is a binary tree of depth 256 where the bits of the hashed key choose left or right at each level and almost every subtree is empty. The compacted form used here is the Jellyfish shape (from the Jellyfish Merkle tree of the Diem project): every leaf sits at the first depth where its key prefix is unique, inner nodes exist only where two keys share a prefix, and an empty child is the `EMPTY` hash. Keys are hashed so the tree stays balanced whatever names users pick, and so ICS23's SMT spec (`PrehashKey SHA256`) applies.
 
@@ -361,6 +382,68 @@ Iteration avoids leaf links. `entriesFrom` descends with a stack of `(inner node
 
 Failure modes: `has` is `get(k) !== undefined`, so a stored value of `undefined` would read as absent; values here are ids and byte arrays, never undefined. There is no key-length limit and keys are stored by reference, so a caller that mutates a key array after `set` corrupts the order; the key-value store copies keys for that reason.
 
+### src/db/indexstore.ts
+
+Purpose: the secondary indices' disk form and the merged cursor the fallback reads through (STATE-PAGING.md section 4). The database never writes the store; this file defines what it reads.
+
+Exports:
+
+- `interface IndexStore { get(key); range(start, end) }`: what the database needs of the store that holds the entries, point reads and ascending ranges over `start <= key < end`. The application's `KvStore` of [chapter 10](10-store.md) satisfies it as it stands, and `src/db/merkle.ts` names the same shape `TreeSource` for the trees.
+- `interface IndexEntryChange { key; value | null }`: one entry a root added (with its value) or removed (null).
+- `INDEX_PREFIX = 0x69` (`'i'`), `INDEX_HEADER = 4` and `EMPTY_VALUE`: the prefix byte, the bytes in front of an index key, and a non-unique entry's value, which is nothing, the id being the last eight bytes of its key.
+- `indexHeader(type, position)`, `entryKey(header, k)` and `afterPrefix(prefix)`: the key helpers.
+- `overlaid(base, over)` and `until(entries, end)`: the merge, and a bound on an ordered map's entries.
+- `class MemoryIndexStore implements IndexStore`: an index store in memory, for a database with no application store behind it.
+
+```ts
+/** The header every entry of one index starts with. */
+export function indexHeader(type: number, position: number): Uint8Array {
+  return Uint8Array.of(INDEX_PREFIX, type >> 8, type & 0xff, position);
+}
+
+/** The store key of an index entry: the header, then the index key. */
+export function entryKey(header: Uint8Array, k: Uint8Array): Uint8Array {
+  const out = new Uint8Array(header.length + k.length);
+  out.set(header);
+  out.set(k, header.length);
+  return out;
+}
+```
+
+A type's index at position p has every entry under the four bytes `'i'`, type, p, and `afterPrefix` of those bytes is the end of its range (it is `prefixEnd` from chapter 10 under another name, returning null for a prefix of nothing but `0xff` bytes instead of throwing). The merge is the one piece of logic in the file:
+
+```ts
+/**
+ * Lay `over` on top of `base`, both ascending by key: an overlay entry replaces the base's entry at the same key,
+ * a null one hides it, and everything else of both comes through in order. This is the cache-KV iterator of the
+ * Cosmos SDK: one step of each cursor at a time, nothing materialised.
+ */
+export function* overlaid<V>(base: Iterator<[Uint8Array, V]>, over: Iterator<[Uint8Array, V | null]>): IterableIterator<[Uint8Array, V]> {
+  let b = base.next();
+  let o = over.next();
+  try {
+    while (!b.done || !o.done) {
+      const c = b.done ? 1 : o.done ? -1 : compareBytes(b.value[0], o.value[0]);
+      if (c < 0) {
+        yield b.value as [Uint8Array, V];
+        b = base.next();
+        continue;
+      }
+      const [k, v] = o.value as [Uint8Array, V | null];
+      if (v !== null) yield [k, v];
+      if (c === 0) b = base.next();
+      o = over.next();
+    }
+  } finally {
+    // A caller that stops early (a page of results) closes the store's cursor too.
+    if (!b.done) base.return?.();
+    if (!o.done) over.return?.();
+  }
+}
+```
+
+Both inputs are ascending by key. At each step the smaller key wins: a base entry below the overlay's next key comes through; an overlay entry at or below the base's key replaces the base's entry at the same key, or hides it when its value is null, and when the keys are equal both cursors advance. Nothing is collected, so a caller that reads a page and stops costs a page, and the `finally` clause closes whichever cursor is still open, which for an LMDB range is what releases its read transaction. The database stacks the function: the store under the unwritten roots' changes, and that under an index's overlay. `MemoryIndexStore` is a `BPlusTree<Uint8Array>` with `apply(changes)` on top: it exists only while some tree is dropped on a database that was given no store (tests, benchmarks, a snapshot being imported), holding the entries as of the last root, and goes when every tree is resident again.
+
 ### src/db/merkle.ts
 
 Purpose: the dense Merkle tree with chunked storage and a version history, and the hashing conventions shared by every tree in the node. `src/types/txproof.ts` reuses `DenseMerkleTree`, `leafHash` and `rootFromPath` for the block's data hash and results hash, so the conventions here are the chain's conventions.
@@ -376,7 +459,10 @@ Exports:
 - `rootFromRange(leaves, from, count, siblings)`: folds a contiguous run of leaf hashes to the root of a tree with `count` leaves; null if the proof does not fit. The verifier side of range proofs for snapshot chunks.
 - `rootFromPath(leaf, index, siblings)`: the inclusion-proof fold.
 - `interface TreeRecords { nodes: [level, index, hash][]; sizeBefore: number | null }`: what one `root()` recorded.
-- `class DenseMerkleTree`.
+- `CHUNK_PREFIX = 0x74` (`'t'`), `chunkKey(tree, level, chunk)` and `treePrefix(tree)`: a chunk's store key and the prefix every chunk key of one tree starts with (STATE-PAGING.md section 5).
+- `interface TreeSource { get; range }` and `interface StoreChange { key; value | null }`: what a dropped tree reads (the same shape as `IndexStore`), and one key a root wrote or deleted, for the store.
+- `class ChunkCache`: the chunks dropped trees have read, least recently used first, bounded by a count and shared by a database's trees, with `hits` and `misses` counted.
+- `class DenseMerkleTree`, which besides the hashing and the versions below has `id` (which tree it is in the store), `reporting`, `takeChunks()`, `release()`, `resident`, `drop(source, cache)`, `rebuild()`, `load(source)` and `entries()`.
 
 The two hashing functions, copied exactly:
 
@@ -419,7 +505,7 @@ export function rootFromPath(leaf: Uint8Array, index: number, siblings: Uint8Arr
     if (this.retain > 0 && this.version >= 0) this.record(k, j, old.slice());
 ```
 
-It records the old hash for the history before overwriting, allocates a chunk pre-filled with `EMPTY` on first use, counts non-empty nodes in and out, and frees the chunk when the count drops to zero. The `old.slice()` matters: `rawNode` returns a view into the chunk, and the view would change under the history entry when the chunk is overwritten.
+It records the old hash for the history before overwriting and, in a resident tree, allocates a chunk pre-filled with `EMPTY` on first use, counts non-empty nodes in and out, and frees the chunk when the count drops to zero; what it does in a dropped tree is under "Chunks on disk" below. The `old.slice()` matters: `rawNode` returns a view into the chunk, and the view would change under the history entry when the chunk is overwritten. A chunk read from the store ends at its last non-empty slot, so `rawNode` treats an offset past a chunk's end as `EMPTY`.
 
 **Growth.** `resize(n)` throws if n is smaller than the current size ("a dense Merkle tree never shrinks: ids are not reused"). When the height grows, it marks leaf 0 dirty, because the nodes above the old root all lie on leaf 0's path and will be computed by it. `setLeaf(i, hash)` writes the leaf and marks it dirty; it rejects an index past the size and a hash that is not 32 bytes.
 
@@ -508,6 +594,176 @@ Two things to notice. First, the version a leaf write is recorded under comes fr
 
 Between roots `nextVersion` is null, so leaf writes are tagged `version + 1`, while inner-node writes made inside `root(v)` are tagged `v`. The two agree only when roots are called with consecutive versions, which every caller does (heights). Second, a fresh tree's floor is the version of its first root, set inside `root()`; nothing but `lowerFloor` and `loadRecords` moves it afterwards, and a tree never raises it, so once a version is askable it stays askable until the retention window passes it.
 
+**Chunks on disk.** A tree knows which tree it is in the store (`id`: a type id, or `TOP_TREE` for the tree over the types), and its chunks have store keys:
+
+```ts
+/** First byte of a dense tree chunk's store key. */
+export const CHUNK_PREFIX = 0x74; // 't'
+
+/** The store key of a chunk: 't', the tree (a type id, or 0 for the tree over the types), the level, the chunk index. */
+export function chunkKey(tree: number, level: number, chunk: number): Uint8Array {
+  const hi = Math.floor(chunk / 2 ** 32);
+  const lo = chunk >>> 0;
+  return Uint8Array.of(CHUNK_PREFIX, tree >> 8, tree & 0xff, level, (hi >>> 8) & 0xff, hi & 0xff, lo >>> 24, (lo >>> 16) & 0xff, (lo >>> 8) & 0xff, lo & 0xff);
+}
+
+/** Every chunk key of one tree starts with this. */
+export function treePrefix(tree: number): Uint8Array {
+  return Uint8Array.of(CHUNK_PREFIX, tree >> 8, tree & 0xff);
+}
+```
+
+The chunk index is six bytes, big-endian, written in two halves for the reason given under "Storage" (a shift would misplace an index at or above 2^31), so one tree's chunks are one range and a level's chunks are consecutive within it. The prefix is `'t'` and not `'c'` because the application store already keys the type counters as `'c'` followed by the type id, and a chunk key of type T's tree would have had T's counter key as a prefix. When `reporting` is set, which the database sets on every root when there is a store to keep the tree, `root()` ends by listing the chunks it changed:
+
+```ts
+  /** After a root: list the chunks it changed for the store, and hand a dropped tree's copies to the cache. */
+  private finishChunks(): void {
+    const out: StoreChange[] = [];
+    if (this.reporting) {
+      for (const ck of this.changed) {
+        const k = Math.floor(ck / LEVEL_SPAN);
+        const c = ck % LEVEL_SPAN;
+        const chunk = this.levels[k]?.get(c);
+        const used = chunk ? usedLength(chunk) : 0;
+        out.push({ key: chunkKey(this.id, k, c), value: used > 0 ? chunk!.subarray(0, used) : null });
+        if (used > 0 && !this.source) this.handedOut.add(chunk!);
+      }
+    }
+    this.chunkChanges = out;
+    this.changed.clear();
+    if (this.source) {
+      this.levels.forEach((level, k) => {
+        for (const [c, chunk] of level) this.cache!.set(this.slot * SLOT_SPAN + k * LEVEL_SPAN + c, chunk);
+      });
+      this.levels.length = 0;
+      this.counts.length = 0;
+    }
+  }
+```
+
+`changed` collected the level and index of every chunk `writeNode` touched, as one number. A chunk's used length is its bytes up to the last non-empty slot, so a chunk that emptied is reported as a deletion (its value null), and the one-chunk upper levels cost what they hold rather than 32 KiB each; a chunk read back from the store is padded to full size again. The values of a resident tree's chunks are views of the live chunks, not copies, which is what keeps a root over a resident tree from copying anything; the price is `handedOut`:
+
+```ts
+  /**
+   * The chunks the last root() changed, as store keys and values (null: delete), when reporting; handed over once,
+   * so the tree does not keep the list alive. The values are views, valid until release().
+   */
+  takeChunks(): StoreChange[] {
+    const out = this.chunkChanges;
+    this.chunkChanges = [];
+    return out;
+  }
+
+  /** The store has written the last change list: its chunks may be written in place again. */
+  release(): void {
+    this.handedOut.clear();
+  }
+```
+
+Until the application has written the list and the database's `dropChanges()` has called `release()`, a chunk among `handedOut` that `writeNode` is about to write again is copied first (the `handedOut.has(chunk)` branch below), so the list keeps describing the root it was made for however many writes the next block makes before the commit. `entries()` yields every chunk as it stands, for a store written from scratch (state sync), reading the store itself while dropped.
+
+**Dropped.** `drop(source, cache)` releases every chunk and from then on every read goes through `chunk()`:
+
+```ts
+  /** A chunk to read from: resident, or the root's own copy, or through the cache from the store. Never written. */
+  private chunk(k: number, c: number): Uint8Array | undefined {
+    const live = this.levels[k]?.get(c);
+    if (live || !this.source) return live;
+    const key = this.slot * SLOT_SPAN + k * LEVEL_SPAN + c;
+    let buf = this.cache!.get(key);
+    if (buf === undefined) {
+      buf = this.source.get(chunkKey(this.id, k, c));
+      if (buf === undefined) return undefined;
+      this.cache!.set(key, buf);
+    }
+    return buf;
+  }
+```
+
+A chunk is the live one (resident, or the root's own copy while a root is in progress), else the cache's, else the store's, which is then cached; the cache key packs the tree's slot in the cache, the level and the chunk index into one number, so one cache serves every tree of a database. `writeNode` in a dropped tree never writes what it read:
+
+```ts
+    const level = this.levels[k]!;
+    this.changed.add(k * LEVEL_SPAN + c);
+    let chunk = level.get(c);
+    if (this.source) {
+      // Dropped: the root writes a private full-size copy, so a chunk read from the store, cached, or handed out in
+      // an earlier change list is never written. Emptied chunks stay until the report deletes them from the store.
+      if (!chunk) {
+        chunk = EMPTY_CHUNK.slice();
+        const stored = this.chunk(k, c);
+        if (stored) chunk.set(stored);
+        level.set(c, chunk);
+      }
+      chunk.set(h, off);
+      return;
+    }
+    if (chunk && this.handedOut.size > 0 && this.handedOut.has(chunk)) {
+      chunk = chunk.slice();
+      level.set(c, chunk);
+    }
+```
+
+The root works on private full-size copies of the chunks it changes, each filled from the store's shorter copy, so a chunk read from the store, cached, or handed out in an earlier change list is never written in place. When the root is done, `finishChunks` lists the copies and hands them to the cache, and `root()` reads its own value (`rootAt`) before that happens, since a cache smaller than one root's working set may evict them at once; the change list, laid over the store until it is written, still has them. The cache is an LRU by count:
+
+```ts
+  get(key: number): Uint8Array | undefined {
+    const v = this.map.get(key);
+    if (v !== undefined) {
+      this.hits++;
+      this.map.delete(key);
+      this.map.set(key, v);
+    } else this.misses++;
+    return v;
+  }
+
+  set(key: number, v: Uint8Array): void {
+    this.map.delete(key);
+    this.map.set(key, v);
+    this.trim();
+  }
+
+  trim(): void {
+    while (this.map.size > this.limit) this.map.delete(this.map.keys().next().value!);
+  }
+```
+
+A `Map` keeps insertion order, so a hit re-inserts the entry at the end and eviction takes from the front; `hits` and `misses` are what the database's `memory()` reports. The default of 256 chunks is at most 8 MiB, and most are smaller, the upper levels' chunks being short; those upper levels, which every path crosses, are what stays cached, so a root over dropped trees costs about what a resident one does once they are in (STATE-PAGING.md 5.3: 215 of the 256 chunks cached after the db suite's runs, a root over 1,000 modified balances at a median of 23.8 ms against 20.2 resident, and 53.7 as a mean because the first root after a drop reads every chunk it touches from LMDB). Between roots a dense tree holds nothing pending, so dropping it touches nothing but its own chunks, and `drop` refuses a tree with unhashed changes; past versions come from the history records exactly as before, which is why `nodeAt` and `pathAt` need no dropped branch. `rebuild()` reads the tree's chunks back with one range, and `load(source)` does the same for a fresh tree at a restart, both padding each chunk back to full size and counting its non-empty nodes:
+
+```ts
+  /**
+   * Release every chunk and read from `source` from now on, through `cache`. The source must hold the tree as of
+   * the last root; between roots nothing is pending in a tree, so that is all there is.
+   */
+  drop(source: TreeSource, cache: ChunkCache): void {
+    if (this.source) return;
+    if (this.dirty.size > 0) throw new Error('a tree with unhashed changes cannot be dropped');
+    this.levels.length = 0;
+    this.counts.length = 0;
+    this.handedOut.clear();
+    this.source = source;
+    this.cache = cache;
+    if (this.slot < 0) this.slot = cache.slot();
+  }
+
+  /** Read every chunk back from the store the tree was dropped to, and keep them resident again. */
+  rebuild(): void {
+    const source = this.source;
+    if (!source) return;
+    this.source = null;
+    this.cache = null;
+    this.readChunks(source);
+  }
+
+  /** A fresh tree takes its chunks from a store that holds it (a restart), instead of hashing every leaf. */
+  load(source: TreeSource): void {
+    if (this.version >= 0 || this.source) throw new Error('chunks are loaded only into a fresh resident tree');
+    this.readChunks(source);
+  }
+```
+
+`test/db.test.ts` ("dense merkle tree: dropped") drives one tree through fourteen versions of growth across chunk boundaries and powers of two, rewrites, emptied slots and an emptied chunk, dropped twice to a cache of two chunks and rebuilt once, and requires the roots, paths, range proofs and stored chunks of a resident tree at every retained version.
+
 ### src/db/smt.ts
 
 Purpose: the compacted sparse Merkle tree behind authenticated indices, with versions by root pointer.
@@ -515,7 +771,8 @@ Purpose: the compacted sparse Merkle tree behind authenticated indices, with ver
 Exports:
 
 - `interface SmtLeaf { keyHash; value }` and `interface SmtProof { siblings; leaf }`.
-- `class SparseMerkleTree` with `currentVersion`, `lowestVersion`, `set(key, value)`, `delete(key)`, `get(key)`, `rootHash()`, `commit(version)`, `rootAt(version)`, `proveAt(key, version)` and `prove(key)`.
+- `NODE_PREFIX = 0x6e` (`'n'`), `nodeHeader(type, position)` and `nodeKey(header, path, depth)`: a node's store key (STATE-PAGING.md section 5).
+- `class SparseMerkleTree` with `currentVersion`, `lowestVersion`, `resident`, `dropSource`, `set(key, value)`, `delete(key)`, `get(key)`, `rootHash()`, `commit(version, report?)`, `takeNodes()`, `rootAt(version)`, `proveAt(key, version)`, `prove(key)`, `entries()`, `drop(source)`, `rebuild()` and `load(source)`.
 - `smtProofRoot(key, proof)`: the verifier's fold, returning `{ root, value }` (value null for absence) or undefined for a malformed proof.
 
 A node is either a leaf `{ hash, leaf: { keyHash, value } }` or an inner node `{ hash, left, right }` with nullable children; the hash is computed once at construction with the same `leafHash` and `innerHash` as `src/db/merkle.ts`, so a leaf of the sparse tree is `leafHash(sha256(key), value)`. `bit(h, i)` reads bit i of a hash, most significant bit first, so depth 0 uses the top bit of the first byte. Nodes are immutable: `insert` and `remove` return a new node when anything below changed and the same node otherwise, so each write copies only the path from the root and every past version is just a root pointer that the garbage collector keeps alive.
@@ -544,11 +801,22 @@ On remove, a leaf left alone under an inner node moves up:
 
 Together they guarantee one shape per key set. The test in `test/db.test.ts` checks it with 3000 random sets and deletes against a tree built from the sorted final key set. Setting a key to the value it already has returns the same node, so the root pointer does not change and no path is copied.
 
-`commit(version)` is the versioning:
+`commit(version, report)` is the versioning:
 
 ```ts
-  commit(version: number): Uint8Array {
+  /**
+   * Remember the current contents as `version`. Versions must increase. With `report`, the nodes that changed
+   * since the last commit are listed for the store (takeNodes); a dropped tree always lists them, since the store
+   * is where they live.
+   */
+  commit(version: number, report = false): Uint8Array {
     if (version <= this.version) throw new Error(`version ${version} is not after ${this.version}`);
+    if (this.source) return this.commitDropped(version);
+    this.nodeChanges = [];
+    if (report) {
+      const before = this.version >= 0 ? (this.versions.get(this.version) ?? null) : null;
+      walkChanged(before, this.root, this.header, new Uint8Array(32), 0, (key, _a, b) => this.nodeChanges.push({ key, value: b ? encodingOf(b) : null }));
+    }
     this.version = version;
     this.versions.set(version, this.root);
     for (const v of this.versions.keys()) if (v < version - this.retain) this.versions.delete(v);
@@ -556,13 +824,24 @@ Together they guarantee one shape per key set. The test in `test/db.test.ts` che
   }
 ```
 
-It requires increasing versions, stores the current root pointer under the version, and drops every stored version below `version - retain`. Review finding 29 (REVIEW-2026-10-28.md) is about the last line: it used to prune only when retention was positive, so `retainVersions: 0` kept every root pointer forever and with them every path those roots reached; it now prunes at any retention, and `test/review.test.ts` asserts that version 3 is gone after committing 0..4 with retention 0. `rootOf(version)` throws a `RangeError` if the version is outside the window or was never committed. `proveAt` walks from that version's root following the key's bits, collecting the sibling at each inner node (`EMPTY` for a missing child), and stops at a leaf or at null:
+It requires increasing versions, stores the current root pointer under the version, and drops every stored version below `version - retain`. Review finding 29 (REVIEW-2026-10-28.md) is about the last line: it used to prune only when retention was positive, so `retainVersions: 0` kept every root pointer forever and with them every path those roots reached; it now prunes at any retention, and `test/review.test.ts` asserts that version 3 is gone after committing 0..4 with retention 0. With `report`, which the database passes whenever a store keeps the tree, the commit also lists the nodes that changed since the last commit for the store, by walking the previous root and the new one together (`walkChanged`, under "Nodes on disk" below) into the subtrees whose hashes differ, so the cost is the changed paths and a value change that moved no leaf reports nothing. A dropped tree takes the other branch, `commitDropped`, also below. `rootOf(version)` throws a `RangeError` if the version is outside the window or was never committed. `proveAt` walks from that version's root following the key's bits, collecting the sibling at each inner node (`EMPTY` for a missing child), and stops at a leaf or at null:
 
 ```ts
   /** Membership or absence proof for a key as of a version. Every buffer in it is a copy; the tree's own stay untouched. */
   proveAt(key: Uint8Array, version: number): SmtProof {
     const keyHash = sha256(key);
     const siblings: Uint8Array[] = [];
+    if (this.source) {
+      this.checkDropped(version);
+      for (let d = 0; ; d++) {
+        const e = this.nodeAt(nodeKey(this.header, keyHash, d), version);
+        if (!e) return { siblings, leaf: null };
+        if (e[0] === LEAF) return { siblings, leaf: { keyHash: e.slice(1, 33), value: e.slice(33) } };
+        const side = bit(keyHash, d);
+        siblings.push(childOf(e, 1 - side).slice());
+        if (isEmpty(childOf(e, side))) return { siblings, leaf: null };
+      }
+    }
     let n = this.rootOf(version);
     for (let d = 0; n && !n.leaf; d++) {
       if (bit(keyHash, d)) {
@@ -576,6 +855,8 @@ It requires increasing versions, stores the current root pointer under the versi
     return { siblings, leaf: n ? { keyHash: n.leaf!.keyHash.slice(), value: n.leaf!.value.slice() } : null };
   }
 ```
+
+The dropped branch walks the same path through the store, one node per depth: an inner node's encoding carries both children's hashes, so the sibling is read off it without another lookup, and the walk ends at a leaf, at a missing node, or at an inner node whose child on the key's side is empty. `nodeAt` reads a past version through the before-image records a dropped tree keeps (below), and the current version straight from the store.
 
 Every buffer in the proof is a copy, and so are the roots `rootHash` and `rootAt` return and the value `get` returns, each a `slice()`. Nodes are shared between versions and the hash in each is what every proof and root is folded from, so a caller writing into a sibling, a leaf or a root it was handed (a proof patched in a test, say) would otherwise rewrite the tree's own memory for every version that reaches that node. The dense tree already copied; the sparse tree now does too.
 
@@ -591,6 +872,172 @@ Every buffer in the proof is a copy, and so are the roots `rootHash` and `rootAt
 ```
 
 Without the prefix check a prover could present any leaf from anywhere in the tree as "the leaf owning this subtree". A proof deeper than 256 siblings is rejected before hashing anything. The leaf hash is recomputed from the leaf's key hash and value, never taken from the proof, so the value is bound.
+
+**Nodes on disk.** Every node has one store key, its path from the root:
+
+```ts
+/** First byte of a sparse tree node's store key. */
+export const NODE_PREFIX = 0x6e; // 'n'
+
+/** The first bytes of every node key of one authenticated index: 'n', the type, the index's position in the type. */
+export function nodeHeader(type: number, position: number): Uint8Array {
+  return Uint8Array.of(NODE_PREFIX, type >> 8, type & 0xff, position);
+}
+
+/** The store key of the node at `depth` on a path: the path's first `depth` bits, packed and zero-padded, then the depth. */
+export function nodeKey(header: Uint8Array, path: Uint8Array, depth: number): Uint8Array {
+  // A leaf one level below the deepest inner node possible (two keys sharing 255 bits) cannot be named.
+  if (depth > 255) throw new RangeError('sparse tree node deeper than 255');
+  const n = (depth + 7) >> 3;
+  const out = new Uint8Array(header.length + n + 1);
+  out.set(header);
+  for (let i = 0; i < n; i++) out[header.length + i] = path[i]!;
+  if (depth & 7) out[header.length + n - 1]! &= (0xff << (8 - (depth & 7))) & 0xff;
+  out[out.length - 1] = depth;
+  return out;
+}
+```
+
+The header is `'n'`, the type and the index's position in its type, the same position the `'i'` prefix uses, and `TypeIndex` hands each tree its header at construction. The root is the node at depth 0 with no path bits, so `nodeKey(header, EMPTY, 0)` names it, which is how a dropped tree finds its root hash in the store. The bits past `depth` are masked off, so every key that passes through an inner node names it by the same key. An inner node is encoded as `0x00`, the left hash, the right hash, 65 bytes; a leaf as `0x01`, the 32-byte key hash, the value (the 8-byte id). `hashOfEncoding` recomputes a node's hash from either encoding, which is how a dropped tree finds its stored root hash; a tree loaded from the store takes each child's hash from its parent's encoding rather than rehashing every node, and the root it then reports is checked against the stored app hash by whoever loaded it. A resident tree finds the nodes a commit changed by walking two versions together:
+
+```ts
+/**
+ * Visit every position where two trees differ, top down: a node of `b` that is not in `a` (or replaces a different
+ * one), and a node of `a` that `b` no longer has. Subtrees with equal hashes are equal and skipped, so the cost is
+ * the changed paths.
+ */
+function walkChanged(a: Node | null, b: Node | null, header: Uint8Array, path: Uint8Array, depth: number, visit: (key: Uint8Array, a: Node | null, b: Node | null) => void): void {
+  if (a === b || (a && b && bytesEqual(a.hash, b.hash))) return;
+  visit(nodeKey(header, path, depth), a, b);
+  const al = a && !a.leaf ? a.left : null;
+  const ar = a && !a.leaf ? a.right : null;
+  const bl = b && !b.leaf ? b.left : null;
+  const br = b && !b.leaf ? b.right : null;
+  if (al || bl) {
+    setBit(path, depth, 0);
+    walkChanged(al, bl, header, path, depth + 1, visit);
+  }
+  if (ar || br) {
+    setBit(path, depth, 1);
+    walkChanged(ar, br, header, path, depth + 1, visit);
+  }
+}
+```
+
+Subtrees with equal hashes are equal and skipped, so the visit is the changed paths: a node of the new root that was not there, or replaced a different one, gets its encoding, and a node of the old root that the new one no longer has gets null, a deletion. `entries()` is the same walk against nothing, every node of the committed tree, for a store written from scratch.
+
+**Dropped.** `drop(source)` lets the nodes go. Writes are then only remembered:
+
+```ts
+  set(key: Uint8Array, value: Uint8Array): void {
+    if (this.source) {
+      const keyHash = sha256(key);
+      this.pending.set(str(keyHash), { keyHash, value });
+    } else this.root = insert(this.root, sha256(key), value, 0);
+  }
+
+  delete(key: Uint8Array): void {
+    if (this.source) {
+      const keyHash = sha256(key);
+      this.pending.set(str(keyHash), { keyHash, value: null });
+    } else this.root = remove(this.root, sha256(key), 0);
+  }
+```
+
+Per key hash the last write wins, undo included, since undo goes through the same calls. `get` answers from the pending writes first and otherwise walks the store by path, and `rootHash()` refuses while writes are pending, because a dropped tree's root is computed at its commit, which applies the remembered writes against the store:
+
+```ts
+  private commitDropped(version: number): Uint8Array {
+    this.work = new Map();
+    const rootKey = nodeKey(this.header, EMPTY, 0);
+    let hash = this.storedRootHash();
+    // The shape depends only on the final key set, so the order the writes are applied in does not matter.
+    for (const p of this.pending.values()) {
+      const e = this.read(rootKey);
+      hash = (p.value ? this.insertAt(0, p.keyHash, p.value, e, hash) : this.removeAt(0, p.keyHash, e, hash)).hash;
+    }
+    this.pending.clear();
+```
+
+`insertAt` and `removeAt` are `insert` and `remove` over encodings instead of nodes, with the same two shape rules (two leaves in one subtree are pushed down to the first bit where they differ, a leaf left alone moves up), reading nodes through `read`, which prefers what this commit has already written, and writing through `write`, which records a node's encoding before the commit (`before`) the first time the commit touches it. What `work` holds at the end, less the nodes whose encoding came back to what it was, is the commit's change list (`takeNodes`), and the before-images of those nodes become the tree's records for past versions, per node key and ascending by version, exactly as the dense tree keeps "before version v this node was x"; `roots` keeps each retained version's root hash, and both are pruned to the window at every commit. `drop` itself makes those records from the versions the resident tree retained, by walking each pair of consecutive roots with `walkChanged`, and turns the writes since the last commit into pending ones by the same kind of walk over the leaves, so a tree may be dropped in the middle of a block:
+
+```ts
+  /**
+   * Let the nodes go and work on `source`, which must hold this tree as of the last commit. Writes since then become
+   * pending writes, and the retained versions become records of what each commit overwrote.
+   */
+  drop(source: TreeSource): void {
+    if (this.source) return;
+    const committed = this.version >= 0 ? (this.versions.get(this.version) ?? null) : null;
+    // What the writes since the last commit changed: every leaf of a subtree that differs, released, then every
+    // leaf of the subtree that replaced it, taken (a leaf in both is taken again, with its value, which is no change).
+    const changed = (a: Node | null, b: Node | null): void => {
+      if (a === b || (a && b && bytesEqual(a.hash, b.hash))) return;
+      if (a && !a.leaf && b && !b.leaf) {
+        changed(a.left, b.left);
+        changed(a.right, b.right);
+        return;
+      }
+      eachLeaf(a, (l) => this.pending.set(str(l.keyHash), { keyHash: l.keyHash, value: null }));
+      eachLeaf(b, (l) => this.pending.set(str(l.keyHash), { keyHash: l.keyHash, value: l.value }));
+    };
+    changed(committed, this.root);
+    const versions = [...this.versions.keys()].sort((a, b) => a - b);
+    for (const v of versions) this.roots.set(v, (this.versions.get(v)?.hash ?? EMPTY).slice());
+    this.floor = versions[0] ?? 0;
+    for (let i = 1; i < versions.length; i++) {
+      const v = versions[i]!;
+      const keys: string[] = [];
+      walkChanged(this.versions.get(versions[i - 1]!) ?? null, this.versions.get(v) ?? null, this.header, new Uint8Array(32), 0, (key, a) => {
+        const s = str(key);
+        let entries = this.history.get(s);
+        if (!entries) this.history.set(s, (entries = []));
+        entries.push({ v, enc: a ? encodingOf(a) : null });
+        keys.push(s);
+      });
+      if (keys.length > 0) this.historyByVersion.set(v, keys);
+    }
+    this.root = null;
+    this.versions.clear();
+    this.source = source;
+  }
+```
+
+`rebuild()` reads the current tree back from the store and every retained version from the records, newest first, each built against the next newer one so that every subtree whose hash did not change is shared between them as it was when the versions were live, and applies the pending writes on top; `load(source)` builds a fresh tree from the store's root node at a restart. The `build` they share reads a node's encoding, recurses into the children whose hashes are not empty, and reuses the other version's node wherever the hash matches:
+
+```ts
+  /** Read the tree back from the store, and every retained version from the records; the pending writes go on top. */
+  rebuild(): void {
+    const source = this.source;
+    if (!source) return;
+    const path = new Uint8Array(32);
+    // Newest first, each built against the next newer one, so whatever did not change between them is shared.
+    let newer: Node | null = null;
+    const built = new Map<number, Node | null>();
+    for (const v of [...this.roots.keys()].sort((a, b) => b - a)) {
+      const h = this.roots.get(v)!;
+      const n: Node | null = isEmpty(h) ? null : this.build((k) => this.nodeAt(k, v), path, 0, h, newer);
+      built.set(v, n);
+      newer = n;
+    }
+    let root: Node | null;
+    if (this.version >= 0) root = built.get(this.version) ?? null;
+    else {
+      const h = this.storedRootHash();
+      root = isEmpty(h) ? null : this.build((k) => source.get(k) ?? null, path, 0, h, null);
+    }
+    for (const p of this.pending.values()) root = p.value ? insert(root, p.keyHash, p.value, 0) : remove(root, p.keyHash, 0);
+    this.source = null;
+    this.pending.clear();
+    this.roots.clear();
+    this.history.clear();
+    this.historyByVersion.clear();
+    for (const [v, n] of built) this.versions.set(v, n);
+    this.root = root;
+  }
+```
+
+The sparse trees are where the heap of the tree tier goes, a node object and two small typed arrays per node, where the dense chunks live in array buffers; that is why the database drops both kinds with one dial and why the rebuild estimate counts sparse leaves (below). `test/db.test.ts` ("sparse merkle tree: dropped") runs forty versions of random sets and deletes over a small key space, so leaves split and collapse often, on a resident tree and one dropped twice, once in the middle of its writes, and rebuilt twice, and requires the same roots, the same `get`, the same proofs sibling for sibling at every retained version, and a store holding exactly the resident tree's nodes.
 
 ### src/db/freeze.ts
 
@@ -728,14 +1175,35 @@ Exports:
 - `interface IndexDef<T> { name; unique; authenticated?; key(obj, k) }`: an index definition. `key` writes the object's key into a `KeyWriter`.
 - `interface ObjectType<T> { id; name; encode(w, obj); decode(r, id); indices }`: a type. The doc comments carry two invariants: the id is "Fixed forever: it is in every id and every leaf hash", and `encode` is the canonical encoding hashed into the state root, which does not write the id because the leaf position implies it. `decode` receives the id for the same reason.
 - `MAX_INSTANCE = 2 ** 32 - 2`: the largest instance the primary index accepts, "the largest instance a JavaScript array can index". `src/db/id.ts` allows 48 bits in an id; this is the bound the per-instance tables keep, and an instance within it also fits the four bytes the arena's header gives it.
-- `interface HotBudget { limit; size }`: how many decoded objects the hot caches of all types may hold together, and how many they hold. The database makes one and hands every type the same object.
+- `interface HotBudget { limit; size; hits; misses }`: how many decoded objects the hot caches of all types may hold together, how many they hold, and how many reads the caches answered and how many decoded from the arena since the database was made. The database makes one and hands every type the same object.
+- `idBytes(id)`: the eight big-endian bytes of an id, the value a unique index entry stores and the sparse trees hash.
 - `class TypeIndex<T>`: the per-type container.
 
-Its private fields are the design of "Objects as bytes" in data:
+Each secondary index is a `Secondary`: its definition, the four bytes every one of its store keys starts with, and either a B+ tree or, while that is dropped, an overlay:
+
+```ts
+/** One secondary index: its definition, where its entries live in the store, and its tree or, while that is dropped, its overlay. */
+interface Secondary<T> {
+  def: IndexDef<T>;
+  /** 'i', type, position: the first bytes of every store key of this index. */
+  header: Uint8Array;
+  tree: BPlusTree<ObjectId> | null;
+  /** While the tree is dropped: per key, what the writes since the last root made of it (null: released). */
+  overlay: BPlusTree<ObjectId | null> | null;
+}
+```
+
+The type's private fields are the design of "Objects as bytes" and of the index tier in data:
 
 ```ts
   private readonly arena: Arena;
   private readonly budget: HotBudget;
+  /** The store's index entries as of the last root, which a dropped index falls back on. */
+  private readonly base: IndexStore;
+  /** Secondary indices in definition order (an index's position is its place here), and by name. */
+  private readonly secondary: Secondary<T>[] = [];
+  private readonly byName = new Map<string, Secondary<T>>();
+  private readonly retain: number;
   /** Arena reference of each committed instance (-1 when absent) and its encoding's length. */
   private refs = new Float64Array(0);
   private lens = new Uint32Array(0);
@@ -748,30 +1216,42 @@ Its private fields are the design of "Objects as bytes" in data:
   private readonly pinned = new Set<number>();
   /** Set when an eviction pass found nothing clean left to drop; cleared at the next root, which unpins. */
   private saturated = false;
+  /**
+   * For every pinned instance, its keys at the last root and now. A write computes both anyway (to unindex the old
+   * value and index the new one); kept, they make a root's index changes a comparison instead of a re-encoding.
+   */
+  private readonly dirtyKeys = new Map<number, DirtyKeys>();
+  /** Objects the arena holds a committed encoding for: each has one entry in every index, for estimates. */
+  committedCount = 0;
 ```
 
-`refs`, `lens` and `touched` grow together in `ensure`, doubling and never below 16 slots, with new references set to -1; a reference needs a `Float64Array` because it packs a slab number above the low 32 bits. `pinned` is what keeps a written object safe from eviction, and `saturated` is what stops a type whose cache is all pinned from sweeping in vain on every write.
+`refs`, `lens` and `touched` grow together in `ensure`, doubling and never below 16 slots, with new references set to -1; a reference needs a `Float64Array` because it packs a slab number above the low 32 bits. `pinned` is what keeps a written object safe from eviction, and `saturated` is what stops a type whose cache is all pinned from sweeping in vain on every write. `base` is the database's view of the store as of the last root (the application's store under the changes of roots not yet written), `secondary` is in definition order because an index's position in it is the position in its store keys, `dirtyKeys` is what makes a root's index report a comparison of byte arrays, and `committedCount` feeds the memory guard's rebuild estimate.
 
-The constructor takes the arena and the shared budget besides the type and the retention window, and builds one `BPlusTree` per index and, for an authenticated index, one `SparseMerkleTree` with the retention window:
+The constructor takes the arena, the shared budget and the store view besides the type and the retention window, and whether the trees start resident; it builds one `Secondary` per index, with a `BPlusTree` or an empty overlay, and, for an authenticated index, one `SparseMerkleTree` with the retention window and the node header of its position:
 
 ```ts
-  constructor(type: ObjectType<T>, retainVersions: number, arena: Arena, budget: HotBudget) {
+  constructor(type: ObjectType<T>, retainVersions: number, arena: Arena, budget: HotBudget, base: IndexStore, resident = true) {
     this.type = type;
+    this.retain = retainVersions;
     this.arena = arena;
     this.budget = budget;
-    for (const ix of type.indices) {
-      if (this.secondary.has(ix.name)) throw new Error(`${type.name}: duplicate index ${ix.name}`);
-      this.secondary.set(ix.name, new BPlusTree());
+    this.base = base;
+    if (type.indices.length > 256) throw new Error(`${type.name}: more than 256 indices`);
+    type.indices.forEach((ix, position) => {
+      if (this.byName.has(ix.name)) throw new Error(`${type.name}: duplicate index ${ix.name}`);
+      const s: Secondary<T> = { def: ix, header: indexHeader(type.id, position), tree: resident ? new BPlusTree() : null, overlay: resident ? null : new BPlusTree() };
+      this.secondary.push(s);
+      this.byName.set(ix.name, s);
       if (ix.authenticated) {
         if (!ix.unique) throw new Error(`${type.name}.${ix.name}: only unique indices can be authenticated`);
-        this.trees.set(ix.name, new SparseMerkleTree(retainVersions));
+        this.trees.set(ix.name, new SparseMerkleTree(retainVersions, nodeHeader(type.id, position)));
         this.authenticated.push(ix.name);
       }
-    }
+    });
   }
 ```
 
-`authenticated` keeps the names in definition order; that order is the order of `indexRoots` in the type leaf, which is why `KeyProof.indexPosition` is meaningful and why reordering a type's indices would change the app hash. Duplicate index names and an authenticated non-unique index are rejected with plain `Error`s at construction: they are configuration mistakes, not runtime failures.
+`authenticated` keeps the names in definition order; that order is the order of `indexRoots` in the type leaf, which is why `KeyProof.indexPosition` is meaningful and why reordering a type's indices would change the app hash, and now also the layout of the `'i'` and `'n'` keys in the store. Duplicate index names, more than 256 indices (the position is one byte) and an authenticated non-unique index are rejected with plain `Error`s at construction: they are configuration mistakes, not runtime failures.
 
 **Reads.** `get` is the cache, then the arena:
 
@@ -786,9 +1266,11 @@ The constructor takes the arena and the shared budget besides the type and the r
     if (v !== undefined) {
       // A cached object, or a tombstone (null), which reads as absent.
       this.touched[instance] = 1;
+      this.budget.hits++;
       return v ?? undefined;
     }
     if (this.refAt(instance) < 0) return undefined;
+    this.budget.misses++;
     const obj = this.decodeAt(instance);
     this.cache(instance, obj);
     return obj;
@@ -800,7 +1282,7 @@ The constructor takes the arena and the shared budget besides the type and the r
   }
 ```
 
-Anything in the cache answers: an object, whose touched bit is set, or a tombstone, as absent. Otherwise an instance with no reference is absent, and one with a reference is decoded from the arena, frozen, and cached, entering with its bit clear. `has` answers without decoding anything: a cached entry decides, else the table.
+Anything in the cache answers, and counts a hit: an object, whose touched bit is set, or a tombstone, as absent. Otherwise an instance with no reference is absent, and one with a reference counts a miss and is decoded from the arena, frozen, and cached, entering with its bit clear. `has` answers without decoding anything: a cached entry decides, else the table. The two counters are the budget's, shared by every type, and `memory()` reports them as `hotHits` and `hotMisses`.
 
 **The cache and eviction.**
 
@@ -848,14 +1330,15 @@ Anything in the cache answers: an object, whose touched bit is set, or a tombsto
     this.saturated = over > 0 && this.hot.size === this.pinned.size;
   }
 
-  /** A root is over: the pins are off, so the budget can be enforced again. */
+  /** A root is over: the pins are off, so the budget can be enforced again, and an overlay has nothing left to say. */
   afterRoot(): void {
     this.saturated = false;
     this.evict();
+    for (const s of this.secondary) s.overlay?.clear();
   }
 ```
 
-`cache` counts a new entry against the shared budget, clears its touched bit (a fresh decode has not earned a second chance, and a write does not need one, since it is pinned), and asks `evict` for room unless the type is saturated. `evict` sweeps from the hand, wrapping at the end of the table: an instance that is not cached, or is pinned, is passed over; a touched one has its bit cleared; the first clean, untouched one is deleted. The sweep is bounded per call, at twice the excess plus 256 instances and never more than twice the table, so a write never pays for a full scan, and what one call leaves the next continues from the hand. The budget is shared but each type evicts only its own entries, so a type that cannot find a victim leaves the total over until another type caches something, the next root, or a new limit. `saturated` is set only when everything the type has cached is pinned, as while a genesis is being built, every object written and none rooted yet; `afterRoot`, which the database calls on every type once a root has unpinned everything, clears it and brings the cache back under the budget in one pass. The database's `setHotLimit` calls `evict` on every type for the same reason.
+`cache` counts a new entry against the shared budget, clears its touched bit (a fresh decode has not earned a second chance, and a write does not need one, since it is pinned), and asks `evict` for room unless the type is saturated. `evict` sweeps from the hand, wrapping at the end of the table: an instance that is not cached, or is pinned, is passed over; a touched one has its bit cleared; the first clean, untouched one is deleted. The sweep is bounded per call, at twice the excess plus 256 instances and never more than twice the table, so a write never pays for a full scan, and what one call leaves the next continues from the hand. The budget is shared but each type evicts only its own entries, so a type that cannot find a victim leaves the total over until another type caches something, the next root, or a new limit. `saturated` is set only when everything the type has cached is pinned, as while a genesis is being built, every object written and none rooted yet; `afterRoot`, which the database calls on every type once a root has unpinned everything, clears it, brings the cache back under the budget in one pass, and empties every overlay, since the store with the root's changes now says what the overlay said. The database's `setHotLimit` calls `evict` on every type for the same reason.
 
 **Writes.**
 
@@ -867,49 +1350,86 @@ Anything in the cache answers: an object, whose touched bit is set, or a tombsto
     const instance = instanceOf(obj.id);
     if (instance > MAX_INSTANCE) throw new DbError(`${this.type.name}: instance ${instance} is beyond the index`);
     const old = this.get(instance);
-    if (old) this.unindex(old);
+    const oldKeys = old ? this.unindex(old) : null;
+    this.wrote(instance, oldKeys, keys);
     this.pinned.add(instance);
     this.cache(instance, obj);
     this.indexKeys(obj, keys);
   }
+
+  /** Remember an instance's keys as committed (on its first write since the root) and as they now stand. */
+  private wrote(instance: number, before: Uint8Array[] | null, now: Uint8Array[] | null): void {
+    if (this.secondary.length === 0) return;
+    const d = this.dirtyKeys.get(instance);
+    if (d && this.pinned.has(instance)) d.current = now;
+    else this.dirtyKeys.set(instance, { committed: before, current: now });
+  }
 ```
 
 ```ts
-  private unindex(obj: T): void {
-    for (const [ix, k] of this.keysOf(obj)) {
-      this.secondary.get(ix.name)!.delete(k);
-      this.trees.get(ix.name)?.delete(k);
+  private unindex(obj: T): Uint8Array[] {
+    const keys = this.keysOf(obj);
+    for (let i = 0; i < keys.length; i++) {
+      const s = this.secondary[i]!;
+      const k = keys[i]!;
+      if (s.tree) s.tree.delete(k);
+      else s.overlay!.set(k, null);
+      this.trees.get(s.def.name)?.delete(k);
     }
+    return keys;
   }
 
   erase(obj: T): void {
-    this.unindex(obj);
+    const keys = this.unindex(obj);
     const instance = instanceOf(obj.id);
+    this.wrote(instance, keys, null);
     this.pinned.add(instance);
     this.cache(instance, null);
   }
 ```
 
-The uniqueness checks (`checkUnique`, shared with the import path) run before anything changes, so a `modify` that would collide on a name leaves the old object in place. The instance check sits with them: an instance past `MAX_INSTANCE` is refused with a `DbError` rather than written, since the tables are indexed by instance and the arena header holds it in four bytes. Nothing in `src/db/` creates ids that large, but `importObject` takes ids from a store or a snapshot, and `insert` and `importCommitted` are the two doors every object comes through. A replace reads the old object (from the cache, or decoded from the arena) and unindexes its keys, then pins the instance, caches the new object, and writes its keys into the B+ tree and, where present, the sparse tree with the 8-byte id as the value. `erase` unindexes and caches a tombstone, pinned: the object is gone for every read at once, while its committed bytes stay in the arena until the root frees them. Neither writes to the arena, and the database's `undoSession` restores old values through the same two methods, so a transaction that fails writes nothing there either.
+The uniqueness checks (`checkUnique`, shared with the import path) run before anything changes, so a `modify` that would collide on a name leaves the old object in place; they go through `find` (below), so they consult the overlay, then the tree if present, then the store. The instance check sits with them: an instance past `MAX_INSTANCE` is refused with a `DbError` rather than written, since the tables are indexed by instance and the arena header holds it in four bytes. Nothing in `src/db/` creates ids that large, but `importObject` takes ids from a store or a snapshot, and `insert` and `importCommitted` are the two doors every object comes through. A replace reads the old object (from the cache, or decoded from the arena) and unindexes its keys, then pins the instance, caches the new object, and writes its keys with `indexKeys`: into the B+ tree, or while that is dropped into the overlay (`unindex` sets null there, a release), and where present into the sparse tree with the 8-byte id as the value, which takes the same writes whether its own nodes are resident or not. `wrote` keeps, per pinned instance, the keys the object had at the last root (from its first write since then) and the keys it has now, both of which the write computed anyway; a root compares those arrays to report its index changes instead of encoding keys again. `erase` unindexes and caches a tombstone, pinned: the object is gone for every read at once, while its committed bytes stay in the arena until the root frees them. Neither writes to the arena, and the database's `undoSession` restores old values through the same two methods, so a transaction that fails writes nothing there either, and while the trees are dropped its overlay entries are put back by the same calls.
 
-The import path skips the cache altogether:
+The import path skips the cache altogether, and comes in two forms:
 
 ```ts
   /** Load a committed object straight into the arena (import), decoded only to build its index entries. */
   importCommitted(obj: T, bytes: Uint8Array): void {
     const keys = this.keysOf(obj);
     this.checkUnique(obj, keys);
-    const instance = instanceOf(obj.id);
+    this.importBytes(instanceOf(obj.id), bytes);
+    this.indexKeys(obj, keys);
+  }
+
+  /** Load a committed object whose index entries the store already holds (a restart): no decode at all. */
+  importBytes(instance: number, bytes: Uint8Array): void {
     if (instance > MAX_INSTANCE) throw new DbError(`${this.type.name}: instance ${instance} is beyond the index`);
     if (this.has(instance)) throw new DbError(`${this.type.name}: instance ${instance} imported twice`);
     this.ensure(instance);
     this.refs[instance] = this.arena.alloc(this.type.id, instance, bytes);
     this.lens[instance] = bytes.length;
-    this.indexKeys(obj, keys);
+    this.committedCount++;
+  }
+
+  /**
+   * After importBytes: fill the B+ trees when resident, and the sparse trees unless `sparse` is false (their nodes
+   * were loaded from the store), from the store's entries. They come in key order, which is the B+ tree's cheapest
+   * order to grow in.
+   */
+  loadIndexEntries(sparse = true): void {
+    for (const s of this.secondary) {
+      const smt = sparse ? this.trees.get(s.def.name) : undefined;
+      if (!s.tree && !smt) continue;
+      for (const [k, v] of this.base.range(s.header, afterPrefix(s.header)!)) {
+        const key = k.subarray(INDEX_HEADER);
+        s.tree?.set(key, this.storedId(s, k, v));
+        smt?.set(key, v);
+      }
+    }
   }
 ```
 
-The bytes go straight into the arena, the decoded object serves for its index keys and is dropped, and nothing is pinned. A second import of the same instance is refused.
+`importCommitted` is the snapshot path and the path of a store from before phase two: the bytes go straight into the arena, the decoded object serves for its index keys and is dropped, and nothing is pinned. `importBytes` is the restart path: no decode at all, only the bytes into the arena, and once every object is in, `loadIndexEntries` walks each index's prefix in the store once and fills the B+ tree, in key order, the tree's cheapest order to grow in, and the sparse tree from the same entries unless its nodes were loaded from the store themselves. Measured at 192,000 accounts the two restart paths cost the same within a few percent, both dominated by hashing the name tree, and the one that reads the entries is the one a node with dropped trees does anyway (STATE-PAGING.md 4.4). A second import of the same instance is refused either way.
 
 **What a root does with a type.** The database's dirty loop (below) asks for the pending value and then flushes or settles it:
 
@@ -940,9 +1460,13 @@ The bytes go straight into the arena, the decoded object serves for its index ke
    */
   flush(instance: number, bytes: Uint8Array | null): void {
     const old = this.refAt(instance);
-    if (old >= 0) this.arena.free(old);
+    if (old >= 0) {
+      this.arena.free(old);
+      this.committedCount--;
+    }
     this.ensure(instance);
     if (bytes) {
+      this.committedCount++;
       this.refs[instance] = this.arena.alloc(this.type.id, instance, bytes);
       this.lens[instance] = bytes.length;
     } else {
@@ -951,20 +1475,127 @@ The bytes go straight into the arena, the decoded object serves for its index ke
       this.uncache(instance);
     }
     this.pinned.delete(instance);
+    this.dirtyKeys.delete(instance);
   }
 
   /** A root found a pending value equal to the committed one: nothing to write, just unpin. */
   settle(instance: number): void {
     this.pinned.delete(instance);
+    this.dirtyKeys.delete(instance);
     if (this.hot.get(instance) === null) this.uncache(instance);
   }
 ```
 
-`pending` returns a value only for a pinned instance: the object written since the last root, `null` for a removal, and `undefined` when nothing is pending, which is how the root tells an imported object (in the arena, never pinned) from a written one. `flush` frees the old entry and writes the new bytes, or for a removal clears the reference and drops the tombstone, and unpins: a written object stays cached, now clean, a candidate for eviction like any other. `settle` is for a value written and written back: nothing to write, the pin comes off, and a tombstone for an object that never reached the arena is dropped. `bytesOf` is the committed encoding, a view into the arena; `bytesFor` prefers a pending value's encoding, so export and snapshots taken between roots see the live state.
+`pending` returns a value only for a pinned instance: the object written since the last root, `null` for a removal, and `undefined` when nothing is pending, which is how the root tells an imported object (in the arena, never pinned) from a written one. `flush` frees the old entry and writes the new bytes, or for a removal clears the reference and drops the tombstone, keeps `committedCount` right, and unpins: a written object stays cached, now clean, a candidate for eviction like any other, and its dirty keys are forgotten, since the root has reported them. `settle` is for a value written and written back: nothing to write, the pin comes off, and a tombstone for an object that never reached the arena is dropped. `bytesOf` is the committed encoding, a view into the arena; `bytesFor` prefers a pending value's encoding, so export and snapshots taken between roots see the live state.
 
-**The rest.** `instances()` yields every present instance in ascending order through `has`, so a type's objects can be walked without decoding any; `rebuildIndexVersions`, `exportObjects` and `encodeSnapshot` walk them that way. `truncate(before)` is the undo of creates: it drops cache entries and pins from `before` on, clears their references, and resets the counter, so the next create reuses the instance an undone create had taken. `keyFor(obj, index)` returns one index key, which `rebuildIndexVersions` uses. `replaceTree` swaps in a rebuilt sparse tree. `refAt` and `relocate` are the type's half of the arena's owner interface, which the database forwards by type. `index(name)` throws on an unknown name, and `hotSize` is the size of the type's cache.
+**The rest.** `instances()` yields every present instance in ascending order through `has`, so a type's objects can be walked without decoding any; `rebuildIndexVersions`, `exportObjects` and `encodeSnapshot` walk them that way. `truncate(before)` is the undo of creates: it drops cache entries, pins and dirty keys from `before` on, clears their references, and resets the counter, so the next create reuses the instance an undone create had taken. `keyFor(obj, index)` returns one index key, which `rebuildIndexVersions` uses, and `freshTree(name)` an empty sparse tree keyed in the store as the index's own is. `replaceTree` swaps in a rebuilt sparse tree, and if the one it replaces was dropped, drops the new one to the same store first. `refAt` and `relocate` are the type's half of the arena's owner interface, which the database forwards by type. `index(name)` returns an index's B+ tree and throws on an unknown name or a dropped tree; `resident` says whether the type's trees are there (a type's indices are dropped or kept together), and `hotSize` is the size of the type's cache.
 
-`clear()` frees every arena entry, empties the tables, the cache, the pins and the B+ trees, gives the cache's entries back to the budget, and resets the counter, but leaves the sparse trees; nothing in `src/` or `test/` calls it.
+`clear()` frees every arena entry, empties the tables, the cache, the pins, the dirty keys, the B+ trees and the overlays, gives the cache's entries back to the budget, and resets the counter and `committedCount`, but leaves the sparse trees; nothing in `src/` or `test/` calls it.
+
+**The B+ trees as a cache over the store.** Every read of an index goes through two private methods that know whether the tree is there:
+
+```ts
+  /** The id a stored entry names: a unique entry's value, a non-unique key's last eight bytes. */
+  private storedId(s: Secondary<T>, k: Uint8Array, v: Uint8Array): ObjectId {
+    return s.def.unique ? u64At(v, 0) : u64At(k, k.length - 8);
+  }
+
+  private find(s: Secondary<T>, k: Uint8Array): ObjectId | undefined {
+    if (s.tree) return s.tree.get(k);
+    const o = s.overlay!.get(k);
+    if (o !== undefined) return o ?? undefined;
+    const v = this.base.get(entryKey(s.header, k));
+    return v === undefined ? undefined : this.storedId(s, k, v);
+  }
+
+  /** The id under an exact key: a tree walk, or while dropped an overlay probe and a store read. */
+  lookupId(name: string, k: Uint8Array): ObjectId | undefined {
+    return this.find(this.secondaryIndex(name), k);
+  }
+
+  /**
+   * Entries from `start` in key order, all of them to the end of the index, or with `prefix` given only those
+   * that start with it. While dropped: a store cursor merged with the overlay.
+   */
+  entries(name: string, start: Uint8Array, prefix: Uint8Array | null): IterableIterator<[Uint8Array, ObjectId]> {
+    return this.entriesOf(this.secondaryIndex(name), start, prefix);
+  }
+
+  /** Not a generator itself, so a resident scan costs what the tree's iterator costs and nothing on top. */
+  private entriesOf(s: Secondary<T>, start: Uint8Array, prefix: Uint8Array | null): IterableIterator<[Uint8Array, ObjectId]> {
+    if (s.tree) return prefix ? s.tree.scan(prefix) : s.tree.scanFrom(start);
+    return this.fallbackEntries(s, start, prefix);
+  }
+
+  private *fallbackEntries(s: Secondary<T>, start: Uint8Array, prefix: Uint8Array | null): IterableIterator<[Uint8Array, ObjectId]> {
+    const end = prefix ? afterPrefix(prefix) : null;
+    const stored = this.base.range(entryKey(s.header, start), end ? entryKey(s.header, end) : afterPrefix(s.header)!);
+    const self = this;
+    function* fromStore(): IterableIterator<[Uint8Array, ObjectId]> {
+      for (const [k, v] of stored) yield [k.subarray(INDEX_HEADER), self.storedId(s, k, v)];
+    }
+    yield* overlaid(fromStore(), until(s.overlay!.entriesFrom(start), end));
+  }
+```
+
+Resident, a lookup is the tree's `get` and a scan the tree's iterator, with nothing on top (`entriesOf` is not a generator for that reason). Dropped, a lookup is an overlay probe (an id, or null for a key the writes since the root released, which reads as absent) and otherwise one store read under the index's header, decoding the id from a unique entry's value or from the last eight bytes of a non-unique key; a scan is the store's range under the header, from `start` to the end of the prefix or of the index, with the header stripped from each key, laid under the overlay's entries by `overlaid` (`src/db/indexstore.ts`), so entries the open sessions added appear in order, entries they removed are skipped, and a key both released and taken again yields the new id. This is what `lookup`, `scan`, `range` and `scanFrom` in the database read through, and what `checkUnique` consults on every write. The dial itself:
+
+```ts
+  /**
+   * Drop the B+ trees and fall back on the store. `changed` is every object of this type written since the last
+   * root, as its committed value and its current one (null for none): what the overlay must say from now on.
+   */
+  dropTrees(changed: [T | null, T | null][]): void {
+    if (!this.resident) return;
+    for (const s of this.secondary) {
+      s.tree = null;
+      s.overlay = new BPlusTree();
+    }
+    // Every key a write released first, then every key one took, so a key passed between two objects ends taken.
+    for (const [before] of changed) if (before) this.keysOf(before).forEach((k, i) => this.secondary[i]!.overlay!.set(k, null));
+    for (const [, now] of changed) if (now) this.keysOf(now).forEach((k, i) => this.secondary[i]!.overlay!.set(k, now.id));
+  }
+
+  /** Build the B+ trees again from what the fallback reads (the store with the overlay on top) and drop the overlays. */
+  rebuildTrees(): void {
+    if (this.resident) return;
+    const built = this.secondary.map((s) => {
+      const tree = new BPlusTree<ObjectId>();
+      for (const [k, id] of this.entriesOf(s, new Uint8Array(0), null)) tree.set(k, id);
+      return tree;
+    });
+    this.secondary.forEach((s, i) => {
+      s.tree = built[i]!;
+      s.overlay = null;
+    });
+  }
+```
+
+The overlay must be, from the moment of the drop, the difference between the last root and now, and the database hands `dropTrees` exactly what that difference is made of: every object of the type written since the last root, as the value the root shadow holds for it and its current value. All the releases go in before all the takes, so a key that passed from one object to another inside the block ends with its new owner, and a key an object kept is released and taken again, which leaves it as it was. From then on the writes themselves keep the overlay (the `overlay!.set` branches of `indexKeys` and `unindex`), and a root empties it. `rebuildTrees` walks the merged view, store and overlay, into fresh trees and drops the overlays; it may be called mid-block too, since the merged view already says what the trees must say. The root's report is a comparison:
+
+```ts
+  /**
+   * The index entries a root reports for one object that went from `before` to `after` (null: absent): a
+   * released key is removed, a taken one added, and a key it kept is left alone. The keys the writes recorded
+   * are used when there are any; `after` is then only asked for its id.
+   */
+  diffEntries(before: T | null, after: T | null, removed: IndexEntryChange[], added: IndexEntryChange[], instance?: number): void {
+    if (this.secondary.length === 0) return;
+    const d = instance === undefined ? undefined : this.dirtyKeys.get(instance);
+    const old = d ? d.committed : before ? this.keysOf(before) : null;
+    const now = d ? d.current : after ? this.keysOf(after) : null;
+    for (let i = 0; i < this.secondary.length; i++) {
+      const s = this.secondary[i]!;
+      const o = old?.[i];
+      const n = now?.[i];
+      if (o && n && bytesEqual(o, n)) continue;
+      if (o) removed.push({ key: entryKey(s.header, o), value: null });
+      if (n) added.push({ key: entryKey(s.header, n), value: s.def.unique ? idBytes(after!.id) : EMPTY_VALUE });
+    }
+  }
+```
+
+Per index, a key the object kept writes nothing, so a transfer, which changes amounts and no key, costs no index write; a released key is a removal and a taken one an addition with the id as value for a unique index and nothing for a non-unique one, whose key already ends with the id. The keys come from `dirtyKeys` when the writes recorded them, and are computed from the objects only when the database calls without an instance (the drop of a database that has no store, which must build its in-memory store's view of the dirty set). `indexEntries()` yields every entry of every index as it stands, through `entriesOf`, so it reads the store while dropped, and `checkStore(store)` (for tests) compares the resident trees with the store both ways: every tree entry must be there with its value, and the store may hold no more entries under an index's header than the tree has.
 
 ### src/db/proof.ts
 
@@ -1027,10 +1658,11 @@ Purpose: the object database itself: types, sessions, the committed and historic
 
 Exports:
 
-- `deepFreeze(value)`: re-exported from `src/db/freeze.ts` (above), so code that imported it from here still does.
-- `interface DatabaseOptions { retainVersions?, hotObjects? }`: the window, where 0 keeps only the current version and `DEFAULT_RETAIN` is 100; and the budget of decoded objects the hot caches share, unbounded by default (`DEFAULT_HOT` is `Infinity`).
-- `interface DatabaseMemory { arena; hotObjects; hotLimit; historyBytes }`: what `memory()` reports, "what the database holds in memory besides the trees and indices, for the memory guard and status".
-- `interface ObjectChange { id; bytes | null }` and `interface Changes { version; objects; counters; history }`: what one `root()` changed, for a store.
+- `deepFreeze(value)`: re-exported from `src/db/freeze.ts` (above), so code that imported it from here still does; `IndexEntryChange` and `IndexStore` are re-exported from `src/db/indexstore.ts` the same way.
+- `interface DatabaseOptions { retainVersions?, hotObjects?, indexStore?, indexTrees?, trees?, treeChunks? }`: the window, where 0 keeps only the current version and `DEFAULT_RETAIN` is 100; the budget of decoded objects the hot caches share, unbounded by default (`DEFAULT_HOT` is `Infinity`); the store that holds the index entries and the trees the application writes from each root's change list, without which a database that drops a tier keeps the entries in memory instead; whether the secondary indices' B+ trees and the Merkle trees start resident (both default to yes); and how many dense tree chunks dropped trees keep cached between reads (`DEFAULT_TREE_CHUNKS` is 256, at most 8 MiB).
+- `setDefaultIndexTrees(resident)` and `setDefaultTrees(resident)`: where the last two options default from, so that `test/setup.ts` can start every database of a run with a tier dropped (`INDEX_TREES=0`, `TREES=0`; [chapter 15](15-tests.md)).
+- `interface DatabaseMemory { arena; objects; hotObjects; hotLimit; historyBytes; indexTrees; trees; treeChunks; treeChunkLimit; hotHits; hotMisses; chunkHits; chunkMisses }`: what `memory()` reports, for the memory guard and status: the arena's figures, the mode of each tier (`objects` is `resident` or `capped`, `indexTrees` is `resident`, `dropped` or `partial`, `trees` is `resident` or `dropped`), the decoded objects cached and their limit, the bytes of past values, the chunks cached and their limit, and the hit and miss counts of both caches.
+- `interface ObjectChange { id; bytes | null }` and `interface Changes { version; objects; counters; history; indices; trees }`: what one `root()` changed, for a store. `indices` is the index entries added (with their value) and removed (null), as store keys, removals first; `trees` the dense tree chunks and sparse tree nodes written or deleted, whose values may be views of live chunks until `dropChanges()`.
 - `interface HistoryRecord { trees; objects; counters }` and `TOP_TREE = 0`: what was true before one version.
 - `encodeHistory(w, h)` / `decodeHistory(r)`: the record's wire form.
 - `class UndoSession`: `created`, `modified`, `removed`, `counters`, `isActive`, `undo()`, `commit()`.
@@ -1067,30 +1699,59 @@ export class UndoSession {
 
 `undo()` and `commit()` delegate to the database and mark the session inactive, so a second close throws.
 
-**Construction.** The constructor makes the shared budget and the arena first, with the database itself as the arena's owner, each question forwarded to the type the entry names; then it builds a `TypeIndex` (given the arena and the budget) and a `DenseMerkleTree` per type, both with the retention window, plus one top tree sized to the number of types:
+**Construction.** The constructor makes the shared budget and the arena first, with the database itself as the arena's owner, each question forwarded to the type the entry names; then the two views of the store that dropped tiers read through; then a `TypeIndex` (given the arena, the budget, the index view and whether its trees start resident) and a `DenseMerkleTree` per type, both with the retention window, plus one top tree sized to the number of types:
 
 ```ts
   constructor(types: ObjectType<any>[], opts: DatabaseOptions = {}) {
     this.retain = Math.max(0, opts.retainVersions ?? DEFAULT_RETAIN);
-    this.hotBudget = { limit: Math.max(0, opts.hotObjects ?? DEFAULT_HOT), size: 0 };
+    this.hotBudget = { limit: Math.max(0, opts.hotObjects ?? DEFAULT_HOT), size: 0, hits: 0, misses: 0 };
     this.arena = new Arena({
       refOf: (type, instance) => this.types.get(type)?.refAt(instance) ?? -1,
       relocate: (type, instance, ref) => this.types.get(type)!.relocate(instance, ref),
     });
+    this.store = opts.indexStore ?? null;
+    const resident = opts.indexTrees ?? defaultIndexTrees;
+    if (!resident && !this.store) this.ownStore = new MemoryIndexStore();
+    this.base = {
+      get: (k) => {
+        const v = this.unwrittenEntries()?.get(k);
+        return v !== undefined ? (v ?? undefined) : this.backing()?.get(k);
+      },
+      range: (start, end) => {
+        const stored = this.backing()?.range(start, end) ?? [][Symbol.iterator]();
+        const pending = this.unwrittenEntries();
+        return pending ? overlaid(stored, until(pending.entriesFrom(start), end)) : stored;
+      },
+    };
+    this.chunkCache = new ChunkCache(opts.treeChunks ?? DEFAULT_TREE_CHUNKS);
+    this.treeBase = {
+      get: (k) => {
+        const v = this.unwrittenEntries()?.get(k);
+        return v !== undefined ? (v ?? undefined) : (this.store ?? this.ownTreeStore)?.get(k);
+      },
+      range: (start, end) => {
+        const stored = (this.store ?? this.ownTreeStore)?.range(start, end) ?? [][Symbol.iterator]();
+        const pending = this.unwrittenEntries();
+        return pending ? overlaid(stored, until(pending.entriesFrom(start), end)) : stored;
+      },
+    };
     for (const t of types) {
       if (this.types.has(t.id)) throw new Error(`duplicate object type ${t.id}`);
-      this.types.set(t.id, new TypeIndex(t, this.retain, this.arena, this.hotBudget));
-      this.trees.set(t.id, new DenseMerkleTree(this.retain));
+      if (t.id === TOP_TREE) throw new Error(`type id ${TOP_TREE} names the tree over the types`);
+      this.types.set(t.id, new TypeIndex(t, this.retain, this.arena, this.hotBudget, this.base, resident));
+      this.trees.set(t.id, new DenseMerkleTree(this.retain, t.id));
     }
     this.order = [...this.types.keys()].sort((a, b) => a - b);
-    this.top = new DenseMerkleTree(this.retain);
+    this.top = new DenseMerkleTree(this.retain, TOP_TREE);
     this.top.resize(this.order.length);
+    this.treesResident = true;
+    if (!(opts.trees ?? defaultTrees)) this.dropTrees();
   }
 ```
 
-`order` is the type ids sorted ascending; a type's position in it is its leaf in the top tree, so the app hash depends on the set of registered types and nothing else about registration order. Duplicate type ids throw.
+`order` is the type ids sorted ascending; a type's position in it is its leaf in the top tree, so the app hash depends on the set of registered types and nothing else about registration order. Duplicate type ids throw, and so does type 0, which names the tree over the types in the store's chunk keys (the note under `src/db/id.ts` is answered here). The two views are the layering of "A dropped tier reads the store": `base`, which the types read their index entries through, is the backing store (the application's, or the in-memory stand-in a database without one builds when it first drops a tree) under the change lists of roots the application has not written yet, `unwritten`, which `unwrittenEntries()` turns into one map the first time something reads it; `treeBase` is the same over the store or the trees' own stand-in. Both stand-ins are what a store written at every root would hold now; the index one is built by `dropIndexTrees` from `indexEntries()` with the dirty set's changes taken back, the tree one by `dropTrees` from `treeEntries()`, and each goes when its tier is resident again. Every `DenseMerkleTree` is given its type id as its tree id, and a database asked to start with its trees dropped drops them at the end of construction, when the trees are empty.
 
-**The dial.** Two methods turn the cache down and up and report what the database holds:
+**The dials.** Three pairs of methods turn the tiers down and up, and two report what the database holds:
 
 ```ts
   /** Change the hot caches' shared budget at run time (the memory guard's first dial); the excess is evicted at once. */
@@ -1100,11 +1761,147 @@ export class UndoSession {
   }
 
   memory(): DatabaseMemory {
-    return { arena: this.arena.stats, hotObjects: this.hotBudget.size, hotLimit: this.hotBudget.limit, historyBytes: this.historyBytes };
+    const withIndices = [...this.types.values()].filter((ti) => ti.type.indices.length > 0);
+    const resident = withIndices.filter((ti) => ti.resident).length;
+    const indexTrees = resident === withIndices.length ? 'resident' : resident === 0 ? 'dropped' : 'partial';
+    return {
+      arena: this.arena.stats,
+      objects: this.hotBudget.limit === Infinity ? 'resident' : 'capped',
+      hotObjects: this.hotBudget.size,
+      hotLimit: this.hotBudget.limit,
+      historyBytes: this.historyBytes,
+      indexTrees,
+      trees: this.treesResident ? 'resident' : 'dropped',
+      treeChunks: this.chunkCache.size,
+      treeChunkLimit: this.chunkCache.limit,
+      hotHits: this.hotBudget.hits,
+      hotMisses: this.hotBudget.misses,
+      chunkHits: this.chunkCache.hits,
+      chunkMisses: this.chunkCache.misses,
+    };
   }
 ```
 
-`setHotLimit` changes the shared limit and lets every type evict down to it at once; the node calls it on every level change of the memory guard, when its application is the core one ([chapter 8](08-node.md)). A limit below what is pinned is not met until the next root unpins: written objects stay whatever the budget. `memory()` reports the arena's `stats`, the decoded objects cached and their limit, and the bytes of past values the window keeps, which `historyBytes` counts up as history is recorded or loaded and down as it is pruned; the RPC's `status` carries it ([chapter 12](12-rpc.md)).
+`setHotLimit` changes the shared limit and lets every type evict down to it at once; the node calls it on every level change of the memory guard, when its application is the core one ([chapter 8](08-node.md)). A limit below what is pinned is not met until the next root unpins: written objects stay whatever the budget. `memory()` reports the arena's `stats`; each tier's mode, the index trees counted over the types that have indices so that a type without any does not make the answer `partial`; the decoded objects cached and their limit; the bytes of past values the window keeps, which `historyBytes` counts up as history is recorded or loaded and down as it is pruned; the chunks cached for dropped trees and their limit; and the hit and miss counts of both caches, from which a rate follows; the RPC's `status` carries it all ([chapter 12](12-rpc.md)). The index tier's dial:
+
+```ts
+  /**
+   * Drop the B+ trees of one type's secondary indices, or of every type's: lookups and scans then read the store,
+   * with the writes since the last root laid over it. Sessions may be open; the overlay starts from what is dirty.
+   */
+  dropIndexTrees(type?: ObjectType<any>): void {
+    if (!this.backing()) {
+      // No application store: one in memory stands in, holding what a store written at every root would hold now,
+      // the entries as of the last root (none before the first). That is the trees as they stand with the writes
+      // since then taken back: a key a write took and released again before the drop must not linger in it.
+      const own = new MemoryIndexStore();
+      if (this.version >= 0) {
+        for (const type of this.order) own.apply(Array.from(this.typeIndexById(type).indexEntries(), ([key, value]) => ({ key, value })));
+        const removed: IndexEntryChange[] = [];
+        const added: IndexEntryChange[] = [];
+        for (const id of this.dirty) {
+          const ti = this.typeIndexById(typeOf(id));
+          const instance = instanceOf(id);
+          ti.diffEntries(instance < ti.nextInstance ? (ti.get(instance) ?? null) : null, this.shadow.get(id) ?? null, removed, added);
+        }
+        own.apply(removed);
+        own.apply(added);
+      }
+      this.ownStore = own;
+    }
+    for (const ti of type ? [this.typeIndex(type) as TypeIndex<AnyObject>] : this.types.values()) {
+      if (!ti.resident) continue;
+      const changed: [AnyObject | null, AnyObject | null][] = [];
+      for (const id of this.dirty) {
+        if (typeOf(id) !== ti.type.id) continue;
+        const instance = instanceOf(id);
+        changed.push([this.shadow.get(id) ?? null, instance < ti.nextInstance ? (ti.get(instance) ?? null) : null]);
+      }
+      ti.dropTrees(changed);
+    }
+  }
+
+  /** Build the dropped B+ trees again from the store (and the overlay), for one type or for all. */
+  rebuildIndexTrees(type?: ObjectType<any>): void {
+    for (const ti of type ? [this.typeIndex(type) as TypeIndex<AnyObject>] : this.types.values()) ti.rebuildTrees();
+    // The in-memory stand-in for a store is only there for dropped trees to fall back on.
+    if (!this.store && [...this.types.values()].every((ti) => ti.resident)) this.ownStore = null;
+  }
+```
+
+For each type the drop collects every dirty object of the type as the pair the overlay is built from, the value the root shadow holds (what the object was at the last root, null for one that did not exist) and the current value (null for one removed, or created and undone), and the type does the rest. Dropping with a store behind is cheap, since it touches only what is dirty; a database without one first builds the stand-in, the entries as the trees hold them with the dirty set's changes taken back (the diff run backwards, current value to committed value). Rebuilding reads a type's whole prefix, 182 to 212 ms for every type at 100,000 balances over LMDB (STATE-PAGING.md 4.4). `indexTreesResident(type)` answers for one type. The tree tier's dial is one method each way:
+
+```ts
+  /**
+   * Drop every Merkle tree, the dense chunks and the sparse nodes together: from now on a root reads the paths it
+   * changes from the store (dense chunks through the shared LRU) and writes the changed ones back through the change
+   * list, and proofs walk the store. Sessions may be open: the trees hold nothing of them but the sparse trees'
+   * writes, which become pending writes. Without an application store the trees go to a store in memory.
+   */
+  dropTrees(): void {
+    if (!this.treesResident) return;
+    if (!this.store) {
+      // What a store written at every root would hold now: the trees as of the last root (nothing before the first).
+      const own = new MemoryIndexStore();
+      if (this.version >= 0) own.apply(Array.from(this.treeEntries(), ([key, value]) => ({ key, value })));
+      this.ownTreeStore = own;
+    }
+    for (const tree of this.denseTrees()) tree.drop(this.treeBase, this.chunkCache);
+    for (const smt of this.sparseTrees()) smt.drop(this.treeBase);
+    this.treesResident = false;
+  }
+
+  /** Read every dropped tree back from the store and keep it resident again. */
+  rebuildTrees(): void {
+    if (this.treesResident) return;
+    for (const tree of this.denseTrees()) tree.rebuild();
+    for (const smt of this.sparseTrees()) smt.rebuild();
+    this.chunkCache.clear();
+    this.ownTreeStore = null;
+    this.treesResident = true;
+  }
+```
+
+The tree over the types, every type's tree and every authenticated index's sparse tree go together and come back together, and the chunk cache is emptied at the rebuild, its contents being resident again. What the guard asks before rebuilding is the estimate:
+
+```ts
+  /**
+   * About how many bytes of heap rebuilding what is dropped would take, per tier (0 for a resident one): every
+   * committed object has one entry in each of its type's indices and one leaf in each authenticated index's sparse
+   * tree. The memory guard rebuilds only what fits.
+   */
+  rebuildEstimate(): { indexTrees: number; trees: number } {
+    let entries = 0;
+    let leaves = 0;
+    let dropped = false;
+    for (const ti of this.types.values()) {
+      if (!ti.resident) {
+        dropped = true;
+        entries += ti.committedCount * ti.type.indices.length;
+      }
+      leaves += ti.committedCount * ti.authenticated.length;
+    }
+    // A dropped tier never reads zero, however empty, so that zero means nothing is dropped.
+    return { indexTrees: dropped ? Math.max(1, entries * INDEX_ENTRY_HEAP) : 0, trees: this.treesResident ? 0 : Math.max(1, leaves * SPARSE_LEAF_HEAP) };
+  }
+```
+
+`INDEX_ENTRY_HEAP` is 210 bytes and `SPARSE_LEAF_HEAP` 1,000, what dropping the two tiers gave back at 192,000 accounts within a few percent (STATE-PAGING.md section 7); the estimate comes from the committed objects, not from what was resident when the trees went, so a database whose trees were dropped from the start can still say what rebuilding would cost (`test/db.test.ts` checks 1,550 live items against 1,550,000 bytes). The last piece of the machinery is `dropChanges`:
+
+```ts
+  /**
+   * Forget the last change list once a store has written it; it holds the encoded bytes of every changed object.
+   * It is also the word that the store now holds the index entries, so dropped indices read them from there.
+   */
+  dropChanges(): void {
+    this.changes = null;
+    this.unwritten = [];
+    this.unwrittenMap = null;
+    for (const tree of this.denseTrees()) tree.release();
+  }
+```
+
+Until the application calls it, every root since the last write lays its index and tree changes over the store (`unwritten`), so a dropped index or tree between `finalizeBlock` and `commit` reads what the root said and not what the store still says, and the dense trees keep their handed-out chunks copy-on-write. `test/db.test.ts` delays the write of some roots on purpose and reads in between.
 
 **Reads.** `get(type, id)` is a map lookup for the type and then the type index's `get`, a cache hit or a decode from the arena, and returns null if the id's type does not match. `lookup(type, index, key)` is an exact match on a unique index. `scan` and `range` are prefix scans on any index, yielding objects in key order. `scanFrom(type, index, start)` yields `[key, object]` pairs from the first key at or after `start` to the end of the index, with no prefix test: it exists for paged listings, where the caller holds the last key it served and wants to resume just past it, and it yields the key alongside the object so the caller can tell where the next page starts. `nextInstance(type)` is the live counter. All of these see the live state, sessions included; the committed view is separate.
 
@@ -1226,9 +2023,18 @@ The fold applies the same first-touch rules as the writes: the parent keeps its 
 
 A created id is null, a modified or removed id is its old value, and otherwise the live object is the committed one. The outermost session is consulted first because an inner session's old value may be something the outer session wrote. `test/db.test.ts` ("proofs describe committed state while a session is open") shows a proof made with a session open verifying against the root computed before it, and `src/app/core/app.ts` serves its account, balance and global-object queries through `getCommitted` for the same reason (review finding 19 was about RPC methods that read live state instead).
 
-**Step 3: `root(version)`.** This is the only method that touches the trees. It refuses to run with a session open and requires versions to increase; the first root sets the floor and marks every type touched so that every type leaf is written. The dirty loop:
+**Step 3: `root(version)`.** This is the only method that touches the trees. It refuses to run with a session open and requires versions to increase; the first root sets the floor and marks every type touched so that every type leaf is written. Then it decides what the root reports for the index tier and runs the dirty loop:
 
 ```ts
+    // The index entries this root changes. The first root of a database writes every entry, since the store holds
+    // none of them yet, unless the objects came from a store that does (a restart); after that, each changed
+    // object's committed keys against its new ones. A database with no store to keep (none given, trees resident)
+    // reports none.
+    const removed: IndexEntryChange[] = [];
+    const added: IndexEntryChange[] = [];
+    const first = this.version < 0;
+    const reportIndices = this.backing() !== null;
+    if (reportIndices && first && !this.importsIndexed) for (const type of this.order) for (const [key, value] of this.typeIndexById(type).indexEntries()) added.push({ key, value });
     for (const id of this.dirty) {
       const type = typeOf(id);
       const ti = this.typeIndexById(type);
@@ -1249,6 +2055,7 @@ A created id is null, a modified or removed id is its old value, and otherwise t
         }
         // Encoded once here, however many times it was modified since the last root.
         bytes = pending ? encode((w) => ti.type.encode(w, pending)) : null;
+        if (reportIndices && !first) ti.diffEntries(before ?? null, pending, removed, added, instance);
         ti.flush(instance, bytes);
         if (keepHistory && before !== undefined) {
           const beforeBytes = before ? encode((w) => ti.type.encode(w, before)) : null;
@@ -1266,12 +2073,24 @@ A created id is null, a modified or removed id is its old value, and otherwise t
     }
     this.dirty.clear();
     this.shadow.clear();
+    // The trees' changes go to the store whenever there is one, and always while the trees are dropped, the store
+    // being where they live; not from the first root of a restart, whose trees the store already has.
+    const reportTrees = (this.store !== null && !(first && this.treesStored)) || !this.treesResident;
+    const treeChanges: StoreChange[] = [];
+    const indices = removed.length === 0 ? added : removed.concat(added);
+    // The store dropped indices read must say what this root says before the overlays are emptied.
+    if (this.store) {
+      if (indices.length > 0) {
+        this.unwritten.push(indices);
+        if (this.unwrittenMap) for (const c of indices) this.unwrittenMap.set(c.key, c.value);
+      }
+    } else this.ownStore?.apply(indices);
     // Pins are off; each type's hot cache comes back under the budget in one pass.
     for (const ti of this.types.values()) ti.afterRoot();
     if (historyIds.length > 0) this.valueHistoryByVersion.set(version, historyIds);
 ```
 
-Each dirty id falls into one of four cases. An instance at or past the counter was created and undone, and never existed. An instance with nothing pending was put straight into the arena by `importObject` (the first root after an import, which is the restart path): its committed bytes are hashed as they are, with no decode and no encode, and copied out of the slab with `slice()` because the change list must outlive the next compaction. A pending value that is the same reference as the shadow was written and written back (a modify undone, an object created and removed again) and is settled and skipped, which is why `test/db.test.ts` ("reports what each root changed") sees neither `b` nor `c` in the change list. Everything else is encoded once, however many times it was modified since the last root, flushed into the arena (which frees the old entry and unpins the object), hashed into its leaf and pushed onto the change list; when history is kept (`retain > 0` and this is not the first root), the value before is encoded too and remembered as bytes, both in `valueHistory` and in the record a store will write, and counted in `historyBytes`. The comparison is by reference, not by value: an object modified to an equal but distinct record is treated as changed, hashed, and reported, which is harmless. After the loop nothing is pinned, and `afterRoot` brings every type's cache back under the budget.
+Each dirty id falls into one of four cases. An instance at or past the counter was created and undone, and never existed. An instance with nothing pending was put straight into the arena by `importObject` (the first root after an import, which is the restart path): its committed bytes are hashed as they are, with no decode and no encode, and copied out of the slab with `slice()` because the change list must outlive the next compaction. A pending value that is the same reference as the shadow was written and written back (a modify undone, an object created and removed again) and is settled and skipped, which is why `test/db.test.ts` ("reports what each root changed") sees neither `b` nor `c` in the change list. Everything else is encoded once, however many times it was modified since the last root, has its index changes reported through `diffEntries` (the committed keys against the current ones, from the keys the writes kept), is flushed into the arena (which frees the old entry and unpins the object), hashed into its leaf and pushed onto the change list; when history is kept (`retain > 0` and this is not the first root), the value before is encoded too and remembered as bytes, both in `valueHistory` and in the record a store will write, and counted in `historyBytes`. The comparison is by reference, not by value: an object modified to an equal but distinct record is treated as changed, hashed, and reported, which is harmless. The index entries are reported whenever there is a store to keep them, the application's or the in-memory stand-in; the first root of a database reports every entry, the genesis, unless the objects were imported with their entries already in the store (a restart), and after that only what changed. The trees are reported whenever there is an application store, except from the first root of a restart whose trees the store already holds, and always while they are dropped, the store being where they live then. Before the overlays are emptied, the root's index changes are laid over the store (`unwritten`) or applied to the stand-in, so a dropped index keeps answering what the root says. Then nothing is pinned, and `afterRoot` brings every type's cache back under the budget and clears the overlays.
 
 Counters follow the same pattern:
 
@@ -1292,15 +2111,23 @@ Counters follow the same pattern:
     this.counterShadow.clear();
 ```
 
-Then every type tree advances, touched or not, so that historical reads line up across trees:
+Then every type tree advances, touched or not, so that historical reads line up across trees, and each one's changed chunks and nodes are collected:
 
 ```ts
+    // Every tree advances to the version, touched or not, so historical reads line up.
     for (const type of this.order) {
       const ti = this.typeIndexById(type);
       const tree = this.trees.get(type)!;
       tree.resize(ti.nextInstance);
+      tree.reporting = reportTrees;
       const typeRoot = tree.root(version);
-      const indexRoots = ti.authenticated.map((name) => ti.trees.get(name)!.commit(version));
+      for (const c of tree.takeChunks()) treeChanges.push(c);
+      const indexRoots = ti.authenticated.map((name) => {
+        const smt = ti.trees.get(name)!;
+        const r = smt.commit(version, reportTrees);
+        for (const c of smt.takeNodes()) treeChanges.push(c);
+        return r;
+      });
       const previous = this.lastIndexRoots.get(type);
       if (!previous || indexRoots.some((r, i) => !bytesEqual(r, previous[i]!))) touched.add(type);
       this.lastIndexRoots.set(type, indexRoots);
@@ -1308,10 +2135,22 @@ Then every type tree advances, touched or not, so that historical reads line up 
       const recs = tree.lastRecords;
       if (keepHistory && (recs.nodes.length > 0 || recs.sizeBefore !== null)) record.trees.push({ tree: type, records: recs });
     }
+    this.top.reporting = reportTrees;
     const root = this.top.root(version);
+    for (const c of this.top.takeChunks()) treeChanges.push(c);
+    if (keepHistory && this.top.lastRecords.nodes.length > 0) record.trees.push({ tree: TOP_TREE, records: this.top.lastRecords });
+    // As with the index entries: dropped trees must read what this root wrote before the store has it.
+    if (this.store) {
+      if (treeChanges.length > 0) {
+        this.unwritten.push(treeChanges);
+        if (this.unwrittenMap) for (const c of treeChanges) this.unwrittenMap.set(c.key, c.value);
+      }
+    } else this.ownTreeStore?.apply(treeChanges);
+    this.version = version;
+    this.changes = { version, objects, counters, history: keepHistory ? record : null, indices, trees: treeChanges };
 ```
 
-A type leaf is rewritten when its objects changed, its counter moved, or any authenticated index root changed. The sparse trees are committed here and nowhere else, so their versions coincide with the dense trees'. The top tree's records go in under `TOP_TREE`. Finally the version advances, `lastChanges` is set, and `pruneHistory(version - retain)` drops object and counter history that only serves versions outside the window, taking its bytes off `historyBytes` and mirroring the tree's `prune` (the trees prune themselves inside their own `root`). The very last step is the arena's:
+A type leaf is rewritten when its objects changed, its counter moved, or any authenticated index root changed. The sparse trees are committed here and nowhere else, so their versions coincide with the dense trees'. Whether the trees report their changes is set per root (`reporting`, and `commit`'s second argument), and whatever a root over resident trees changed in a type's tree, in its sparse trees and in the top tree is taken from each one once and gathered into `treeChanges`; a root over dropped trees reports the same way, its private copies and the nodes it wrote. The top tree's records go in under `TOP_TREE`. The tree changes are laid over the store, or applied to the stand-in, like the index changes, and the version advances and `lastChanges` is set with both lists; then `pruneHistory(version - retain)` drops object and counter history that only serves versions outside the window, taking its bytes off `historyBytes` and mirroring the tree's `prune` (the trees prune themselves inside their own `root`). The very last step is the arena's:
 
 ```ts
     if (this.retain > 0) this.pruneHistory(version - this.retain);
@@ -1322,7 +2161,7 @@ A type leaf is rewritten when its objects changed, its counter moved, or any aut
 
 A block rewrites every object it touches, so the slabs written before it collect dead entries, and the ones now more than half dead, two at most, are copied out and released here. The change list is safe from it: every byte array in it is a fresh encoding or a copy.
 
-**Step 4: what the store does with it.** `lastChanges` holds the encoded bytes of every changed object, and `src/app/core/app.ts` writes them in one key-value transaction: a put or delete per object, the moved counters, the history record under `'h' || version`, a delete of the history record for the version that just left the window, and the height and app hash. Then it calls `dropChanges()`. Review finding 36 is why that method exists: the change list after genesis is a second copy of the whole state, and after a restart (where the root is recomputed over every object) the same again, measured at 500 MiB per gigabyte of genesis; `test/genesis.test.ts` asserts `db.lastChanges` is null in both situations.
+**Step 4: what the store does with it.** `lastChanges` holds the encoded bytes of every changed object, the index entries added and removed and the chunks and nodes changed, and `src/app/core/app.ts` writes them in one key-value transaction: a put or delete per object, the index entries in order (removals first), the chunks and nodes, the moved counters, the history record under `'h' || version`, a delete of the history record for the version that just left the window, and the height and app hash. Then it calls `dropChanges()`. Review finding 36 is why that method exists: the change list after genesis is a second copy of the whole state, and after a restart (where the root is recomputed over every object) the same again, measured at 500 MiB per gigabyte of genesis; `test/genesis.test.ts` asserts `db.lastChanges` is null in both situations. Since phase two it is also the word that the store is up to date, as described under "The dials". `test/db.test.ts` checks the lists against the store after every root: written to a `MemoryKv`, the `'i'` keys equal `indexEntries()` and the `'t'` and `'n'` keys equal `treeEntries()`, and `checkIndexStore()` finds nothing to report.
 
 **Step 5: proofs at any version in the window.** `checkVersion` requires a computed root and a version in `[lowestVersion, currentVersion]`, where the database's `lowestVersion` has the same shape as a tree's: the larger of its floor and `version - retain`. `getAt(type, id, version)` and `countAt(type, version)` are the historical reads:
 
@@ -1369,7 +2208,55 @@ The first entry with `v > version` holds the value before that later change, whi
 
 The value is a copy (`slice()`), since what `bytesAt` returns may be a view into a slab that a later compaction releases. `proof(id)` is `proofAt` at the current version. `typeLeafProofAt(type, version)` returns just the type leg, which the snapshot manifest uses for every type and the importer checks against the header's app hash; `rangeProofAt(type, from, to, version)` returns the siblings for a chunk of instances; `rootAt(version)` is the app hash at a version; `typeOrder` exposes the leaf order. `proveKeyAt(type, index, key, version)` and `proveKey` build a `KeyProof` from the index's sparse tree at that version plus the same type leg, throwing `DbError` if the index is not authenticated. README.md measures a past-height object proof with verification at 37,000 per second on the gigabyte state, within a tenth of the current-height figure, because the history lookups are a few map reads per node.
 
-**Step 6: a restart.** `openObjectDatabase` in `src/app/core/app.ts` imports every stored object with `importObject(id, bytes)` (allowed only before the first root and with no session open; it puts the bytes into the arena as they are, decodes them once for the index keys, and bumps the counter past the instance), sets the counters with `setCounter` (which refuses a counter below an imported object), calls `root(height)`, compares with the stored app hash, drops the change list, and then feeds back the history records inside the window in ascending version order with `loadHistory(version, rec)`:
+**Step 6: a restart.** `openObjectDatabase` in `src/app/core/app.ts` ([chapter 11](11-application.md)) imports every stored object with `importObject(id, bytes, indexed)`, allowed only before the first root and with no session open; with `indexed`, which is the case for every store written since phase two, the bytes go into the arena as they are and the object is not decoded at all, and otherwise it is decoded once for its index keys, as before; either way the counter is bumped past the instance. Then it sets the counters with `setCounter` (which refuses a counter below an imported object), and takes the indices and the trees from the store:
+
+```ts
+  /**
+   * After importing objects whose index entries the store holds (importObject with `indexed`): fill the sparse
+   * trees, and the B+ trees where resident, from the store's entries instead of decoding every object.
+   */
+  loadIndexEntries(): void {
+    if (!this.store || this.importsIndexed !== true || this.version >= 0) throw new DbError('index entries are loaded from the store only after an indexed import');
+    // The sparse trees come from the entries unless their nodes are already in place: loaded, or in the store a
+    // dropped tree reads.
+    const sparse = this.treesResident ? !this.treesLoaded : !this.treesStored;
+    for (const ti of this.types.values()) ti.loadIndexEntries(sparse);
+  }
+```
+
+```ts
+  /**
+   * After importing objects whose trees the store holds as of the version about to be rooted (a restart): take the
+   * trees from the store instead of computing them, so the first root hashes no object and inserts no key, and
+   * reports nothing. With `checkLeaves`, every imported object is still hashed and compared with its leaf.
+   */
+  loadTrees(checkLeaves = false): void {
+    if (!this.store || this.importsIndexed !== true || this.version >= 0) throw new DbError('trees are loaded from the store only after an indexed import');
+    if (this.treesResident) {
+      for (const tree of this.denseTrees()) tree.load(this.treeBase);
+      for (const smt of this.sparseTrees()) smt.load(this.treeBase);
+    }
+    if (checkLeaves) {
+      for (const type of this.order) this.trees.get(type)!.resize(this.typeIndexById(type).nextInstance);
+      for (const id of this.dirty) {
+        const ti = this.typeIndexById(typeOf(id));
+        const bytes = ti.bytesOf(instanceOf(id));
+        if (bytes && !bytesEqual(objectLeaf(id, bytes), this.trees.get(typeOf(id))!.node(0, instanceOf(id)))) throw new DbError(`object ${id} does not hash to its leaf in the stored tree`);
+      }
+    }
+    this.dirty.clear();
+    this.treesStored = true;
+    this.treesLoaded = true;
+  }
+
+  /** The store holds the trees as of the version the first root computes, which computes them again anyway (a restart): report none. */
+  assumeStoredTrees(): void {
+    if (!this.store || this.version >= 0) throw new DbError('only a database about to take its first root over a store can assume its trees are stored');
+    this.treesStored = true;
+  }
+```
+
+`loadTrees` is the default path: every dense tree reads its chunks and every sparse tree its nodes from the store (a database whose trees start dropped reads nothing, the store being what it reads anyway), and `dirty` is cleared, so the first root hashes no object and inserts no key, and reports no tree changes (`treesStored`). The root it then computes equals the stored app hash by construction unless the store is inconsistent, so by itself it would no longer prove that the objects hash to it; with `checkLeaves`, which `openObjectDatabase` passes by default, every imported object is hashed and compared with its leaf as read from the loaded trees, about an eighth of the restart, which keeps what the old path had: a corrupt object store fails at startup, not when something reads the object. `assumeStoredTrees` is the old path kept beside it (`fromTrees: false`): the trees are computed from the objects as always, and the database is only told not to report chunks the store already has. Then `loadIndexEntries` fills the B+ trees from the `'i'` prefix, and the sparse trees too unless their nodes are already in place. Measured at 191,896 accounts (STATE-PAGING.md 5.3): the trees from the store with the leaf check 5.18 s, without it 4.56 s, computed from the objects 8.46 s. The application then calls `root(height)`, compares with the stored app hash, writes whatever a store from before these phases is missing (that root's index or tree changes), drops the change list, and feeds back the history records inside the window in ascending version order with `loadHistory(version, rec)`:
 
 ```ts
   loadHistory(version: number, rec: HistoryRecord): void {
@@ -1387,11 +2274,11 @@ It then keeps each object's "before" bytes in `valueHistory` exactly as the stor
 
 The two `lowerFloor` lines are the fix for review finding 44. A record names only the trees that changed in its version, and a `DenseMerkleTree`'s floor used to move only inside `loadRecords`, so a type whose objects did not change anywhere in the window (accounts on a quiet chain, where only balances move) kept its floor at the restart height, and `proofAt` for one of its objects at an earlier version threw `RangeError: version ... is not available` from `tree.rootAt` while `lowestVersion` admitted the version. Lowering every tree's floor is sound for exactly the reason the comment gives: a tree the record does not name was untouched in that version, so its current hashes are its hashes then. The regression test in `test/review.test.ts` reopens a store after three transfer blocks and proves both a balance (changed in every retained version) and the faucet account (changed in none) at height 2.
 
-**Step 7: rebuilding index history.** Sparse-tree versions are root pointers into an in-memory structure, so they do not survive a restart. Rather than persisting tree nodes, `rebuildIndexVersions` reconstructs them from the object history, which is possible only because the tree has one shape per key set:
+**Step 7: rebuilding index history.** Sparse-tree versions are root pointers into an in-memory structure, so they do not survive a restart; the store holds the current tree's nodes, not its past versions. `rebuildIndexVersions` reconstructs them from the object history, which is possible only because the tree has one shape per key set:
 
 ```ts
       for (const name of ti.authenticated) {
-        const rebuilt = new SparseMerkleTree(this.retain);
+        const rebuilt = ti.freshTree(name);
         const put = (obj: AnyObject | null) => obj && rebuilt.set(ti.keyFor(obj, name), encode((w) => w.u64(obj.id)));
         const drop = (obj: AnyObject | null) => obj && rebuilt.delete(ti.keyFor(obj, name));
         for (const id of candidates) put(this.getAt(ti.type, id, lowest));
@@ -1411,23 +2298,31 @@ The two `lowerFloor` lines are the fix for review finding 44. A record names onl
       }
 ```
 
-The candidates are every present instance of the type (`instances()`, which decodes nothing) plus every id of the type with history. The history holds bytes, so the keys a version released are found by decoding each changed object's earlier bytes in the loop, and `getAt` decodes the values it puts. The tree is built at the lowest version, committed, then replayed one version at a time. The comment on the inner loop is review finding 12: the first version of this code dropped and re-added per object, so when two objects swapped keys in one block (validator keys A to temporary, B to A, temporary to B), a later drop erased a key the previous put had just taken, and every affected node failed to restart with "rebuilt index does not match the live one". Dropping every released key before putting any taken key fixes it; `test/review.test.ts` reproduces the swap. The final check against the live root is the safety net: if the rebuild is wrong in any way, the node refuses to start rather than serve wrong proofs. README.md's large-genesis figures show the cost: of an 11.8 s restart, 3.7 s is this rebuild, which is why it notes the authenticated name index is "built twice, once live and once to recover past versions". The method returns early when `lowestVersion === version`, that is, when no history was loaded.
+The candidates are every present instance of the type (`instances()`, which decodes nothing) plus every id of the type with history. The history holds bytes, so the keys a version released are found by decoding each changed object's earlier bytes in the loop, and `getAt` decodes the values it puts. The tree is built at the lowest version, committed, then replayed one version at a time. The comment on the inner loop is review finding 12: the first version of this code dropped and re-added per object, so when two objects swapped keys in one block (validator keys A to temporary, B to A, temporary to B), a later drop erased a key the previous put had just taken, and every affected node failed to restart with "rebuilt index does not match the live one". Dropping every released key before putting any taken key fixes it; `test/review.test.ts` reproduces the swap. The final check against the live root is the safety net: if the rebuild is wrong in any way, the node refuses to start rather than serve wrong proofs. The rebuilt tree is made by `freshTree`, so it carries the index's node header, and `replaceTree` drops it to the store first when the tree it replaces is dropped, turning its versions into before-image records. README.md's large-genesis figures show the cost: of an 11.8 s restart, 3.7 s is this rebuild, which is why it notes the authenticated name index is "built twice, once live and once to recover past versions"; with the indices and the trees now loaded from the store, this replay is most of what is left of a restart (STATE-PAGING.md 5.3: 3.5 s of history at height 1 in a 5.2 s restart). The method returns early when `lowestVersion === version`, that is, when no history was loaded.
 
-**Bulk import and export.** `importObject(id, bytes)` loads one object into a fresh database:
+**Bulk import and export.** `importObject(id, bytes, indexed)` loads one object into a fresh database:
 
 ```ts
-  /** Load one object into an empty database, before the first root(). Counters are set separately. */
-  importObject(id: ObjectId, bytes: Uint8Array): void {
+  /**
+   * Load one object into an empty database, before the first root(). Counters are set separately. With `indexed`,
+   * the index store already holds the object's index entries (a restart from the application's store): the object
+   * is not decoded at all, and loadIndexEntries() builds the indices from the store once every object is in.
+   */
+  importObject(id: ObjectId, bytes: Uint8Array, indexed = false): void {
     if (this.version >= 0 || this.sessions.length > 0) throw new DbError('import only into a fresh database');
+    if (this.importsIndexed !== null && this.importsIndexed !== indexed) throw new DbError('an import is indexed or not throughout');
+    if (indexed && !this.store) throw new DbError('an indexed import needs the index store');
+    this.importsIndexed = indexed;
     const ti = this.typeIndexById(typeOf(id));
     // Decoded once for its index keys and not kept: the arena holds the bytes, the first root hashes them as they are.
-    ti.importCommitted(decode(bytes, (r) => ti.type.decode(r, id)), bytes);
+    if (indexed) ti.importBytes(instanceOf(id), bytes);
+    else ti.importCommitted(decode(bytes, (r) => ti.type.decode(r, id)), bytes);
     if (instanceOf(id) >= ti.nextInstance) ti.nextInstance = instanceOf(id) + 1;
     this.dirty.add(id);
   }
 ```
 
-The object is decoded once, because its index keys are computed from the decoded form, and then dropped: `importCommitted` keeps the bytes in the arena, and the id is marked dirty so the first root hashes them as they are. `exportObjects()` yields every object of every type in id order as encoded bytes, walking `instances()` and taking `bytesFor`, so nothing is decoded: the bytes are views into the arena (or a pending value's encoding), good until the next compaction, and `src/app/core/app.ts` writes them to the store at once. `counters()` returns the counters. `encodeSnapshot(height, appHash)` writes `SNAPSHOT_VERSION` (2), the height, the hash, and per type in order the counter and the present objects:
+Without `indexed` (a snapshot, or a store from before phase two) the object is decoded once, because its index keys are computed from the decoded form, and then dropped: `importCommitted` keeps the bytes in the arena, and the id is marked dirty so the first root hashes them as they are. With `indexed` nothing is decoded; the indices come from the store afterwards (`loadIndexEntries`), which needs a store to come from, and an import is indexed or not throughout, since the first root must know whether to report every entry. `treeEntries()` and `indexEntries()` yield every chunk and node, and every index entry, as they stand, which `writeImportedState` in `src/app/core/app.ts` writes into an empty store after a state-sync import. `exportObjects()` yields every object of every type in id order as encoded bytes, walking `instances()` and taking `bytesFor`, so nothing is decoded: the bytes are views into the arena (or a pending value's encoding), good until the next compaction, and `src/app/core/app.ts` writes them to the store at once. `counters()` returns the counters. `encodeSnapshot(height, appHash)` writes `SNAPSHOT_VERSION` (2), the height, the hash, and per type in order the counter and the present objects:
 
 ```ts
       w.array(this.order, (w, type) => {
@@ -1467,12 +2362,23 @@ Each object's bytes come from `bytesFor`, so a snapshot decodes and encodes noth
 - "object database: arena and hot cache: serves reads from the arena once decoded objects are evicted, and never evicts what is dirty": with a budget of two, five unrooted objects stay cached, pinned, until the root; then the cache keeps its budget while every object reads correctly from the arena, frozen, by id and by name; a removal is a tombstone that hides the object and leaves it out of the export before the root frees its bytes; and with a budget of zero a modified object stays cached until the root, then reads back from the arena.
 - "keeps history as bytes, agrees between getAt and bytesAt, and exports after churn what it holds": with a budget of one, `bytesAt` at every version is the encoding of what `getAt` returns, `historyBytes` is counted, every exported object is the encoding of what `get` returns, and the window still closes behind.
 - "computes the same roots whatever the cache budget": five versions of creates, modifies and removes give the same roots with a budget of zero as with a million.
+- "object database: index entries and dropped index trees: reports every index entry a root adds and removes, so a store written from them equals the trees": the first root reports every entry; a key changing hands in one block reports its removals before its additions; a value-only change and an object created and removed before a root report nothing; written to a `MemoryKv`, the store equals `indexEntries()` and `checkIndexStore()` is clean, and notices a deleted entry.
+- "answers lookups and merged scans from the store and the overlay while the trees are dropped": lookups and scans from the store, pending inserts in order and pending removals skipped, a key removed and re-taken yielding its new owner, uniqueness against the overlay and the store, an undone session restoring the overlay, a read between a root and its write seeing the root's changes, and a rebuild changing nothing.
+- "drops and rebuilds with the same roots and lookups as resident trees, under random writes and sessions": twelve seeds of 400 random steps on a resident twin and a dropping one, with the database's own store and with an injected `MemoryKv`, the same observations after every step and the same root at every version.
+- "round-trips a drop and a rebuild in the middle of a block without changing a root or a lookup": the dial turned inside blocks changes neither roots nor observations nor entries.
+- "object database: trees on disk and dropped trees: reports the chunks and nodes each root changes, so a store written from them holds the trees": the first root reports every chunk and node, a value change no sparse node, an emptied chunk and collapsed nodes deletions, and the store equals `treeEntries()` after every write; a database with no store reports none.
+- "gives the same roots, object proofs, key proofs and range proofs with the trees dropped, at every version in the window, through undo and compaction": the acceptance test of STATE-PAGING.md section 9: 26 versions of 3 KB items on a resident twin and one over a `MemoryKv` with a cache of three chunks, dropped and rebuilt inside sessions, some undone, the store written late for some roots, every root and every proof in the window identical, the arena compacted, the cache both hit and missed.
+- "runs on trees dropped from the start, with or without a store behind": the same roots and proofs as a resident database, and a rebuild estimate from the objects.
+- "dense merkle tree: dropped: reads its chunks through a bounded cache and computes the same roots and paths as a resident tree": fourteen versions across chunk boundaries and powers of two, dropped twice to a cache of two chunks, the same roots, paths, range proofs and stored chunks at every retained version.
+- "sparse merkle tree: dropped: gives the roots and proofs of a resident tree, writing back only the nodes it changed": forty versions over a small key space, dropped between commits and in the middle of writes, the same roots, lookups and proofs at every retained version, and a store holding exactly the resident tree's nodes.
 
 `test/arena.test.ts` tests the arena alone, with a `Map` as its owner: "stores encodings across growing slabs and reads them back" (a 300,000-byte entry opens a second slab of 512 KiB, `used` counts every header, an encoding past `MAX_ENTRY` and a reference into a slab never made are refused), and "counts freed entries dead and compacts a slab that is more than half dead, moving the live ones" (nothing is compacted while the slab is the current one; once it is not, its live quarter moves to the next slab, byte for byte, the owner gets the new references, 256 KiB is released, and a new entry never reuses the released slab's number).
 
 `test/review.test.ts` adds the regressions from REVIEW-2026-10-28.md that belong to this layer: "rebuilds index history correctly when two objects swap keys in one version" (finding 12), "prunes sparse tree versions even with a zero retention window" (finding 29), and "proves a past height for an object type nothing changed in the window, after a restart" (finding 44: an application on a `MemoryKv` runs three transfer blocks, is reopened from the store, and proves a balance and the faucet account at height 2 against `db.rootAt(2)`).
 
-`test/app.test.ts` exercises the database through the real application: "proves objects against the app hash" (a proof goes stale when another type's leaf changes the top tree); "proves past heights inside the retention window" (balances at heights 2 to 6 decode to the expected amounts, a height outside the window throws, a proof against the wrong hash fails); "proves account names present and absent, now and at past heights" (key proofs for names and symbols, tampering, a name proven absent against the genesis hash, and index roots agreeing between an object proof and a key proof at the same height); and "restarts from the store with the same app hash and keeps producing the same hashes" (after a restart the window is provable again from height 0, name proofs at past heights are byte-identical, and after more blocks the oldest versions leave memory and the store).
+`test/app.test.ts` exercises the database through the real application: "proves objects against the app hash" (a proof goes stale when another type's leaf changes the top tree); "proves past heights inside the retention window" (balances at heights 2 to 6 decode to the expected amounts, a height outside the window throws, a proof against the wrong hash fails); "proves account names present and absent, now and at past heights" (key proofs for names and symbols, tampering, a name proven absent against the genesis hash, and index roots agreeing between an object proof and a key proof at the same height); and "restarts from the store with the same app hash and keeps producing the same hashes" (after a restart the window is provable again from height 0, name proofs at past heights are byte-identical, and after more blocks the oldest versions leave memory and the store). Its second group, "core application: index entries in the store", is the application's side of the index and tree tiers: the store's entries, chunks and nodes equal the database's after every commit; an application reopened from them has the same hash and the same proofs, by the default path, with the leaves checked, recomputing from the objects, and with the trees dropped; a tampered object is caught by the leaf check and by the recomputing path; a store from before these phases is filled in on opening; a state imported from a snapshot is written with its entries and trees; and blocks run with the index trees, or both tiers, dropped and rebuilt on the way, with the mempool's session open, give the hashes, results and proofs of an application that never drops them ([chapter 11](11-application.md)).
+
+`test/memory.test.ts` drives the dials from the memory guard: a node whose heap is driven to `pressure` has its cache capped and both tiers dropped, keeps following the chain on the fallbacks, proves objects against them as a validator with resident trees does, and rebuilds them at `ok` only once the estimate fits under the warn line ([chapter 8](08-node.md)). And every suite runs with a tier dropped from the start under `INDEX_TREES=0` and `TREES=0` ([chapter 15](15-tests.md)).
 
 `test/genesis.test.ts` ("loads a genesis whose application state is in a file ...") checks that neither a fresh nor a reopened database keeps `lastChanges`, finding 36.
 
@@ -1485,17 +2391,21 @@ Known simplifications, from DESIGN.md section 10 and the code:
 - The B+ tree merges but never borrows, so fill can degrade under adversarial delete patterns.
 - Versions must be consecutive for leaf and inner history to agree (`pendingVersion` in `src/db/merkle.ts`); the code relies on callers using heights.
 - `loadSnapshot` does not check that every registered type is present (noted and left in REVIEW-2026-10-28.md).
-- All consensus state lives in memory, by design: README.md measures a 1 GB genesis at about 1.1 GB of process memory at rest, and a node joining by state sync at about three times the state during the join. Phase one of STATE-PAGING.md keeps the objects as bytes behind a bounded cache, but decoded objects were only about a sixth of the heap; the secondary indices, the name tree and the Merkle trees, the other five sixths, stay resident until the later phases put them in LMDB.
+- All consensus state is resident by default, by design: README.md measures a 1 GB genesis at about 1.1 GB of process memory at rest, and a node joining by state sync at about three times the state during the join. Every tier is now also in LMDB and the memory guard can drop the index trees and the Merkle trees, which takes the database to 40 to 50% of its resident heap, but a store cannot yet be opened with its tiers already dropped: a node builds every tier resident before the guard samples, so a heap smaller than the resident state aborts at startup (STATE-PAGING.md section 9).
+- The history window is the growth no dial can shed: past values, overwritten tree nodes and the recent transaction ids stay in memory for the window, and under load they are what drove the paging benchmark's node back to `pressure` with everything dropped (STATE-PAGING.md 7.1). Cold arena slabs are not released at `warn` either.
+- The sparse trees' past versions are not in the store: a restart replays every account to rebuild them (step 7), which is now most of what a restart costs.
+- A chunk on disk is 1,024 hashes, so a block whose leaves are scattered over a large state rewrites nearly every chunk of the trees it touches (12 MiB per root at 192,000 accounts); smaller chunks would about halve that.
 
 Exercises:
 
 1. Add borrowing from a sibling to `rebalance` in `src/db/bptree.ts` and measure average leaf fill after the random test's 60,000 operations, before and after.
 2. Convert an `ObjectProof` into two ICS23 `ExistenceProof` messages (one per leg) and check them with an off-the-shelf ICS23 verifier configured with the spec in the header of `src/db/proof.ts`.
 3. Write a property test for range proofs: for random leaf counts and ranges, `rangeProofAt` and `rootFromRange` must agree with `rootAt`, and a proof with one sibling dropped, duplicated or swapped must make `rootFromRange` return null or a different root.
-4. Persist sparse-tree versions instead of rebuilding them: write the path copied by each `set` and `delete` to the store, and compare restart time against the 3.7 s the README reports for the rebuild.
+4. Persist the sparse trees' past versions instead of rebuilding them: the store holds the current tree's nodes, and a dropped tree already keeps before-image records per commit (`src/db/smt.ts`), so write those records under a versioned key at every commit, load them at a restart, and compare the restart against the 3.5 s of history STATE-PAGING.md 5.3 reports.
 5. Authenticate a non-unique index with a sparse tree over `key || id` and design a proof for "every entry with this prefix"; note what the type leaf would have to carry.
 6. Make `loadSnapshot` strict: require every registered type in `order`, and add a test that a snapshot with a missing or extra type is rejected.
-7. Count the hot cache's hits and misses per type, report them in `memory()`, and run the genesis benchmark's block of random transfers with the cache capped at 100,000 and at 10,000: how closely does the block time follow the miss rate?
+7. Make the dense tree's chunk size a parameter of the store (STATE-PAGING.md 5.3 suggests smaller chunks on disk would about halve a scattered block's commit): keep 1,024 hashes in memory, write a chunk as several keys, and measure the commit of the scale suite's block of 2,400 random transfers and the cost of a root over dropped trees at each size.
+8. Open a store with its tiers already dropped when the heap is known to be too small for them (STATE-PAGING.md section 9 lists it as not built): `indexTrees: false` and `trees: false` already work for a database built from genesis or reopened, so what is missing is the decision in the node; measure the heap a `--heap` below the resident state needs to start on the fallbacks.
 
 ## Where to next
 

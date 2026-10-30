@@ -1,14 +1,18 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-two files, 146 cases, about 4,440 lines counting the shared harness
-in `test/helpers.ts`. The whole suite takes about a minute (70.9 s, all passing, on the run
-this chapter was checked against, under the default ML-DSA-44 keys); nearly all of that time is
-the network scenarios, which run real consensus timers. The same suite runs on the chain's other
-signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (145 passing and one skipped, the case
-that is about ML-DSA signing): every testnet and application genesis the
+`test/**/*.test.ts`: twenty-two files, 160 cases, about 5,170 lines counting the shared harness
+in `test/helpers.ts` and the setup file. The whole suite takes about a minute (70.9 s, all
+passing, on the run this chapter was checked against, under the default ML-DSA-44 keys); nearly
+all of that time is the network scenarios, which run real consensus timers. The same suite runs
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (159 passing and
+one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
-every key is derived with it. One file: `npx vitest run test/staking.test.ts`. One case, by a
+every key is derived with it. It also runs with the object database's accelerators turned off
+from the start: `INDEX_TREES=0 npm test` drops every secondary index's B+ tree, `TREES=0 npm test`
+every Merkle tree, and the two together drop both, so that every lookup, scan, root and proof
+in every suite goes through the fallbacks STATE-PAGING.md describes ([chapter 9](09-database.md));
+all four combinations pass. One file: `npx vitest run test/staking.test.ts`. One case, by a
 substring of its title: `npx vitest run test/consensus.test.ts -t partition`. The nodes are
 silent unless you ask: `LOG=debug npm test` (or `info`, `warn`) turns on the per-node logger
 through `testLogger`. The files are organised by layer, in the order of this tutorial: `units`,
@@ -16,7 +20,7 @@ through `testLogger`. The files are organised by layer, in the order of this tut
 schemes from a key pair up to a chain running on the second one; `network`, `consensus`,
 `recovery` and `engine` run the engine on the toy key-value application, and `memory` covers the
 memory guard and the collection scheduler, its node case on the core application so that the
-guard's dial on the object database shows; `chain`, `app`, `staking`, `staking-net`, `fees` and
+guard's dials on the object database show; `chain`, `app`, `staking`, `staking-net`, `fees` and
 `genesis` cover the core application; `txproof`, `light`, `rpc` and
 `sync` cover proofs, clients and catching up; `review` holds one regression test per finding of
 the external review and the later cases of the same kind, and `review2` five more that each
@@ -304,6 +308,8 @@ built by `signedTxBytes` from `src/app/core/client.ts` instead.
 export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
+    // INDEX_TREES=0 runs the suites with the index trees dropped (test/setup.ts).
+    setupFiles: ['test/setup.ts'],
     testTimeout: 60_000,
     hookTimeout: 60_000,
     // Nodes in one test share timers and the event loop; keep files sequential.
@@ -320,6 +326,28 @@ nodes advance in three seconds, or an evidence test that waits for block time to
 gives wrong answers when another file's four-node network is starving the same cores. The TCP
 test also binds fixed ports (`127.0.0.1:38881` and `38882`), which two parallel copies could
 not share. Within a file, tests already run sequentially.
+
+### `test/setup.ts`
+
+Run before every test file, it is the whole of the two environment switches:
+
+```ts
+import { setDefaultIndexTrees, setDefaultTrees } from '../src/db/database.ts';
+
+if (process.env.INDEX_TREES === '0') setDefaultIndexTrees(false);
+if (process.env.TREES === '0') setDefaultTrees(false);
+```
+
+`setDefaultIndexTrees(false)` makes every `ObjectDatabase` constructed afterwards start with its
+secondary indices' B+ trees dropped, unless its options say otherwise, so every lookup and scan
+in the run reads the index store with the overlay of the writes since the last root on top;
+`setDefaultTrees(false)` does the same for the Merkle trees, so every root, object proof and key
+proof reads chunks and nodes from the store ([chapter 9](09-database.md)). The suites are not
+written for either mode in particular, which is the point: an application test that passes with
+the trees resident and with them dropped shows that the fallback gives the same hashes and the
+same answers, and that is the acceptance test STATE-PAGING.md sets for phases three and four
+(section 9). Tests that need a particular mode say so in their own options (`indexTrees: true`
+for the resident twin in `test/db.test.ts`), and those win over the default.
 
 ## The suites, file by file
 
@@ -496,11 +524,20 @@ reading a newer entry.
 
 ### test/db.test.ts
 
-Twenty-one tests on the object database and the trees beneath it ([the database
+Thirty tests on the object database and the trees beneath it ([the database
 chapter](09-database.md)). The fixture defines two object types: `ItemType` (type id 7) with
 a unique, authenticated index `byName` and a non-unique `byGroup`, and `CounterType` (type id
 3) with no indices. `fresh()` makes a database over both, `mk` creates an item, `byName` and
-`inGroup` query the two indices.
+`inGroup` query the two indices. For the store-backed cases, `persistIndex(db, kv)` writes the
+last root's index and tree changes to a `MemoryKv` as the application's commit does and calls
+`dropChanges()`; `storeEntries` and `viewEntries` list the store's `'i'` keys and the
+database's `indexEntries()` for comparison, `storedTrees` and `treeView` do the same for the
+`'t'` and `'n'` keys and `treeEntries()`; `observe(db)` is everything the indices let a caller
+see (every name's lookup, every group's scan, a full scan of each index and a cursor from the
+middle of each) as one string; `proofsAt(db, v, names)` is everything a version can be asked to
+prove (its root, every item's and the counter's object proof, the key proofs of a list of
+names, several range proofs and both type leaves); and `prng(seed)` is a small deterministic
+generator so a failing sequence can be replayed.
 
 **`it('serves reads from the arena once decoded objects are evicted, and never evicts what is dirty')`**
 (describe `object database: arena and hot cache`). A database with `hotObjects: 2`. Five items
@@ -526,6 +563,76 @@ after the churn. Ten more roots close the window behind version 1, and `getAt` t
 creates each and from version 2 on a modify and a remove, are run with `hotObjects: 0` and with a
 million: the two lists of roots are equal. Eviction changes where an object is read from, never
 what is hashed.
+
+**`it('reports every index entry a root adds and removes, so a store written from them equals the trees')`**
+(describe `object database: index entries and dropped index trees`). A database given a
+`MemoryKv` as its `indexStore`, three items, a root: the first root reports six entries (three
+names and three group keys with the id appended); written to the store, the `'i'` keys equal
+`indexEntries()` and `checkIndexStore()` has nothing to say. Alice gives up her name and bob
+takes it in one block, with a new group: six changes, and every removal comes before the first
+addition, so applying the list in order leaves the name with bob. A change of value only, and an
+object created and removed before the root, report no entry at all. Deleting one `'i'` key from
+the store makes `checkIndexStore()` complain.
+
+**`it('answers lookups and merged scans from the store and the overlay while the trees are dropped')`**.
+After a root and its write, `dropIndexTrees()` and `memory().indexTrees` is `dropped`; a name
+lookup and a group scan come from the store. A pending insert appears in order in the scan and a
+pending removal is skipped; a key removed and then taken by another object yields the new owner,
+in the lookup and in the scan; uniqueness is checked against the overlay and the store alike,
+and a key released by a rename can be taken; an object created and removed leaves nothing
+behind; a session that renames, removes and creates while dropped is undone and `observe`
+reads exactly as before it. Between a root and the store's write of it the dropped indices read
+the root's own changes. After `rebuildIndexTrees()` the trees are `resident`, the store checks
+out, and `observe` is unchanged.
+
+**`it('drops and rebuilds with the same roots and lookups as resident trees, under random writes and sessions')`**.
+`playTwins` for seeds 1 to 12, 400 steps each, alternately with the database's own in-memory
+store and with an injected `MemoryKv`. A resident database and one that starts dropped run the
+same random sequence of creates, renames (a unique key changing hands), a name handed from one
+object to another inside a block, regroupings, removals, nested sessions committed or undone,
+roots, and, on the dropping twin only, the dial turned at arbitrary moments, sessions open or
+not; both must throw or not throw alike at every step, `observe` must agree after every step,
+and every root must match. With the injected store the write of a root is sometimes delayed to
+a later step, so the reads in between must see the root's own changes, and whenever the store
+is written it must equal the resident twin's `indexEntries()`.
+
+**`it('round-trips a drop and a rebuild in the middle of a block without changing a root or a lookup')`**.
+Six versions of ten creates, a rename into another group and a removal, run once plain and once
+with `ItemType`'s trees dropped after each version's creates and rebuilt every second version
+before the root; the roots, the observations before and after each root, and the index entries
+are identical.
+
+**`it('reports the chunks and nodes each root changes, so a store written from them holds the trees')`**
+(describe `object database: trees on disk and dropped trees`). 1,500 items, more than a chunk
+of leaves. The first root reports more than three chunks and at least 2,999 sparse nodes (a leaf
+per name and at least one inner node fewer); written, the store's `'t'` and `'n'` keys equal
+`treeEntries()`. A change of value rewrites the leaf's path and the type leaf and no sparse
+node, and deletes nothing. Removing the whole second chunk of leaves reports a chunk deletion,
+and a rename reports sparse nodes deleted as leaves move and collapse. A database with no store
+and resident trees reports no tree changes at all.
+
+**`it('gives the same roots, object proofs, key proofs and range proofs with the trees dropped, at every version in the window, through undo and compaction')`**.
+A resident database and one over a `MemoryKv` with `treeChunks: 3`, both retaining four
+versions. Twenty-six versions of 3 KB items (long names, so rewrites leave slabs mostly dead
+and the arena compacts), each with four creates, twelve modifications of which a quarter are
+renames, a removal every other version, a counter object from version 6 on, and a session that
+removes, renames and creates, undone every third version and kept otherwise; the dropping twin
+has `dropTrees()` turned at versions 1, 7, 13, 19 and 25 and `rebuildTrees()` at 4, 10, 16 and
+22, inside that session, and `dropTrees()` again at 20 outside it. Every root matches; the store is
+sometimes written only before the next version, so proofs in between read the root's own
+changes; whenever it is written it equals the resident twin's `treeEntries()`; at every version
+in the window `proofsAt` for the last twelve names, the first and a very old one is byte for
+byte the resident twin's; the chunk cache never holds more than three chunks. At the end the
+arena has compacted at least once, the trees are `dropped`, the chunk cache has both hit and
+missed, and after a final `rebuildTrees()` every proof in the window still agrees.
+
+**`it('runs on trees dropped from the start, with or without a store behind')`**. Six versions
+of 300 creates and, from the second on, 50 removes, on a database with resident trees, one with
+`trees: false` and no store, and one with `trees: false` over a `MemoryKv` written after every
+root: the same roots and the same `proofsAt` two versions back each time. `rebuildEstimate().trees`
+is `1550 * 1000` for the two dropped databases (a leaf of the name tree per live item, 1,800
+created and 250 removed, at 1,000 bytes each) and 0 for the resident one: what rebuilding would
+take comes from the objects, not from what was resident when the trees went.
 
 **`it('assigns dense ids and serves unique and range lookups')`** (describe `object database`).
 Three items get ids `objectId(7, 0)`, `(7, 1)`, `(7, 2)`; `instanceOf(c.id)` is 2. The unique
@@ -595,6 +702,17 @@ retaining 3 versions; ten versions each grow it and rewrite some leaves. After e
 recorded then, every leaf's `pathAt(i, old)` folds to that root, and a path beyond that version's
 size throws `/beyond size/`; a version outside the window throws `/not available/`.
 
+**`it('reads its chunks through a bounded cache and computes the same roots and paths as a resident tree')`**
+(describe `dense merkle tree: dropped`). Two trees retaining three versions, the second
+reporting its chunks to a `MemoryKv` after every root. Fourteen versions grow the trees across
+chunk boundaries and powers of two (600 leaves, then 250 more each time), rewrite forty random
+leaves of which every seventh is emptied, and at version 9 empty a whole chunk. The second tree
+is dropped to a `ChunkCache(2)` at versions 3 and 10 and rebuilt at 7. At every version the roots
+agree and the cache holds at most two chunks; for every retained version the roots, the paths of
+the first, last, chunk-boundary and a random leaf, and a range proof agree; and the tree's
+`entries()` equal the resident tree's, so the store holds exactly the chunks the resident tree
+would write.
+
 **`it('reproduces at a later version the proofs it made at the time')`** (describe `object
 database: versions`). A database with `retainVersions: 5`; twelve versions, each in a session,
 create, modify, every fourth remove, a counter at version 6. After each root the proof of every
@@ -634,6 +752,16 @@ root, which the tree kept.
 **`it('keeps past versions inside the window')`**. A tree retaining 2 versions; six commits,
 each adding `a_i` and deleting `a_{i-2}`. Versions 3 to 5: `rootAt` matches, `proveAt` shows
 `a_i` present with its value and `a_{i-2}` absent; `rootAt(2)` throws `/not available/`.
+
+**`it('gives the roots and proofs of a resident tree, writing back only the nodes it changed')`**
+(describe `sparse merkle tree: dropped`). Two trees retaining three versions, keyed under the
+node header of type 9, over a key space of 120 names so that leaves split and collapse often.
+Forty versions of 25 random sets and deletes; the second tree is dropped to a `MemoryKv` at
+versions 3 and 22, and at version 17 in the middle of the writes, which become pending, and
+rebuilt at 12 and 30. Before every commit `get` agrees for every seventh key; every commit's root
+equals the resident tree's; the nodes the dropped tree reports, written to the store, leave it
+holding exactly the resident tree's `entries()`; `lowestVersion` agrees; and for every retained
+version `rootAt` and the proofs of 26 keys, present and absent, agree sibling for sibling.
 
 **`it('proves index keys and rebuilds index versions from history')`** (describe `object
 database: key proofs`). A database with `retainVersions: 4`; eight versions each create `n_v`,
@@ -836,23 +964,35 @@ what V8 does on its own as well as what the scheduler asks for.
 of the core application (`appFor` makes a `CoreApp`, and the application genesis holds one
 faucet account and no inflation): two validators and a full node that is created but not
 started, then made again with
-`net.makeNode(2, { memory: { stats: () => stats(heap), intervalMs: 20 } })`, so its guard
-samples an invented heap fifty times a second; an `onMemory` listener records the levels and
-an `RpcServer` is opened on it. At height 2 the level is `ok`, the database's `hotLimit` is
-`Infinity`, and `status.memory` is `{ level: 'ok', shedding: false }`. The heap is set to 900,
-90% of the limit: within 5 s `isShedding` is true, the level is `pressure`, the `hotLimit` is
-10,000 and the cache holds no more than that (the first dial: the cache of decoded objects
-capped, the excess evicted at once), `mempool.paused` is true, `submitTx` answers
-`paused`, `broadcastTx` and `block` over the RPC reject with `-32004`, `GET /events` is 503,
-`/health` reports `memory: 'pressure'`, and `status.memory` is
-`{ level: 'pressure', shedding: true, heapUsed: 900 }`. Then the claim that matters: the node
-advances two more heights while shedding, because consensus and block sync are not what is
-shed. At 500 shedding ends within 5 s, the pool is resumed, the `hotLimit` is `Infinity` again,
-`submitTx` answers something other than `paused` (the test's key-value transaction is refused
-by the core application, not by the pause), and `block` answers. At 990 the `critical` level
-is reported; what to do then (the CLI stops the node) is the caller's, not the node's. The sequence seen is exactly `['pressure', 'ok', 'critical']`:
-10% to 90% is straight to `pressure` and 90% to 50% straight to `ok`, one sample crossing
-several thresholds each way.
+`net.makeNode(2, { memory: { stats: () => stats(heap, limit), intervalMs: 20 } })`, so its
+guard samples an invented heap against an invented limit fifty times a second; an `onMemory`
+listener records the levels and an `RpcServer` is opened on it. At height 2 the level is `ok`,
+the database's `hotLimit` is `Infinity`, and `status.memory` is `{ level: 'ok', shedding: false }`.
+The heap is set to 900, 90% of the limit: within 5 s `isShedding` is true, the level is
+`pressure`, the `hotLimit` is 10,000 and the cache holds no more than that (the first dial: the
+cache of decoded objects capped, the excess evicted at once), `memory().indexTrees` and
+`memory().trees` are both `dropped` (the second and third: every index read goes to the store
+through the overlay, every root and proof reads its paths from the store), `mempool.paused` is
+true, `submitTx` answers `paused`, `broadcastTx` and `block` over the RPC reject with `-32004`,
+`GET /events` is 503, `/health` reports `memory: 'pressure'`, and `status.memory` is
+`{ level: 'pressure', shedding: true, heapUsed: 900, database: { objects: 'capped', indexTrees: 'dropped', trees: 'dropped' } }`.
+Then the claims that matter: the node advances two more heights while shedding, because
+consensus and block sync are not what is shed, and its blocks ran against the dropped trees, so
+a hash that differed from the validators' would have stopped it there; and an object proof of
+the faucet at its height, read from the dropped trees, is byte for byte the proof a validator
+with its trees resident makes at the same height. Then the heap eases, but not far enough: the
+limit is set to four times what `rebuildEstimate()` says the two tiers would take (both
+estimates are above zero) and the heap to 64% of it, 6% below the warn line, a quarter of what
+rebuilding needs. Within 5 s shedding ends, the level is `ok`, the pool is resumed and the
+`hotLimit` is `Infinity` again, and 100 ms later, five samples, both tiers are still `dropped`:
+the node runs on the fallbacks at `ok` rather than take the heap straight back up. At 20% of the
+limit the next samples rebuild them, `trees` and then `indexTrees` read `resident`,
+`accountByName('faucet')` answers from the rebuilt index, `submitTx` answers something other
+than `paused` (the test's key-value transaction is refused by the core application, not by the
+pause), and `block` answers. At 99% the `critical` level is reported; what to do then (the CLI
+stops the node) is the caller's, not the node's. The sequence seen is exactly
+`['pressure', 'ok', 'critical']`: 10% to 90% is straight to `pressure` and 90% to 64% straight
+to `ok`, one sample crossing several thresholds each way.
 
 ### test/chain.test.ts
 
@@ -898,13 +1038,16 @@ to the transfer's.
 
 ### test/app.test.ts
 
-Eleven unit tests on `CoreApp` ([11](11-application.md)) with no network: one genesis
+Sixteen unit tests on `CoreApp` ([11](11-application.md)) with no network: one genesis
 validator, a faucet with one billion base units, zero inflation and no block reward, so every
 balance is predictable. `block(app, txs)` calls `finalizeBlock` then `commit` with
 `blockTime(h) = genesisTime + 1000n * h`. `tx(ops, keys, expiration)` signs with
 `DEFAULT_FEES` and an expiration a minute after genesis. `FEES` holds what the default schedule
 charges for a transfer and for registering the premium name `alice`. `withAlice()` is the common
-fixture: alice registered at height 1 and paid 5,000 at height 2.
+fixture: alice registered at height 1 and paid 5,000 at height 2. Eleven cases under
+`describe('core application')` cover the account and asset layer; five more under
+`describe('core application: index entries in the store')` cover what the application writes
+for the database's index and tree tiers and how it reopens from them.
 
 **`it('starts from genesis with the core asset and the faucet')`**. The faucet is `3.0` with its
 genesis balance; the core asset is `CORE`, its supply equals the faucet's balance, its issuer is
@@ -985,6 +1128,59 @@ proofs at heights 0, 1 and 2 are byte-identical to `a`'s. The next block gives t
 and `b` the same hash. After four more blocks the window slides: the lowest provable height is 3,
 height 2 throws, and the history keys in the store (prefix `0x68`) are exactly versions
 `[4, 5, 6, 7]`.
+
+The second group shares one check, `consistent(app, kv)`: the store's `'i'` keys equal
+`db.indexEntries()`, `db.checkIndexStore()` reports nothing (every resident tree entry is in
+the store with its value, and the store holds no more entries under an index's prefix than the
+tree has), and the store's `'t'` and `'n'` keys equal `db.treeEntries()`.
+
+**`it('writes the entries with every commit, reopens from them, and fills in a store that predates them')`**
+(describe `core application: index entries in the store`). An app on a `MemoryKv` is
+consistent after genesis, after a block registering alice and bob, a block paying both, and a
+transfer between them; three empty blocks and one dated two minutes on expire every recent
+transaction id, and the store is consistent again, their entries gone with them. An app
+reopened from the store has the same hash, finds bob by name and his balance, and is
+consistent: the indices came from the entries. A copy of the store with every `'i'` key left
+out, as a store written before phase two would be, opens to the same hash, and afterwards holds
+exactly the entries of the original: they were derived from the objects once and written.
+
+**`it('runs blocks with the trees dropped and rebuilt on the way, with the hashes of an app that never drops them')`**.
+`paged.db.dropIndexTrees()` reports `dropped`; every block run on the paged app and on a resident
+twin gives the same app hash and the same results: a registration, a payment next to a second
+`alice` registration that fails, a `checkTx` against the pending session, as the mempool checks,
+that refuses a name taken in the store; after `rebuildIndexTrees()` a block from alice, then
+consistent; dropped again, a block registering carol, and the store's entries equal the resident
+twin's `indexEntries()`.
+
+**`it('writes the entries of a state imported from a snapshot')`**. `exportSnapshot` in chunks
+of three objects, `importSnapshot` into a fresh database, `CoreApp.writeImportedState` into an
+empty store: the store's entries and trees equal the original app's, and an app opened on it has
+the original's hash and is consistent, the path a node that joined by state sync restarts along.
+
+**`it('writes the trees with every commit and restarts from them, with the proofs of the original')`**.
+An app on a `MemoryKv` and a twin in memory run three blocks (two registrations, two payments,
+a transfer beside a third registration) with equal hashes, and the store is consistent.
+`proofsOf(app)` collects, at every height in the window, the object proofs of the faucet, alice,
+bob, an absent account and a balance, and the name proofs of alice, carol and nobody. An app
+reopened from the store has the same hash and the identical `proofsOf`, and is consistent: the
+trees came from their chunks and nodes. `openObjectDatabase` with `{ fromTrees: false }`
+(compute the trees from the objects), `{ checkLeaves: true }` and `{ trees: false }` (start
+dropped) each give the same hash and alice's proof at every height. A copy of the store with
+alice's object overwritten by bob's bytes is refused: by the default path with
+`/does not hash to its leaf/` (the leaf check), and by the recomputing path with
+`/do not hash to the stored app hash/`. The reopened app and the twin keep agreeing on the next
+block. A copy of the store with every `'t'` and `'n'` key left out opens to the same hash and
+then holds exactly the trees of the original.
+
+**`it('runs blocks with the Merkle trees dropped and rebuilt, with the hashes and proofs of an app that keeps them')`**.
+`dropTrees()` and `dropIndexTrees()`, and `memory()` reports both `dropped`. Every block on the
+paged app and on a resident twin must agree in hash and results and, at every height in the
+window, in the faucet's object proof and the name proofs of alice and bob. While everything is
+dropped, `checkTx` refuses a second `alice` and admits a payment. After `rebuildTrees()` a block
+from alice is consistent. Then a `checkTx` registering dave leaves pending writes in the
+mempool's session, `dropTrees()` is turned in the middle of them, a block registering carol
+agrees, and the store's trees equal the resident twin's; both tiers rebuilt, the store is
+consistent.
 
 ### test/staking.test.ts
 
@@ -1820,6 +2016,11 @@ Pitfalls the existing tests have already met:
 - **Cleanup.** Stop the testnet in `afterEach`; push extra nodes into `net.nodes` so `stop()`
   reaches them; `rmSync` temporary directories; close `LmdbEnv`s and `WorkerVerifier` pools in
   `finally`. A node left running keeps timers alive into the next test.
+- **Dropped trees.** Run a new database or application test under `INDEX_TREES=0` and `TREES=0`
+  as well as resident before calling it done: a test that reaches into a type's B+ tree directly
+  (`index(name)` throws while it is dropped) or assumes a root reports no store changes will
+  pass in one mode and fail in the other. A test that is about one mode says so in its options,
+  as the twins in `test/db.test.ts` do with `indexTrees: true` and `indexTrees: false`.
 - **Ports.** The RPC uses port 0. Only the TCP p2p test binds fixed ports (38881 and 38882); a
   new TCP test should pick its own.
 

@@ -206,11 +206,9 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   cleanly and exits with code 3, so a supervisor restarts it with a larger limit instead
   of finding a dead process. Levels are hysteretic, left 5 points below the threshold
   they were entered at, so a heap hovering at a threshold does not flap, and one sample
-  may cross several. Each level also sets the first of the dials `STATE-PAGING.md` plans,
-  the object database's cache of decoded objects (section 6): unbounded at `ok`, 100,000
-  objects at `warn`, 10,000 at `pressure` and `critical`, the excess evicted at once, so a
-  filling heap trades speed for room before anything is refused (a block of transfers
-  among random accounts takes about twice as long with the cache capped). The scheduler
+  may cross several. Each level also turns the object database's dials (section 6;
+  `STATE-PAGING.md` section 7), tabled below, so a filling heap trades speed for room
+  before anything is refused. The scheduler
   moves collections to known moments: right after each
   commit, when the node idles until the next proposal, a minor collection runs
   synchronously and, once the heap has grown since the last major collection by 256 MiB
@@ -222,6 +220,41 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   process under `--max-old-space-size` of three quarters of physical memory (`--heap
   <MiB>` otherwise, at least 256), a 64 MiB semi-space and `--expose-gc`, passing
   signals on and exiting with the child's code.
+
+The guard's dials, as built (`src/node/node.ts`, `onMemoryLevel` and `rebuildWhatFits`):
+
+| level | heap used of limit | what the database does |
+|---|---|---|
+| `ok` | under 70% | the cache of decoded objects unbounded; dropped index trees and Merkle trees rebuilt, each only when it fits (below) |
+| `warn` | 70% | the cache capped at 100,000 decoded objects, the excess evicted at once; a major collection started |
+| `pressure` | 85% | the cache capped at 10,000; the index trees dropped, then the Merkle trees; the mempool paused and costly RPC methods refused, since proofs at past heights read history |
+| `critical` | 95% | clean stop, the tiers kept dropped while the node stops; reached only when one block's working set does not fit |
+
+Rebuilding is conditional because dropping takes a large state from above the pressure
+line to well below the ok line in one go (at 192,000 accounts the heap gave back 130 MiB
+for the index trees and 193 MiB for the Merkle trees), and a node that rebuilt everything
+at the first `ok` sample took the heap straight back over the pressure line: measured with
+the literal rule, it changed level 30 times in 40 seconds, rebuilding each time. So after
+a drop the node waits until ten samples have been seen (ten seconds at the default
+interval), then rebuilds a tier only when its estimated heap fits under the warn line
+beside the highest of those ten samples, the index trees first. The estimate
+(`rebuildEstimate()`) counts 210 bytes of heap per index entry and 1,000 per sparse tree
+leaf, which is what dropping them gave back at that size within a few percent. What does
+not fit stays dropped, the node running on the fallbacks at `ok`, and the guard asks again
+at every sample while the level is `ok`, logging once what it is waiting for (`memory:
+staying paged until the heap has room to rebuild`). The limit the guard measures against
+is the old generation's: V8's `heap_size_limit` adds the young generation's reserve to
+`--max-old-space-size` (192 MiB with 64 MiB semi-spaces), which long-lived objects never
+fill, and a process aborts when the old generation is full; with `--heap 744` the levels'
+lines taken from 936 MiB put `pressure` past the abort, and a node under load died without
+shedding anything, so `memoryStats()` takes the limit from `--max-old-space-size` when the
+process was started with it (in `node`'s own arguments or `NODE_OPTIONS`). The mempool
+stays paused at `pressure` although admission through the fallbacks is correct, because
+admission is what grows the heap under load: every pooled transaction pins the objects it
+touches decoded in the pending session, and a full mempool held about 330 MiB more live
+heap than an idle one in the paging benchmark. Shedding it is what lets the level come
+down, and with the rebuild conditional, `ok` is reached with the trees still dropped, so
+the node admits and commits through the fallbacks without flapping.
 
 ## 5. Signatures: ML-DSA-44 or secp256k1, chosen by genesis
 
@@ -328,13 +361,19 @@ ids make adding one unusually easy.
   (a secp256k1 key 34). Referencing accounts by id keeps a transfer at about 40 bytes
   plus its signature; the key is stored once, in the account. Ids are also what makes
   the Merkle tree below trivial.
-- **All consensus state in memory.** The disk holds a copy of every object (so a
-  restart reloads rather than replays), the history of the provable window, account
-  history and snapshots in the `app` store, next to the blocks the engine keeps.
-  State is bounded by RAM, which is the Graphene trade-off made explicit. Encodings
-  are binary and compact for that reason. `STATE-PAGING.md` specifies how memory
-  becomes a cache over LMDB, tier by tier, so that a node near its heap limit keeps
-  working, slower; its first phase, the objects kept as bytes, is built (below).
+- **Memory as a cache, LMDB as the truth.** The design began as Graphene's: all
+  consensus state in memory, the disk a copy of every object so that a restart reloads
+  rather than replays, state bounded by RAM. `STATE-PAGING.md` made memory a cache at
+  every tier and LMDB the truth, and all five of its phases are built: the `app` store
+  holds, at every committed height, every object's encoding, every secondary index entry,
+  the dense trees' chunks and the sparse trees' nodes, beside the history of the provable
+  window, account history and snapshots, next to the blocks the engine keeps. With memory
+  to spare nothing is evicted and the node runs as the Graphene design does, a lookup in
+  tens of nanoseconds; under pressure the memory guard (section 4) evicts tier by tier,
+  the decoded objects, then the index trees, then the Merkle trees, and reads fall
+  through to the store, whose memory map the operating system pages in and out. What
+  bounds the node is then the working set of one block plus the cache it is granted, not
+  the size of the state. Encodings are binary and compact in any case.
 - **Indices.** The primary index of a type is a table by instance: slot i describes
   instance i, no hashing at all (what a slot holds is the next item). A secondary index is a key encoder plus one ordered byte map. Keys are
   byte strings whose lexicographic order is the scan order: big-endian integers, strings
@@ -343,12 +382,14 @@ ids make adding one unusually easy.
   tree with fan-out 32 (the tm2 shape, without its copy-on-write persistence, since
   indices are derived state): keys in sorted arrays inside each node, binary search at
   every level, iteration by a stack of (node, child) rather than leaf links, merges on
-  underflow but no borrowing. The same tree is the in-memory key-value store. Indices
-  are rebuilt on load; the B+ trees are not part of the root, while the unique indices
-  that need proofs are authenticated by sparse Merkle trees whose roots are in the
-  type leg (see "Authenticated indices" below).
-- **Objects as bytes: the arena and the hot cache.** Specified in `STATE-PAGING.md`,
-  whose phase one is implemented in `src/db/arena.ts` and `src/db/index.ts`. The
+  underflow but no borrowing. The same tree is the in-memory key-value store. The B+
+  trees are accelerators: every entry is also a key in the `app` store (two bullets
+  down), from which a restart rebuilds them in key order and to which reads fall
+  through while they are dropped. They are not part of the root, while the unique
+  indices that need proofs are authenticated by sparse Merkle trees whose roots are in
+  the type leg (see "Authenticated indices" below).
+- **Objects as bytes: the arena and the hot cache.** Tier one of `STATE-PAGING.md`
+  (phase one), implemented in `src/db/arena.ts` and `src/db/index.ts`. The
   committed encoding of every object lives in an arena: slabs of bytes, 256 KiB first and
   doubling to 16 MiB, filled by a bump allocator, each entry a 10-byte header (type u16,
   instance u32, length u32) followed by the encoding. A type's primary index is a table
@@ -375,9 +416,35 @@ ids make adding one unusually easy.
   speed; capped at 100,000 objects, 17% less heap with an empty cache and a block of
   random transfers twice as slow. The budget it revealed: decoded objects are about a
   sixth of the heap, 0.55 KB of the 3.2 KB per account, and the secondary indices, the
-  name tree and the Merkle trees the other 2.65 KB, which is where the later phases
-  (index entries and tree chunks on disk, the in-memory structures kept as droppable
-  accelerators) aim.
+  name tree and the Merkle trees the other 2.65 KB, which is what the two tiers below
+  put on disk.
+- **Index entries on disk and droppable index trees.** Tier two of `STATE-PAGING.md`
+  (phases two and three; `src/db/indexstore.ts`). Every secondary index entry is one key
+  in the `app` store, written and deleted in the same transaction as the objects of the
+  version that changed it: `'i' type u16, index position u8, key bytes -> id u64` for a
+  unique index, and for a non-unique one the same with the id appended to the key and an
+  empty value; the position is the index's place in its type's definition. Bytewise
+  order in LMDB is the order the B+ trees keep, so a prefix scan is a range and a cursor
+  from a start key is `scanFrom`. Each root reports the entries it added and removed
+  (`Changes.indices`, removals first, so a key handed from one object to another in one
+  block ends with its new owner), by comparing the keys each dirty object had at the last
+  root with its keys now; a transfer, which changes amounts and no key, writes no entry,
+  and the first root writes every entry. The B+ trees are accelerators the guard drops at
+  `pressure` (`dropIndexTrees`) and rebuilds from the prefix when memory allows
+  (`rebuildIndexTrees`), both with sessions open. While a type's trees are dropped,
+  `lookup` is one LMDB get and `scan` an LMDB cursor merged lazily with two layers laid
+  over it: the change lists of roots the application has not written yet (the store is a
+  block behind between `finalizeBlock` and `commit`, until `dropChanges()` says it is
+  written), and per index an overlay B+ tree of the writes since the last root, a key to
+  its id or to null for a key released, which the writes keep in place of the dropped
+  tree and which a drop in the middle of a block builds from the dirty set. Uniqueness
+  checks consult the overlay, then the tree if present, then LMDB. A database without a
+  store (tests, a snapshot being imported) builds an in-memory one when it first drops a
+  tree and lets it go when every tree is resident again; `INDEX_TREES=0` starts every
+  database in the tests dropped. Measured (`docs/benchmarks.md` section 4.11): the
+  entries cost a 500-transfer block's commit about 0.7 ms, 7%, and 58 MiB of LMDB at
+  192,000 accounts; a lookup through LMDB costs about what a resident one does and a scan
+  four to six times as much, still under a microsecond an entry.
 - **Undo sessions.** Nested, Graphene style, with two uses: one session per transaction,
   undone on failure, and one pending session holding the mempool's speculative state,
   undone before every block and rebuilt by the engine's post-commit recheck. There is no
@@ -405,7 +472,9 @@ ids make adding one unusually easy.
   chunk is first set and released when its last node becomes empty, so memory follows
   the live objects rather than the counter: recent transaction ids, which come and go,
   cost only their live window. Changed objects are remembered and their paths
-  recomputed in one pass at the end of each block, shared ancestors once.
+  recomputed in one pass at the end of each block, shared ancestors once. The chunks a
+  root changes are also written to the `app` store at every commit, so the live trees
+  are an accelerator the guard can drop (see "Trees on disk" below).
 - **Versions.** root(v) is called once per block with the height as the version. With a
   retention window (default 100 heights), every overwritten node hash is remembered as
   "before version v it was x", every overwritten object as its encoding before v, and
@@ -447,25 +516,67 @@ ids make adding one unusually easy.
   another leaf that owns the subtree, which proves absence) plus the same type leg,
   so "no account named alice" is provable. The B+ tree is not hashed on purpose: its
   root would depend on node layout, which depends on the order of writes, and a node
-  rebuilds its indices from objects on restart. The sparse tree has one shape per key
-  set, so every node, after any history, hashes alike; that is also what lets past
-  index versions be rebuilt from the object history after a restart instead of
-  persisting tree nodes. Nodes are immutable and writes copy the path, so a past
-  version is a root pointer. Lookups by owner and similar non-unique indices stay
-  unauthenticated.
+  rebuilds its B+ trees from their stored entries on restart. The sparse tree has one
+  shape per key set, so every node, after any history, hashes alike; that is also what
+  lets past index versions be rebuilt from the object history after a restart (the
+  store holds the current nodes, below, not past ones). Nodes are immutable and writes
+  copy the path, so a past version is a root pointer. Lookups by owner and similar
+  non-unique indices stay unauthenticated.
+- **Trees on disk and droppable Merkle trees.** Tier three of `STATE-PAGING.md` (phase
+  four; `src/db/merkle.ts`, `src/db/smt.ts`). Every root also reports the tree chunks
+  and sparse tree nodes it wrote or deleted (`Changes.trees`), and the commit writes
+  them with the rest: dense chunks under `'t' tree u16, level u8, chunk u48`, the tree
+  being the type id or 0 for the tree over the types, a chunk stored without its
+  trailing empty hashes and deleted when it becomes all empty; sparse nodes under
+  `'n' type u16, index position u8, path bits packed, depth u8`, an inner node as `0x00`
+  with both children's hashes, a leaf as `0x01` with the key hash and the id, so a walk
+  down one key's path reads one node per level and finds every sibling hash on the way.
+  A tree's leaf count is its type's counter, which the store already keeps. A resident
+  sparse tree finds its changed nodes by walking the old and the new root together into
+  the subtrees whose hashes differ. The live trees are accelerators: the guard drops
+  them all together at `pressure` (`dropTrees`), after the index trees, and rebuilds
+  them when memory allows (`rebuildTrees`), both with sessions open. Dropped, a dense
+  tree releases its chunks, and a root works on private full-size copies of the chunks
+  it changes, read from the store through a `ChunkCache` all the database's trees share
+  (256 chunks, at most 8 MiB, so the upper levels stay resident); the copies become the
+  root's change list. A dropped sparse tree only remembers each key's last write and
+  applies them at the root by walking each key's path from the stored nodes with the
+  same shape rules, so the root is the same whatever the order; for past versions a
+  dropped tree keeps records of what each commit overwrote, as the dense trees do.
+  Proofs at the current version read the same way; proofs at past versions still need
+  the history records, which stay in memory for the window. `TREES=0` starts every
+  database in the tests dropped. Measured (`docs/benchmarks.md` section 4.12): writing
+  the chunks costs nothing measurable for a block whose writes are local and a fifth of
+  the commit (about 12 MiB of chunks) for a block scattered over 192,000 accounts; with
+  the trees dropped a root over 1,000 modifications takes 54 ms against 20 (median 24),
+  an object proof a fifth more and a name proof four times as much; the genesis store
+  grew from 92.7 to 213 MiB.
 - **Deferred execution caveat.** The state after block N is committed to by the app
   hash in header N+1, so a proof about height N is checked against header N+1 and
   that header's commit.
-- **Persistence and recovery.** State lives in memory; the key-value store holds a copy
-  of every object. Each root() reports the objects that changed and the counters that
-  moved, and the app's commit writes exactly those plus the height and app hash in
-  one LMDB transaction. On start the app reads everything back, rebuilds indices and
-  trees, checks the root against the stored app hash, and the engine replays the
-  blocks after it through the existing info() handshake. Nothing speculative is ever
-  written: the pending session is undone before the block runs.
+- **Persistence and recovery.** Each root() reports the objects that changed, the
+  counters that moved, the index entries added and removed, and the chunks and nodes
+  written or deleted, and the app's commit (`CoreApp.persist`) writes exactly those
+  plus the version's history record, the height and the app hash in one LMDB
+  transaction, so the store holds every tier's complete state at every committed
+  height. On start the app imports every object as bytes with no decode, loads the
+  dense and sparse trees from their chunks and nodes (`loadTrees`), builds the B+ trees
+  from the index entries in key order (`loadIndexEntries`; the sparse trees too when
+  the store has no nodes), and computes the root, which must equal the stored app hash.
+  A root read from stored trees equals the stored hash by construction, so the open
+  also hashes every object and compares it with its leaf (`checkLeaves`, about an
+  eighth of the restart), and a corrupt object store still fails at startup rather than
+  when something reads the object (`object <id> does not hash to its leaf in the stored
+  tree`). `checkLeaves: false` skips the check and `fromTrees: false` recomputes the
+  trees from the objects, the old path, about twice as slow: at 192,000 accounts the
+  restart went from 8.4 to 5.2 s (4.6 without the leaf check). A store written before
+  the entries or the chunks existed has no `'i'` or `'t'` prefix; opening it computes
+  what is missing from the objects and writes it once. Then the engine replays the
+  blocks after the stored height through the existing info() handshake. Nothing
+  speculative is ever written: the pending session is undone before the block runs.
 - **Reads.** With ids, a read by id is one map lookup for the type and one for the
   instance in the hot cache, or on a miss a decode from the arena; nothing is hashed. Name and symbol lookups go through the
-  B+ tree of their index, and a proof's length grows with the height of the type's
+  B+ tree of their index, or one LMDB get while the tree is dropped, and a proof's length grows with the height of the type's
   dense tree (the log of its counter), so those paths do depend on state size, though
   the measured throughput was flat at the sizes tried (`docs/benchmarks.md`). The
   signature cache is the one hash-map lookup on the hot path, on short keys. Nothing
@@ -616,9 +727,11 @@ node must continue consensus with the exact proposer priorities.
 
 ## 10. Implementation status (2026-10-30)
 
-Everything above is implemented in TypeScript under `src/`. 146 tests in 22 files
+Everything above is implemented in TypeScript under `src/`. 160 tests in 22 files
 pass, and the whole suite passes under either signature scheme
-(`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there). The engine
+(`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there) and with
+either tier of state paging dropped from the start (`INDEX_TREES=0`, `TREES=0`, or
+both: every lookup, scan, root and proof through the store). The engine
 tests (consensus, recovery, network, units) run on the key-value test app; the
 database and application have their own suites, and one test runs the core application
 on a live four-validator network with a full node, gossiping signed transactions and
@@ -639,11 +752,21 @@ its levels on injected samples, checks the scheduler's decisions against an inje
 collector and its observer against real collections, and runs a full node of the core
 application in a two-validator testnet through load shedding and back while it keeps
 following the chain, its database's cache capped at `pressure` and unbounded again at
-`ok`. Phase one of state paging (`STATE-PAGING.md`) has cases of its own: the arena suite
-grows slabs, counts dead bytes and compacts, and the database suite evicts clean objects
-and never dirty ones, keeps history as bytes, and computes the same roots whatever the
-cache budget. Phases two to four of that specification are designed and not built, and of
-phase five only the first dial, the cache cap, is.
+`ok`, its index trees and Merkle trees dropped at `pressure` while it follows the chain
+and proves objects through the store, kept dropped at `ok` while rebuilding is estimated
+not to fit, and rebuilt once it does. State paging (`STATE-PAGING.md`) has cases of its
+own: the arena suite grows slabs, counts dead bytes and compacts; the database suite
+evicts clean objects and never dirty ones, keeps history as bytes, checks that the
+entries, chunks and nodes each root reports equal the trees when applied to a store,
+plays randomised writes, nested sessions, roots, drops and rebuilds against a database
+that never drops, and requires the roots, object proofs, key proofs and range proofs of
+a dropped database to equal a resident one's at every version in the window; the
+application suite restarts from the stored entries and trees, catches a tampered object
+by the leaf check, fills in a store written before them, and runs blocks with both tiers
+dropped and rebuilt against an application that never drops. All five phases are built;
+the paging benchmark (`docs/benchmarks.md` section 4.13) ran a node under a heap limit of
+1.25 times its resident state for 40 seconds, through `pressure` with every tier
+dropped, for 107 blocks and 59,128 transfers without an abort.
 
 | module | what it is |
 |---|---|
@@ -654,9 +777,9 @@ phase five only the first dial, the cache cap, is.
 | `src/mempool.ts` | FIFO pool with checkTx admission and post-commit recheck |
 | `src/p2p/` | transport interface, in-memory and TCP transports, wire messages, peer database, network with handshake and peer exchange |
 | `src/node/` | block executor with crash recovery, the memory guard with load shedding and the collection scheduler, and the node that wires everything |
-| `src/db/` | object ids, index keys, B+ tree, sparse Merkle tree, the arena of encoded objects (`arena.ts`), per-type indices with a bounded cache of decoded objects, deep freezing of records (`freeze.ts`), dense Merkle tree with chunks and versions, ICS23-shaped object and key proofs, the database with undo sessions and persisted history |
+| `src/db/` | object ids, index keys, B+ tree, sparse Merkle tree with its nodes on disk, the arena of encoded objects (`arena.ts`), per-type indices with a bounded cache of decoded objects and droppable B+ trees, the index entries' disk form and the merged cursor over store and overlay (`indexstore.ts`), deep freezing of records (`freeze.ts`), dense Merkle tree with chunks and versions and a shared chunk cache for dropped trees, ICS23-shaped object and key proofs, the database with undo sessions, persisted history and the memory dials |
 | `src/store/` | key-value interface with environment-wide transactions, in-memory and LMDB stores, block store on top with headers kept alone |
-| `bench/` | benchmarks (`npm run bench`): crypto, codec, database, store, application, a four-validator network with block sync, and (`npm run bench:genesis`) a gigabyte genesis: load time, memory, disk, reads at that size, restart, then at that scale a live node serving RPC under load, scattered batch transfers, proofs at past heights, history, and a state-sync import |
+| `bench/` | benchmarks (`npm run bench`): crypto, codec, database, store, application, a four-validator network with block sync, and (`npm run bench:genesis`) a gigabyte genesis: load time, memory, disk, reads at that size, restart, then at that scale a live node serving RPC under load, scattered batch transfers, proofs at past heights, history, and a state-sync import, and (`npm run bench -- paging`) the same state under the memory guard: a node in a child process under a heap limit of 1.25 times its resident heap with its mempool kept full for 40 seconds, then the database through each mode the guard sets |
 | `src/light/` | light client with bisection forward and the hash chain walked backward, node-backed and RPC providers, and the checks on state, key and transaction queries |
 | `src/rpc/` | JSON-RPC server with events and limits, JSON shapes, methods, a fetch client |
 | `src/wallet/` | encrypted keystore, written under a lock file |
@@ -705,17 +828,31 @@ done about each finding.
 - Index roots inside a type leaf are the SMT roots at that height; the B+ tree indices used for lookups are not authenticated.
 - The version history window is not trimmed under memory pressure: shedding touches the
   mempool, the RPC and the signature cache, and the guard caps the database's cache of
-  decoded objects, while the trees keep their own retention
-  (`retain.versions`), so a node whose history is what fills the heap needs a smaller
-  window or a larger heap. Trimming it on `pressure` is further work.
+  decoded objects and drops its index trees and Merkle trees, while the history keeps
+  its own retention (`retain.versions`). It and the recent transaction ids are the
+  growth no dial sheds (a block of scattered transfers adds tens of thousands of
+  records), and they are what drove the paging benchmark's node back to `pressure` with
+  everything dropped, so a node whose history is what fills the heap needs a smaller
+  window or a larger heap. Paging the window is further work.
 - The mempool is bounded by count, 10,000 transactions, not by bytes; each may be up to
-  1 MiB. Under pressure the node pauses admission rather than trimming the pool.
+  1 MiB. Under pressure the node pauses admission rather than trimming the pool, although
+  admission through the dropped tiers would be correct: a full mempool's pending session
+  pins every object it touches decoded in the cache, about 330 MiB more heap than idle in
+  the paging benchmark, and shedding it is what lets the level come down.
 - ArrayBuffers (ML-DSA keys, stored bytes, the arena's slabs) live outside the V8 heap and
   outside the memory guard's fraction; a machine that runs out of physical memory for them
   meets the operating system's killer, not V8's limit. The guard reports `arrayBuffers` and
   `rss` beside the heap figures but acts on the heap alone.
-- Phase one of state paging alone does not reduce memory much: decoded objects are about
-  a sixth of the heap per account, and the secondary indices, the name tree and the
-  Merkle trees, all still resident, are the bulk. Phases two to four of `STATE-PAGING.md`
-  (index entries and tree chunks in LMDB, the in-memory structures dropped under
-  pressure) are what would let a state larger than the heap keep committing.
+- What the memory guard can drop saves 50 to 60% of the resident heap, not more: with
+  the cache capped and both tiers dropped the database runs on 40 to 50% of it (at
+  192,000 accounts the index trees give back 130 to 175 MiB, the Merkle trees 190 to
+  220 MiB and the cache up to 190 MiB), at 5 to 20% less throughput, all of it in the
+  commit. Of `STATE-PAGING.md` three things are not built: cold arena slabs are not
+  released at `warn`, so the encoded copy of every object stays in memory at every
+  level; a store cannot be opened with its tiers already dropped, so a node whose
+  `--heap` is below its resident state aborts at startup rather than paging from the
+  first block; and the store holds the sparse trees' current nodes only, so a restart
+  rebuilds their past versions by replaying every account, most of what remains of a
+  restart (3.5 s of 5.2 at 192,000 accounts). And chunks of 1,024 hashes on disk make a
+  block scattered over the state rewrite nearly every chunk it touches, a fifth of the
+  commit at that size; smaller chunks would cut it about in half.

@@ -11,6 +11,8 @@ npm run bench                  # crypto, codec, db, store, app, network: about t
 npm run bench -- db app        # a subset
 npm run bench:genesis          # the genesis and scale suites on a 1 GB genesis: about six minutes
 BENCH_GENESIS_MB=100 npm run bench:genesis   # a smaller genesis
+CHAIN_SCHEME=secp256k1 BENCH_GENESIS_MB=56 npm run bench -- paging   # the paging suite: that state under the memory guard's modes (section 4.13)
+BENCH_PAGING_HEAP=700 CHAIN_SCHEME=secp256k1 BENCH_GENESIS_MB=56 npm run bench -- paging   # with the node's heap limit set in MiB
 BENCH_KEEP=1 npm run bench:genesis           # keep the generated files and stores for inspection
 BENCH_LOG=debug npm run bench -- network     # log the late-joining node of the network suite
 CHAIN_SCHEME=secp256k1 npm run bench         # every suite on secp256k1 keys; ML-DSA-44 without it
@@ -18,8 +20,11 @@ CHAIN_SCHEME=secp256k1 npm run bench         # every suite on secp256k1 keys; ML
 
 Both scripts run Node with `--expose-gc` so memory can be measured after a collection. Nothing
 else is special: the benchmarks are plain TypeScript run by Node like the rest of the code.
-Temporary files go under the system temp directory. The genesis and scale suites keep theirs when
-`BENCH_KEEP` is set; the app and store suites always remove theirs.
+Temporary files go under the system temp directory. The genesis, scale and paging suites keep
+theirs when `BENCH_KEEP` is set; the app and store suites always remove theirs. The paging
+suite is not part of `bench:genesis`: it builds the same large state, runs a node in a child
+process under a real heap limit for 40 seconds and then the database through each mode the
+guard can set, so it is asked for by name.
 
 Each suite prints its results as it goes and the runner ends with two markdown tables: one of
 rates (`ops/s`, mean, median and 99th percentile of an iteration) and one of measurements that
@@ -209,8 +214,8 @@ memory and to LMDB. The genesis has 1,001 accounts; transfers are pre-signed.
 | finalizeBlock 500 transfers, warm (signatures cached by checkTx) | 27,400 | 18 ms |
 | finalizeBlock 1,500 transfers, warm (about 3.6 MiB with a block shell) | 26,100 | 57 ms |
 | finalizeBlock, empty block | 31,700 | 32 µs |
-| commit to memory (after a 500-transfer block) | 380 | 2.6 ms |
-| commit to LMDB (after a 500-transfer block) | 114 | 8.8 ms |
+| commit to memory (after a 500-transfer block) | 260 to 320 | 3.1 to 3.9 ms |
+| commit to LMDB (after a 500-transfer block) | 104 | 9.6 ms |
 
 Genesis with 1,001 accounts parses, applies and roots in 79 ms.
 
@@ -221,8 +226,13 @@ signature must be verified, runs at the pool's speed, 6,300 a second. The differ
 whole cost of signatures and the reason the mempool verifies at admission: a validator that saw
 the transactions through gossip spends 57 ms on 1,500 transfers (about 3.6 MiB with a block
 shell; the benchmark hands the transactions straight to the application, without building a
-block), one that did not spends 240 ms. Commit to LMDB is 9 ms, one write transaction for the
-application's store.
+block), one that did not spends 240 ms. Commit to LMDB is 9.6 ms, one write transaction for the
+application's store. It was 8.8 ms before the secondary index entries and the Merkle trees'
+chunks and nodes were written in that transaction with the objects (sections 4.11 and 4.12): a
+500-transfer block writes about a thousand entries (each transfer leaves a recent transaction
+id, which has two indices; the balances change no key), about 0.7 ms, 7%, and at 1,001 accounts
+its chunks cost nothing measurable. Commit to memory carries the same bookkeeping, 2.6 ms
+before and 3.1 to 3.9 since.
 
 ### 4.6 network
 
@@ -272,6 +282,11 @@ root (hash every object, build the trees, build the name tree) and a single LMDB
 of 614 MiB. The restart costs more than the build because the store is read object by object
 and the name tree is built twice: once live while importing, once in `rebuildIndexVersions` to
 recover past-version proofs. The second build is the one obvious saving left on this path.
+Since this run the restart path has changed (section 4.12): the trees come back from their
+stored chunks and nodes and the indices from their stored entries, so the live build of the
+name tree and the hashing of every object are gone from it, and what remains is the import,
+a check of every object against its leaf and the rebuild of the name tree's past versions. The
+ML-DSA-44 gigabyte was not rerun; the 192,000-account secp256k1 run went from 8.4 to 5.2 s.
 
 ### 4.8 scale
 
@@ -323,11 +338,11 @@ method; the crypto rows are in section 4.1. What changed:
 | network: 6,000 transfers submitted to one node | 5.4 s, 1,116 tx/s, blocks full at 1,664 | 3.7 s, 1,618 tx/s, blocks of 1,000 |
 | block sync of those blocks | 4,629 tx/s | 6,182 tx/s |
 | genesis of 192,000 accounts: parse | 6.4 s at 157 MiB/s | 2.3 s at 25 MiB/s |
-| genesis: build (apply, root, persist) | 8.0 s | 5.7 s |
+| genesis: build (apply, root, persist) | 8.0 s | 5.7 s (7.8 s since the index entries, chunks and nodes are written with it; section 4.12) |
 | memory after building: heap + array buffers | 584 + 536 MiB | 597 + 41 MiB |
 | peak resident set during the build | 3.7 GB | 1.7 GB |
-| LMDB on disk, then with a snapshot | 614 MiB, 1,120 MiB | 34.6 MiB, 68.3 MiB |
-| restart from LMDB | 11.8 s | 8.7 s |
+| LMDB on disk, then with a snapshot | 614 MiB, 1,120 MiB | 34.6 MiB, 68.3 MiB (the state 213 MiB since; 4.12) |
+| restart from LMDB | 11.8 s | 8.7 s (5.2 s from the stored trees; 4.12) |
 | RPC account by name with a proof, 16 clients | 6,467 calls/s | 8,155 calls/s |
 | broadcastTx of 2,000 transfers, 16 clients | 2,456 tx/s | 3,130 tx/s |
 | scattered batch transfers applied | 18,700/s | 18,360/s |
@@ -345,7 +360,12 @@ there is the commit cadence, not the limit. The one number that does not shrink 
 are array buffers, 536 MiB against 41) and what the heap holds is the object database itself,
 the account, balance and authority objects, the index entries, the tree chunks and the name
 tree. That is about 3.2 KB per account under either scheme, and it is the floor the next
-section sizes from; section 4.10 measures how it divides.
+section sizes from; section 4.10 measures how it divides. Three secp256k1 rows carry a second
+figure: the build, the store and the restart moved when the index entries and the trees' chunks
+and nodes began to be written with the objects (sections 4.11 and 4.12), the store sixfold, the
+build a third slower and the restart two fifths shorter. The ML-DSA-44 column was not rerun;
+the entries, chunks and nodes hold ids, names and hashes, not keys, so the same additions are
+expected there.
 
 ### 4.10 The arena
 
@@ -373,8 +393,185 @@ one) and 5 to 15% of speed, while capped it saves 17% of the heap with an empty 
 of a block of random transfers taking twice as long, which is the degraded mode the memory guard
 turns on rather than a mode to run in. By itself it does not move memory much, because decoded
 objects were only about a sixth of the heap, 0.55 KB of the 3.2 KB per account, and the rest is
-the secondary indices, the name tree and the Merkle trees, which is what the later phases of the
-specification put on disk.
+the secondary indices, the name tree and the Merkle trees, which is what the next two sections
+put on disk.
+
+### 4.11 The index tier
+
+Phases two and three of [STATE-PAGING.md](../STATE-PAGING.md) (section 4 there): every
+secondary index entry is one LMDB key in the application store, written in the same transaction
+as the objects of the version that changed it, and the B+ trees become accelerators the memory
+guard can drop, lookups and scans falling through to the store merged with the writes since the
+last root ([DESIGN.md](../DESIGN.md) section 6). Measured against the phase-one code on the same
+machine, alternating the two (single runs vary by about 5%, so most rows give the range of
+several); the genesis rows at 191,896 accounts under secp256k1 (56 MB):
+
+| | before | after |
+|---|---:|---:|
+| commit to LMDB (after a 500-transfer block) | 8.65 to 9.21 ms, mean 8.95 | 8.86 to 10.0 ms, mean 9.63 |
+| commit to memory (after a 500-transfer block) | 2.55 to 2.88 ms | 3.13 to 3.87 ms |
+| modify 1,000 balances + root (db suite, no store) | 19.3 to 19.6 ms | 19.7 to 19.8 ms |
+| first root over 100,000 objects (db suite, no store) | 323 to 326 ms | 347 to 354 ms |
+| genesis: build (apply, root, persist) | 5.96 s | 6.67 to 6.73 s |
+| of which root / persist | 1,569 / 406 ms | 1,809 to 1,903 / 946 to 959 ms |
+| LMDB on disk after genesis | 34.6 MiB | 92.7 MiB |
+| block of 500 transfers at that size: commit to LMDB | 10.6 ms | 11.8 to 12.2 ms |
+| restart from LMDB | 8.92 s | 8.43 to 8.49 s |
+| of which import / indices and root | 3,899 / 1,119 ms | 281 to 298 / 4,462 to 4,508 ms |
+| heap after a restart | 585 MiB | 572 MiB (array buffers 79 to 90 MiB) |
+
+The fallback, from the db suite at 100,000 balances and 21,000 accounts (per 1,000 lookups and
+per 100 scanned entries, the same runs):
+
+| | resident | dropped, in-memory store | dropped, LMDB |
+|---|---:|---:|---:|
+| lookup by unique index (byOwnerAsset), 1,000 | 1.04 to 1.34 ms | 1.18 to 1.46 ms | 1.02 to 1.20 ms |
+| scan 100 entries of a non-unique index (byAsset) | 9 to 13 µs | 24 to 28 µs | 50 to 57 µs |
+| modify 1,000 balances + root | 19.7 to 20.8 ms | 22.1 to 23.0 ms | |
+| rebuild every index tree | | 130 to 138 ms | 182 to 212 ms |
+
+Analysis. A 500-transfer block writes about a thousand entries (each transfer leaves a recent
+transaction id, which has two indices; the balances change no key), so its commit costs about
+0.7 ms more, 7%. The genesis writes 576,000 entries (a name, an owner-asset key and an asset
+key per account): a third of a second to list them at the first root, half a second to write
+them, and 58 MiB of LMDB, about 100 bytes an entry with LMDB's page overhead; peak RSS during
+the build rose with them (1.69 to 2.18 GiB), the heap after building did not (607 MiB). A
+restart now builds the indices from the stored entries, in key order and with no object
+decoded, which took the import from 3.9 s to 0.3 s and moved the work into the indices-and-root
+phase; it is as fast, within a few percent, as decoding every object for its keys was (the old
+path, kept for a store that predates the entries, took 8.49 s against 8.43 in the same run),
+because both are dominated by hashing the name tree, which section 4.12 removes. A lookup
+through LMDB costs about what a resident one does, since both are dominated by building the key
+and fetching the object (the resident row varies more between runs than the difference); a scan
+costs four to six times as much, the price of copying every key and value out of LMDB and
+merging two cursors, still under a microsecond an entry. At genesis scale, `account by name`
+over 192,000 accounts measured 1.78 ms per 1,000 resident against 1.81 in a direct comparison of
+the two builds (15 rounds each, medians), about 2%. The db suite's rows carry no store, so they
+show only the bookkeeping, the keys kept per dirty object.
+
+### 4.12 The trees tier
+
+Phase four of [STATE-PAGING.md](../STATE-PAGING.md) (section 5 there): the dense trees' changed
+chunks and the sparse trees' changed nodes are written at every root, the live trees become
+accelerators the guard drops after the index trees, a root over dropped trees reads each changed
+leaf's path through a bounded chunk cache and writes the changed chunks back, and a restart
+takes the trees from the store, hashing every object against its leaf. Measured against the
+phase-three code on the same machine; the genesis rows at 191,896 accounts under secp256k1
+(56 MB), single runs:
+
+| | before | after |
+|---|---:|---:|
+| genesis: build (apply, root, persist) | 6.94 s | 7.80 s |
+| of which root / persist | 1,861 / 973 ms | 2,125 / 1,672 ms |
+| LMDB on disk after genesis | 92.7 MiB | 213 MiB |
+| heap after building | 607 MiB | 607 MiB |
+| restart from LMDB | 8.41 s | 5.2 s (4.6 s without the leaf check) |
+| of which indices, trees and root | 4,518 ms | 761 ms |
+| heap after a restart | 572 MiB | 572 MiB |
+| block of 500 transfers (accounts 0 to 500): commit to LMDB | 13.2 ms | 13.6 ms |
+| scale suite, block of 2,400 transfers among random accounts: commit | 45.7 ms | 55.1 ms |
+| scale suite, state sync: write the imported state / open it | 1.09 / 5.72 s | 1.84 / 1.59 s |
+| commit to LMDB (after a 500-transfer block), 1,001 accounts | 9.72 ms | 9.48 to 9.96 ms |
+| first root over 100,000 objects (db suite, no store) | 358 ms | 347 to 356 ms |
+| modify 1,000 balances + root (no store) | 19.3 to 20.5 ms | 19.8 to 20.4 ms |
+| modify 10,000 balances + root (no store) | 159 to 162 ms | 161 to 167 ms |
+
+The three ways to reopen the same store, in one run: the trees from their chunks and nodes
+with every object hashed against its leaf (the default) 5.18 s, the same without the leaf
+check 4.56 s, the trees computed from the objects 8.46 s.
+
+Dropped trees, from the db suite (100,000 balances and 21,000 accounts, the trees over LMDB;
+means, and medians where a first cold iteration pulls the mean):
+
+| | resident | dropped |
+|---|---:|---:|
+| modify 1,000 balances + root | 20.2 ms | 53.7 ms (median 23.8) |
+| modify 10,000 balances + root | 170 ms | 207 ms (median 179) |
+| object proof, current version, per 100 | 1.13 ms | 1.35 ms |
+| object proof, past version, per 100 | 1.14 ms | 1.35 ms |
+| name proof (sparse tree), per 100 | 428 µs | 1.87 ms |
+| drop / rebuild every tree | | 0.3 / 180 ms |
+
+Analysis. The genesis writes about 600,000 sparse nodes (the name tree of 192,000 leaves and
+their inner nodes) and 25 MiB of chunks: 120 MiB more of LMDB, 0.7 s more to write and a
+quarter of a second more to list at the first root, which, with the entries of section 4.11, is
+where the build's 5.9 s of section 4.10 became 7.8. A block's commit costs what its chunks
+cost: a chunk holds 1,024 hashes, so a block whose leaves are spread over the whole state
+rewrites nearly every chunk of the trees it touches, 6.1 MiB per root for a thousand random
+balances among 100,000 and the same for ten thousand, about 12 MiB at 192,000 accounts, where
+the commit of a scattered block grows by a fifth (9 ms); a block whose writes are local (the
+genesis suite's transfers among consecutive accounts) costs nothing measurable, nor does the
+1,001-account application suite. Smaller chunks on disk would cut the scattered case about in
+half at this size. The restart is the gain: the trees come back from their chunks and nodes, so
+the first root hashes no object and inserts no key into a sparse tree, and 8.4 s became 5.2, of
+which the leaf check (every object hashed and compared with its leaf, so that a corrupt object
+store still fails at startup) is about an eighth; what is left is mostly the history, 3.5 s at
+height 1 to rebuild the sparse trees' past versions by replaying every account, which the store
+does not hold in a form to load. A root over dropped trees costs about what a resident one does
+once the upper levels are cached (215 of the 256 cached chunks after these runs); the first one
+after a drop reads every chunk it touches from LMDB, which is the cold iteration behind the
+53.7 ms mean. Object proofs cost about the same dropped as resident, being dominated by building
+the proof rather than reading twenty hashes; a name proof reads about twenty nodes from LMDB and
+costs four times as much. Rebuilding reads 400 chunks and the name tree's 42,000 nodes, and
+every retained version of the name tree from the records. The state-sync rows moved both ways:
+writing the imported state now writes its entries, chunks and nodes too (1.09 to 1.84 s), and
+opening it takes the trees from them (5.72 to 1.59 s).
+
+### 4.13 paging
+
+`CHAIN_SCHEME=secp256k1 BENCH_GENESIS_MB=56 npm run bench -- paging` builds the 191,896-account
+state of section 4.9 and runs it through the memory guard's modes (STATE-PAGING.md section 7.1).
+First a node, in a child process started with `--max-old-space-size=744`, 1.25 times the heap of
+the resident state (595 MiB): a single validator over the store, its mempool kept two blocks
+ahead with transfers among random accounts, for 40 seconds (`BENCH_PAGING_HEAP` sets another
+limit in MiB).
+
+| seconds | what happened |
+|---|---|
+| 0 | store opened in 1.24 s (the trees from their chunks), 396 MiB of heap; 3,300 to 3,600 transfers per 2 s |
+| 4 to 9 | `warn` (the cache capped) as the mempool's pending session and the history window fill the heap |
+| 9.2 | `pressure` at 669 MiB: mempool paused, index trees and Merkle trees dropped; next sample 225 MiB, `ok` |
+| 13.3 | after ten samples, the index trees rebuilt; the Merkle trees stay dropped, 183 MiB needed and 96 MiB of room |
+| 21.5 | `pressure` again at 633 MiB, index trees dropped; from then on rebuilding never fits (313 MiB needed, no room) |
+| 30 to 43 | `warn` and `pressure` alternate around 550 to 580 MiB after collections, all tiers dropped, mempool paused and resumed |
+
+In all: 107 blocks and 59,128 transfers in 40 s (1,478 a second, against 1,700 to 1,800 in the
+first eight seconds), 79 of the blocks and 44,036 of the transfers committed with the Merkle
+trees dropped, and no abort.
+
+Then the database alone, in the parent process after the node session (so with a full history
+window): blocks of 500 random transfers, six per mode, checked through `checkTx` first as
+admission does, then finalized and committed to LMDB; the modes added up as the guard's levels
+add them:
+
+| mode | blocks/s | transfers/s | finalize | commit | checkTx of 500 | heap after | array buffers |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| resident | 7.2 | 3,579 | 50.3 ms | 89.4 ms | 55.8 ms | 1,125 MiB | 114 MiB |
+| cache capped at 10,000 | 7.0 | 3,478 | 49.8 ms | 93.9 ms | 51.1 ms | 936 MiB | 113 MiB |
+| and index trees dropped | 7.6 | 3,820 | 40.4 ms | 90.5 ms | 49.9 ms | 761 MiB | 102 MiB |
+| and Merkle trees dropped | 5.7 | 2,869 | 45.9 ms | 128 ms | 57.9 ms | 543 MiB | 81 MiB |
+| everything rebuilt (1.06 s) | 7.0 | 3,518 | 46.7 ms | 95.4 ms | 48.4 ms | 948 MiB | 116 MiB |
+
+Analysis. The node is the point of the suite: a heap a quarter larger than its resident state,
+a load that fills the rest within ten seconds, and a node that kept committing for the whole
+run with every tier dropped for most of it. Two runs before the guard's changes show what they
+are for: with the levels' lines taken from V8's `heap_size_limit`, which includes the young
+generation's reserve, the same node reached `warn` and died of an out-of-memory error at 19.5 s
+without ever shedding, because `pressure` sat past the point of the abort; with the lines fixed
+and the trees rebuilt at the first `ok` sample, it changed level 30 times in 40 seconds,
+rebuilding each time, and committed 622 transfers a second. What still grows under this load and
+drives the late alternation is not a tier the guard can drop: the history window (100 versions
+of overwritten tree nodes and object bytes, each block of scattered transfers adding tens of
+thousands of records) and the recent transaction ids. The same mode suite run on the state
+before any node session (no history yet) gave 10.6, 10.2, 11.5, 10.7 and 10.3 blocks a second
+and 493, 512, 382, 189 and 617 MiB of heap: the index trees give back 130 to 175 MiB and the
+Merkle trees 190 to 220 MiB, the cache up to 190 MiB when it holds 200,000 decoded objects
+(nothing when it held fewer than its cap), and with everything dropped the database runs on 40
+to 50% of its resident heap. Throughput holds within 10% until the Merkle trees go, and falls by
+5 to 20% with them (a rerun measured 6.7 against 7.0 blocks a second), all of it in the commit:
+a root over dropped trees reads its chunks from LMDB and writes private copies, where a resident
+one writes in place. The index trees dropped cost nothing a block of transfers notices (the
+transfers look up no index; a block's finalize even gets faster without the B+ tree updates).
 
 ## 5. What bounds what
 
@@ -390,15 +587,29 @@ specification put on disk.
   transfers in 85 ms on a 387,000-leaf tree.
 - **Persistence bounds nothing yet.** Two LMDB write transactions per block, one for the chain
   store (block, commit, results, validator sets, state) and one for the application's changes,
-  about 10 ms each; a snapshot or pruning adds its own.
+  about 10 ms each; a snapshot or pruning adds its own. The application's transaction carries
+  the index entries and the tree chunks and nodes a block changed (sections 4.11 and 4.12):
+  9.6 ms after a 500-transfer block at 1,001 accounts, and a fifth more for a block scattered
+  over 192,000 accounts, whose chunks are about 12 MiB.
 - **Memory is the state plus the history window.** About 1.1 GB per gigabyte of ML-DSA-44
   genesis, half of it the keys themselves (a fortieth of that under secp256k1), plus changed
   objects times retained versions, plus two copies more during a state-sync join. The other
   half is the object database's own objects, indices and trees, the same under both schemes:
   measured per account with its balance and two keys, 6.1 KB under ML-DSA-44 and 3.5 KB under
-  secp256k1.
+  secp256k1, with everything resident.
+- **Paging bounds memory by the working set, not the state.** Under the memory guard the
+  state is a cache over LMDB: the cache of decoded objects capped at `warn`, the index trees
+  and then the Merkle trees dropped at `pressure`, rebuilt at `ok` when they fit. With
+  everything dropped the database runs on 40 to 50% of its resident heap at 5 to 20% less
+  throughput, all of it in the commit (section 4.13), and a node whose heap was a quarter
+  larger than its resident state kept committing under a full mempool for the whole run. What
+  it does not shed is the history window and the recent transaction ids, and a store cannot yet
+  be opened with its tiers dropped, so the resident state must still fit the heap once, at
+  startup.
 - **Disk is the blocks.** 2.5 KiB per transfer under ML-DSA-44, 154 bytes under secp256k1;
-  state is smaller than its genesis; a snapshot doubles the state store while kept.
+  state is smaller than an ML-DSA-44 genesis and, since its index entries, chunks and nodes are
+  stored, about four times a secp256k1 one (213 MiB for a 56 MB genesis; section 4.12); a
+  snapshot adds the objects again while kept.
 
 ## 6. What the benchmarks found
 
@@ -432,13 +643,28 @@ For a chain with `S` bytes of application state (roughly the genesis size), `B` 
   should have enough threads to admit the network's full rate with margin, since a block it did
   not see through gossip costs it the whole verification again.
 
+A node that pages (the memory guard's `pressure` level; [running.md](running.md) section 12)
+needs less memory than that, with two provisos. With the cache capped and the index and Merkle
+trees dropped the database runs on 40 to 50% of its resident heap (section 4.13), so the heap
+must hold the resident state once, at startup, since a store cannot yet be opened with its tiers
+dropped, and what the guard pages away is the load's growth: the mempool's pending session, the
+history window, the recent transaction ids. Plan the heap for the resident state plus a margin,
+and expect a node that lives at its limit to run 5 to 20% slower, all of it in the commit, with
+the trees coming back only when they fit under the `warn` line. On disk the store grows for it:
+every index entry, every dense tree chunk and every sparse tree node is written beside the
+objects, 213 MiB against 34.6 for 192,000 secp256k1 accounts, about 1.1 KB an account in all
+(sections 4.11 and 4.12), so ten million secp256k1 accounts would be about 12 GB of state
+rather than the 1.9 in the table below, and a block scattered over the state rewrites about
+12 MiB of chunks per commit. The addition holds ids, names and hashes, not keys, so it should be
+the same under ML-DSA-44, which was not re-measured; the table's disk figures predate it.
+
 Per account, from the genesis suite at 192,000 accounts with two keys and one balance each
 (sections 4.7 and 4.9), divided through:
 
 | per account | ML-DSA-44 | secp256k1 |
 |---|---:|---:|
 | the two public keys, tags included | 2,626 B | 68 B |
-| LMDB on disk | 3,330 B | 189 B |
+| LMDB on disk | 3,330 B | 189 B; 1,164 B with the index entries, chunks and nodes (4.12) |
 | memory at rest, heap and array buffers | 6,070 B | 3,490 B |
 | of which decoded objects (section 4.10) | about 0.55 KB | about 0.55 KB |
 | of which indices, name tree and Merkle trees | about 2.65 KB | about 2.65 KB |
@@ -465,34 +691,41 @@ cost of the chain almost entirely: the state of ten million accounts fits a smal
 evidence window a few gigabytes, where ML-DSA-44 needs a hundred and fifty. In memory it does
 not: the floor is the object database's own representation, 3.2 KB per account, five sixths of it
 indices and trees, so ten million accounts need tens of gigabytes of JavaScript heap under either
-scheme, above Node's default old-space limit (`--max-old-space-size`) and beyond a laptop. Signature scheme is the right
-knob for disk and bandwidth; for memory at that scale the knob is the in-memory representation
-of state, which is item 6 below.
+scheme to run resident, above Node's default old-space limit (`--max-old-space-size`) and beyond
+a laptop; paged, 40 to 50% of that, with the resident state still needed once at startup (above).
+Signature scheme is the right knob for disk and bandwidth; for memory at that scale the knobs
+are the memory guard's dials and, beyond them, the history window and opening a store already
+paged, items 1 and 3 below.
 
 ## 8. Further work the numbers point to
 
-1. **Restart.** Build the name tree once on reopen, or persist the sparse tree's node history, to
-   remove the 3.7 s rebuild per gigabyte. Hashing stored bytes directly on import instead of
-   re-encoding every object is done: the arena keeps the imported bytes and the first root
-   hashes them as they are (section 4.10).
-2. **State sync.** Stream chunks into the store instead of holding them all, then rebuild from
+1. **History window paging.** The history window and the recent transaction ids are the growth
+   no dial of the memory guard sheds: 100 versions of overwritten tree nodes and object bytes,
+   tens of thousands of records per block of scattered transfers, which is what drove the paging
+   benchmark's node from `ok` back to `pressure` with every tier dropped (section 4.13). Prior
+   values are already bytes (section 4.10); what remains is to keep them in the store and only
+   the roots in memory, so that a node can live at its limit under load.
+2. **Cold slab release.** STATE-PAGING.md's eviction order releases cold arena slabs at `warn`,
+   between the decoded cache and the index trees; it is not built, so the encoded copy of every
+   object stays in memory whatever the level.
+3. **Opening a store with its tiers dropped.** A node builds every tier resident before the guard
+   samples, so a `--heap` below the resident state aborts at startup rather than paging from the
+   first block; opening with the index trees and Merkle trees dropped when the heap is known to
+   be too small for them is what would let a state larger than the heap run at all.
+4. **The sparse trees' past versions at restart.** The store holds the current nodes, not past
+   ones, so a restart rebuilds the name tree's retained versions by replaying every account, 3.5 s
+   of the 5.2 s restart at 192,000 accounts (section 4.12); keeping the window's before-images in
+   the store would remove most of what is left of a restart.
+5. **Smaller chunks.** A chunk of 1,024 hashes makes a block scattered over the state rewrite
+   nearly every chunk of the trees it touches, about 12 MiB per root at 192,000 accounts, a fifth
+   of the commit (section 4.12); smaller chunks on disk would cut that about in half at this size,
+   and the dropped-mode root, which reads and writes whole chunks, with it.
+6. **State sync.** Stream chunks into the store instead of holding them all, then rebuild from
    the store; that removes one of the three copies and most of the peak.
-3. **Signatures per block.** A per-signature or per-kilobyte transaction fee would price the
+7. **Signatures per block.** A per-signature or per-kilobyte transaction fee would price the
    96% of block space that ML-DSA-44 signatures take; FEES.md leaves it open.
-4. **Block space.** Larger blocks or a shorter commit timeout raise the network's rate directly
+8. **Block space.** Larger blocks or a shorter commit timeout raise the network's rate directly
    until admission (6,700/s per node) binds.
-5. **History memory.** Prior values are kept as bytes, not decoded objects, since the arena
-   (section 4.10); what remains is to drop them to the store, keeping only the roots in memory.
-6. **State memory.** The object database costs about 3.2 KB of heap per account whatever the
-   key size (section 4.9): decoded objects, index entries, tree chunks and name-tree nodes.
-   Phase one of STATE-PAGING.md is built: objects live as encoded bytes in an arena, decoded on
-   access through a bounded cache. Its measured effect is small (section 4.10): 6% more memory
-   with the cache unbounded and 17% less with it capped, because the decoded objects were only
-   0.55 KB of the 3.2 KB. The next lever is the indices and the name tree, which with the Merkle
-   trees are the other 2.65 KB: compact in-memory forms of them, or the disk forms of
-   STATE-PAGING.md tiers two and three (one LMDB key per index entry, tree chunks written at
-   every commit, the in-memory structures kept only as accelerators that can be dropped), are
-   what ten million accounts would need.
 
 ## 9. Adding a benchmark
 

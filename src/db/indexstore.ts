@@ -8,7 +8,7 @@
  *
  * The position is the index's place in its type's definition. A non-unique
  * key already ends with the id (index.ts appends it), so the entry is the
- * key the B+ tree holds with the three-byte header in front, and bytewise
+ * key the B+ tree holds with the four-byte header in front, and bytewise
  * order in the store is the order the tree keeps: a prefix scan is a range,
  * and a cursor from a start key is `scanFrom`.
  *

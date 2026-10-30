@@ -1,6 +1,6 @@
 # 11. The application
 
-This chapter is about the part of the node that gives the chain its meaning: accounts, assets, balances, fees, and the staking rules that decide who the validators are. The engine from the earlier chapters never looks inside a transaction; it hands bytes to the application through the `Application` interface described in [chapter 05](05-mempool-executor.md) (`initChain`, `checkTx`, `finalizeBlock`, `commit`, `info`) and takes back an app hash, per-transaction results and validator updates. The application owns the object database from [chapter 09](09-database.md), where every account, asset, balance and validator is an object with a numeric id and a place in a Merkle tree, and it writes those objects to the key-value store from [chapter 10](10-store.md) at every commit. The JSON-RPC server in [chapter 12](12-rpc.md) reads the application's committed state, proofs, account history and snapshots. All of it lives in `src/app/core/`, twelve files that this chapter walks through one by one.
+This chapter is about the part of the node that gives the chain its meaning: accounts, assets, balances, fees, and the staking rules that decide who the validators are. The engine from the earlier chapters never looks inside a transaction; it hands bytes to the application through the `Application` interface described in [chapter 05](05-mempool-executor.md) (`initChain`, `checkTx`, `finalizeBlock`, `commit`, `info`) and takes back an app hash, per-transaction results and validator updates. The application owns the object database from [chapter 09](09-database.md), where every account, asset, balance and validator is an object with a numeric id and a place in a Merkle tree, and it writes those objects, with their index entries and the Merkle trees' chunks and nodes, to the key-value store from [chapter 10](10-store.md) at every commit. The JSON-RPC server in [chapter 12](12-rpc.md) reads the application's committed state, proofs, account history and snapshots. All of it lives in `src/app/core/`, twelve files that this chapter walks through one by one.
 
 ## Concepts
 
@@ -1097,9 +1097,18 @@ Absent instances (removed objects) are `EMPTY` leaves, so the dense tree's shape
 
 The application itself: sessions, the signature cache, blocks, persistence, snapshots and queries. Its header states the concurrency rule the whole file rests on: "Signature verification is the only asynchronous step, because it goes to the worker pool. Everything that touches the database is synchronous and happens after any await, so the undo sessions nest cleanly even though checkTx calls overlap each other and a finalizeBlock."
 
-**`CoreAppOptions`**: `genesis` (the engine's `Genesis`), optional `appGenesis` (already parsed, required when it lives in a file), `verifier` (the worker pool or the inline one), optional `kv` (default an in-memory store), `retainVersions`, `snapshotInterval` (default 1000; 0 disables), `snapshotsKept` (default 2), `snapshotChunkObjects` (default 2000), `log`.
+**`CoreAppOptions`**: `genesis` (the engine's `Genesis`), optional `appGenesis` (already parsed, required when it lives in a file), `verifier` (the worker pool or the inline one), optional `kv` (default an in-memory store), `retainVersions`, `indexTrees` and `trees` (start the database with its secondary indices' B+ trees, or its Merkle trees, dropped and reading the store, STATE-PAGING.md sections 4 and 5; both default to resident, and the test setup turns them off for a whole run), `snapshotInterval` (default 1000; 0 disables), `snapshotsKept` (default 2), `snapshotChunkObjects` (default 2000), `log`.
 
 The store's key layout, from the constants at the top of the file:
+
+```ts
+// Key layout of the app store: 'm' meta, 'o' id, 'c' type, 'h' version, 'a' account history, 'q' history sequence,
+// 'i' index entry (db/indexstore.ts), 't' dense tree chunk (db/merkle.ts), 'n' sparse tree node (db/smt.ts).
+const META_KEY = key((k) => k.u8(0x6d));
+const OBJECT_PREFIX = key((k) => k.u8(0x6f));
+const INDEX_PREFIX_KEY = Uint8Array.of(INDEX_PREFIX);
+const CHUNK_PREFIX_KEY = Uint8Array.of(CHUNK_PREFIX);
+```
 
 | prefix | key | value |
 |---|---|---|
@@ -1109,16 +1118,57 @@ The store's key layout, from the constants at the top of the file:
 | `h` | version u64 | the database history record for that version |
 | `a` | account u64, sequence u64 | a history entry |
 | `q` | account u64 | the account's next history sequence |
+| `i` | type u16, index position u8, key bytes (and the id u64 for a non-unique index) | the id u64 for a unique index, empty for a non-unique one |
+| `t` | tree u16 (a type id, or 0 for the tree over the types), level u8, chunk u48 | a dense Merkle tree chunk: up to 1,024 hashes, trailing empties cut off |
+| `n` | type u16, index position u8, path bits packed, depth u8 | a sparse Merkle tree node: `0x00` and two child hashes, or `0x01`, a key hash and the 8-byte id |
 | `s` | height u64 | a snapshot manifest |
 | `k` | height u64, type u16, chunk u32 | a snapshot chunk |
 
-**`OpenedDatabase`** is what reopening returns: the database, the stored height and app hash, `staleHistory` (history versions in the store that fell outside the window) and timing figures for the startup log.
+The three middle prefixes are the database's own, defined in `src/db/indexstore.ts`, `src/db/merkle.ts` and `src/db/smt.ts` and explained in [chapter 09](09-database.md); the application only writes what the database's change list says and lends the database the store to read them back from. They are what makes the store hold every tier of the state, not only the objects: a restart no longer rebuilds the indices by decoding every object or the trees by hashing them, and the memory guard can drop either tier and let the database fall back on these keys ([chapter 8](08-node.md)). `'t'` rather than `'c'` for the chunks because `'c'` is the counters, and a chunk key of type T's tree would otherwise have had T's counter key as a prefix.
 
-**`openObjectDatabase(kv, types, retainVersions?)`** loads a database from a store written by `CoreApp`, or returns null if the store is empty:
+**`OpenedDatabase`** is what reopening returns: the database, the stored height and app hash, `staleHistory` (history versions in the store that fell outside the window) and timing figures for the startup log. **`OpenOptions`** says how to open it:
 
 ```ts
+/** How to open a store: the database's options, and how the trees come back. */
+export interface OpenOptions {
+  retainVersions?: number;
+  indexTrees?: boolean;
+  trees?: boolean;
+  /**
+   * Take the Merkle trees from their chunks and nodes in the store (the default) instead of hashing every object and
+   * inserting every index key again. Either way the root must equal the stored app hash; a store written before the
+   * trees were has none, and computes them.
+   */
+  fromTrees?: boolean;
+  /**
+   * With the trees from the store, hash every object and compare it with its leaf (the default): the root then still
+   * proves that the objects are the ones the app hash commits to, as it did when the trees were computed from them.
+   * Off, a restart is about an eighth faster and a corrupt object goes unnoticed until something reads it.
+   */
+  checkLeaves?: boolean;
+}
+```
+
+**`openObjectDatabase(kv, types, opts = {})`** loads a database from a store written by `CoreApp`, or returns null if the store is empty:
+
+```ts
+  const db = new ObjectDatabase(types, { retainVersions, indexStore: kv, indexTrees: opts.indexTrees, trees: opts.trees });
+  // A store written before the index entries were (STATE-PAGING.md phase two) has none: the objects are decoded for
+  // their keys as they always were, and the entries written once below. An empty prefix in a store that has objects
+  // means exactly that, because every write of objects carries their entries in the same transaction. The same holds
+  // for the trees' chunks and nodes (phase four).
+  const has = (prefix: Uint8Array) => {
+    const probe = kv.range(prefix, prefixEnd(prefix));
+    const found = !probe.next().done;
+    probe.return?.(undefined); // close the cursor rather than leave it to the collector
+    return found;
+  };
+  const indexed = has(INDEX_PREFIX_KEY);
+  const treesStored = indexed && has(CHUNK_PREFIX_KEY);
+  const t0 = performance.now();
+  let objects = 0;
   for (const [k, v] of kv.range(OBJECT_PREFIX, prefixEnd(OBJECT_PREFIX))) {
-    db.importObject(decode(k, (r) => (r.u8(), r.u64())), v);
+    db.importObject(decode(k, (r) => (r.u8(), r.u64())), v, indexed);
     objects++;
   }
   for (const t of types) {
@@ -1126,10 +1176,25 @@ The store's key layout, from the constants at the top of the file:
     if (c) db.setCounter(t.id, Number(decode(c, (r) => r.u64())));
   }
   const t1 = performance.now();
+  // The trees come from their chunks and nodes: no object is hashed and no index key inserted into a sparse tree,
+  // which was most of a restart (STATE-PAGING.md 5.3). Recomputing them gives the same root, only slower.
+  if (treesStored) {
+    if (opts.fromTrees ?? true) db.loadTrees(opts.checkLeaves ?? true);
+    else db.assumeStoredTrees();
+  }
+  // The indices come from their entries, so no object is decoded on the way in.
+  if (indexed && objects > 0) db.loadIndexEntries();
   const appHash = db.root(Number(meta.height));
   if (!bytesEqual(appHash, meta.appHash)) throw new Error('stored objects do not hash to the stored app hash');
-  // That root produced a change list holding the encoded bytes of every object; the store already has them.
+  const missing = [...(indexed ? [] : db.lastChanges!.indices), ...(treesStored ? [] : db.lastChanges!.trees)];
+  if (missing.length > 0) kv.write((w) => missing.forEach((c) => (c.value ? w.put(c.key, c.value) : w.del(c.key))));
+  // That root's change list may hold the encoded bytes of every object; the store already has them.
   db.dropChanges();
+```
+
+The database is given the store itself as `indexStore`, the read-only view it falls back on when its trees are dropped, and whichever tiers the options say to start dropped. Two probes then decide how the rest of the store is read, each one cursor positioned on a prefix and closed again: a store written by these phases has index entries under `'i'` and chunks under `'t'` (the sparse nodes always come with the chunks), and an empty prefix in a store that holds objects can only mean the store predates them, because every commit writes the objects and their entries in one transaction. With `indexed`, every `o` entry is imported as bytes with no decode at all (`importObject(id, bytes, true)`, [chapter 09](09-database.md)); without it each object is decoded once for its index keys, as a restart always did. The counters follow. Then the trees, three ways: by default `loadTrees(true)` takes every dense tree's chunks and every sparse tree's nodes from the store, so the first root hashes no object and inserts no key, and still hashes every imported object against its leaf (`checkLeaves`), which is what keeps the property the old path had, that a corrupt object store fails at startup and not when something reads the object; `checkLeaves: false` skips that and saves about an eighth of the restart; and `fromTrees: false` calls `assumeStoredTrees()` instead, which only tells the database that the trees it is about to compute from the objects are already in the store, so the first root reports no chunks, the old path kept for comparison and for a store without trees. With `indexed`, `loadIndexEntries()` fills the B+ trees, and the sparse trees unless their nodes were just loaded, from the `'i'` prefix in key order. Then the root at the stored height, which must equal the stored app hash, and the one-time upgrade: a store from before phase two or four has that root's change list holding every index entry or every chunk and node, which are written in one transaction, so the store is complete from then on. Finally the change list is dropped (review finding 36: otherwise a second copy of every object sat in memory). The history follows:
+
+```ts
   const t2 = performance.now();
   const staleHistory: number[] = [];
   for (const [k, v] of kv.range(HISTORY_PREFIX, prefixEnd(HISTORY_PREFIX))) {
@@ -1140,14 +1205,14 @@ The store's key layout, from the constants at the top of the file:
   db.rebuildIndexVersions();
 ```
 
-It imports every `o` entry, sets the counters, recomputes the root at the stored height and refuses to start if it differs, drops the change list that the root produced (review finding 36: otherwise a second copy of every object sat in memory), loads the history records inside the retention window (the rest are reported as stale for the next commit to delete), and rebuilds the index versions so proofs at past heights work again. The store is never trusted blindly: a corrupted object makes the root differ and the node refuses to start.
+The history records inside the retention window are loaded (the rest are reported as stale for the next commit to delete), and the index versions are rebuilt so proofs at past heights work again. The store is never trusted blindly: a corrupted object makes the root differ, or fails the leaf check, and the node refuses to start; `test/app.test.ts` overwrites alice's object with bob's bytes and expects `does not hash to its leaf` from the default path and `do not hash to the stored app hash` from the recomputing one. What the three paths cost on the same store, 191,896 accounts under secp256k1 (STATE-PAGING.md 5.3): the trees from the store with the leaf check 5.18 s, without it 4.56 s, the trees computed from the objects 8.46 s; the restart as a whole went from 8.41 s before phase four to 5.2 s, and what is left is mostly the history, since rebuilding the sparse trees' past versions replays every account.
 
 **`CoreApp`** implements `Application`. Its fields: `chainId`, the public `db`, the store, the verifier, the signing `context`, the logger, `height`, `appHash`, `lastTime`, the `pending` session, the `sigCache` (transaction id hex to address hex to the set of hashes of every signature by that signer over that body that verified), `toPersist` (what the next `commit` writes), `staleHistory`, the `recorder`, the three snapshot settings and `lastHistory` (what the last commit wrote, for the RPC's event streams).
 
 **The genesis and reopen paths** are the constructor:
 
 ```ts
-    const stored = openObjectDatabase(this.kv, CORE_TYPES, opts.retainVersions);
+    const stored = openObjectDatabase(this.kv, CORE_TYPES, { retainVersions: opts.retainVersions, indexTrees: opts.indexTrees, trees: opts.trees });
     if (stored) {
       this.db = stored.db;
       this.height = stored.height;
@@ -1159,7 +1224,7 @@ It imports every `o` entry, sets the counters, recomputes the root at the stored
       const t0 = performance.now();
       const g = opts.appGenesis ?? parseAppGenesis(opts.genesis.appState);
       const t1 = performance.now();
-      this.db = new ObjectDatabase(CORE_TYPES, { retainVersions: opts.retainVersions });
+      this.db = new ObjectDatabase(CORE_TYPES, { retainVersions: opts.retainVersions, indexStore: this.kv, indexTrees: opts.indexTrees, trees: opts.trees });
       applyGenesis(this.db, g, opts.genesis.genesisTime, schemeTag(opts.genesis.signatureScheme ?? 'ml-dsa-44'));
       const t2 = performance.now();
       this.appHash = this.db.root(0);
@@ -1171,7 +1236,7 @@ It imports every `o` entry, sets the counters, recomputes the root at the stored
     this.pending = this.db.startSession();
 ```
 
-A store with state wins over genesis, so genesis is parsed only once in a node's life; **`CoreApp.hasState(kv)`** lets the node skip parsing it at all. Genesis is applied, hashed as version 0 and persisted immediately. The scheme handed to `applyGenesis` is the engine genesis's `signatureScheme`, ML-DSA-44 when absent, turned into its tag by `schemeTag`; from then on the application reads it from the committed `global` object (`chainScheme`, below) and never from the genesis document again, so a reopened store carries its own scheme. Either way the constructor ends by opening the pending session. The README reports a one-gigabyte genesis (193,536 accounts with two keys each) parsing as a token stream in 6.4 s and building its objects, first root and LMDB write in 8.1 s, and a restart from LMDB at that size in 11.8 s, most of it decoding objects and rebuilding index history.
+A store with state wins over genesis, so genesis is parsed only once in a node's life; **`CoreApp.hasState(kv)`** lets the node skip parsing it at all. On both paths the database is given the store as its `indexStore` and the two tier options, so a database built from genesis can drop its trees as well as one reopened from the store. Genesis is applied, hashed as version 0 and persisted immediately; that first root's change list holds every index entry and every chunk and node besides every object (576,000 entries, about 600,000 sparse nodes and 25 MiB of chunks for 191,896 accounts, STATE-PAGING.md 4.4 and 5.3), so the genesis write is where the store grows from 34.6 to 213 MiB at that size. The scheme handed to `applyGenesis` is the engine genesis's `signatureScheme`, ML-DSA-44 when absent, turned into its tag by `schemeTag`; from then on the application reads it from the committed `global` object (`chainScheme`, below) and never from the genesis document again, so a reopened store carries its own scheme. Either way the constructor ends by opening the pending session. The README reports a one-gigabyte genesis (193,536 accounts with two keys each) parsing as a token stream in 6.4 s and building its objects, first root and LMDB write in 8.1 s, and a restart from LMDB at that size in 11.8 s, most of it decoding objects and rebuilding index history; those figures predate the index entries and the trees in the store, which took the restart of the 191,896-account secp256k1 state from 8.4 s to 5.2 s (STATE-PAGING.md 5.3, quoted under `openObjectDatabase` above).
 
 **`initChain(_genesis)`** refuses to run on an application that already has blocks and returns the genesis app hash with the active set as validator updates; when the set is non-empty, the engine uses it in place of its own genesis list (`STAKING.md` section 2.3).
 
@@ -1254,6 +1319,15 @@ Why two signature passes? Review finding 3 showed that resolving every key befor
         if (c.bytes) w.put(objectKey(c.id), c.bytes);
         else w.del(objectKey(c.id));
       }
+      // Removals first in the list, so a key that changed hands within the block ends with its new owner.
+      for (const c of p.changes.indices) {
+        if (c.value) w.put(c.key, c.value);
+        else w.del(c.key);
+      }
+      for (const c of p.changes.trees) {
+        if (c.value) w.put(c.key, c.value);
+        else w.del(c.key);
+      }
       for (const [type, next] of p.changes.counters) w.put(counterKey(type), encode((wr) => wr.u64(BigInt(next))));
       if (p.changes.history) w.put(historyKey(p.changes.version), encode((wr) => encodeHistory(wr, p.changes.history!)));
       // History that no longer serves any provable height: the version that just left the window, and leftovers found at startup.
@@ -1265,7 +1339,7 @@ Why two signature passes? Review finding 3 showed that resolving every key befor
     this.db.dropChanges();
 ```
 
-History entries with their per-account sequence numbers, the changed objects (a null encoding is a removal), the moved counters, the version's history record, deletion of the record that just left the window, and the meta last, all in one write. Then the change list is dropped. A crash between `finalizeBlock` and `commit` leaves the store at the previous height and the engine replays the block on restart, which is why `info()` reports the stored height.
+History entries with their per-account sequence numbers, the changed objects (a null encoding is a removal), the index entries the block added and removed (`Changes.indices`, removals before additions, so a unique key that passed from one object to another inside the block ends with its new owner when the list is applied in order; a transfer, which changes amounts and no key, adds none), the dense tree chunks and sparse tree nodes the root changed (`Changes.trees`, a null value deleting a chunk that emptied or a node that collapsed), the moved counters, the version's history record, deletion of the record that just left the window, and the meta last, all in one write. Then the change list is dropped, which is also the word to the database that the store now holds what the root reported: until then it lays the list over the store for whatever index or tree is dropped, so a query between `finalizeBlock` and `commit` never sees an index older than the objects ([chapter 09](09-database.md)). The extra writes are not a mode; a node that never pages pays them anyway so that the fallback exists the moment it is needed, and they are measured (STATE-PAGING.md 4.4 and 5.3): a 500-transfer block writes about a thousand index entries, and `commit to LMDB` went from a mean of 8.95 to 9.63 ms, 7%; the chunks cost nothing measurable for a block whose writes are local, and a fifth more (45.7 to 55.1 ms) for a block of 2,400 transfers scattered over 192,000 accounts, which rewrites nearly every chunk of the trees it touches, about 12 MiB. A crash between `finalizeBlock` and `commit` leaves the store at the previous height and the engine replays the block on restart, which is why `info()` reports the stored height.
 
 Snapshots: **`takeSnapshot()`** exports the committed state at the current height and writes it in one store transaction:
 
@@ -1285,7 +1359,7 @@ Snapshots: **`takeSnapshot()`** exports the committed state at the current heigh
   }
 ```
 
-The `stale` expression keeps the newest `snapshotsKept − 1` earlier heights and deletes the rest; with the default of two, every snapshot but the previous one goes. (`-(1) || undefined` is `-1`, so `slice(0, -1)` drops the last element; with `snapshotsKept` of 1 it is `-0 || undefined`, so every earlier height is stale.) **`snapshotHeights()`**, **`manifestBytes(height)`** and **`chunkBytes(height, type, index)`** serve them to peers. **`CoreApp.writeImportedState(kv, db, height, appHash)`** is the other end: it writes a database loaded from a snapshot into an empty store, as a commit would have, refusing a store that already has state; state sync calls it inside the environment-wide transaction that also writes the chain store, so the two stores never disagree about whether the join happened. The README measures a snapshot export of a gigabyte state at 3.5 s and a complete state-sync import of 201 chunks (504 MiB) at 37 s end to end.
+The `stale` expression keeps the newest `snapshotsKept − 1` earlier heights and deletes the rest; with the default of two, every snapshot but the previous one goes. (`-(1) || undefined` is `-1`, so `slice(0, -1)` drops the last element; with `snapshotsKept` of 1 it is `-0 || undefined`, so every earlier height is stale.) **`snapshotHeights()`**, **`manifestBytes(height)`** and **`chunkBytes(height, type, index)`** serve them to peers. **`CoreApp.writeImportedState(kv, db, height, appHash)`** is the other end: it writes a database loaded from a snapshot into an empty store, as a commit would have, every object from `exportObjects()`, every index entry from `indexEntries()` and every chunk and node from `treeEntries()`, then the counters and the meta, refusing a store that already has state; state sync calls it inside the environment-wide transaction that also writes the chain store, so the two stores never disagree about whether the join happened, and the node that opens the store afterwards reads its indices and trees from it like any other (1.84 s to write and 1.59 s to open the gigabyte state, against 1.09 and 5.72 before the trees were written, STATE-PAGING.md 5.3). The README measures a snapshot export of a gigabyte state at 3.5 s and a complete state-sync import of 201 chunks (504 MiB) at 37 s end to end.
 
 **`info()`** returns the committed height and app hash.
 
@@ -1439,6 +1513,14 @@ A failed `checkTx` leaves nothing behind in the pending session, and a failed tr
 - `creates and issues user assets up to the max supply`: an asset `ALICE` is `4.1`, only its issuer can issue, issuing past the max supply fails while the issues around it succeed, and `byAsset` lists the holders.
 - `proves objects against the app hash`, `proves past heights inside the retention window`, `proves account names present and absent, now and at past heights`: object and key proofs verify against the right hash, fail against the wrong one, and a name is proven absent at height 0 and present later.
 - `restarts from the store with the same app hash and keeps producing the same hashes`: two applications on the same blocks agree; one reopened from the store reports the stored height and hash, has every past height provable with byte-identical proofs, continues to the same hash as the other, and the history window slides in both memory and store.
+
+A second group, `core application: index entries in the store`, is the application's side of STATE-PAGING.md phases two to four. Its `consistent(app, kv)` check is applied after every commit: the store's `'i'` entries equal `db.indexEntries()` and `checkIndexStore()` finds nothing to report, and the store's `'t'` and `'n'` entries equal `db.treeEntries()`.
+
+- `writes the entries with every commit, reopens from them, and fills in a store that predates them`: the store is consistent after genesis, after three blocks of registrations, payments and a transfer, and after the recent transaction ids expire and take their entries with them; an application reopened from the store has the same hash, finds bob and his balance, and is consistent; and a copy of the store with every `'i'` key left out, as a store written before phase two would be, is opened, derives the entries from the objects once and writes them, so that it then holds exactly the entries of the original.
+- `runs blocks with the trees dropped and rebuilt on the way, with the hashes of an app that never drops them`: with `dropIndexTrees()` turned, blocks run on the paged application and on a resident twin give the same app hash and the same results, a taken name is refused in a block and, against the pending session as admission checks it, in `checkTx`; after `rebuildIndexTrees()` and a further drop the store still equals the resident twin's indices.
+- `writes the entries of a state imported from a snapshot`: a snapshot exported in chunks of three objects, imported, and written with `writeImportedState` leaves a store whose entries and trees equal the original application's, and an application opened on it has the original's hash.
+- `writes the trees with every commit and restarts from them, with the proofs of the original`: after three blocks the reopened application has the same hash and, at every height in the window, the same object proofs and name proofs as the one that wrote the store; the three reopen paths (`fromTrees: false`, `checkLeaves: true`, `trees: false`) give the same hash and proofs; a store in which alice's object was overwritten with bob's bytes is refused by the leaf check with `does not hash to its leaf` and by the recomputing path with `do not hash to the stored app hash`; the reopened application keeps producing the twin's hashes; and a copy of the store without its `'t'` and `'n'` keys computes the trees on opening and writes them once.
+- `runs blocks with the Merkle trees dropped and rebuilt, with the hashes and proofs of an app that keeps them`: with both tiers dropped, blocks match a resident twin in hash, results and, at every height in the window, the faucet's object proof and the name proofs of alice and bob; `checkTx` refuses a taken name and admits a transfer while everything is dropped; the trees are rebuilt, a `checkTx` leaves pending writes in the mempool's session and the trees are dropped in the middle of them, another block matches, and after both tiers are rebuilt the store is consistent.
 
 `test/fees.test.ts` covers `FEES.md`:
 

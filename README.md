@@ -2,7 +2,8 @@
 
 A proof-of-stake blockchain built from first principles as a learning tool: Tendermint
 consensus with instant finality, a Cosmos-style split between consensus and
-application, Graphene-style peer networking, and one signature scheme per chain, chosen
+application, Graphene-style peer networking, an object database with a Merkle root that
+pages its state to LMDB under memory pressure, and one signature scheme per chain, chosen
 by genesis: post-quantum ML-DSA-44 or secp256k1. Written in TypeScript so that every
 mechanism is readable in one sitting.
 
@@ -18,7 +19,7 @@ Requires Node 24 (it runs TypeScript directly; there is no build step).
 
 ```sh
 npm install
-npm test                      # 146 tests, about a minute; CHAIN_SCHEME=secp256k1 runs them on secp256k1 keys
+npm test                      # 160 tests, about a minute; CHAIN_SCHEME=secp256k1 runs them on secp256k1 keys, INDEX_TREES=0 or TREES=0 with the database's index or Merkle trees dropped
 node scripts/localnet.ts 4 30 # 4 validators in one process for 30 seconds, driving the app from a faucet, RPC on :26657
 ```
 
@@ -51,12 +52,15 @@ own file named by `"appStateFile"` in `genesis.json`; the node streams it with
 `stream-json` at first start and never reads it again.
 
 `start` runs the node in a child process under a heap limit, three quarters of memory
-unless `--heap <MiB>` says otherwise, with a memory guard that caps the object database's
-cache of decoded objects and sheds load (the mempool, costly RPC calls, new event streams,
-the signature cache) as the heap fills and stops the node cleanly with exit code 3 before
-V8 would abort it, and with garbage collections scheduled in the idle moment after each
-commit. The five-second status line, `status`
-and `/health` report the heap, the guard's level and the collection pauses.
+unless `--heap <MiB>` says otherwise, with a memory guard that pages the state as the heap
+fills: it caps the object database's cache of decoded objects, then drops the secondary
+indices' B+ trees and the Merkle trees, whose entries, chunks and nodes LMDB holds at every
+height, so lookups, scans, roots and proofs read through the store, slower, and rebuilds them
+when the heap has room; it sheds load as well (the mempool, costly RPC calls, new event
+streams, the signature cache) and stops the node cleanly with exit code 3 before V8 would
+abort it, and garbage collections are scheduled in the idle moment after each commit. The
+five-second status line, `status` and `/health` report the heap, the guard's level and the
+collection pauses, and `status` which tiers of the state are resident.
 
 Set `LOG=debug` to watch every proposal, vote and timeout. Node state is kept in an
 LMDB environment under each node's data directory; of the four runtime dependencies,
@@ -65,7 +69,8 @@ LMDB environment under each node's data directory; of the four runtime dependenc
 ## Performance
 
 `npm run bench` runs the benchmarks in `bench/` (about two and a half minutes;
-`npm run bench -- db app` for a subset). The figures below are from an Apple M4 Pro
+`npm run bench -- db app` for a subset; `npm run bench -- paging` the state paging suite
+of docs/benchmarks.md section 4.13). The figures below are from an Apple M4 Pro
 (12 cores, 11 verification threads) on Node 24, one process. The network suite runs
 four validators inside that process on the in-memory transport, so it measures the
 engine and the application, not the wire.
@@ -80,7 +85,7 @@ engine and the application, not the wire.
 | checkTx (admission to the mempool) | 6,700 transfers/s through the pool |
 | finalizeBlock, signatures verified at admission | 26,000 transfers/s; 1,500 transfers (about 3.6 MiB with a block shell) in 57 ms |
 | finalizeBlock, cold (block sync, or a node that missed the gossip) | 6,300 transfers/s |
-| commit after a 500-transfer block | 2.6 ms to memory, 8.8 ms to LMDB |
+| commit after a 500-transfer block | 3.1 to 3.9 ms to memory, 9.6 ms to LMDB (2.6 and 8.8 before the index entries and tree chunks were written with the objects) |
 | object database | root after 1,000 changed objects in 19 ms; 100,000 objects in 91 MiB |
 | proofs | object proof 777 bytes, 88,000/s; name proof 958 bytes, 400,000/s |
 | four validators, empty blocks | 9.5 blocks/s with a 50 ms commit timeout |
@@ -115,7 +120,7 @@ with two ML-DSA-44 keys each, named by `appStateFile`), loads it, and measures t
 | object proof + verify / name proof + verify | 40,000 / 46,000 per second; 3.4 KiB and 932 B |
 | a block of 500 transfers | 25 ms to finalize, 10 ms to commit |
 | snapshot export | 3.5 s |
-| restart from LMDB | 11.8 s (decode 5.0 s, root 3.2 s, rebuilding index history 3.7 s) |
+| restart from LMDB | 11.8 s (decode 5.0 s, root 3.2 s, rebuilding index history 3.7 s), measured before the trees were stored; a restart now takes the trees and indices from the store and checks every object against its leaf, which took the 192,000-account secp256k1 run from 8.4 to 5.2 s (docs/benchmarks.md section 4.12) |
 
 Memory is dominated by the keys themselves (ML-DSA-44 keys; under secp256k1 the same accounts
 hold a fortieth as many key bytes): a 1 GB genesis is about 1.1 GB of heap and
@@ -125,8 +130,10 @@ state stays in memory by design and hex halves to binary while objects and trees
 back. Node's default heap limit suffices. At the sizes measured, lookups by id and by
 name ran as fast as with a thousand accounts, although a lookup by name walks a B+ tree
 whose depth grows with the log of the state, as does the length of a proof. A restart
-costs more than the first load because the store is read object by object and the
-authenticated name index is built twice, once live and once to recover past versions.
+cost more than the first load in this run because the store was read object by object and
+the authenticated name index built twice, once live and once to recover past versions; the
+live build is gone now that the trees and indices come back from the store, and the
+past-version rebuild is what remains.
 
 ### Steady state at that size
 
@@ -156,6 +163,12 @@ sync holds the whole gigabyte in chunks before it can rebuild, so plan for about
 three times the state's resting memory in all during the join (chunks, the rebuilt
 state and the opened store).
 
+A `paging` suite runs the 192,000-account secp256k1 state under the memory guard: a node
+under a heap limit of 1.25 times its resident state kept committing for 40 seconds with
+every tier dropped for most of it, 107 blocks and 59,128 transfers without an abort, and
+with the cache capped and both tiers dropped the database runs on 40 to 50% of its
+resident heap at 5 to 20% less throughput (docs/benchmarks.md section 4.13).
+
 ## Reading order
 
 Each file opens with a comment explaining what it does and why. A good path through
@@ -173,7 +186,7 @@ the code, from the bottom up:
 10. `src/p2p/network.ts` — handshake, peer exchange, duplicate connections.
 11. `src/sync/blocksync.ts` — how a lagging node catches up.
 12. `src/node/node.ts` — the wiring.
-13. `src/db/id.ts`, `src/db/keys.ts`, `src/db/arena.ts`, `src/db/index.ts` — typed objects, dense ids, objects kept as bytes in an arena behind a cache of decoded ones, and indices as ordered byte keys.
+13. `src/db/id.ts`, `src/db/keys.ts`, `src/db/arena.ts`, `src/db/index.ts`, `src/db/indexstore.ts` — typed objects, dense ids, objects kept as bytes in an arena behind a cache of decoded ones, indices as ordered byte keys, and the index entries' disk form with the merged cursor a dropped index reads through.
 14. `src/db/bptree.ts` — the B+ tree behind every index and the in-memory store.
 15. `src/db/merkle.ts`, `src/db/proof.ts` — the dense Merkle tree, its versions, and how an ICS23-shaped proof is checked.
 16. `src/db/smt.ts` — the sparse Merkle tree behind proofs by name, and why the B+ tree is not hashed.
@@ -205,7 +218,7 @@ src/mempool.ts  transaction pool
 src/p2p         transports, messages, peer db, network
 src/sync        block sync
 src/node        executor, memory guard and collection scheduler, node
-src/db          object database: ids, arena and hot cache, B+ tree indices, versioned Merkle tree, proofs, sessions
+src/db          object database: ids, arena and hot cache, B+ tree indices with their entries on disk, versioned Merkle trees with their chunks and nodes on disk, both droppable under memory pressure, proofs, sessions
 src/store       key-value interface, LMDB, block store
 src/light       light client, providers (in-process and RPC), query verification
 src/rpc         JSON-RPC server, events, client
