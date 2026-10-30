@@ -13,7 +13,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { writeAtomic } from '../store/files.ts';
 import { encode } from '../codec/writer.ts';
 import { fromHex, sha256 , toHex } from '../crypto/hash.ts';
-import { PUBLIC_KEY_SIZE } from '../crypto/keys.ts';
+import { isPublicKey } from '../crypto/keys.ts';
 import type { Genesis } from '../types/genesis.ts';
 import type { ValidatorUpdate } from '../types/validator.ts';
 import type { Application, CheckTxResult, FinalizeBlockRequest, FinalizeBlockResult, InitChainResult } from './types.ts';
@@ -73,7 +73,7 @@ export class KvStoreApp implements Application {
       } catch {
         return { kind: 'bad', error: 'bad public key hex' };
       }
-      if (publicKey.length !== PUBLIC_KEY_SIZE) return { kind: 'bad', error: 'bad public key size' };
+      if (!isPublicKey(publicKey)) return { kind: 'bad', error: 'bad public key' };
       if (!/^\d+$/.test(parts[2]!)) return { kind: 'bad', error: 'bad power' };
       return { kind: 'val', update: { publicKey, power: BigInt(parts[2]!) } };
     }

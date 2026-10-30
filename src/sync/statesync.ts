@@ -16,6 +16,7 @@
 import { CoreApp } from '../app/core/app.ts';
 import { chunkCount, importSnapshot, manifestFromBytes, verifyChunk, verifyManifest, type SnapshotChunk, type SnapshotManifest } from '../app/core/snapshot.ts';
 import { bytesEqual, toHex } from '../crypto/hash.ts';
+import { schemeName, schemeOf, type SchemeTag } from '../crypto/keys.ts';
 import type { Verifier } from '../crypto/verifier.ts';
 import type { ObjectDatabase } from '../db/database.ts';
 import type { ObjectType } from '../db/index.ts';
@@ -54,6 +55,8 @@ export interface StateSyncOptions {
   log: Logger;
   trustHeight: bigint;
   trustHash: Uint8Array;
+  /** The chain's signature scheme from genesis; a validator set with keys of another is not this chain's. */
+  scheme: SchemeTag;
   /**
    * How old evidence may be, given the imported state (the unbonding period
    * it holds, unless the operator fixed one): headers this far below the
@@ -221,6 +224,9 @@ export async function stateSync(o: StateSyncOptions): Promise<{ height: bigint }
   const lastValidators = await setsAt(H, atH.header.validatorsHash);
   const validators = await setsAt(H + 1n, next.validatorsHash);
   const nextValidators = await setsAt(H + 2n, next.nextValidatorsHash);
+  for (const set of [lastValidators, validators, nextValidators]) {
+    for (const v of set.validators) if (schemeOf(v.publicKey) !== o.scheme) throw new Error(`state sync: a validator key is not a ${schemeName(o.scheme)} key; this is not the chain genesis describes`);
+  }
   // The block and its commit come from one peer; a commit that does not verify marks that peer and the next one is asked.
   const block = await ask(sources(), async (p) => {
     const m = await o.requester.request(p, { type: 'blockRequest', height: H }, 'blockResponse', (m) => m.height === H, timeout);
@@ -322,6 +328,7 @@ export async function stateSync(o: StateSyncOptions): Promise<{ height: bigint }
     lastValidators,
     validators,
     nextValidators,
+    scheme: o.scheme,
   };
   // The application store and the chain state land in one transaction, so a crash leaves either a complete join or
   // nothing, and a restart simply joins again.

@@ -1,14 +1,19 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: nineteen files, 132 cases, about 3,950 lines counting the shared harness
-in `test/helpers.ts`. The whole suite takes a little over a minute (74.1 s, all passing, on the
-run this chapter was checked against); nearly all of that time is the network scenarios, which
-run real consensus timers. One file: `npx vitest run test/staking.test.ts`. One case, by a
+`test/**/*.test.ts`: twenty files, 137 cases, about 4,130 lines counting the shared harness
+in `test/helpers.ts`. The whole suite takes about a minute (70.9 s, all passing, on the run
+this chapter was checked against, under the default ML-DSA-44 keys); nearly all of that time is
+the network scenarios, which run real consensus timers. The same suite runs on the chain's other
+signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (53.7 s on that run, 136 passing and
+one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
+suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
+every key is derived with it. One file: `npx vitest run test/staking.test.ts`. One case, by a
 substring of its title: `npx vitest run test/consensus.test.ts -t partition`. The nodes are
 silent unless you ask: `LOG=debug npm test` (or `info`, `warn`) turns on the per-node logger
 through `testLogger`. The files are organised by layer, in the order of this tutorial: `units`,
-`store` and `db` cover what sits under the engine; `network`, `consensus`, `recovery` and
+`store` and `db` cover what sits under the engine, and `schemes` the two signature schemes from
+a key pair up to a chain running on the second one; `network`, `consensus`, `recovery` and
 `engine` run the engine on the toy key-value application; `chain`, `app`, `staking`,
 `staking-net`, `fees` and `genesis` cover the core application; `txproof`, `light`, `rpc` and
 `sync` cover proofs, clients and catching up; `review` holds one regression test per finding of
@@ -18,7 +23,7 @@ below.
 
 ## The harness
 
-Everything the suites share lives in `test/helpers.ts`, 151 lines. It exports two constants,
+Everything the suites share lives in `test/helpers.ts`, 157 lines. It exports two constants,
 seven functions, two interfaces and one shared verifier.
 
 ### `FAST_TIMEOUTS`
@@ -71,9 +76,10 @@ export function seedFor(label: string): Uint8Array {
 ```
 
 Every key in the suites comes from a label: `seedFor('chain/faucet')`,
-`seedFor('st/op/a')`. The same label always gives the same ML-DSA-44 key pair through
-`keyPairFromSeed`, so a test can hold the key of a node it did not create, for example to
-forge a vote in the name of validator 3 (`keyPairFromSeed(net.validatorSeed(3))`). Each file
+`seedFor('st/op/a')`. The same label always gives the same key pair through
+`keyPairFromSeed` (in `DEFAULT_SCHEME` unless a scheme is passed), so a test can hold the key of
+a node it did not create, for example to forge a vote in the name of validator 3
+(`keyPairFromSeed(net.validatorSeed(3))`). Each file
 prefixes its labels (`rpc/`, `rv/`, `sync/`, `fees/`) so two files never share an account key
 by accident.
 
@@ -96,7 +102,7 @@ export const verifier = new InlineVerifier();
 ```
 
 One `InlineVerifier` shared by every node in every testnet. The production node uses a
-`WorkerVerifier`, a pool of worker threads that checks ML-DSA signatures off the main thread
+`WorkerVerifier`, a pool of worker threads that checks signatures off the main thread
 ([the crypto chapter](02-crypto.md)). In a test, six nodes in one process would start six pools,
 each of which must be closed, and the threads would compete with the consensus timers for the
 machine. The inline verifier calls `verify` synchronously on the calling thread: no threads to
@@ -119,6 +125,8 @@ export interface TestnetOptions {
   limits?: Partial<ValidationLimits>;
   /** Indices to create but not start. */
   skipStart?: number[];
+  /** The chain's signature scheme; CHAIN_SCHEME from the environment, else ML-DSA-44. */
+  scheme?: SchemeTag;
   /** Handed to the application; JSON, or a function of the validator public keys in index order. */
   appState?: string | ((validatorKeys: Uint8Array[]) => string);
   /** False leaves the engine's validator list out of genesis, so the application must supply the set. */
@@ -132,7 +140,10 @@ export interface TestnetOptions {
 follow but do not vote. `powers` sets voting power per validator (default 10 each).
 `dataDirFor` returns a directory for a node that should persist to LMDB, or `null` to keep
 it in memory (the default). `skipStart` creates nodes without starting them, for "node down"
-and "late joiner" scenarios. `appState` is the application's genesis document; as a function
+and "late joiner" scenarios. `scheme` is the signature scheme the validator and node keys are
+derived with and the genesis names; it defaults to `DEFAULT_SCHEME`, which is `CHAIN_SCHEME`
+from the environment or ML-DSA-44, and only `test/schemes.test.ts` passes one explicitly
+(`Scheme.secp256k1`). `appState` is the application's genesis document; as a function
 it receives the validator public keys, which is how the staking network test puts the engine's
 keys into the application's validator list. `engineValidators: false` leaves `validators` out
 of the engine genesis entirely, so the application must hand the engine the set from
@@ -166,6 +177,7 @@ The genesis is built once and shared:
 ```ts
   const genesis: Genesis = {
     chainId,
+    signatureScheme: schemeName(scheme),
     genesisTime: BigInt(Date.now()) - 1000n,
     validators:
       opts.engineValidators === false
@@ -175,7 +187,13 @@ The genesis is built once and shared:
   };
 ```
 
-Note `genesisTime`: one second before now, on the wall clock. Network tests therefore run on
+`signatureScheme` is the name of the scheme the validator keys above were made with
+(`keyPairFromSeed(validatorSeed(i), scheme)`), so the engine's genesis check that every
+validator key is of the named scheme passes whichever scheme the run is on, and every node
+derives its own keys with the same one ([chapter 8](08-node.md)). The application genesis
+documents the suites write by hand (`test/app.test.ts`, `test/staking.test.ts`,
+`test/fees.test.ts`, `test/genesis.test.ts`, `test/review.test.ts`) carry the same
+`signatureScheme: schemeName(DEFAULT_SCHEME)`. Note `genesisTime`: one second before now, on the wall clock. Network tests therefore run on
 real time, and a transaction for a network test needs an expiration of
 `BigInt(Date.now()) + 60_000n`. The application unit tests use a fixed genesis time instead;
 the difference is a common pitfall, discussed at the end of the chapter.
@@ -329,7 +347,7 @@ truncation, no ignored tail, no length a peer can use to exhaust memory.
 **`it('round-trips p2p messages')`**. Five wire messages (`addrRequest`, `addrResponse`,
 `status`, `inv`, `reject`) pass through `encodeMessage` and `decodeMessage` unchanged.
 
-**`it('signs deterministically and binds the context')`** (describe `ML-DSA-44 keys`). Two
+**`it('signs deterministically and binds the context')`** (describe `keys and signatures`). Two
 signatures of the same message under the same context are byte-identical; the signature
 verifies under its context and fails under `signContext('c', 'vote')` (another purpose), under
 `signContext('other', 'tx')` (another chain) and over a different message. This is domain
@@ -373,6 +391,56 @@ from ever producing the evidence that would slash it.
 same bytes again are `'seen'`, `bad` (no `=`) is `'invalid'`, 100 bytes is `'too-large'`,
 `b=2` is `'added'`. `reap(1_000_000)` returns `['a=1', 'b=2']` in arrival order; `reap(8)` fits
 only one. After `update([tx('a=1')])`, the committed transaction is gone and `size` is 1.
+
+### test/schemes.test.ts
+
+Five tests on the two signature schemes ([02](02-crypto.md)), from a key pair up to a chain
+running on the second one. The first four are unit tests under `describe('signature schemes')`;
+the fifth runs a testnet under `describe('a chain on secp256k1')`, with an `RpcServer` stopped
+before the network in `afterEach`. These are the only cases that name a scheme explicitly;
+everything else in the suite follows `DEFAULT_SCHEME`.
+
+**`it('signs and verifies under each scheme, with tagged keys and signatures that tell them apart')`**.
+For each of `Scheme.mlDsa44` and `Scheme.secp256k1`: a key pair from
+`keyPairFromSeed(seed, scheme)` reports that scheme, its public key starts with the scheme's tag
+byte and is `publicKeySize(scheme)` long; a signature over a message starts with the same tag
+and is `signatureSize(scheme)` long; it verifies under its context and fails under the `vote`
+context, over a changed message and with one bit flipped; signing again gives identical bytes,
+so both schemes are deterministic; the key and signature written with `fixed` decode back
+through `decodePublicKey` and `decodeSignature`, which read the size from the tag; and
+`generateSeed(scheme)` yields a seed whose key pair is of that scheme. Then one seed under both
+schemes: two different addresses, and neither key verifies the other's signature. `schemeOf`
+names a key's scheme, `isPublicKey` refuses a truncated key, and a key or a signature whose
+first byte is `9` or `0` throws `unknown signature scheme`.
+
+**`it('refuses the high-S twin of a secp256k1 signature, so a signed object has one encoding')`**.
+ECDSA admits two `s` values for every signature, `s` and `n - s`; the test rebuilds the twin
+from the curve order (`secp256k1.Point.Fn.ORDER`) and expects it refused while the original
+verifies. Without low-S enforcement anyone relaying a transaction could rewrite its signature
+and give it a second valid encoding and a second hash.
+
+**`it('keeps each key's scheme in the keystore, and reads an old file as ML-DSA-44')`**. A
+keystore gets `ml` with the default scheme and `ec` with secp256k1; reopened, `get` returns each
+in its scheme with the same public key, and `list()` reports both schemes. Then the `scheme`
+field is deleted from `ml`'s record on disk, as a file written before there were two schemes
+would look; reopened again, `ml` is ML-DSA-44 in both `get` and `list` ([14](14-wallet-cli.md)).
+
+**`it('refuses a genesis whose validator keys are not of the scheme it names')`**. `genesisState`
+with `signatureScheme: 'secp256k1'` and an ML-DSA key throws `/not a secp256k1 key/`; with no
+scheme named (ML-DSA-44) and a secp256k1 key throws `/not a ml-dsa-44 key/`; the matching pairs
+produce a chain state whose `scheme` is the tag named ([03](03-types.md)).
+
+**`it('runs on secp256k1 keys end to end and refuses keys and signatures of the other scheme')`**.
+`makeTestnet` with `scheme: Scheme.secp256k1`, four core-application validators and a faucet
+whose key is secp256k1. At height 3 the chain state's `scheme` and node 0's `nodeKey.scheme` are
+secp256k1, and the commit of block 2 holds signatures of `signatureSize(Scheme.secp256k1)`, 65
+bytes, a tag and 64 bytes against 2,421 for ML-DSA-44; `status` over an `RpcServer` reports
+`signatureScheme: 'secp256k1'` ([12](12-rpc.md)). An `accountCreate` for alice with a secp256k1
+key, signed by the faucet, is `added` and alice exists. The same operation with an ML-DSA key in
+the authority is refused with `/must be a secp256k1 key/`; a `validatorCreate` with an ML-DSA
+consensus key with `/consensus key must be a secp256k1 key/`; and a transfer signed by the
+faucet's seed under ML-DSA-44, relabelled with the faucet's secp256k1 address, with
+`/another scheme/`: the scheme check runs before any verification work ([11](11-application.md)).
 
 ### test/store.test.ts
 
@@ -965,7 +1033,8 @@ measuring an operation's encoded body.
 `isCheapName`: a digit, a dot, a hyphen, or no vowel (y counts as one) makes a name cheap, so
 `alice`, `bob` and `xyz` are premium while `alice1`, `al-ice`, `a.b` and `mrkt` are cheap. A
 transfer costs 100. Registering `alice` costs `premiumFee` plus the data fee of the body, which
-is over 2 x 1,312 bytes because it carries two ML-DSA keys; `alice1` costs `basicFee` plus data;
+is over twice `publicKeySize(DEFAULT_SCHEME)` because it carries two keys of the chain's scheme;
+`alice1` costs `basicFee` plus data;
 sixteen-key authorities cost more by more than thirty keys' worth of data fee; an account update
 is its flat fee plus data. Asset symbols cost by length: 100,000 for three characters, 50,000
 for four, 10,000 for six. `scale: 25_000` turns the 100 transfer into 250, `scale: 0` makes
@@ -1252,7 +1321,10 @@ the block was decided. One slashed to zero tokens with 1,000 shares still outsta
 **`it('accepts both valid signatures a key can make over one body, whichever was seen first')`**.
 The chain's own signer is deterministic, but FIPS 204's default is hedged, so the test signs
 the same body a second time with `ml_dsa44.sign` and fresh entropy and gets different valid
-bytes. `checkTx` admits the hedged copy, so the cache has seen that one; a block carrying the
+bytes, prefixed with the `Scheme.mlDsa44` tag before they go into the transaction, as every
+signature on the wire is. The case is declared with `it.skipIf(DEFAULT_SCHEME !== Scheme.mlDsa44)`:
+it is about ML-DSA signing, and it is the one case `CHAIN_SCHEME=secp256k1 npm test` skips.
+`checkTx` admits the hedged copy, so the cache has seen that one; a block carrying the
 deterministic copy first and the hedged one second gives `['ok', 'duplicate transaction']`.
 The first is accepted although it was never checked (its signature verifies and is cached in
 its own right), and the second is the same transaction again. A cache keyed per signer and
@@ -1620,9 +1692,13 @@ Pitfalls the existing tests have already met:
   (`genesisTime: BigInt(Date.now()) - 1000n`), so there the expiration must be
   `BigInt(Date.now()) + 60_000n`, and anything derived from a fixed time is `/expired/`.
 - **Keys.** Derive every key from `seedFor` with a prefix unique to your file, so a faucet in one
-  file is never the faucet of another. The validator and node keys of a testnet are
-  `net.validatorSeed(i)` and `net.nodeSeed(i)`; a node created as a full node becomes a validator
-  only by recreating it with `validatorSeed`.
+  file is never the faucet of another, and in the chain's scheme: `keyPairFromSeed(seed)` with no
+  scheme follows `DEFAULT_SCHEME`, which is what `makeTestnet` and the hand-written genesis
+  documents name, so a test that passes no scheme anywhere runs correctly under either
+  `CHAIN_SCHEME`; a key made with an explicit scheme the chain does not use is refused the moment
+  a transaction names it. The validator and node keys of a testnet are `net.validatorSeed(i)` and
+  `net.nodeSeed(i)`; a node created as a full node becomes a validator only by recreating it with
+  `validatorSeed`.
 - **Cleanup.** Stop the testnet in `afterEach`; push extra nodes into `net.nodes` so `stop()`
   reaches them; `rmSync` temporary directories; close `LmdbEnv`s and `WorkerVerifier` pools in
   `finally`. A node left running keeps timers alive into the next test.

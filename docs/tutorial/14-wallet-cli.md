@@ -4,7 +4,7 @@ This chapter is where a person meets the chain. `src/wallet/keystore.ts` keeps s
 
 ## Concepts
 
-**Seeds and deterministic keys.** ML-DSA-44 key generation is deterministic from a 32-byte seed (`keyPairFromSeed` in `src/crypto/keys.ts`, chapter 2): the same seed always yields the same 1,312-byte public key and 2,560-byte secret key, and the address is `sha256(publicKey)`. So a wallet only ever has to store seeds. That is what makes a keystore small and makes "export" a 64-character hex string.
+**Seeds and deterministic keys.** Key generation is deterministic from a 32-byte seed under both of the chain's signature schemes (`keyPairFromSeed(seed, scheme)` in `src/crypto/keys.ts`, chapter 2): the same seed and scheme always yield the same public key (1,313 bytes with ML-DSA-44, 34 with secp256k1, the scheme tag included) and secret key (2,561 or 33 bytes; for secp256k1 the seed is the secret key itself), and the address is `sha256(publicKey)`, so one seed has a different address under each scheme. So a wallet only ever has to store seeds, and which scheme each was made for. That is what makes a keystore small and makes "export" a 64-character hex string.
 
 **An encrypted keystore.** The problem is to keep seeds on disk such that the file reveals nothing without a passphrase, and such that a wrong passphrase is detected rather than producing garbage keys. Two primitives do it. *scrypt* is a password-based key derivation function designed to be expensive in memory as well as time, so that guessing passphrases in bulk on specialised hardware is costly; it takes the passphrase, a random salt (so two keystores with the same passphrase derive different keys) and the cost parameters `N`, `r`, `p`, and produces a key of any length, here 32 bytes. *AES-256-GCM* is authenticated encryption: it encrypts with a 12-byte IV (which must never repeat under one key) and produces a 16-byte authentication tag; decryption with the wrong key or a tampered ciphertext fails the tag check instead of returning wrong bytes. The keystore derives one key per file from the passphrase and salt, and seals each seed under it with its own IV. A wrong passphrase derives a wrong key, every tag check fails, and `get` reports "wrong passphrase". This is the same construction as the BitShares `cli_wallet`'s encrypted `wallet.json` and Ethereum's keystore files (scrypt plus AES, with a check on the result), with GCM standing in for a separate MAC. `RPC-SYNC-PROOFS.md` section 3.6 fixes the file format and the parameters, and section 5 lists them: scrypt N 32768, r 8, p 1.
 
@@ -33,19 +33,19 @@ This chapter is where a person meets the chain. `src/wallet/keystore.ts` keeps s
 
 Purpose: named seeds sealed under one passphrase, in a JSON file a person can inspect.
 
-Two private shapes describe the file. `SealedKey` is `{ address, publicKey, iv, ciphertext, tag }`, all hex; `KeystoreFile` is `{ version: 1, kdf: { name: 'scrypt', N, r, p, salt }, keys: Record<name, SealedKey> }`. Public keys and addresses are stored in the clear on purpose: `publicKeyOf` can read them without the passphrase, which is what `init` would need to write a genesis from a locked keystore. On disk, with the hex shortened, a keystore holding one key looks like this:
+Two private shapes describe the file. `SealedKey` is `{ address, publicKey, scheme?, iv, ciphertext, tag }`, all hex but the scheme, which is the name of the scheme the seed was made for and is absent in a file written when there was only ML-DSA-44; `KeystoreFile` is `{ version: 1, kdf: { name: 'scrypt', N, r, p, salt }, keys: Record<name, SealedKey> }`. Public keys and addresses are stored in the clear on purpose: `publicKeyOf` can read them without the passphrase, which is what `init` would need to write a genesis from a locked keystore. On disk, with the hex shortened, a keystore holding one key looks like this:
 
 ```json
 {
   "version": 1,
   "kdf": { "name": "scrypt", "N": 32768, "r": 8, "p": 1, "salt": "…" },
   "keys": {
-    "faucet": { "address": "…", "publicKey": "…", "iv": "…", "ciphertext": "…", "tag": "…" }
+    "faucet": { "address": "…", "publicKey": "…", "scheme": "ml-dsa-44", "iv": "…", "ciphertext": "…", "tag": "…" }
   }
 }
 ```
 
-The sizes follow from the primitives: the salt is 16 random bytes (32 hex digits), the address is a sha256 (64), the public key is ML-DSA-44's 1,312 bytes (2,624), the IV is 12 bytes (24), the ciphertext is the 32-byte seed with no padding since GCM is a stream mode (64), and the tag is 16 bytes (32).
+The sizes follow from the primitives: the salt is 16 random bytes (32 hex digits), the address is a sha256 (64), the public key is the tagged key, 1,313 bytes for ML-DSA-44 (2,626) or 34 for secp256k1 (68), the IV is 12 bytes (24), the ciphertext is the 32-byte seed with no padding since GCM is a stream mode (64), and the tag is 16 bytes (32).
 
 **`SCRYPT`** is the exported parameter set `{ N: 32768, r: 8, p: 1 }`. The derivation:
 
@@ -63,18 +63,19 @@ private static derive(passphrase: string, kdf: KeystoreFile['kdf']): Buffer {
 - **`open(path, passphrase)`** parses the file, refuses any version but 1 or any KDF but scrypt, derives the key, and then "checks the passphrase against the first key, if any" by decrypting it. The test is `first !== undefined`, not a truthiness test: whenever a key exists, whatever its name, the check runs. An empty keystore cannot detect a wrong passphrase, which is a consequence of there being no separate passphrase check value in the file. What happens then is worth stating exactly, because it is easy to overstate: the first `add` seals its seed under the key scrypt derives from whatever passphrase was typed. That derivation is deterministic, so the seed is not lost; it opens with the mistyped passphrase and refuses the intended one, and the next `open` with the intended passphrase fails the check against that first key and says "wrong passphrase". (The check happens at `open`; the CLI's `keys` command on an empty keystore relies on the user typing the passphrase correctly.)
 - **`openOrCreate(path, passphrase)`** is what the CLI calls: open if the file exists, else create.
 
-**`list()`** returns `{ name, address, publicKey }` for every key, without unlocking anything, and **`has(name)`** checks the name; both reflect the file as this handle last read or wrote it, so a key another handle added since is seen after this handle's next write, or by opening the file again. **`add(name, seed = generateSeed())`**:
+**`list()`** returns `{ name, address, publicKey, scheme }` for every key, without unlocking anything (`'ml-dsa-44'` for a record that names no scheme), and **`has(name)`** checks the name; both reflect the file as this handle last read or wrote it, so a key another handle added since is seen after this handle's next write, or by opening the file again. **`add(name, seed?, scheme = DEFAULT_SCHEME)`**:
 
 ```ts
-  add(name: string, seed: Uint8Array = generateSeed()): KeyPair {
+  add(name: string, seed?: Uint8Array, scheme: SchemeTag = DEFAULT_SCHEME): KeyPair {
     if (name === '') throw new Error('a key needs a name');
     if (this.has(name)) throw new Error(`key ${name} already exists`);
+    seed ??= generateSeed(scheme);
     if (seed.length !== SEED_SIZE) throw new Error(`seed must be ${SEED_SIZE} bytes`);
-    const pair = keyPairFromSeed(seed);
+    const pair = keyPairFromSeed(seed, scheme);
     const iv = randomBytes(12);
     const cipher = createCipheriv('aes-256-gcm', this.key, iv);
     const ciphertext = Buffer.concat([cipher.update(seed), cipher.final()]);
-    const sealed: SealedKey = { address: toHex(pair.address), publicKey: toHex(pair.publicKey), iv: iv.toString('hex'), ciphertext: ciphertext.toString('hex'), tag: cipher.getAuthTag().toString('hex') };
+    const sealed: SealedKey = { address: toHex(pair.address), publicKey: toHex(pair.publicKey), scheme: schemeName(scheme), iv: iv.toString('hex'), ciphertext: ciphertext.toString('hex'), tag: cipher.getAuthTag().toString('hex') };
     this.mutate((keys) => {
       if (name in keys) throw new Error(`key ${name} already exists`); // another handle got there first
       keys[name] = sealed;
@@ -83,7 +84,7 @@ private static derive(passphrase: string, kdf: KeystoreFile['kdf']): Buffer {
   }
 ```
 
-A name that is not empty and not taken, a seed of the right size, a fresh IV per seed; the seed is sealed before the lock is taken, so the key generation and the encryption are not done while other writers wait, and the insertion happens under the lock against the keys on disk at that moment. The second `already exists` check is the one that matters between handles: this handle's `has` saw the file as it last read it, and a name another handle added since is only visible under the lock. The empty name is refused for two reasons: `keys add ''` would store a key that no later command can name, and the empty string is the one name that a truthiness test in `open` would have skipped, leaving a keystore whose only key never checked the passphrase. `add` is both "generate" and "import": the CLI's `keys import` passes a seed, `keys add` lets the default generate one.
+A name that is not empty and not taken, a seed of the right size (generated for the scheme when none is given: `generateSeed(scheme)` skips the few 32-byte values that are not secp256k1 keys), the key pair derived in that scheme, a fresh IV per seed; the seed is sealed before the lock is taken, so the key generation and the encryption are not done while other writers wait, and the insertion happens under the lock against the keys on disk at that moment. The second `already exists` check is the one that matters between handles: this handle's `has` saw the file as it last read it, and a name another handle added since is only visible under the lock. The empty name is refused for two reasons: `keys add ''` would store a key that no later command can name, and the empty string is the one name that a truthiness test in `open` would have skipped, leaving a keystore whose only key never checked the passphrase. `add` is both "generate" and "import": the CLI's `keys import` passes a seed, `keys add` lets the default generate one, and both pass the scheme `--scheme` names. The record keeps that scheme's name beside the public key, so `get` can derive the same key again. `DEFAULT_SCHEME` is ML-DSA-44 unless `CHAIN_SCHEME` is set in the environment; the CLI never relies on the default and always passes a scheme.
 
 **`get(name)`** is the inverse and the passphrase check:
 
@@ -99,11 +100,11 @@ get(name: string): KeyPair {
   } catch {
     throw new Error('wrong passphrase');
   }
-  return keyPairFromSeed(new Uint8Array(seed));
+  return keyPairFromSeed(new Uint8Array(seed), schemeTag(k.scheme ?? 'ml-dsa-44'));
 }
 ```
 
-`decipher.final()` is where GCM verifies the tag; any failure is reported as a wrong passphrase, which is also what a corrupted ciphertext looks like. The returned `KeyPair` holds the seed, both keys and the address, regenerated from the seed each time.
+`decipher.final()` is where GCM verifies the tag; any failure is reported as a wrong passphrase, which is also what a corrupted ciphertext looks like. The returned `KeyPair` holds the seed, both keys and the address, regenerated from the seed each time in the scheme the record names. A record without one is from a keystore written when there was one scheme, and is read as ML-DSA-44, so an old file keeps every key it had; `test/schemes.test.ts` deletes the field from a record and checks exactly that.
 
 **`seedOf(name)`** returns the raw seed for export. **`remove(name)`** deletes the name under the lock (it has no CLI command). **`publicKeyOf(name)`** reads the stored public key without decrypting.
 
@@ -177,29 +178,30 @@ A node directory's keystore is the one `init` wrote one level up, shared by the 
 
 **`passphrase()`** reads `--passphrase-file`, then `CHAIN_PASSPHRASE`, then prompts. The prompt hides the echo by replacing `stdout.write` after the prompt text has been written and swallowing everything until the answer arrives; it is a trick, not a terminal mode change, and it is restored in the callback. Everything, not only single-character writes: readline echoes a typed character one at a time, but on an edit (a backspace, a cursor movement) it redraws the whole line, prompt and typed text together, and a filter that let longer writes through would print the passphrase typed so far the first time the user corrected a mistake. **`openKeystore(path)`** is `Keystore.openOrCreate(path, await passphrase())`. The `keys` command guards it: `list` and `export` throw `` `no keystore at ${path}` `` when the file does not exist, so a mistyped `--keystore` cannot quietly create an empty keystore, while `add` and `import` create one on purpose.
 
-**`init(dir, count, basePort)`** writes a testnet:
+**`init(dir, count, basePort, scheme)`** writes a testnet:
 
 ```ts
 const pass = process.env.CHAIN_PASSPHRASE ?? 'testnet';
 const ks = Keystore.create(join(dir, 'keystore.json'), pass);
-const faucet = ks.add('faucet');
-const seeds = Array.from({ length: count }, () => ({ node: generateSeed(), val: generateSeed() }));
-const operators = seeds.map((_, i) => ks.add(`op${i}`));
+const faucet = ks.add('faucet', undefined, scheme);
+const seeds = Array.from({ length: count }, () => ({ node: generateSeed(scheme), val: generateSeed(scheme) }));
+const operators = seeds.map((_, i) => ks.add(`op${i}`, undefined, scheme));
 const account = (name: string, publicKey: Uint8Array, balance: string) => ({ name, owner: authorityJson([publicKey]), active: authorityJson([publicKey]), balance });
 const genesis: Genesis = {
   chainId: `chain-${toHex(generateSeed()).slice(0, 8)}`,
+  signatureScheme: schemeName(scheme),
   genesisTime: BigInt(Date.now()),
   consensus: { maxEvidenceAgeMs: BigInt(UNBONDING_MS), version: 1 },
   appState: appGenesisBytes({
     accounts: [account('faucet', faucet.publicKey, '1000000000000'), ...operators.map((k, i) => account(`op${i}`, k.publicKey, '5000000000'))],
     staking: { unbondingPeriodMs: UNBONDING_MS },
     communityPool: 100_000,
-    validators: seeds.map((s, i) => ({ operator: `op${i}`, consensusKey: toHex(keyPairFromSeed(s.val).publicKey), selfBond: 20_000 })),
+    validators: seeds.map((s, i) => ({ operator: `op${i}`, consensusKey: toHex(keyPairFromSeed(s.val, scheme).publicKey), selfBond: 20_000 })),
   }),
 };
 ```
 
-The keystore gets a `faucet` key and one operator key `op0..opN-1`; each node gets a p2p key seed and a consensus key seed, which go into its `config.json` in the clear (node keys are not wallet keys; the validator's consensus seed has to be readable by the node process). The genesis funds the faucet with 10^12 base units, each operator with 5x10^9, and registers each node's consensus key as a validator operated by `opN` with a self-bond of 20,000 whole tokens; the application-owned validator set is chapter 11's territory. Ports: p2p at `basePort + 2i`, RPC at `basePort + 2i + 1`, and each node's `seeds` are all the others. The passphrase is `CHAIN_PASSPHRASE` or the word `testnet`, and the command prints it, as the spec requires.
+`scheme` is what `--scheme ml-dsa-44|secp256k1` named on the command line, ML-DSA-44 when absent (`main` turns the name into a tag with `schemeTag`, which refuses a name it does not know). It is written into the genesis as `signatureScheme` and every key the testnet starts with is made for it: the faucet and operator keys in the keystore, each node's p2p key seed and consensus key seed. The keystore gets a `faucet` key and one operator key `op0..opN-1`; each node gets a p2p key seed and a consensus key seed, which go into its `config.json` in the clear (node keys are not wallet keys; the validator's consensus seed has to be readable by the node process). The node derives both keys from those seeds with the genesis scheme when it starts (chapter 8), which is why the seeds alone are enough. The genesis funds the faucet with 10^12 base units, each operator with 5x10^9, and registers each node's consensus key as a validator operated by `opN` with a self-bond of 20,000 whole tokens; the application-owned validator set is chapter 11's territory. Ports: p2p at `basePort + 2i`, RPC at `basePort + 2i + 1`, and each node's `seeds` are all the others. The passphrase is `CHAIN_PASSPHRASE` or the word `testnet`, and the command prints it, as the spec requires.
 
 **`start(nodeDir)`** assembles a node: the config and the genesis one directory up, a `WorkerVerifier` (chapter 2's thread pool), a logger at `LOG` level, an `LmdbEnv` under `data/lmdb`, then `Node.create` with the TCP transport, seeds, state-sync anchor and retention from the config. After `node.start()` it opens an `RpcServer` on `rpcListen`, logs a status line every five seconds (height, peers, mempool size, round, active validators, community pool) and shuts everything down in order on `SIGINT` or `SIGTERM`: RPC, node, LMDB, verifier.
 
@@ -228,6 +230,7 @@ async function send(rpc: RpcClient, operations: OperationDraft[], signer: KeyPai
 
 An `OperationDraft` is an operation without its `fee`; `withFees` fills it from the schedule with `calculateFee`, which knows that account creation is priced by name (cheap or premium) and by size, that asset symbols are priced by length, and that everything else has a flat fee. One signer, one signature. The expiration is a minute ahead, or half of the chain's `maxTxExpirationMs` when that is shorter: `applyTransaction` refuses an expiration further past block time than the chain allows, so on a chain with a short window a fixed minute would have every transaction the CLI built refused as "too far in the future", and half the window leaves room for block time trailing the wall clock. A transaction refused at check time (`-32002`) surfaces as the `RpcClientError` that `main` prints; one included but failed prints the application's error from the result and sets the exit code to 1, so a script that drives the CLI can tell the two outcomes apart without parsing the text.
 
+- `chainScheme(rpc)` asks `status` for the chain's `signatureScheme` (ML-DSA-44 if the node reports none) and returns its tag: what a key made for that chain must be. `create` passes it to `ks.add` when the keystore has no key of that name yet, and `create-validator` derives the node's consensus key from its seed with it.
 - `keyFor(keystorePath, name)` opens the keystore (prompting if needed) and returns the named key.
 - `leaves(o)` flattens a nested parameters object to `"fees.transfer.fee" -> value` pairs; `parameters` prints them, `proposals` diffs each proposal's parameters against the live ones, and `proposedParameters(rpc, overrides)` applies `path=value` overrides to the live parameters, keeping a number a number and a string (an amount) a string, and parses the result with `chainParametersFromJson` so a typo in a path is refused before anything is signed.
 
@@ -286,20 +289,20 @@ It asks for the proof at `latest - 1` because the header that commits to height 
 
 | command | arguments | what it does | RPC calls |
 |---|---|---|---|
-| `init` | `<dir> [validators=4] [basePort=26656]` | writes `genesis.json`, `keystore.json` (faucet and `opN` keys, passphrase printed) and `nodeN/config.json` for each validator | none |
+| `init` | `<dir> [validators=4] [basePort=26656] [--scheme ml-dsa-44\|secp256k1]` | writes `genesis.json` naming the scheme, `keystore.json` (faucet and `opN` keys made for it, passphrase printed) and `nodeN/config.json` for each validator | none |
 | `start` | `<nodeDir>` | runs the node over TCP with LMDB and its RPC on `rpcListen`; `LOG` sets the level | serves them |
-| `keys list` | `[--keystore path]` | names and addresses in the keystore; fails if the file does not exist | none |
-| `keys add` | `<name>` | generates a seed, seals it, prints the address | none |
-| `keys import` | `<name> <seedHex>` | seals a given 32-byte seed | none |
+| `keys list` | `[--keystore path]` | one line per key: name, scheme and address; fails if the file does not exist | none |
+| `keys add` | `<name> [--scheme s]` | generates a seed for the scheme (ML-DSA-44 when absent), seals it, prints the address | none |
+| `keys import` | `<name> <seedHex> [--scheme s]` | seals a given 32-byte seed as a key of the scheme (ML-DSA-44 when absent) | none |
 | `keys export` | `<name>` | prints the seed in hex; fails if the file does not exist | none |
 | `show` | `<target>` | height, peers, community pool, bonded, inflation; each active validator's operator, status, stake, self-bond and power; the first 50 accounts with balances | `status`, `object 4.0`, `object 2.0`, `validator` per active entry, `accounts` |
 | `account` | `<target> <name>` | the account with balances, operated validator and history count, and a name proof checked by the light client | `status`, `object 4.0`, `account (prove, height)`, `header`, `commit`, plus the light client's `status`, `header`, `commit`, `validatorSet` |
 | `history` | `<target> <account>` | the newest 50 history entries, decoded, hashes shortened | `accountHistory (limit 50, reverse)` |
 | `tx` | `<target> <hash>` | height, index, result, and the decoded operations | `tx` |
 | `verify-tx` | `<target> <hash>` | the same, verified by the light client: inclusion and, when committed, the result | `tx (prove)`, then the light client's calls |
-| `create` | `<target> <name>` | the faucet registers a new account whose single key is taken from or added to the keystore | `status`, `object 4.0`, `account faucet`, `parameters`, `broadcastTx commit` |
+| `create` | `<target> <name>` | the faucet registers a new account whose single key is taken from the keystore or added to it in the chain's scheme | `status` (for the scheme, when the key is new), `status`, `object 4.0`, `account faucet`, `parameters`, `broadcastTx commit` |
 | `transfer` | `<target> <from> <to> <amount>` | a core-asset transfer signed by `from` | `status`, `object 4.0`, `account` x2, `parameters`, `broadcastTx commit` |
-| `create-validator` | `<nodeDir> <operator> <selfBond>` | registers the node's consensus key (from its `config.json`) as a validator operated by `operator`; needs a node directory | `status`, `object 4.0`, `account`, `parameters`, `broadcastTx commit` |
+| `create-validator` | `<nodeDir> <operator> <selfBond>` | registers the node's consensus key (derived from the seed in its `config.json` with the chain's scheme) as a validator operated by `operator`; needs a node directory | `status`, `object 4.0`, `account`, `status` (for the scheme), `parameters`, `broadcastTx commit` |
 | `delegate` | `<target> <from> <operator> <amount>` | delegates `amount` to the operator's validator | `account`, `validator`, `parameters`, `broadcastTx commit`, plus `status` and `object 4.0` |
 | `undelegate` | `<target> <from> <operator> <amount>` | converts the amount to shares at the delegation's current rate (all shares if the amount covers the whole delegation) and undelegates | `delegation`, `account`, `parameters`, `broadcastTx commit`, plus `status` and `object 4.0` |
 | `unjail` | `<target> <operator>` | the operator asks for its jailed validator back | `account`, `validator`, `parameters`, `broadcastTx commit`, plus `status` and `object 4.0` |
@@ -311,7 +314,7 @@ It asks for the proof at `latest - 1` because the header that commits to height 
 | `light verify` | `<target> verify [height]` | verifies forward to a height or to the latest, prints the height, hash, validator count and the number of steps, saves the anchor | `status`, then `header`, `commit`, `validatorSet` per step |
 | `join` | `<dir> <nodeN> <seedAddr> <trustHeight> <trustHash> [basePort=26700]` | writes a full node's `config.json` with a state-sync anchor and `backfill: true`; start it with `start` | none |
 
-A few of the commands are worth reading closely. `create` reuses an existing key of that name if the keystore has one, otherwise adds one, and the registrar and signer are both the faucet, so `create` works only where the keystore holds the faucet key. `undelegate` reads the delegation first because the operation takes shares, not tokens:
+A few of the commands are worth reading closely. `keys add` and `keys import` make a key for whatever `--scheme` names, ML-DSA-44 when absent, since there is no chain in view; the chain refuses a key of the other scheme when a transaction names it (chapter 11), not before. `create` reuses an existing key of that name if the keystore has one, otherwise adds one made for the scheme `status` reports (`ks.add(name, undefined, await chainScheme(rpc))`), and the registrar and signer are both the faucet, so `create` works only where the keystore holds the faucet key. `undelegate` reads the delegation first because the operation takes shares, not tokens:
 
 ```ts
 const d = await rpc.call('delegation', { delegator: from, validator: need(2, 'operator') });
@@ -328,8 +331,8 @@ Chapter 11's staking rules keep delegations in shares whose value changes with r
 2. `chainInfo`: `status` for the chain id, `object` for `4.0` for the precision (5 by default, so one token is 100,000 base units).
 3. `accountId` twice: `account` for `faucet` gives `3.0`, for `alice` gives her id or throws "no account alice".
 4. `toUnits('12.5', 5)` is `1250000n`.
-5. `keyFor`: the passphrase from the environment, `Keystore.openOrCreate` (scrypt derivation, then `get` of the first key as the passphrase check), then `get('faucet')` (one AES-GCM decryption, one ML-DSA key generation from the seed).
-6. `send`: `chainInfo` again, `parameters` for the schedule, `withFees` puts the `transfer.fee` from it on the operation, `signedTxBytes` encodes the body, signs it under the chain's transaction context with the faucet's secret key and appends the 2,420-byte signature; the whole transaction is about 2.5 KiB (`README.md`, "Performance").
+5. `keyFor`: the passphrase from the environment, `Keystore.openOrCreate` (scrypt derivation, then `get` of the first key as the passphrase check), then `get('faucet')` (one AES-GCM decryption, one key generation from the seed in the scheme the record names, ML-DSA-44 on this testnet).
+6. `send`: `chainInfo` again, `parameters` for the schedule, `withFees` puts the `transfer.fee` from it on the operation, `signedTxBytes` encodes the body, signs it under the chain's transaction context with the faucet's secret key and appends the signature, 2,421 bytes under ML-DSA-44; the whole transaction is about 2.5 KiB (`README.md`, "Performance"). On a testnet made with `--scheme secp256k1` the signature is 65 bytes and the transaction about 150.
 7. `broadcastTx` in `commit` mode: the node's `checkTx` admits it, it is gossiped, proposed, committed, and the RPC answers with its height and result, within the 30-second default. The CLI prints `included at height 57 (tx 31d0…)`, or the application's error if it was included but failed.
 
 Seven RPC calls before the broadcast (`status` and `object` twice each, `account` twice, `parameters` once), of which the two `object` and two `account` calls are costly: with the broadcast that is 28 tokens of the default burst of 100.
@@ -347,6 +350,7 @@ The CLI has no automated test. `RPC-SYNC-PROOFS.md` section 6 lists "every CLI c
 - No CLI test. A test that spawns `node src/cli.ts` against an in-process RPC server, or that refactors `main` into callable functions, would close the gap the spec left.
 - `keys add` and `keys import` create the keystore when the path does not exist (`openOrCreate`), and an empty keystore cannot detect a wrong passphrase, so the first `add` after a mistyped passphrase seals its seed under the mistyped passphrase: the seed can be recovered with that passphrase and not with the intended one, and every later `open` with the intended one reports "wrong passphrase".
 - `keys export` prints the seed in the clear to stdout; there is no `keys remove` even though `Keystore.remove` exists.
+- `keys add` and `keys import` take the scheme from `--scheme` and never from a chain, so a key made for the wrong scheme is only refused when a transaction names it; `create` is the one command that asks the chain first. `keys export` prints the seed alone, and importing it elsewhere needs the same `--scheme` to get the same address.
 - The core asset (`4.0`) and the dynamic properties (`2.0`) are hard-coded ids in `chainInfo` and `show`; `parameters` already reports the core asset id.
 - `account` verifies the name mapping only; balances and the rest are printed unverified. Verifying a balance would need an object proof for the balance object plus the name proof.
 - One signer per transaction and only the operations the commands expose: no `accountUpdate`, `assetCreate`, `assetIssue`, `validatorUpdate` or `redelegate`, and no non-core-asset transfers, though the application supports them all.

@@ -1,7 +1,7 @@
 import type { Reader } from '../codec/reader.ts';
 import { Writer, encode } from '../codec/writer.ts';
 import { HASH_SIZE, toHex } from '../crypto/hash.ts';
-import { SIGNATURE_SIZE } from '../crypto/keys.ts';
+import { decodeSignature } from '../crypto/keys.ts';
 
 export const VoteType = { Prevote: 1, Precommit: 2 } as const;
 export type VoteType = (typeof VoteType)[keyof typeof VoteType];
@@ -56,7 +56,7 @@ export function decodeVote(r: Reader): Vote {
     round: r.u32(),
     blockHash: r.option((r) => r.fixed(HASH_SIZE)),
     validatorIndex: r.u32(),
-    signature: r.fixed(SIGNATURE_SIZE),
+    signature: decodeSignature(r),
   };
 }
 

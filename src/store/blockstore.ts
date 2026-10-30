@@ -3,8 +3,8 @@
  * validator sets by hash, on a key-value store.
  *
  * Validator sets are stored by hash rather than by height because they
- * rarely change and each one is large (1.3 KB per validator with ML-DSA
- * keys). A block header names its set by hash, so the set that signed any
+ * rarely change and each one can be large (1.3 KB per validator with
+ * ML-DSA-44 keys). A block header names its set by hash, so the set that signed any
  * past height can be found in two lookups. That is what evidence
  * verification needs. Blocks are also indexed by hash for queries.
  *

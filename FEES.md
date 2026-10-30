@@ -47,12 +47,15 @@ price at once. The result is capped at the maximum share supply.
   digit, a dot or a hyphen, or with no vowel at all (a, e, i, o, u, y), is cheap;
   every other name is premium. "alice" is premium, "alice1" and "mrkt" are cheap.
 - **Data fee** = `bytes * pricePerKbyte / 1024`, rounded down, over the encoded
-  operation body (everything after the fee field). Authorities hold 1312-byte
-  ML-DSA public keys, so a registration with one key per authority is about 2.7 KB
-  and a sixteen-key authority about 21 KB; this is the one place size matters.
-- Signatures (2420 bytes each) are not charged. A per-signature price would need a
-  transaction-level payer, and operations are the unit of payment here, as in
-  BitShares. Left for a later revision if block space becomes the constraint.
+  operation body (everything after the fee field). Authorities hold tagged public
+  keys of the chain's scheme, 1313 bytes under ML-DSA-44 or 34 under secp256k1, so
+  a registration with one key per authority is about 2.7 KB or about 120 bytes, and
+  a sixteen-key authority about 21 KB or about 620 bytes; this is the one place size
+  matters, and under secp256k1 it hardly does.
+- Signatures (2421 bytes each under ML-DSA-44, 65 under secp256k1, tag included) are
+  not charged. A per-signature price would need a transaction-level payer, and
+  operations are the unit of payment here, as in BitShares. Left for a later revision
+  if block space becomes the constraint.
 
 Defaults (`DEFAULT_FEES`, base units; with precision 5 a value of 100 is 0.001 of the
 core asset): transfer 100; accountCreate basic 1 000, premium 5 000, 100 per KB;

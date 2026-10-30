@@ -18,7 +18,8 @@ Principle: as simple as possible, borrowing proven ideas from other chains.
   The proposer for round r is always derived from the height's base set with one
   increment-by-r call, never incrementally across rounds, because the rescale step is
   not path independent and nodes that skipped rounds would otherwise disagree.
-- **Validator keys:** ML-DSA-44 (see §5). No aggregation exists for ML-DSA, so commits
+- **Validator keys:** ML-DSA-44 or secp256k1, one scheme per chain, named by genesis
+  (see §5). No aggregation exists for ML-DSA and none is used for ECDSA, so commits
   are linear in validator count.
 - **Timestamps:** proposer-based. Proposer sets block time, which must be after the
   previous block's; validators reject a fresh proposal whose time is outside a window
@@ -75,7 +76,8 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
 
 - **Topology:** flat. One TCP stream per peer, one message type field, no channel
   multiplexing. After the handshake, inbound and outbound peers are indistinguishable.
-- **Node identity:** long-lived ML-DSA-44 node keypair. Node id = SHA-256 of public key.
+- **Node identity:** long-lived node keypair of the chain's signature scheme (§5). Node
+  id = SHA-256 of the tagged public key.
 - **Handshake (mutual, nonce-bound, 1.5 round trips, no ECDH):**
   - A connects and sends hello_A: chain id, node pubkey, 32-byte nonce, advertised
     inbound addr:port, last committed height, user agent.
@@ -83,8 +85,9 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   - A replies auth_A: sig_A over (hello_A || hello_B).
   - Either side may instead send reject: wrong chain, connected to self, already
     connected to this node id, not accepting connections, invalid hello or signature.
-  - Signatures use ML-DSA-44 with context "<chainId>/p2p". The nonces bind each
-    signature to this session, so there is no replay and no need for a shared secret.
+  - Signatures use the chain's scheme with context "<chainId>/p2p"; a hello whose key
+    is not a well-formed tagged key is rejected. The nonces bind each signature to
+    this session, so there is no replay and no need for a shared secret.
   - Transport: authenticated, not encrypted. Every consensus message and tx is
     independently signed, so confidentiality adds nothing. X25519 is dropped entirely.
 - **Framing:** 4-byte length, 1-byte message type, binary payload (see §4 codec).
@@ -146,8 +149,8 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
 - **Worker pool, verification only:** Node worker_threads, size = cpu count - 1. A job
   is a batch of (sig, msg, pubkey, context) and returns booleans. The main thread never
   calls verify directly outside tests. Signing stays on the main thread: once per
-  consensus step, ~2 ms, and it keeps the persist-then-broadcast order of the
-  double-sign guard trivial.
+  consensus step, ~2 ms under ML-DSA-44 and a tenth of that under secp256k1, and it
+  keeps the persist-then-broadcast order of the double-sign guard trivial.
 - **Integers:** heights, times, amounts and voting power are BigInt. Plain numbers are
   doubles and carry only bounded integer fields whose encoding is u8, u16 or u32:
   rounds, the protocol version, basis-point rates, counters, instance numbers. No
@@ -155,9 +158,9 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
 - **Codec:** hand-written binary encode/decode per message and per state object,
   Graphene raw-serializer style. Deterministic by construction. JSON is not used for
   anything that gets hashed or signed.
-- **Crypto:** @noble/post-quantum ML-DSA-44 for every signature (see §5). SHA-256 from
-  Node built-in crypto for hashing. Grover halves SHA-256 preimage strength to 128
-  bits, which is sufficient.
+- **Crypto:** @noble/post-quantum ML-DSA-44 or @noble/curves secp256k1 for every
+  signature, one scheme per chain (see §5). SHA-256 from Node built-in crypto for
+  hashing. Grover halves SHA-256 preimage strength to 128 bits, which is sufficient.
 - **Transport abstraction:** one interface, two implementations.
   - TCP via Node net, with manual length-prefix framing.
   - In-memory, linking node instances directly. Supports injected latency, drops, and
@@ -177,7 +180,8 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   state) and an `app` store (every object by id, counters, the version history of
   the provable window, account history, snapshot manifests and chunks, height and
   app hash). Validator sets are
-  stored by hash because they rarely change and are 1.3 KB per validator; a header
+  stored by hash because they rarely change and are 1.3 KB per validator under
+  ML-DSA-44 (50 B under secp256k1); a header
   names its set by hash, so the set that signed any past height is two lookups away,
   which is what evidence verification needs. They are also stored by height, with
   proposer priorities, for a node joining by state sync (section 9). The double-sign
@@ -190,36 +194,71 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   and the account history entries), then pruning. On startup the node asks the app
   its height and replays any blocks the app missed, checking the app hash matches.
 
-## 5. Signatures: ML-DSA-44 (post-quantum)
+## 5. Signatures: ML-DSA-44 or secp256k1, chosen by genesis
 
-- **Scheme:** ML-DSA-44 (FIPS 204, NIST level 2) via `@noble/post-quantum/ml-dsa.js`.
-  Used for validator votes and proposals, transactions, and p2p node identity. One
-  scheme in the codebase.
-- **Sizes:** public key 1312 B, secret key 2560 B, signature 2420 B.
-- **Speed:** an external estimate taken when the scheme was chosen, not a measurement
-  of this code base: noble pure-JS on an Apple M4, ML-DSA-65, about 294 sign/s and
-  610 verify/s, ML-DSA-44 somewhat faster. Budget ~1 ms per verify. Hence the worker
-  pool. The benchmark suite (`bench/crypto.bench.ts`) measures ML-DSA-44 as used
-  here; `docs/benchmarks.md` has those numbers.
+- **Two schemes, one per chain.** Genesis names the scheme in `signatureScheme`:
+  `"ml-dsa-44"` (FIPS 204, NIST level 2, post-quantum, via
+  `@noble/post-quantum/ml-dsa.js`; the default when the field is absent, so every
+  earlier genesis keeps its meaning) or `"secp256k1"` (ECDSA over the Bitcoin curve
+  via `@noble/curves/secp256k1.js`). The one scheme serves validator votes and
+  proposals, transactions and p2p node identity, and cannot change after genesis.
+- **Tagged keys and signatures.** Every public key, secret key and signature carries a
+  one-byte scheme tag in front of its raw bytes (1 = ML-DSA-44, 2 = secp256k1), so a
+  decoder knows how many bytes follow (`decodePublicKey`, `decodeSignature`; an
+  unknown tag is a codec error) and a verifier knows which scheme to run. `verify` is
+  false when the tags of the key and the signature differ or are unknown.
+- **Sizes, tag included:** ML-DSA-44 public key 1313 B, secret key 2561 B, signature
+  2421 B; secp256k1 public key 34 B (33 compressed), secret key 33 B, signature 65 B
+  (64 compact). Seeds are 32 bytes under both; a secp256k1 seed is the secret key
+  itself, and `generateSeed` skips the few values that are not valid keys.
+- **The secp256k1 construction:** ECDSA with RFC 6979 deterministic nonces over the
+  digest `sha256(len(context) || context || msg)`, so the context is bound in ahead
+  of the message with its length; low-S signatures only, on signing and on verifying,
+  so the high-S twin of a valid signature is refused and a signed object has one
+  encoding. ML-DSA-44 is unchanged: deterministic (`extraEntropy: false`), the
+  context taken natively.
+- **Where the other scheme is refused:** genesis validators (`genesis validator key is
+  not a <scheme> key`) and genesis accounts, validator-set updates (`nextState` halts
+  rather than sign with a set that carries one; the application refuses such a key
+  earlier, in checkTx), account authorities in accountCreate and accountUpdate (`key
+  must be a <scheme> key`), consensus keys in validatorCreate and validatorUpdate
+  (`consensus key must be a <scheme> key`), transaction signatures (`signature of
+  another scheme than the chain uses`, before any verification work; the batch
+  pre-verification skips them too), and the validator sets a state-synced node is
+  served (`state sync: a validator key is not a <scheme> key; this is not the chain
+  genesis describes`). A peer's hello must carry a well-formed tagged key; a node
+  makes its own with the genesis scheme.
+- **The scheme in state.** `ChainState.scheme` is the engine's copy, set from genesis
+  and carried from block to block; the application's global properties hold the same
+  (`GlobalProperties.scheme`, set by `applyGenesis`), so it is part of the app hash
+  and two nodes whose genesis files name different schemes never agree on a root. A
+  node derives its node key and its validator key with the genesis scheme, and
+  `status` reports it as `signatureScheme`.
+- **Speed:** measured by `bench/crypto.bench.ts` (`docs/benchmarks.md` section 4.1).
+  Verification in pure JavaScript is close between the schemes, 0.9 ms for ML-DSA-44
+  and 0.7 ms for secp256k1 on one thread, so verification goes through the worker
+  pool under either. Signing is not close, 2 ms against 0.23 ms, nor are sizes.
 - **API:**
   ```ts
-  const keys = ml_dsa44.keygen(seed32)
-  const sig  = ml_dsa44.sign(msg, keys.secretKey, { context, extraEntropy: false })
-  const ok   = ml_dsa44.verify(sig, msg, keys.publicKey, { context })
+  const keys = keyPairFromSeed(seed32, scheme)           // tagged publicKey and secretKey
+  const sig  = sign(msg, keys.secretKey, context)        // the scheme the secret key is tagged with
+  const ok   = verify(sig, msg, keys.publicKey, context) // false across schemes or for an unknown tag
   ```
-- **Deterministic signing:** `extraEntropy: false` everywhere, so a given signer
-  produces the same signature for the same body every time. It does not make a
-  transaction unique: ML-DSA verification accepts hedged (randomised) signatures too,
-  a body may be signed by any subset of keys that satisfies its authorities, and the
-  signatures may come in any order, so a body has several valid signed encodings.
-  Identity is the body hash (section 7); every valid encoding is the same transaction
-  to replay protection.
+- **Deterministic signing:** a given signer produces the same signature for the same
+  body every time, under either scheme. It does not make a transaction unique:
+  ML-DSA verification accepts hedged (randomised) signatures too, an ECDSA signer may
+  choose another nonce, a body may be signed by any subset of keys that satisfies its
+  authorities, and the signatures may come in any order, so a body has several valid
+  signed encodings. Identity is the body hash (section 7); every valid encoding is the
+  same transaction to replay protection.
 - **Domain separation via context:** `"<chainId>/vote"`, `"<chainId>/proposal"`,
   `"<chainId>/tx"`, `"<chainId>/p2p"`. A signature for one purpose can never verify as
-  another. Context max is 255 bytes.
-- **Key storage:** persist the 32-byte seed only. Derive the keypair at startup.
-- **Addresses:** SHA-256 of the public key. Keys live in state, in account authorities
-  (§7); a transaction signature carries the 32-byte address of its key, and the verifier
+  another. Context max is 255 bytes; ML-DSA takes it natively and ECDSA hashes it in.
+- **Key storage:** persist the 32-byte seed only, with the scheme beside it in the
+  keystore. Derive the keypair at startup.
+- **Addresses:** SHA-256 of the tagged public key, so one seed gives a different
+  address under each scheme. Keys live in state, in account authorities (§7); a
+  transaction signature carries the 32-byte address of its key, and the verifier
   resolves the key from the authorities the transaction requires. Keys are never sent
   with transactions.
 - **Verify cache:** keyed by tx id and signer address, holding the hashes of the
@@ -230,11 +269,16 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   which depend on state, are rechecked every time. The cache holds 20 000 bodies and
   evicts the oldest.
 - **Consequences accepted:**
-  - a simple transfer tx is ~2.5 KB, nearly all of it the one signature.
-  - a block commit is `48 + N + 2420 × S` bytes for N validator slots and S present
-    signatures (height, round, block hash, a count, one presence byte per slot).
-    100 validators all signing ≈ 242 KB per block. Light clients download full
-    commits. Keep the validator set modest.
+  - a simple transfer tx is 2,510 bytes under ML-DSA-44, nearly all of it the one
+    signature, and 154 bytes under secp256k1.
+  - a block commit is `48 + N + S × signatureSize` bytes for N validator slots and S
+    present signatures (height, round, block hash, a count, one presence byte per
+    slot), the signature 2421 or 65 bytes with its tag. 100 validators all signing
+    ≈ 242 KB per block under ML-DSA-44 and 6.6 KB under secp256k1. Light clients
+    download full commits. Keep the validator set modest under ML-DSA-44.
+  - ML-DSA keys dominate state: an account's two keys are 2,626 bytes and a validator
+    set 1.3 KB per member, which `docs/benchmarks.md` measures as the bulk of a large
+    genesis; secp256k1 removes that (68 and 50 bytes).
 
 ## 6. Application state: an object database with a Merkle root
 
@@ -251,9 +295,10 @@ ids make adding one unusually easy.
   through every nested object and array (a byte array cannot be frozen in
   JavaScript and is the one thing a caller must not write into); a modification
   replaces the object.
-- **Why ids and not keys or names.** An ML-DSA public key is 1312 bytes. Referencing
-  accounts by id keeps a transfer at about 40 bytes plus its signature; the key is stored
-  once, in the account. Ids are also what makes the Merkle tree below trivial.
+- **Why ids and not keys or names.** An ML-DSA-44 public key is 1313 bytes with its tag
+  (a secp256k1 key 34). Referencing accounts by id keeps a transfer at about 40 bytes
+  plus its signature; the key is stored once, in the account. Ids are also what makes
+  the Merkle tree below trivial.
 - **All consensus state in memory.** The disk holds a copy of every object (so a
   restart reloads rather than replays), the history of the provable window, account
   history and snapshots in the `app` store, next to the blocks the engine keeps.
@@ -371,7 +416,7 @@ The first real application on the object database, BitShares style.
 
 | type | id | indices | holds |
 |---|---|---|---|
-| global | 1 | | core asset id, fee schedule (FEES.md), max transaction expiration, staking parameters |
+| global | 1 | | core asset id, fee schedule (FEES.md), max transaction expiration, staking parameters, the signature scheme (§5) |
 | dynamic | 2 | | height, last block time, community pool, inflation, bonded total, the active set and the expected signers (STAKING.md) |
 | account | 3 | byName (unique, authenticated) | name, owner authority, active authority, registrar |
 | asset | 4 | bySymbol (unique, authenticated) | symbol, precision, issuer, max and current supply |
@@ -402,11 +447,12 @@ The first real application on the object database, BitShares style.
   the hash of its full signed bytes instead, so one body signed twice, or by a
   different satisfying subset of keys, is one transaction to the application and two
   to the mempool and the index. Each signature is a 32-byte key address plus the
-  2420-byte signature; the key is resolved from the authorities the operations
-  require, walking member accounts to depth 2. A signature by any other key, or two
-  by the same key, is rejected, as in BitShares; beyond that any satisfying subset of
-  keys in any order is accepted, and so is a hedged ML-DSA signature, so a body has
-  several valid signed encodings. Replay protection is the expiration plus the set of
+  tagged signature (2421 bytes under ML-DSA-44, 65 under secp256k1); the key is
+  resolved from the authorities the operations require, walking member accounts to
+  depth 2. A signature by any other key, or two by the same key, or one of another
+  scheme than the chain's, is rejected, as in BitShares; beyond that any satisfying
+  subset of keys in any order is accepted, and so is a hedged ML-DSA signature or an
+  ECDSA signature under another nonce, so a body has several valid signed encodings. Replay protection is the expiration plus the set of
   unexpired tx ids, pruned at the start of every block. There are no account nonces,
   so independent transactions from one account never wait for each other, and a
   transaction signed by several accounts needs no agreement on whose nonce to use.
@@ -453,7 +499,8 @@ The first real application on the object database, BitShares style.
   block is handed to the engine as updates (section 8 and STAKING.md).
 - **Genesis** (`appState`, JSON): the core asset's symbol, precision and max supply; the
   fee schedule (any subset, over the defaults); the expiration window; and the initial
-  accounts with their authorities (public keys in hex) and core balances. A small one
+  accounts with their authorities (tagged public keys in hex, of the chain's scheme)
+  and core balances. A small one
   is inline in `genesis.json`; a large one (a token distribution: hundreds of
   megabytes of public keys, beyond what V8 holds as one string) is named by
   `appStateFile` and read as a token stream with `stream-json`, one account at a
@@ -505,10 +552,11 @@ misbehaviour list than every other node and diverge the state. Validator sets ar
 also stored by the height they sign, priorities included, because a state-synced
 node must continue consensus with the exact proposer priorities.
 
-## 10. Implementation status (2026-10-28)
+## 10. Implementation status (2026-10-30)
 
-Everything above is implemented in TypeScript under `src/`. 132 tests in 19 files
-pass. The engine
+Everything above is implemented in TypeScript under `src/`. 137 tests in 20 files
+pass, and the whole suite passes under either signature scheme
+(`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there). The engine
 tests (consensus, recovery, network, units) run on the key-value test app; the
 database and application have their own suites, and one test runs the core application
 on a live four-validator network with a full node, gossiping signed transactions and
@@ -521,12 +569,15 @@ application-owned set through delegation, a stopped validator being jailed, its
 return by unjail, and a light client following the whole sequence. The fee suite prices
 operations against the schedule (FEES.md), checks that a stated fee is what is charged,
 and adopts a schedule change by proposal, after which a transaction priced under the
-old schedule fails instead of paying more.
+old schedule fails instead of paying more. The schemes suite signs, verifies and
+round-trips tagged keys under each scheme, refuses cross-scheme keys and signatures,
+unknown tags and the high-S twin, keeps each key's scheme in the keystore, and runs a
+four-validator chain on secp256k1 end to end.
 
 | module | what it is |
 |---|---|
 | `src/codec/` | deterministic binary writer and reader |
-| `src/crypto/` | sha256, ML-DSA-44 keys and signing, verification worker pool |
+| `src/crypto/` | sha256, tagged keys and signing under ML-DSA-44 or secp256k1, verification worker pool |
 | `src/types/` | validator set and proposer selection, votes, evidence, blocks, proposals, genesis, chain state |
 | `src/consensus/` | the Tendermint state machine, vote sets, evidence pool, private validator with double-sign guard, block validation |
 | `src/mempool.ts` | FIFO pool with checkTx admission and post-commit recheck |

@@ -1,3 +1,4 @@
+import { schemeName, schemeTag, type SchemeName } from '../crypto/keys.ts';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fromHex, toHex } from '../crypto/hash.ts';
@@ -19,6 +20,8 @@ export interface GenesisValidator {
 
 export interface Genesis {
   chainId: string;
+  /** The signature scheme every validator key, account key and signature on this chain must use; ML-DSA-44 when absent. */
+  signatureScheme?: SchemeName;
   /** Unix milliseconds. Block 1 must be later than this. */
   genesisTime: bigint;
   /** The initial validator set, unless the application supplies one from initChain. */
@@ -35,6 +38,7 @@ export function genesisToJson(g: Genesis): string {
   return JSON.stringify(
     {
       chainId: g.chainId,
+      signatureScheme: g.signatureScheme,
       genesisTime: g.genesisTime.toString(),
       validators: g.validators?.map((v) => ({ publicKey: toHex(v.publicKey), power: v.power.toString(), name: v.name })),
       consensus: g.consensus ? { maxEvidenceAgeMs: g.consensus.maxEvidenceAgeMs?.toString(), version: g.consensus.version } : undefined,
@@ -51,8 +55,10 @@ export function genesisFromJson(s: string, baseDir = '.'): Genesis {
   const j = JSON.parse(s);
   if (typeof j.chainId !== 'string' || j.chainId.length === 0) throw new Error('genesis: bad chainId');
   const appStateFile = typeof j.appStateFile === 'string' ? resolve(baseDir, j.appStateFile) : undefined;
+  if (j.signatureScheme !== undefined) schemeTag(String(j.signatureScheme)); // a name the code knows, or a clear error
   return {
     chainId: j.chainId,
+    ...(j.signatureScheme !== undefined ? { signatureScheme: schemeName(schemeTag(String(j.signatureScheme))) } : {}),
     genesisTime: BigInt(j.genesisTime),
     validators: Array.isArray(j.validators) ? (j.validators as any[]).map((v) => ({ publicKey: fromHex(v.publicKey), power: BigInt(v.power), name: v.name })) : undefined,
     consensus: j.consensus

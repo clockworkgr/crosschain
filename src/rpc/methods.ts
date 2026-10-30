@@ -3,6 +3,7 @@
  * node and its application; the server (server.ts) only parses, limits and
  * dispatches. See RPC-SYNC-PROOFS.md section 3.3 for the contract.
  */
+import { schemeName } from '../crypto/keys.ts';
 import { CoreApp } from '../app/core/app.ts';
 import { decodeVirtualData, HISTORY_KIND_NAMES, HistoryKind } from '../app/core/history.ts';
 import { delegationOf, powerOf, precisionOf, selfBondOf, tokensForShares, validatorByOperator } from '../app/core/staking.ts';
@@ -117,6 +118,7 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
         return {
           chainId: state.chainId,
           version: state.version,
+          signatureScheme: schemeName(state.scheme),
           latestHeight: state.lastHeight.toString(),
           latestHash: last ? toHex(blockHash(last.block)) : null,
           latestTime: state.lastBlockTime.toString(),

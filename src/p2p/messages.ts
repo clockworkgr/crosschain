@@ -6,7 +6,7 @@
 import { decode, type Reader } from '../codec/reader.ts';
 import { Writer, encode } from '../codec/writer.ts';
 import { HASH_SIZE } from '../crypto/hash.ts';
-import { PUBLIC_KEY_SIZE, SIGNATURE_SIZE } from '../crypto/keys.ts';
+import { decodePublicKey, decodeSignature } from '../crypto/keys.ts';
 import { decodeBlock, decodeCommit, decodeHeader, encodeBlock, encodeCommit, encodeHeader, type Block, type Commit, type Header } from '../types/block.ts';
 import { ValidatorSet } from '../types/validator.ts';
 import { decodeProposal, encodeProposal, type Proposal } from '../types/proposal.ts';
@@ -117,7 +117,7 @@ export function encodeHello(w: Writer, h: Hello): void {
 export function decodeHello(r: Reader): Hello {
   return {
     chainId: r.string(256),
-    publicKey: r.fixed(PUBLIC_KEY_SIZE),
+    publicKey: decodePublicKey(r),
     nonce: r.fixed(NONCE_SIZE),
     listenAddr: r.string(256),
     height: r.u64(),
@@ -256,9 +256,9 @@ export function decodeMessage(buf: Uint8Array): Message {
       case 'hello':
         return { type, hello: decodeHello(r) };
       case 'helloAck':
-        return { type, hello: decodeHello(r), signature: r.fixed(SIGNATURE_SIZE) };
+        return { type, hello: decodeHello(r), signature: decodeSignature(r) };
       case 'auth':
-        return { type, signature: r.fixed(SIGNATURE_SIZE) };
+        return { type, signature: decodeSignature(r) };
       case 'reject':
         return { type, code: r.u8(), reason: r.string(1024) };
       case 'addrRequest':

@@ -8,15 +8,17 @@ the subject of the [tutorial](tutorial/00-overview.md); design decisions are in
 ## 1. Requirements and installation
 
 - Node 24 or later. The code is TypeScript run directly by Node; there is no build step.
-- `npm install` fetches three runtime dependencies, `@noble/post-quantum` (ML-DSA-44
-  signatures), `lmdb` (the on-disk store, the one direct dependency that needs native code) and
-  `stream-json` (streaming parser for large genesis files), and three development tools
-  (TypeScript for `npm run typecheck`, Vitest for `npm test`, and Node's type definitions).
+- `npm install` fetches four runtime dependencies, `@noble/post-quantum` (ML-DSA-44
+  signatures), `@noble/curves` (secp256k1 signatures), `lmdb` (the on-disk store, the one
+  direct dependency that needs native code) and `stream-json` (streaming parser for large
+  genesis files), and three development tools (TypeScript for `npm run typecheck`, Vitest for
+  `npm test`, and Node's type definitions).
 
 ```sh
 git clone <this repository> crosschain && cd crosschain
 npm install
-npm test                 # 132 tests, about a minute
+npm test                 # 137 tests, about a minute
+CHAIN_SCHEME=secp256k1 npm test   # the same suite on secp256k1 keys (one ML-DSA-only case is skipped)
 npm run typecheck
 ```
 
@@ -33,8 +35,10 @@ The script starts the given number of validators inside one process on an in-mem
 opens a JSON-RPC server on node 0 (`RPC_PORT` changes the port), and drives the application from
 a faucet account: every second it registers an account, pays one, or delegates to a validator.
 It prints heights, voting powers, mempool size, account count and balances once a second, and
-at the end verifies an object proof against the app hash. While it runs, any CLI command works
-against it:
+at the end verifies an object proof against the app hash. `CHAIN_SCHEME=secp256k1` in the
+environment runs it on secp256k1 keys instead of ML-DSA-44; the same variable switches the
+tests and the benchmarks, while a node started from a directory ignores it and follows its
+genesis (section 6). While it runs, any CLI command works against it:
 
 ```sh
 node src/cli.ts show http://127.0.0.1:26657
@@ -46,19 +50,22 @@ node src/cli.ts show http://127.0.0.1:26657
 
 ```sh
 export CHAIN_PASSPHRASE=testnet
-node src/cli.ts init ./testnet 4 26656
+node src/cli.ts init ./testnet 4 26656                      # ML-DSA-44 signatures
+node src/cli.ts init ./testnet 4 26656 --scheme secp256k1   # or secp256k1; one scheme per chain
 ```
 
-`init <dir> <validators> [basePort]` writes:
+`init <dir> <validators> [basePort] [--scheme ml-dsa-44|secp256k1]` writes:
 
 | path | content |
 |---|---|
-| `testnet/genesis.json` | the chain: id, genesis time, consensus settings, and the application genesis inline (a faucet with 10,000,000 tokens, one operator account per validator with 50,000, and the validators with a self-bond of 20,000 each) |
-| `testnet/keystore.json` | an encrypted keystore holding the faucet key and the operator keys `op0`..`opN`, under the passphrase from `CHAIN_PASSPHRASE` (default `testnet`) |
+| `testnet/genesis.json` | the chain: id, signature scheme, genesis time, consensus settings, and the application genesis inline (a faucet with 10,000,000 tokens, one operator account per validator with 50,000, and the validators with a self-bond of 20,000 each) |
+| `testnet/keystore.json` | an encrypted keystore holding the faucet key and the operator keys `op0`..`opN`, all of the chain's scheme, under the passphrase from `CHAIN_PASSPHRASE` (default `testnet`) |
 | `testnet/nodeN/config.json` | one per node: name, p2p listen address, RPC address, seeds, the node key seed, and the validator (consensus) key seed |
 
 Ports go up in steps of two from `basePort`: node 0 listens for peers on 26656 and serves RPC on
-26657, node 1 on 26658 and 26659, and so on.
+26657, node 1 on 26658 and 26659, and so on. `--scheme` fixes the signature scheme of every key
+and signature on the chain, ML-DSA-44 when absent (section 6); every key `init` makes, in the
+keystore and in the node directories, is of it.
 
 ### 3.2 Start
 
@@ -116,21 +123,21 @@ their operator account.
 
 | command | what it does |
 |---|---|
-| `init [dir=./testnet] [validators=4] [basePort=26656]` | writes a genesis, a keystore and one directory per validator (section 3.1) |
+| `init [dir=./testnet] [validators=4] [basePort=26656] [--scheme ml-dsa-44\|secp256k1]` | writes a genesis, a keystore and one directory per validator, every key of the named scheme, ML-DSA-44 when absent (section 3.1) |
 | `start <nodeDir>` | runs a node with its RPC (section 3.2) |
 | `join <dir> <nodeN> <seedAddr> <trustHeight> <trustHash> [basePort=26700]` | writes a directory for a node that joins by state sync from a header the operator trusts (section 9); refuses to touch a directory that already has a `config.json` |
-| `keys list` | names and addresses in the keystore (`--keystore <path>`, default `./keystore.json`, for every `keys` command) |
-| `keys add <name>` | generates a key under that name |
-| `keys import <name> <seedHex>` | adds a key from a 32-byte seed |
+| `keys list` | names, schemes and addresses in the keystore (`--keystore <path>`, default `./keystore.json`, for every `keys` command) |
+| `keys add <name> [--scheme ml-dsa-44\|secp256k1]` | generates a key under that name, of the given scheme (ML-DSA-44 when absent); it must be the chain's, which `status` reports |
+| `keys import <name> <seedHex> [--scheme ml-dsa-44\|secp256k1]` | adds a key from a 32-byte seed, derived under the given scheme (ML-DSA-44 when absent) |
 | `keys export <name>` | prints a key's seed |
 | `show <target>` | chain status, the active validators, and the first 50 accounts by name with their balances |
 | `account <target> <name>` | the account, its balances and its validator, with the proof that the name maps to this account (or to none) verified by the light client; the balances themselves are the node's answer, not proven |
 | `history <target> <account>` | the newest 50 entries of the account's history: operations it took part in and virtual events (rewards, slashes, matured unbondings); the `accountHistory` RPC method pages further back |
 | `tx <target> <hash>` | where a transaction landed: height, position, result, decoded operations |
 | `verify-tx <target> <hash>` | the inclusion and result proofs checked by the light client, at any height before or after its anchor (section 11); prints the proven height and result (for the position and the operations, use `tx`) |
-| `create <target> <name>` | the faucet registers a new account; its key is created in the keystore |
+| `create <target> <name>` | the faucet registers a new account; its key is created in the keystore, of the chain's scheme |
 | `transfer <target> <from> <to> <amount>` | pays `to` from `from` in the core asset |
-| `create-validator <nodeDir> <operator> <selfBond>` | registers the node's consensus key as a validator operated by `operator`, bonding `selfBond` |
+| `create-validator <nodeDir> <operator> <selfBond>` | registers the node's consensus key, derived under the chain's scheme, as a validator operated by `operator`, bonding `selfBond` |
 | `delegate <target> <from> <operator> <amount>` | delegates tokens to the validator run by `operator` |
 | `undelegate <target> <from> <operator> <amount>` | starts unbonding that many tokens' worth of shares (all of them when the amount is at or above the delegation's value); they return after the unbonding period |
 | `unjail <target> <operator>` | returns a jailed validator to the candidate set after its jail time |
@@ -187,7 +194,8 @@ more than 1,000 ahead ignored). They are `timeouts` and `limits` options of `Nod
 that embeds one.
 
 Environment: `LOG` sets the log level (`debug`, `info`, `warn`, `error`); `CHAIN_PASSPHRASE`
-the keystore passphrase.
+the keystore passphrase. `CHAIN_SCHEME` is read only by the local network script, the tests and
+the benchmarks (section 2); a node follows the scheme its genesis names.
 
 Data lives under `nodeN/data`: the LMDB environment in `lmdb` holds two stores, `chain` (blocks,
 commits, validator sets, results, the transaction index, the headers a state-synced node keeps
@@ -204,6 +212,7 @@ refused). Back a node up by copying `data` while the node is stopped.
 ```json
 {
   "chainId": "chain-1a2b3c4d",
+  "signatureScheme": "ml-dsa-44",
   "genesisTime": "1761600000000",
   "validators": [{ "publicKey": "<hex>", "power": "10", "name": "v0" }],
   "consensus": { "maxEvidenceAgeMs": "604800000", "version": 1 },
@@ -214,6 +223,7 @@ refused). Back a node up by copying `data` while the node is stopped.
 | field | meaning |
 |---|---|
 | `chainId` | the chain's identity; signatures are bound to it, so two chains never accept each other's votes or transactions |
+| `signatureScheme` | the signature scheme of every validator key, account key and signature on the chain: `ml-dsa-44` (the default when absent, so an older file keeps its meaning; post-quantum, 1,313-byte keys and 2,421-byte signatures) or `secp256k1` (34-byte keys and 65-byte signatures). `init --scheme` sets it; any other value is refused (`unknown signature scheme "x"; one of ml-dsa-44, secp256k1`). It is written into the chain state and into the application's global properties, which the app hash covers, so it cannot be changed after genesis: nodes whose genesis files name different schemes never agree on a block |
 | `genesisTime` | unix milliseconds; block 1 must be later |
 | `validators` | the engine's initial set, used only when the application supplies none. `init` leaves it out and declares validators in the application genesis instead |
 | `consensus.maxEvidenceAgeMs` | how old evidence of double signing may be; `init` sets the unbonding period. A node running the core application follows the staking unbonding period in force instead, so the two never drift apart |
@@ -242,7 +252,8 @@ The application genesis (the content of `appState` or of the file):
 
 - `accounts` are created in order, so the first is `3.0` and becomes the issuer of the core asset.
   Balances are in base units (with precision 5, `1000000000000` is 10,000,000 tokens). An
-  authority is a threshold with weighted keys and, optionally, weighted member accounts.
+  authority is a threshold with weighted keys, each of the chain's scheme (the hex starts with
+  the scheme tag), and, optionally, weighted member accounts.
 - `fees` is any subset of the schedule, in base units, over the defaults in [FEES.md](../FEES.md).
 - `staking` is any subset of the parameters in [STAKING.md](../STAKING.md) section 4; the token
   amounts there (`minSelfBond`, `minDelegation`, `validatorCreationFee`, `fixedRewardPerBlock`) are
@@ -251,7 +262,7 @@ The application genesis (the content of `appState` or of the file):
   10,000, durations from 1 ms to 100 years, `minSelfBond` and `minDelegation` at least 1, and
   `inflationMinBps` no more than `inflationMaxBps`.
 - `communityPool` is whole tokens created at genesis for rewards.
-- `validators` name operator accounts, their consensus public keys, and a self-bond in whole tokens
+- `validators` name operator accounts, their consensus public keys (of the chain's scheme), and a self-bond in whole tokens
   taken from the operator's balance. Each operator must be one of the `accounts`, with a balance
   that covers its self-bond, or the genesis is refused.
 
@@ -261,7 +272,9 @@ accounts loads in about 15 seconds (see [benchmarks.md](benchmarks.md)).
 ## 7. Keys and signing
 
 The keystore (`keystore.json`) holds named 32-byte seeds encrypted with a key derived from the
-passphrase by scrypt, under AES-256-GCM. The file is written atomically. The CLI opens it for any
+passphrase by scrypt, under AES-256-GCM, each with the scheme its key pair is derived under;
+`keys list` prints it beside the name, and a file written before there were two schemes reads
+as ML-DSA-44 throughout. The file is written atomically. The CLI opens it for any
 command that signs, taking the passphrase from `--passphrase-file`, then `CHAIN_PASSPHRASE`, then
 a prompt that echoes nothing.
 
@@ -287,8 +300,12 @@ mempool queues 10,000 of them and remembers the last 100,000 hashes it has seen.
 where a transaction travels as hex inside a request body of at most 1 MiB, it can be a little
 under 512 KiB.
 
-Signing keys are ML-DSA-44: 1,312-byte public keys and 2,420-byte signatures. A transfer with one
-signature is 2,509 bytes on the wire, almost all of it signature.
+Signing keys are of the chain's scheme (section 6): ML-DSA-44, 1,313-byte public keys and
+2,421-byte signatures, or secp256k1, 34-byte keys and 65-byte signatures, each with its one-byte
+scheme tag in front. A transfer with one signature is 2,510 bytes on the wire under ML-DSA-44,
+almost all of it signature, and 154 bytes under secp256k1. A key or signature of the other
+scheme is refused wherever it enters the chain, so `keys add --scheme` must name the chain's
+scheme; `create` and `create-validator` ask `status` for it and follow it.
 
 ## 8. The JSON-RPC
 
@@ -312,7 +329,7 @@ mixes them with requests is answered for the requests alone. `GET /health` answe
 
 | method | parameters | result | costly |
 |---|---|---|---|
-| `status` | | chain id, protocol version, latest height, hash, time and app hash, `catchingUp`, `lowestHeight` kept, `joinedAt` (state sync; forgotten at a restart), peer count, this node's validator address, `rpcVersion` | |
+| `status` | | chain id, protocol version, `signatureScheme` (`ml-dsa-44` or `secp256k1`), latest height, hash, time and app hash, `catchingUp`, `lowestHeight` kept, `joinedAt` (state sync; forgotten at a restart), peer count, this node's validator address, `rpcVersion` | |
 | `genesis` | | the genesis document (without any application state file path) | |
 | `header` | `height?` | the header; below the lowest block, one the node keeps alone when it has it (section 9) | |
 | `block` | `height?` | header, transactions (hex), last commit, evidence, commit | yes |
@@ -401,7 +418,8 @@ The node asks peers for their newest snapshot, verifies its manifest against the
 header the light client has verified from the trusted one, fetches and verifies every chunk
 against the manifest's range proofs (a corrupt chunk costs the peer reputation and is refetched
 elsewhere), rebuilds the state, fetches the block at the snapshot height with its validator
-sets and the headers below it as far back as evidence of double signing may reach (the unbonding
+sets (whose keys must be of the scheme the local `genesis.json` names, or the join stops) and
+the headers below it as far back as evidence of double signing may reach (the unbonding
 period), each checked against the hash the header above it names, writes it all in one
 transaction, and continues with consensus. The snapshot it picks is the newest that two peers
 offer, or else the newest offered, and it must not be older than the trusted header, so trust a
@@ -483,16 +501,23 @@ node's answer, unproven.
 
 ## 12. Operating notes
 
-- **Disk.** A full block of transfers is 4 MiB; state is about the size of its keys (a gigabyte
-  of genesis becomes 614 MiB of LMDB); a snapshot adds as much again. `retain.blocks` prunes
+- **Disk.** A full block of transfers is 4 MiB, a transfer in it 2.5 KiB under ML-DSA-44 or 154
+  bytes under secp256k1; state is about the size of its keys (a gigabyte of ML-DSA-44 genesis
+  becomes 614 MiB of LMDB; secp256k1 keys are a fortieth the size, so the same accounts make a
+  far smaller state); a snapshot adds as much again. `retain.blocks` prunes
   blocks outside the evidence window, and the headers a state-synced node keeps alone go as the
   window moves on; snapshots are kept to `retain.snapshots`. Account history and stored validator
   sets are never pruned and grow with use.
 - **Memory.** The whole state stays in memory by design: about 1.1 GB per gigabyte of genesis,
   plus the version history (changed objects times the retention window) and, during a state
-  sync join, two more copies. Node's default heap suffices for a gigabyte.
+  sync join, two more copies. Node's default heap suffices for a gigabyte. Per account with its
+  balance and two keys the measured cost is 6.1 KB under ML-DSA-44 and 3.5 KB under secp256k1
+  (docs/benchmarks.md section 7): the keys account for the difference, the object database's
+  own objects, indices and trees for the rest, so ten million accounts need tens of gigabytes
+  of heap under either scheme and `--max-old-space-size` above Node's default. On disk the
+  same accounts are 3.3 KB and 190 bytes each.
 - **CPU.** Signature verification is the only heavy work; the node uses a worker pool of all
-  cores but one. One core verifies about 1,200 signatures a second.
+  cores but one. One core verifies about 1,100 ML-DSA-44 or 1,400 secp256k1 signatures a second.
 - **Monitoring.** The status log line, `GET /health`, and `status` (`catchingUp` is true when a
   peer is more than one block ahead).
 - **Upgrades.** There is no deployed network and encodings may change between versions. A node
@@ -511,6 +536,12 @@ node's answer, unproven.
 | `operation 0 states a fee of X, the schedule requires Y` | the fee schedule changed after the transaction was built; rebuild it |
 | `missing active authority of ...` or `no required authority` | signed with a key that is not in the account's authorities |
 | `transaction expired` | built more than 60 seconds ago (or half of `maxTxExpirationMs`, when that is shorter), or the sender's clock is behind the chain's |
+| `key must be a secp256k1 key` (or `ml-dsa-44`) | an account key of the other scheme than the chain's, in a genesis account or an `accountCreate` or `accountUpdate`; `status` reports the chain's `signatureScheme`, and `keys add <name> --scheme <scheme>` makes a key of it |
+| `consensus key must be a secp256k1 key` (or `ml-dsa-44`); `genesis validator <operator>: consensus key must be a ... key` | a `validatorCreate`, a `validatorUpdate` or an application-genesis validator whose consensus key is of the other scheme; `create-validator` derives the key under the chain's scheme, so this comes from a hand-built transaction or genesis |
+| `signature of another scheme than the chain uses` | a transaction signed with a key of the other scheme (one added with the wrong `--scheme`); sign with a key of the chain's scheme |
+| `genesis validator key is not a secp256k1 key` (or `ml-dsa-44`) | the engine's `validators` list in `genesis.json` holds keys of another scheme than `signatureScheme` names |
+| `unknown signature scheme "x"; one of ml-dsa-44, secp256k1` | `signatureScheme` in `genesis.json`, or a `--scheme` flag, is not one of the two names |
+| `state sync: a validator key is not a secp256k1 key; this is not the chain genesis describes` | the peers serve a chain of another scheme than the local `genesis.json` names: the wrong genesis file, or seeds on another chain |
 | `catchingUp: true` for long | the node is far behind and fetching blocks; verification runs at a few thousand transfers a second |
 | `state sync: no peers; replaying from genesis` | no peer connected within 30 seconds of starting; check the seeds and that they are running |
 | `state sync: no peer offers a snapshot; replaying from genesis` | the connected peers export no snapshots (`snapshotInterval: 0`) or have not reached their first one |

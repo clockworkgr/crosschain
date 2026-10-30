@@ -13,7 +13,7 @@ import { decode } from '../src/codec/reader.ts';
 import { encode } from '../src/codec/writer.ts';
 import { FileSignStateStore, SignStep } from '../src/consensus/privval.ts';
 import { toHex } from '../src/crypto/hash.ts';
-import { keyPairFromSeed, sign, signContext, SIGNATURE_SIZE } from '../src/crypto/keys.ts';
+import { DEFAULT_SCHEME, keyPairFromSeed, Scheme, schemeName, sign, signContext, zeroSignature } from '../src/crypto/keys.ts';
 import { InlineVerifier, WorkerVerifier, type VerifyJob } from '../src/crypto/verifier.ts';
 import { KvStoreApp } from '../src/app/kvstore.ts';
 import { bond, reward } from '../src/app/core/staking.ts';
@@ -67,6 +67,7 @@ function genesis(): Genesis {
   const acct = (name: string, k: typeof faucet, balance: bigint) => ({ name, owner: authorityJson([k.publicKey]), active: authorityJson([k.publicKey]), balance: balance.toString() });
   return {
     chainId,
+    signatureScheme: schemeName(DEFAULT_SCHEME),
     genesisTime,
     validators: [{ publicKey: keyPairFromSeed(seedFor('rv/val')).publicKey, power: 10n }],
     appState: appGenesisBytes({
@@ -111,7 +112,7 @@ describe('review regressions', () => {
     const create = tx(app, [{ type: 'accountCreate', registrar: FAUCET_ID, name: 'alice', owner: makeAuthority([alice.publicKey]), active: makeAuthority([alice.publicKey]) }]);
     expect((await app.checkTx(create)).ok).toBe(true); // primes the cache
     const signed = signTransaction(chainId, { expiration: app.dynamic().time + 60_000n, operations: withFees([{ type: 'accountCreate', registrar: FAUCET_ID, name: 'alice', owner: makeAuthority([alice.publicKey]), active: makeAuthority([alice.publicKey]) }], app.feeSchedule()) }, [faucet]);
-    const corrupted = encodeTransaction({ ...signed, signatures: [{ address: signed.signatures[0]!.address, signature: new Uint8Array(SIGNATURE_SIZE) }] });
+    const corrupted = encodeTransaction({ ...signed, signatures: [{ address: signed.signatures[0]!.address, signature: zeroSignature(DEFAULT_SCHEME) }] });
     const r = await block(app, [corrupted]);
     expect(r.txResults[0]!.ok).toBe(false);
     expect(r.txResults[0]!.error).toMatch(/invalid signature/);
@@ -179,15 +180,15 @@ describe('review regressions', () => {
     expect(reward(db, emptied, 100n, 10_000)).toBe(false);
   });
 
-  it('accepts both valid signatures a key can make over one body, whichever was seen first', async () => {
+  it.skipIf(DEFAULT_SCHEME !== Scheme.mlDsa44)('accepts both valid signatures a key can make over one body, whichever was seen first', async () => {
     // Signing is randomised, so two signatures over one body differ; the cache keeps every verified one.
     const app = makeApp();
     await block(app);
     const body = { expiration: app.dynamic().time + 60_000n, operations: withFees([{ type: 'transfer' as const, from: FAUCET_ID, to: objectId(TYPE.account, 1), asset: CORE, amount: T(1) }], app.feeSchedule()) };
     const a = encodeTransaction(signTransaction(chainId, body, [faucet]));
     // This chain's signer is deterministic; a hedged signer (FIPS 204's default) yields other valid bytes.
-    const hedged = ml_dsa44.sign(txBodyBytes(body), faucet.secretKey, { context: signContext(chainId, 'tx'), extraEntropy: crypto.getRandomValues(new Uint8Array(32)) });
-    const b = encodeTransaction({ ...body, signatures: [{ address: faucet.address, signature: hedged }] });
+    const hedged = ml_dsa44.sign(txBodyBytes(body), faucet.secretKey.subarray(1), { context: signContext(chainId, 'tx'), extraEntropy: crypto.getRandomValues(new Uint8Array(32)) });
+    const b = encodeTransaction({ ...body, signatures: [{ address: faucet.address, signature: new Uint8Array([Scheme.mlDsa44, ...hedged]) }] });
     expect(toHex(a)).not.toBe(toHex(b));
     expect((await app.checkTx(b)).ok).toBe(true); // the mempool saw B
     const r = await app.finalizeBlock({ height: app.lastHeight + 1n, time: app.dynamic().time + 1000n, txs: [a, b], proposerAddress: new Uint8Array(32), lastCommitSigners: [], misbehavior: [] });
@@ -255,7 +256,7 @@ describe('review regressions', () => {
 
   it('has the test application refuse a validator update the engine could not apply, and fold repeated ones', async () => {
     const app = new KvStoreApp();
-    await app.initChain({ chainId: 'kv', genesisTime: 0n, validators: [{ publicKey: alice.publicKey, power: 10n }], appState: new Uint8Array() });
+    await app.initChain({ chainId: 'kv', signatureScheme: schemeName(DEFAULT_SCHEME), genesisTime: 0n, validators: [{ publicKey: alice.publicKey, power: 10n }], appState: new Uint8Array() });
     const enc = (s: string) => new TextEncoder().encode(s);
     const r = await app.finalizeBlock({ height: 1n, time: 1n, txs: [enc(`val:${toHex(bob.publicKey)}:0`), enc(`val:${toHex(bob.publicKey)}:5`), enc(`val:${toHex(bob.publicKey)}:7`)], proposerAddress: new Uint8Array(32), lastCommitSigners: [], misbehavior: [] });
     expect(r.txResults.map((t) => t.ok)).toEqual([false, true, true]);
@@ -496,7 +497,7 @@ describe('review regressions on a network', () => {
     await node.stop();
     // Pretend the node had already signed a proposal for the next height before dying.
     const store = new FileSignStateStore(join(tmp, 'priv_validator_state.bin'));
-    store.save({ height: h + 1n, round: 0, step: SignStep.Propose, signBytes: new Uint8Array([1]), signature: new Uint8Array(SIGNATURE_SIZE) });
+    store.save({ height: h + 1n, round: 0, step: SignStep.Propose, signBytes: new Uint8Array([1]), signature: zeroSignature(DEFAULT_SCHEME) });
     const restarted = await net.makeNode(0);
     net.nodes[0] = restarted;
     await restarted.start();

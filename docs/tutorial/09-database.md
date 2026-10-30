@@ -6,7 +6,7 @@ This chapter covers `src/db/`: the in-memory object database that holds every pi
 
 ### Objects, types and dense ids
 
-The model is the object database of Graphene, the framework behind BitShares. All consensus state is a set of typed objects held in memory. Each type (account, asset, balance, validator, ...) has a small integer id, and each object of a type has an instance number taken from a per-type counter that only ever goes up. The pair is the object's id, written `type.n`. DESIGN.md section 6 states the two reasons for this: a reference by id is eight bytes where a public key is 1312 (ML-DSA-44), so a transfer names its accounts cheaply and the keys stay in state; and dense instance numbers make the primary index an array and the Merkle tree a complete binary tree, with no key hashing and no balancing.
+The model is the object database of Graphene, the framework behind BitShares. All consensus state is a set of typed objects held in memory. Each type (account, asset, balance, validator, ...) has a small integer id, and each object of a type has an instance number taken from a per-type counter that only ever goes up. The pair is the object's id, written `type.n`. DESIGN.md section 6 states the two reasons for this: a reference by id is eight bytes where a public key is 1,313 bytes with ML-DSA-44 (34 with secp256k1, the scheme tag included either way), so a transfer names its accounts cheaply and the keys stay in state; and dense instance numbers make the primary index an array and the Merkle tree a complete binary tree, with no key hashing and no balancing.
 
 The two halves pack into one unsigned 64-bit integer: 16 bits of type, 48 bits of instance. Worked example: the id of instance 5 of type 3 is
 

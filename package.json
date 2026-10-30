@@ -16,6 +16,7 @@
     "bench:genesis": "node --expose-gc bench/run.ts genesis scale"
   },
   "dependencies": {
+    "@noble/curves": "^2.4.0",
     "@noble/post-quantum": "^0.7.1",
     "lmdb": "^3.5.9",
     "stream-json": "^3.7.0"

@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 import { CoreApp } from '../src/app/core/app.ts';
 import { appGenesisBytes, authorityJson, loadAppGenesis, parseAppGenesis, parseAppGenesisStream, type AppGenesisJson } from '../src/app/core/genesis.ts';
 import { toHex } from '../src/crypto/hash.ts';
-import { keyPairFromSeed } from '../src/crypto/keys.ts';
+import { DEFAULT_SCHEME, keyPairFromSeed, schemeName } from '../src/crypto/keys.ts';
 import { InlineVerifier } from '../src/crypto/verifier.ts';
 import { MemoryKv } from '../src/store/kv.ts';
 import { genesisToJson, loadGenesisFile } from '../src/types/genesis.ts';
@@ -56,20 +56,20 @@ describe('genesis loading', () => {
     expect((await stream(dup)).accounts).toEqual(parseAppGenesis(new TextEncoder().encode(dup)).accounts);
     expect((await stream(dup)).accounts.length).toBe(0);
     // A negative balance is an error, not a zero.
-    expect(() => new CoreApp({ genesis: { chainId: 'g', genesisTime: 1n, appState: appGenesisBytes({ ...doc, accounts: [{ ...doc.accounts![0]!, balance: '-1' }] }) }, verifier })).toThrow(/negative balance/);
+    expect(() => new CoreApp({ genesis: { chainId: 'g', signatureScheme: schemeName(DEFAULT_SCHEME), genesisTime: 1n, appState: appGenesisBytes({ ...doc, accounts: [{ ...doc.accounts![0]!, balance: '-1' }] }) }, verifier })).toThrow(/negative balance/);
   });
 
   it('loads a genesis whose application state is in a file, and reaches the same app hash as an inline one', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'crosschain-genesis-'));
     try {
       writeFileSync(join(dir, 'state.json'), appGenesisBytes(doc));
-      writeFileSync(join(dir, 'genesis.json'), genesisToJson({ chainId: 'g', genesisTime: 1n, appState: new Uint8Array(), appStateFile: 'state.json' }));
+      writeFileSync(join(dir, 'genesis.json'), genesisToJson({ chainId: 'g', signatureScheme: schemeName(DEFAULT_SCHEME), genesisTime: 1n, appState: new Uint8Array(), appStateFile: 'state.json' }));
       const g = loadGenesisFile(join(dir, 'genesis.json'));
       expect(g.appStateFile).toBe(join(dir, 'state.json'));
       expect(g.appState.length).toBe(0);
       expect(genesisToJson(g)).not.toContain('"appState"');
       const fromFile = new CoreApp({ genesis: g, appGenesis: await loadAppGenesis(g), verifier });
-      const inline = new CoreApp({ genesis: { chainId: 'g', genesisTime: 1n, appState: appGenesisBytes(doc) }, verifier });
+      const inline = new CoreApp({ genesis: { chainId: 'g', signatureScheme: schemeName(DEFAULT_SCHEME), genesisTime: 1n, appState: appGenesisBytes(doc) }, verifier });
       expect(toHex(fromFile.lastAppHash)).toBe(toHex(inline.lastAppHash));
       expect(fromFile.accountByName('alice')?.id).toBe(inline.accountByName('alice')?.id);
       // Neither a fresh database nor a reopened one keeps the encoded bytes of every object around.

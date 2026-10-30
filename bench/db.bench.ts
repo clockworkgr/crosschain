@@ -63,7 +63,7 @@ export async function run(): Promise<void> {
     db.undoSession(s);
   });
 
-  // Accounts: a 1312-byte key in each authority, and a name in an authenticated unique index (a sparse Merkle tree).
+  // Accounts: a key of the chain's scheme in each authority (1313 or 34 bytes with its tag), and a name in an authenticated unique index (a sparse Merkle tree).
   const auth = makeAuthority([keyPairFromSeed(seed('db')).publicKey]);
   const A = 20_000;
   await bench(`create ${A.toLocaleString('en-US')} accounts (name index is an SMT) + root`, { iterations: 1, warmup: 0 }, () => {

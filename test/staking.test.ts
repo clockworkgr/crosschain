@@ -8,7 +8,7 @@ import type { OperationDraft } from '../src/app/core/tx.ts';
 import { AssetType, BalanceType, DelegationType, DynamicType, GlobalType as GlobalTypeRef, ProposalType, RedelegationType, TYPE, UnbondingType, ValidatorStatus, ValidatorType, type ChainParameters, type StakingParameters } from '../src/app/core/types.ts';
 import { encode } from '../src/codec/writer.ts';
 import { toHex } from '../src/crypto/hash.ts';
-import { keyPairFromSeed, type KeyPair } from '../src/crypto/keys.ts';
+import { DEFAULT_SCHEME, keyPairFromSeed, schemeName, type KeyPair } from '../src/crypto/keys.ts';
 import { InlineVerifier } from '../src/crypto/verifier.ts';
 import { objectId } from '../src/db/id.ts';
 import { verifyKeyProof } from '../src/db/proof.ts';
@@ -52,6 +52,7 @@ function makeGenesis(staking: StakingParametersJson = PARAMS, validators = [0, 1
   const acct = (name: string, k: KeyPair, balance: bigint) => ({ name, owner: authorityJson([k.publicKey]), active: authorityJson([k.publicKey]), balance: balance.toString() });
   return {
     chainId,
+    signatureScheme: schemeName(DEFAULT_SCHEME),
     genesisTime,
     appState: appGenesisBytes({
       accounts: [acct('faucet', faucet, T(10_000)), acct('op-a', ops[0]!, T(1000)), acct('op-b', ops[1]!, T(1000)), acct('op-c', ops[2]!, T(1000))],

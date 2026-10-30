@@ -13,7 +13,7 @@ of a block reward is computed on the stake before the proposer bonus is paid.
 | topic | decision |
 |---|---|
 | stake model | delegated: any account bonds core tokens to a validator; power = own bond + delegations |
-| identity | a `validator` object owned by an operator account, with its own ML-DSA consensus key, rotatable |
+| identity | a `validator` object owned by an operator account, with its own consensus key of the chain's signature scheme, rotatable |
 | active set | top N candidates by bonded stake, N a parameter (21), recomputed every block |
 | reward source | a community pool fed by fees and a bonded-ratio-targeting mint; the pool pays a fixed reward per block |
 | reward split | proposer bonus 5%, remainder to the signers of the previous commit pro rata to their token stake in base units (consensus power is whole tokens, rounded down) |
@@ -73,7 +73,7 @@ u64 like every other amount; shares are scaled so rounding is negligible (sectio
 
 | type | id | fields | indices |
 |---|---|---|---|
-| validator | 7 | operator (account id), consensusKey (1312 B), tokens, shares, status (candidate, jailed, tombstoned), jailedUntil (ms), createdHeight | byOperator (unique, authenticated), byConsensusAddress (unique, authenticated; key = sha256(consensusKey)), byPower (non-unique; key = 2^64-1 - tokens, so an ascending scan is descending power) |
+| validator | 7 | operator (account id), consensusKey (tagged: 1313 B under ML-DSA-44, 34 B under secp256k1), tokens, shares, status (candidate, jailed, tombstoned), jailedUntil (ms), createdHeight | byOperator (unique, authenticated), byConsensusAddress (unique, authenticated; key = sha256(consensusKey)), byPower (non-unique; key = 2^64-1 - tokens, so an ascending scan is descending power) |
 | delegation | 8 | delegator (account id), validator (validator id), shares | byDelegatorValidator (unique, authenticated), byValidator (non-unique) |
 | unbonding | 9 | delegator, validator, tokens, creationHeight, completion (ms) | byCompletion (non-unique), byDelegatorValidator (non-unique) |
 | redelegation | 10 | delegator, source, destination, tokens (initial), creationHeight, completion (ms) | byCompletion (non-unique), byDelegatorSourceDestination (non-unique), byDelegatorDestination (non-unique) |
@@ -107,7 +107,7 @@ genesis:
 
 | parameter | default | note |
 |---|---|---|
-| maxValidators | 21 | active set size; a commit costs `48 + N + 2420 × S` bytes for N slots and S signatures |
+| maxValidators | 21 | active set size; a commit costs `48 + N + S × signatureSize` bytes for N slots and S signatures, the signature 2421 B under ML-DSA-44 or 65 B under secp256k1, tag included |
 | unbondingPeriodMs | 604 800 000 (7 d) | also the evidence age; a light client's trusting period must stay below it, which is the client's own setting (nothing checks it against the chain) |
 | minSelfBond | 10 000 | operator's own delegation; below it the validator leaves the active set, unslashed |
 | minDelegation | 10 | floor on any delegate or redelegate amount |
@@ -175,8 +175,8 @@ New operation tags continue after assetIssue (4).
 
 | operation | fields | authority | fee payer | rules |
 |---|---|---|---|---|
-| validatorCreate | operator, consensusKey, selfBond | active(operator) | operator | operator has no validator; consensus address unused by any validator, tombstoned ones included; selfBond >= minSelfBond; pays validatorCreationFee into the pool; creates validator, the operator's delegation and the signingInfo |
-| validatorUpdate | validator, consensusKey | active(operator) | operator | key rotation; new address unused; takes effect through the set computation at the end of the block (so at H+2 in the engine); not allowed when tombstoned |
+| validatorCreate | operator, consensusKey, selfBond | active(operator) | operator | consensusKey a key of the chain's scheme (`consensus key must be a <scheme> key`); operator has no validator; consensus address unused by any validator, tombstoned ones included; selfBond >= minSelfBond; pays validatorCreationFee into the pool; creates validator, the operator's delegation and the signingInfo |
+| validatorUpdate | validator, consensusKey | active(operator) | operator | key rotation to a key of the chain's scheme (the other is refused as on create); new address unused; takes effect through the set computation at the end of the block (so at H+2 in the engine); not allowed when tombstoned |
 | delegate | delegator, validator, amount | active(delegator) | delegator | amount >= minDelegation; validator not tombstoned (jailed allowed); moves amount from the delegator's core balance into the validator |
 | undelegate | delegator, validator, shares | active(delegator) | delegator | shares <= owned; the operator's delegation may not go below minSelfBond unless the validator is tombstoned; fewer than maxEntries pending; creates an unbonding entry maturing at time + unbondingPeriodMs |
 | redelegate | delegator, source, destination, shares | active(delegator) | delegator | source != destination; destination not tombstoned; the stake being moved must not come from a still-pending redelegation into source (no chains); fewer than maxEntries pending for the triple; unbonds from source and delegates the tokens to destination immediately; creates a redelegation entry maturing at time + unbondingPeriodMs that stays slashable by source |
@@ -274,7 +274,9 @@ genesis gains:
 }
 ```
 
-`applyGenesis` creates the validator objects, moves each self-bond from the operator
+`applyGenesis` checks that each consensus key is of the chain's scheme (`genesis
+validator <operator>: consensus key must be a <scheme> key`), creates the validator
+objects, moves each self-bond from the operator
 account's balance into the validator (issuing shares at `SHARE_SCALE`), funds the
 pool from the core asset's genesis allocation, sets `inflationPpb` to
 `inflationMinBps`, computes the active set, and `initChain` returns it. The

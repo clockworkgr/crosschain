@@ -21,7 +21,7 @@ import { CORE_TYPES } from '../app/core/types.ts';
 import { getGlobal } from '../app/core/state.ts';
 import { FileSignStateStore, MemorySignStateStore, PrivValidator } from '../consensus/privval.ts';
 import type { ValidationLimits } from '../consensus/validate.ts';
-import { keyPairFromSeed, type KeyPair } from '../crypto/keys.ts';
+import { keyPairFromSeed, schemeTag, type KeyPair } from '../crypto/keys.ts';
 import { InlineVerifier, type Verifier } from '../crypto/verifier.ts';
 import { Mempool, type AddTxResult } from '../mempool.ts';
 import { InvKind, MAX_HEADERS } from '../p2p/messages.ts';
@@ -135,7 +135,9 @@ export class Node {
     this.chainId = cfg.genesis.chainId;
     this.log = cfg.log ?? makeLogger(cfg.name, cfg.logLevel ?? 'info');
     this.verifier = cfg.verifier ?? new InlineVerifier();
-    this.nodeKey = keyPairFromSeed(cfg.nodeKeySeed);
+    // One scheme per chain, genesis's, for the node identity and the validator key alike.
+    const scheme = schemeTag(cfg.genesis.signatureScheme ?? 'ml-dsa-44');
+    this.nodeKey = keyPairFromSeed(cfg.nodeKeySeed, scheme);
     if (cfg.dataDir) mkdirSync(cfg.dataDir, { recursive: true });
     // Two nodes on one directory would share a signing guard that neither sees the other write.
     this.releaseLock = cfg.dataDir ? lockDataDir(cfg.dataDir) : null;
@@ -145,7 +147,7 @@ export class Node {
     this.evidencePool = new EvidencePool();
     this.privValidator = cfg.validatorSeed
       ? new PrivValidator(
-          keyPairFromSeed(cfg.validatorSeed),
+          keyPairFromSeed(cfg.validatorSeed, scheme),
           cfg.dataDir ? new FileSignStateStore(join(cfg.dataDir, 'priv_validator_state.bin')) : new MemorySignStateStore(),
           this.chainId,
         )
@@ -213,6 +215,7 @@ export class Node {
         log: this.log,
         trustHeight: this.cfg.stateSync.trustHeight,
         trustHash: this.cfg.stateSync.trustHash,
+        scheme: this.nodeKey.scheme,
         // The same age the node will hold blocks to: the operator's figure, else the unbonding period the imported state holds.
         evidenceAgeMs: (db) => this.cfg.limits?.maxEvidenceAgeMs ?? getGlobal(db).staking.unbondingPeriodMs,
         transaction: (fn) => this.env.transaction(fn),

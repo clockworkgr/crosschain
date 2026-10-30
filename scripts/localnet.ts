@@ -5,6 +5,7 @@
  *
  *   node scripts/localnet.ts [validators=4] [seconds=30]
  */
+import { DEFAULT_SCHEME, schemeName } from '../src/crypto/keys.ts';
 import { CoreApp } from '../src/app/core/app.ts';
 import { makeAuthority } from '../src/app/core/authority.ts';
 import { signedTxBytes, withFees } from '../src/app/core/client.ts';
@@ -32,6 +33,7 @@ const operators = Array.from({ length: count }, (_, i) => keyPairFromSeed(seed(`
 const account = (name: string, publicKey: Uint8Array, balance: string) => ({ name, owner: authorityJson([publicKey]), active: authorityJson([publicKey]), balance });
 const genesis: Genesis = {
   chainId,
+  signatureScheme: schemeName(DEFAULT_SCHEME),
   genesisTime: BigInt(Date.now()),
   appState: appGenesisBytes({
     accounts: [account('faucet', faucet.publicKey, '1000000000000'), ...operators.map((k, i) => account(`op${i}`, k.publicKey, '5000000000'))],

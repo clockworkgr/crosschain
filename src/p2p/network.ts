@@ -17,12 +17,12 @@
  * not lost.
  *
  * Both nonces sit inside the signed bytes, so a signature can never be
- * replayed in another session. Node identity is sha256 of the ML-DSA public
- * key.
+ * replayed in another session. Node identity is sha256 of the node's public
+ * key, which is of the chain's signature scheme.
  */
 import { randomBytes } from 'node:crypto';
 import { bytesEqual, toHex } from '../crypto/hash.ts';
-import { PUBLIC_KEY_SIZE, addressOf, sign, signContext, type KeyPair } from '../crypto/keys.ts';
+import { addressOf, isPublicKey, sign, signContext, type KeyPair } from '../crypto/keys.ts';
 import type { Verifier } from '../crypto/verifier.ts';
 import type { Logger } from '../util/log.ts';
 import { NONCE_SIZE, RejectCode, decodeMessage, encodeMessage, handshakeSignBytes, type Hello, type Message, type MessageType } from './messages.ts';
@@ -240,7 +240,7 @@ export class Network {
   /** Checks common to both directions. Returns a reject code or null. */
   private vetHello(h: Hello): { code: number; reason: string } | null {
     if (h.chainId !== this.cfg.chainId) return { code: RejectCode.WrongChain, reason: 'wrong chain id' };
-    if (h.publicKey.length !== PUBLIC_KEY_SIZE) return { code: RejectCode.Invalid, reason: 'bad public key' };
+    if (!isPublicKey(h.publicKey)) return { code: RejectCode.Invalid, reason: 'bad public key' };
     if (bytesEqual(h.publicKey, this.cfg.nodeKey.publicKey)) return { code: RejectCode.Self, reason: 'connected to self' };
     const until = this.bannedIds.get(toHex(addressOf(h.publicKey)));
     if (until !== undefined && until > Date.now()) return { code: RejectCode.NotAccepting, reason: 'banned' };

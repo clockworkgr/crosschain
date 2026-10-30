@@ -21,7 +21,7 @@ import type { Token } from 'stream-json/parser.js';
 import { fromHex, toHex, compareBytes } from '../../crypto/hash.ts';
 import type { ObjectDatabase } from '../../db/database.ts';
 import { idFromString, objectId } from '../../db/id.ts';
-import { PUBLIC_KEY_SIZE } from '../../crypto/keys.ts';
+import { isPublicKey, schemeName, schemeOf, type SchemeTag } from '../../crypto/keys.ts';
 import { checkAuthority, type Authority } from './authority.ts';
 import { checkAccountName, checkAssetSymbol } from './names.ts';
 import { bootstrapValidators } from './staking.ts';
@@ -273,13 +273,13 @@ export function appGenesisBytes(g: AppGenesisJson): Uint8Array {
 }
 
 /** Create the genesis objects in an empty database. Genesis is trusted configuration, so problems are fatal. */
-export function applyGenesis(db: ObjectDatabase, g: AppGenesis, genesisTime: bigint): void {
+export function applyGenesis(db: ObjectDatabase, g: AppGenesis, genesisTime: bigint, scheme: SchemeTag): void {
   const symbolProblem = checkAssetSymbol(g.coreAsset.symbol);
   if (symbolProblem) throw new Error(`genesis core asset: ${symbolProblem}`);
   if (g.coreAsset.precision > MAX_PRECISION) throw new Error('genesis core asset: precision too high');
   if (g.coreAsset.maxSupply < 1n || g.coreAsset.maxSupply > MAX_SHARE_SUPPLY) throw new Error('genesis core asset: bad max supply');
 
-  db.create(GlobalType, (id) => ({ id, coreAsset: objectId(TYPE.asset, 0), fees: g.fees, maxTxExpirationMs: g.maxTxExpirationMs, staking: g.staking }));
+  db.create(GlobalType, (id) => ({ id, coreAsset: objectId(TYPE.asset, 0), fees: g.fees, maxTxExpirationMs: g.maxTxExpirationMs, staking: g.staking, scheme }));
   db.create(DynamicType, (id) => ({
     id,
     height: 0n,
@@ -293,7 +293,7 @@ export function applyGenesis(db: ObjectDatabase, g: AppGenesis, genesisTime: big
   }));
 
   const accounts = g.accounts.map((a) => {
-    const problem = checkAccountName(a.name) ?? checkAuthority(a.owner) ?? checkAuthority(a.active);
+    const problem = checkAccountName(a.name) ?? checkAuthority(a.owner, scheme) ?? checkAuthority(a.active, scheme);
     if (problem) throw new Error(`genesis account ${a.name}: ${problem}`);
     return db.create(AccountType, (id) => ({ id, name: a.name, owner: a.owner, active: a.active, registrar: id }));
   });
@@ -317,7 +317,7 @@ export function applyGenesis(db: ObjectDatabase, g: AppGenesis, genesisTime: big
   db.modify(AssetType, core.id, (x) => ({ ...x, currentSupply: supply }));
 
   for (const v of g.validators) {
-    if (v.consensusKey.length !== PUBLIC_KEY_SIZE) throw new Error(`genesis validator ${v.operator}: bad consensus key`);
+    if (!isPublicKey(v.consensusKey) || schemeOf(v.consensusKey) !== scheme) throw new Error(`genesis validator ${v.operator}: consensus key must be a ${schemeName(scheme)} key`);
     if (!accounts.some((a) => a.name === v.operator)) throw new Error(`genesis validator ${v.operator}: no such genesis account`);
   }
   bootstrapValidators(db, g.validators.map((v) => ({ operator: accounts.find((a) => a.name === v.operator)!.id, consensusKey: v.consensusKey, selfBond: v.selfBond })));

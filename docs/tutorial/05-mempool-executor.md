@@ -131,7 +131,7 @@ The app hash:
 
 Sorted entries through the deterministic codec, then `sha256`: every node that applied the same blocks reports the same hash, whatever order the keys were inserted in. The initial hash is `sha256` of nothing.
 
-`parse(tx)` decodes with `TextDecoder('utf-8', { fatal: true })` so invalid UTF-8 is an error rather than replacement characters, then recognises the two forms and validates the public key length (`PUBLIC_KEY_SIZE`, 1312 bytes for ML-DSA-44) and that the power is decimal digits. `checkTx` is `parse` and nothing more: it is stateless, so the post-commit recheck can never evict anything for this application. `initChain` loads `genesis.appState` as a JSON object of string keys into `committed`, persists, and returns the app hash with no validators (the engine uses the genesis list). `finalizeBlock`:
+`parse(tx)` decodes with `TextDecoder('utf-8', { fatal: true })` so invalid UTF-8 is an error rather than replacement characters, then recognises the two forms and validates the public key with `isPublicKey` (a known scheme tag followed by exactly that scheme's key, [chapter 2](02-crypto.md)) and that the power is decimal digits. `checkTx` is `parse` and nothing more: it is stateless, so the post-commit recheck can never evict anything for this application. `initChain` loads `genesis.appState` as a JSON object of string keys into `committed`, persists, and returns the app hash with no validators (the engine uses the genesis list). `finalizeBlock`:
 
 ```ts
   async finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult> {

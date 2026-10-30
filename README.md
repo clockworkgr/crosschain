@@ -2,8 +2,9 @@
 
 A proof-of-stake blockchain built from first principles as a learning tool: Tendermint
 consensus with instant finality, a Cosmos-style split between consensus and
-application, Graphene-style peer networking, and post-quantum ML-DSA-44 signatures
-everywhere. Written in TypeScript so that every mechanism is readable in one sitting.
+application, Graphene-style peer networking, and one signature scheme per chain, chosen
+by genesis: post-quantum ML-DSA-44 or secp256k1. Written in TypeScript so that every
+mechanism is readable in one sitting.
 
 `DESIGN.md` records every design decision and why it was made; `STAKING.md`,
 `RPC-SYNC-PROOFS.md` and `FEES.md` are the specifications it points to. The `docs/`
@@ -17,7 +18,7 @@ Requires Node 24 (it runs TypeScript directly; there is no build step).
 
 ```sh
 npm install
-npm test                      # 132 tests, about a minute
+npm test                      # 137 tests, about a minute; CHAIN_SCHEME=secp256k1 runs them on secp256k1 keys
 node scripts/localnet.ts 4 30 # 4 validators in one process for 30 seconds, driving the app from a faucet, RPC on :26657
 ```
 
@@ -25,7 +26,7 @@ A real testnet over TCP, one terminal per node:
 
 ```sh
 export CHAIN_PASSPHRASE=testnet               # the keystore passphrase init prints
-node src/cli.ts init ./testnet 4              # genesis, keystore, 4 node directories (p2p 26656, 26658, ...; RPC one port up)
+node src/cli.ts init ./testnet 4              # genesis, keystore, 4 node directories (p2p 26656, 26658, ...; RPC one port up); --scheme secp256k1 for that scheme
 node src/cli.ts start ./testnet/node0         # repeat for node1..node3
 node src/cli.ts show ./testnet/node1          # status, validators and accounts over the node's RPC
 node src/cli.ts create ./testnet/node0 alice  # the faucet registers alice; her key goes into the keystore
@@ -50,7 +51,7 @@ own file named by `"appStateFile"` in `genesis.json`; the node streams it with
 `stream-json` at first start and never reads it again.
 
 Set `LOG=debug` to watch every proposal, vote and timeout. Node state is kept in an
-LMDB environment under each node's data directory; of the three runtime dependencies,
+LMDB environment under each node's data directory; of the four runtime dependencies,
 `lmdb` is the one that needs native code.
 
 ## Performance
@@ -63,9 +64,11 @@ engine and the application, not the wire.
 
 | what | result |
 |---|---|
-| ML-DSA-44 verify | 1,200/s on one thread, 8,300/s on the worker pool |
-| ML-DSA-44 sign | 3 to 9 ms, run to run |
-| signed transfer | 2,509 bytes; 1,664 filled a 4 MiB block in the four-validator run (the codec's estimate with a 2 KiB shell is 1,668) |
+| ML-DSA-44 verify | 1,100/s on one thread, 7,400/s on the worker pool |
+| ML-DSA-44 sign | 2.0 ms (a rejection loop; earlier runs saw 3 to 9 ms) |
+| secp256k1 verify | 1,400/s on one thread, 9,200/s on the worker pool |
+| secp256k1 sign | 0.23 ms |
+| signed transfer | 2,510 bytes under ML-DSA-44, 154 under secp256k1; 1,664 ML-DSA-44 transfers filled a 4 MiB block in the four-validator run (the codec's estimate with a 2 KiB shell is 1,668) |
 | checkTx (admission to the mempool) | 6,700 transfers/s through the pool |
 | finalizeBlock, signatures verified at admission | 26,000 transfers/s; 1,500 transfers (about 3.6 MiB with a block shell) in 57 ms |
 | finalizeBlock, cold (block sync, or a node that missed the gossip) | 6,300 transfers/s |
@@ -76,20 +79,22 @@ engine and the application, not the wire.
 | four validators under load | 1,100 transfers/s sustained, full 4 MiB blocks |
 | block sync of those blocks | 4,600 transfers/s |
 
-Signatures set every limit. A signed transfer is 2,509 bytes: a 41-byte operation, 48
-bytes of framing and signer address, and a 2,420-byte signature; verifying it costs
-0.8 ms of CPU. A node verifies a signature once, at admission or in the block, and
+Signatures set every limit. A signed transfer is 2,510 bytes under ML-DSA-44: a 41-byte
+operation, 48 bytes of framing and signer address, and a 2,421-byte signature with its
+scheme tag; under secp256k1 the signature is 65 bytes and the transfer 154. Verifying
+one costs 0.7 to 0.9 ms of CPU under either scheme. A node verifies a signature once,
+at admission or in the block, and
 reuses the result while its cache entry lasts (the cache holds 20,000 transaction
 bodies); a signer whose key an earlier transaction of the same block introduces is
 verified in the per-transaction pass instead of the batch. Block space bounds the live
-network: a 4 MiB block holds about 1,660 transfers once the previous commit and the
+network: a 4 MiB block holds about 1,660 ML-DSA-44 transfers once the previous commit and the
 header are in it, at about a block a second. The object database and the store are
 nowhere near their limits at this scale.
 
 ### A large genesis
 
 `npm run bench:genesis` writes a 1 GB (1,000 MiB) application genesis (193,536 accounts
-with two ML-DSA keys each, named by `appStateFile`), loads it, and measures the result; set
+with two ML-DSA-44 keys each, named by `appStateFile`), loads it, and measures the result; set
 `BENCH_GENESIS_MB` for another size. Same machine:
 
 | what | result |
@@ -104,7 +109,8 @@ with two ML-DSA keys each, named by `appStateFile`), loads it, and measures the 
 | snapshot export | 3.5 s |
 | restart from LMDB | 11.8 s (decode 5.0 s, root 3.2 s, rebuilding index history 3.7 s) |
 
-Memory is dominated by the keys themselves: a 1 GB genesis is about 1.1 GB of heap and
+Memory is dominated by the keys themselves (ML-DSA-44 keys; under secp256k1 the same accounts
+hold a fortieth as many key bytes): a 1 GB genesis is about 1.1 GB of heap and
 array buffers at rest (measured after a collection; the resident set is larger, since it
 counts LMDB's memory map and pages the allocator keeps), roughly its size, since the
 state stays in memory by design and hex halves to binary while objects and trees add it
@@ -148,7 +154,7 @@ Each file opens with a comment explaining what it does and why. A good path thro
 the code, from the bottom up:
 
 1. `src/codec/writer.ts` — one byte representation for everything that is hashed or signed.
-2. `src/crypto/keys.ts` — ML-DSA-44 signing with context strings for domain separation.
+2. `src/crypto/keys.ts` — ML-DSA-44 and secp256k1 behind one tagged key and signature format, one scheme per chain, with context strings for domain separation.
 3. `src/types/validator.ts` — the validator set and Tendermint's proposer selection.
 4. `src/types/block.ts`, `src/types/vote.ts` — what a block, a commit and a vote are.
 5. `src/consensus/privval.ts` — the double-sign guard. Short, and the most important safety property in the node.

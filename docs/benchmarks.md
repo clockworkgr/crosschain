@@ -13,6 +13,7 @@ npm run bench:genesis          # the genesis and scale suites on a 1 GB genesis:
 BENCH_GENESIS_MB=100 npm run bench:genesis   # a smaller genesis
 BENCH_KEEP=1 npm run bench:genesis           # keep the generated files and stores for inspection
 BENCH_LOG=debug npm run bench -- network     # log the late-joining node of the network suite
+CHAIN_SCHEME=secp256k1 npm run bench         # every suite on secp256k1 keys; ML-DSA-44 without it
 ```
 
 Both scripts run Node with `--expose-gc` so memory can be measured after a collection. Nothing
@@ -57,8 +58,12 @@ and cached, because signing is the slow part of setting up.
   24.13, macOS. The network suites run four validators inside the benchmark process on the
   in-memory transport with one millisecond of simulated latency, sharing one verification pool
   of eleven threads. They measure the engine and the application, not the wire or the kernel.
-- **Signing varies.** ML-DSA-44 signing has a rejection loop; its mean moved between 3 and 9 ms
-  from run to run. Verification is stable at about 0.8 ms.
+- **Signing varies.** ML-DSA-44 signing has a rejection loop; its mean has moved between 2 ms
+  (the run in section 4.1) and 9 ms from run to run. secp256k1 signing has no such loop and
+  stays at 0.23 ms. Verification is stable under both, about 0.9 ms and 0.7 ms.
+- **One scheme per run.** Every suite runs under the chain's default scheme, ML-DSA-44, unless
+  `CHAIN_SCHEME=secp256k1` is set; the crypto suite alone measures both schemes in one run.
+  The figures below are from ML-DSA-44 runs except where both are given.
 - **p99 is mostly garbage collection.** Iterations that allocate see a 10 ms 99th percentile on
   a 1 ms median; that is a collection landing in the window, not the operation.
 - **RSS is not a budget.** Resident set size includes LMDB's memory map (file-backed, evictable)
@@ -80,25 +85,32 @@ and cached, because signing is the slow part of setting up.
 
 ### 4.1 crypto
 
-What the whole system rests on: ML-DSA-44 key generation, signing and verification, sha256, and
-the worker pool that spreads verification over threads.
+What the whole system rests on: key generation, signing and verification under each of the two
+schemes, sha256, and the worker pool that spreads verification over threads.
 
-| benchmark | ops/s | mean |
-|---|---:|---:|
-| keyPairFromSeed | 1,489 | 672 µs |
-| sign (256 B message) | 107 to 333 | 3 to 9 ms |
-| verify, inline | 1,200 | 833 µs |
-| sha256 (2.5 KB) | 802,000 | 1.2 µs |
-| WorkerVerifier.verify, 256 signatures on 11 threads | 8,274 | 31 ms per 256 |
-| WorkerVerifier.verifyOne (round trip) | 978 | 1.02 ms |
+| benchmark | ML-DSA-44 ops/s | mean | secp256k1 ops/s | mean |
+|---|---:|---:|---:|---:|
+| keyPairFromSeed | 1,400 | 714 µs | 4,708 | 212 µs |
+| sign (256 B message) | 504 | 1.98 ms | 4,334 | 231 µs |
+| verify, inline | 1,144 | 874 µs | 1,391 | 719 µs |
+| WorkerVerifier.verify, 256 signatures on 11 threads | 7,437 | 34.4 ms per 256 | 9,215 | 27.8 ms per 256 |
+| WorkerVerifier.verifyOne (round trip) | 916 | 1.09 ms | 1,304 | 767 µs |
 
-Sizes: public key 1,312 bytes, signature 2,420, secret key 2,560.
+sha256 over 2.5 KB: 776,570 a second, 1.3 µs each (258 µs per 200).
 
-Analysis. One core verifies 1,200 signatures a second; eleven threads reach 8,300, a speed-up of
-6.9, with the rest lost to serialising jobs into worker messages. A single job through the pool
-costs 1 ms round trip, the same as verifying inline, so the pool only pays when it is given
-batches; that fact shaped the application change in section 6. Hashing is three orders of
-magnitude cheaper than any signature operation and never appears in a profile.
+Sizes, tag included: ML-DSA-44 public key 1,313 bytes, signature 2,421, secret key 2,561;
+secp256k1 public key 34, signature 65, secret key 33.
+
+Analysis. Verification in pure JavaScript is close between the schemes: one core verifies
+1,100 ML-DSA-44 or 1,400 secp256k1 signatures a second, and eleven threads reach 7,400 and
+9,200, speed-ups of 6.5 and 6.6, with the rest lost to serialising jobs into worker messages.
+A single job through the pool costs about as much as verifying inline (1.1 ms against 0.9 for
+ML-DSA-44, 0.8 against 0.7 for secp256k1), so the pool only pays when it is given batches;
+that fact shaped the application change in section 6. Signing and sizes are not close:
+secp256k1 signs more than eight times faster and makes a key pair three times faster, and
+its keys and signatures are about a fortieth the size, which takes a transfer from 2.5 KB to
+154 bytes and a validator's share of a commit from 2.4 KB to 66 bytes. Hashing is three
+orders of magnitude cheaper than any signature operation and never appears in a profile.
 
 ### 4.2 codec
 
@@ -109,8 +121,9 @@ magnitude cheaper than any signature operation and never appears in a profile.
 | txHash | 788,000 |
 | txsRoot over 500 transactions | 651 (1.5 ms) |
 
-A signed transfer is 2,509 bytes: a 41-byte operation, 48 bytes of framing and signer address,
-and a 2,420-byte signature. The suite's estimate of how many fit a 4 MiB block, 1,668, subtracts
+A signed transfer is 2,510 bytes under ML-DSA-44: a 41-byte operation, 48 bytes of framing and
+signer address, and a 2,421-byte signature, tag included; under secp256k1 the signature is 65
+bytes and the transfer 154. The suite's estimate of how many fit a 4 MiB block, 1,668, subtracts
 a 2 KiB shell; the proposer measures the real shell (header, previous commit, evidence) and keeps
 1 KiB spare, so the count depends on the validator set and the evidence, and the four-validator
 network in section 4.6 filled a block with 1,664. Encoding and decoding are microseconds and
@@ -249,7 +262,9 @@ as a token stream, built, written to LMDB, read, snapshotted and reopened.
 
 Analysis. The state is its keys: 387,000 ML-DSA public keys are 508 MiB, and the heap around
 them (objects, indices, trees) is about the same again, so a gigabyte of hex genesis is 1.1 GB
-at rest. Lookups are the same speed as with a thousand accounts; proofs grow by one sibling per
+at rest. The suite ran under ML-DSA-44; under secp256k1 the same 387,000 keys would be 13 MiB,
+the objects, indices and trees around them would cost the same, and the genesis file itself
+shrinks with the keys. Lookups are the same speed as with a thousand accounts; proofs grow by one sibling per
 doubling (22 siblings here against 21 for 100,000 balances). Parsing runs at 157 MiB/s, about
 the speed of the hashing of the keys it yields. Building is apply (decode, index, tree leaves),
 root (hash every object, build the trees, build the name tree) and a single LMDB transaction
@@ -288,25 +303,72 @@ export, read the chunks back and verify them, rebuild, write, reopen, with no pe
 no light-client verification of the header. It is bounded by walking every object three times
 (export, rebuild, open) and by holding three copies of the state while it does so.
 
+### 4.9 secp256k1
+
+Everything above ran on ML-DSA-44. `CHAIN_SCHEME=secp256k1 npm run bench` runs the same suites
+on secp256k1, and `CHAIN_SCHEME=secp256k1 BENCH_GENESIS_MB=56 npm run bench:genesis` builds a
+genesis of 191,896 accounts with two keys each, the account count of the gigabyte in section 4.7,
+which takes 56 MB of JSON when a key is 68 hex characters instead of 2,626. Same machine, same
+method; the crypto rows are in section 4.1. What changed:
+
+| benchmark | ML-DSA-44 | secp256k1 |
+|---|---:|---:|
+| signed transfer | 2,510 B | 154 B |
+| transfers per 4 MiB block, estimate | 1,668 | 26,533 |
+| checkTx on the worker pool, 32 in flight | 6,677/s | 9,216/s |
+| finalizeBlock 500 transfers, cold, worker pool | 6,292/s | 7,065/s |
+| finalizeBlock 500 transfers, warm | 27,400/s | 28,321/s |
+| saveBlock, 500 transfers with results and index | 8.2 ms (1.2 MiB) | 5.7 ms (75 KiB) |
+| network: 6,000 transfers submitted to one node | 5.4 s, 1,116 tx/s, blocks full at 1,664 | 3.7 s, 1,618 tx/s, blocks of 1,000 |
+| block sync of those blocks | 4,629 tx/s | 6,182 tx/s |
+| genesis of 192,000 accounts: parse | 6.4 s at 157 MiB/s | 2.3 s at 25 MiB/s |
+| genesis: build (apply, root, persist) | 8.0 s | 5.7 s |
+| memory after building: heap + array buffers | 584 + 536 MiB | 597 + 41 MiB |
+| peak resident set during the build | 3.7 GB | 1.7 GB |
+| LMDB on disk, then with a snapshot | 614 MiB, 1,120 MiB | 34.6 MiB, 68.3 MiB |
+| restart from LMDB | 11.8 s | 8.7 s |
+| RPC account by name with a proof, 16 clients | 6,467 calls/s | 8,155 calls/s |
+| broadcastTx of 2,000 transfers, 16 clients | 2,456 tx/s | 3,130 tx/s |
+| scattered batch transfers applied | 18,700/s | 18,360/s |
+| state sync pipeline, local | 201 chunks (504 MiB), 36.6 s | 199 chunks (31.7 MiB), 13.9 s |
+
+Analysis. Verification is the one cost that barely moves (section 4.1), so the rates that are
+bound by it, admission and a cold block, gain a third at most; a warm block, bound by evaluation
+and the root, does not move at all. Everything that is bound by bytes moves by the ratio of the
+sizes: a transfer is sixteen times smaller, sixteen times more fit a block, the chain store
+writes a sixteenth, and the state on disk is an eighteenth. The network figure is not a
+block-space figure under secp256k1: six thousand transfers went into six blocks of a thousand
+because the proposer reaps a thousand at a time, not because the blocks were full, so the rate
+there is the commit cadence, not the limit. The one number that does not shrink is the heap:
+597 MiB for the same accounts against 584 MiB, because the keys never lived in the heap (they
+are array buffers, 536 MiB against 41) and what the heap holds is the object database itself,
+the account, balance and authority objects, the index entries, the tree chunks and the name
+tree. That is about 3.2 KB per account under either scheme, and it is the floor the next
+section sizes from.
+
 ## 5. What bounds what
 
-- **Signatures bound everything that touches a transaction.** 0.8 ms of CPU per signature,
-  verified once per node, at admission or in the block, and reused while its cache entry lasts
+- **Signatures bound everything that touches a transaction.** 0.7 to 0.9 ms of CPU per
+  signature, secp256k1 to ML-DSA-44, verified once per node, at admission or in the block, and reused while its cache entry lasts
   (the cache holds 20,000 transaction bodies; a signer whose key an earlier transaction of the
   same block introduces is verified in the per-transaction pass). A node admits 6,700 transfers
   a second on eleven threads; a network of such nodes commits what its block space allows.
 - **Block space bounds the live network.** About 1,660 transfers per 4 MiB block (1,664 with
   four validators' commit in the shell) at about one block a second with these timeouts.
-  Signatures are 96% of a transfer's bytes.
+  Signatures are 96% of a transfer's bytes under ML-DSA-44 and 42% under secp256k1.
 - **The root bounds nothing yet.** 15 µs per changed object plus hashing; 2,400 scattered
   transfers in 85 ms on a 387,000-leaf tree.
 - **Persistence bounds nothing yet.** Two LMDB write transactions per block, one for the chain
   store (block, commit, results, validator sets, state) and one for the application's changes,
   about 10 ms each; a snapshot or pruning adds its own.
-- **Memory is the state plus the history window.** About 1.1 GB per gigabyte of genesis, plus
-  changed objects times retained versions, plus two copies more during a state-sync join.
-- **Disk is the blocks.** 2.5 KiB per transfer; state is smaller than its genesis; a snapshot
-  doubles the state store while kept.
+- **Memory is the state plus the history window.** About 1.1 GB per gigabyte of ML-DSA-44
+  genesis, half of it the keys themselves (a fortieth of that under secp256k1), plus changed
+  objects times retained versions, plus two copies more during a state-sync join. The other
+  half is the object database's own objects, indices and trees, the same under both schemes:
+  measured per account with its balance and two keys, 6.1 KB under ML-DSA-44 and 3.5 KB under
+  secp256k1.
+- **Disk is the blocks.** 2.5 KiB per transfer under ML-DSA-44, 154 bytes under secp256k1;
+  state is smaller than its genesis; a snapshot doubles the state store while kept.
 
 ## 6. What the benchmarks found
 
@@ -330,11 +392,51 @@ For a chain with `S` bytes of application state (roughly the genesis size), `B` 
 - memory: 1.1 × S of heap and array buffers at rest (the resident set is larger); about 3 × S in
   all while joining by state sync, when the chunks, the rebuilt state and the opened store are
   held together; add the history window (changed objects per block × retained versions × their
-  size);
-- disk: 0.6 × S for the state, 1.2 × S with a snapshot, plus 2.5 KiB × T × B for blocks;
-- CPU: one core verifies 1,200 signatures a second; a validator should have enough threads to
-  admit the network's full rate with margin, since a block it did not see through gossip costs
-  it the whole verification again.
+  size). S is mostly keys under ML-DSA-44: an account's two keys are 2,626 bytes against 68
+  under secp256k1, so the same accounts make a far smaller S there, while the objects, indices
+  and trees around the keys cost the same;
+- disk: 0.6 × S for the state, 1.2 × S with a snapshot, plus 2.5 KiB × T × B for blocks under
+  ML-DSA-44 (154 bytes × T × B under secp256k1); a commit of N validators adds 48 + N bytes plus
+  2,421 or 65 per signature to every block;
+- CPU: one core verifies 1,100 ML-DSA-44 or 1,400 secp256k1 signatures a second; a validator
+  should have enough threads to admit the network's full rate with margin, since a block it did
+  not see through gossip costs it the whole verification again.
+
+Per account, from the genesis suite at 192,000 accounts with two keys and one balance each
+(sections 4.7 and 4.9), divided through:
+
+| per account | ML-DSA-44 | secp256k1 |
+|---|---:|---:|
+| the two public keys, tags included | 2,626 B | 68 B |
+| LMDB on disk | 3,330 B | 189 B |
+| memory at rest, heap and array buffers | 6,070 B | 3,490 B |
+| of which the object database's own objects, indices and trees | about 3.2 KB | about 3.2 KB |
+
+A worked example: ten million accounts with two keys each, a hundred validators, one-second
+blocks, the default seven-day unbonding period. The figures are a linear extrapolation from a
+point fifty times smaller; lookups are hash and tree based, so the shape should hold, but
+nothing has been measured at that scale.
+
+| ten million accounts, 100 validators | ML-DSA-44 | secp256k1 |
+|---|---:|---:|
+| state on disk, then with a snapshot | 33 GB, 67 GB | 1.9 GB, 3.8 GB |
+| memory at rest | 61 GB | 35 GB |
+| memory while joining by state sync (chunks, rebuilt state, opened store) | about 180 GB | about 40 GB |
+| a full commit (100 signatures) | 242 KB | 6.6 KB |
+| blocks per day at one a second | 21 GB | 570 MB |
+| blocks the evidence window keeps (seven days) | 146 GB | 4 GB |
+| restart (read, decode, index, rebuild) | about 10 minutes | about 8 minutes |
+
+With one key per account (the same key as owner and active) take 1,313 or 34 bytes off the disk
+figures and a little more off memory; it changes the ML-DSA-44 column by a third and the
+secp256k1 column hardly at all. Two conclusions. On disk and in commits secp256k1 removes the
+cost of the chain almost entirely: the state of ten million accounts fits a small SSD and the
+evidence window a few gigabytes, where ML-DSA-44 needs a hundred and fifty. In memory it does
+not: the floor is the object database's own representation, 3.2 KB per account, so ten million
+accounts need tens of gigabytes of JavaScript heap under either scheme, above Node's default
+old-space limit (`--max-old-space-size`) and beyond a laptop. Signature scheme is the right
+knob for disk and bandwidth; for memory at that scale the knob is the in-memory representation
+of state, which is item 6 below.
 
 ## 8. Further work the numbers point to
 
@@ -344,11 +446,16 @@ For a chain with `S` bytes of application state (roughly the genesis size), `B` 
 2. **State sync.** Stream chunks into the store instead of holding them all, then rebuild from
    the store; that removes one of the three copies and most of the peak.
 3. **Signatures per block.** A per-signature or per-kilobyte transaction fee would price the
-   96% of block space that signatures take; FEES.md leaves it open.
+   96% of block space that ML-DSA-44 signatures take; FEES.md leaves it open.
 4. **Block space.** Larger blocks or a shorter commit timeout raise the network's rate directly
    until admission (6,700/s per node) binds.
 5. **History memory.** Store prior values compactly (bytes, not decoded objects) or drop them to
    the store, keeping only the roots in memory.
+6. **State memory.** The object database costs about 3.2 KB of heap per account whatever the
+   key size (section 4.9): decoded objects, index entries, tree chunks and name-tree nodes.
+   Keeping objects as their encoded bytes and decoding on access, or holding cold objects in the
+   store behind a bounded cache, would cut that by most of its size and is what ten million
+   accounts would need.
 
 ## 9. Adding a benchmark
 

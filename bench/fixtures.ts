@@ -1,8 +1,9 @@
 /**
  * Shared material: a thousand funded user accounts, a genesis with and
  * without validators, and pre-signed transfers between the users. Signing
- * is the slow part (ML-DSA-44), so each set is made once and kept.
+ * is the slow part (under ML-DSA-44 above all), so each set is made once and kept.
  */
+import { DEFAULT_SCHEME, schemeName } from '../src/crypto/keys.ts';
 import { signedTxBytes, withFees } from '../src/app/core/client.ts';
 import { appGenesisBytes, authorityJson, DEFAULT_FEES } from '../src/app/core/genesis.ts';
 import { TYPE } from '../src/app/core/types.ts';
@@ -30,6 +31,7 @@ export function makeGenesis(validators: number, genesisTime: bigint): Genesis {
   const operators = Array.from({ length: validators }, (_, i) => keyPairFromSeed(seed(`op/${i}`)));
   return {
     chainId: CHAIN_ID,
+    signatureScheme: schemeName(DEFAULT_SCHEME),
     genesisTime,
     appState: appGenesisBytes({
       accounts: [account('faucet', faucet, 1_000_000n * UNIT), ...users.map((k, i) => account(`user${i}`, k, 10_000n * UNIT)), ...operators.map((k, i) => account(`op${i}`, k, 100_000n * UNIT))],

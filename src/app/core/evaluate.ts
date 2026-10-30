@@ -1,7 +1,7 @@
 import type { ObjectDatabase } from '../../db/database.ts';
 import { idToString, type ObjectId } from '../../db/id.ts';
 import { key } from '../../db/keys.ts';
-import { addressOf, PUBLIC_KEY_SIZE } from '../../crypto/keys.ts';
+import { addressOf, isPublicKey, schemeName, schemeOf } from '../../crypto/keys.ts';
 import { checkAuthority, type Authority } from './authority.ts';
 import { HistoryKind, virtualData } from './history.ts';
 import { checkAccountName, checkAssetSymbol } from './names.ts';
@@ -106,7 +106,7 @@ function checkAmount(amount: bigint, what: string): void {
 }
 
 function checkNewAuthority(db: ObjectDatabase, auth: Authority): void {
-  const bad = checkAuthority(auth);
+  const bad = checkAuthority(auth, getGlobal(db).scheme);
   if (bad) throw new TxError(bad);
   for (const m of auth.accounts) accountOf(db, m.account);
 }
@@ -178,7 +178,7 @@ function applyStakingOperation(ctx: EvalContext, op: Operation): void {
   switch (op.type) {
     case 'validatorCreate': {
       accountOf(db, op.operator);
-      if (op.consensusKey.length !== PUBLIC_KEY_SIZE) throw new TxError('bad consensus key size');
+      if (!isPublicKey(op.consensusKey) || schemeOf(op.consensusKey) !== g.scheme) throw new TxError(`consensus key must be a ${schemeName(g.scheme)} key`);
       if (validatorByOperator(db, op.operator)) throw new TxError('account already operates a validator');
       if (keyEverUsed(db, addressOf(op.consensusKey))) throw new TxError('consensus key already in use');
       if (op.selfBond < p.minSelfBond) throw new TxError(`self-bond must be at least ${p.minSelfBond}`);
@@ -192,7 +192,7 @@ function applyStakingOperation(ctx: EvalContext, op: Operation): void {
       const v = validatorOf(db, op.validator);
       if (v.operator !== op.operator) throw new TxError('not the operator of that validator');
       if (v.status === ValidatorStatus.tombstoned) throw new TxError('validator is tombstoned');
-      if (op.consensusKey.length !== PUBLIC_KEY_SIZE) throw new TxError('bad consensus key size');
+      if (!isPublicKey(op.consensusKey) || schemeOf(op.consensusKey) !== g.scheme) throw new TxError(`consensus key must be a ${schemeName(g.scheme)} key`);
       if (keyEverUsed(db, addressOf(op.consensusKey))) throw new TxError('consensus key already in use');
       db.modify(ValidatorType, v.id, (x) => ({ ...x, consensusKey: op.consensusKey }));
       recordValidatorKey(db, v.id, op.consensusKey);

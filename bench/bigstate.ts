@@ -5,6 +5,7 @@
  * directory. Accounts take two keys each from a pool of POOL key pairs, so
  * signing on behalf of account i uses `keys[(2 * i + 1) % POOL]`.
  */
+import { DEFAULT_SCHEME, schemeName } from '../src/crypto/keys.ts';
 import { closeSync, openSync, readdirSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { CoreApp } from '../src/app/core/app.ts';
@@ -90,7 +91,7 @@ export async function buildBigState(dir: string, verifier: Verifier, log?: (leve
   const t0 = performance.now();
   const accounts = writeAppGenesis(file, keys.map((k) => toHex(k.publicKey)), MB * 1024 * 1024);
   const fileBytes = statSync(file).size;
-  writeFileSync(join(dir, 'genesis.json'), genesisToJson({ chainId: CHAIN_ID, genesisTime, appState: new Uint8Array(), appStateFile: 'app-genesis.json' }));
+  writeFileSync(join(dir, 'genesis.json'), genesisToJson({ chainId: CHAIN_ID, signatureScheme: schemeName(DEFAULT_SCHEME), genesisTime, appState: new Uint8Array(), appStateFile: 'app-genesis.json' }));
   const genesis = loadGenesisFile(join(dir, 'genesis.json'));
   const t1 = performance.now();
   const appGenesis = await loadAppGenesis(genesis);

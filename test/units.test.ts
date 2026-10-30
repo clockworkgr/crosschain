@@ -53,7 +53,7 @@ describe('codec', () => {
   });
 });
 
-describe('ML-DSA-44 keys', () => {
+describe('keys and signatures', () => {
   const kp = keyPairFromSeed(seedFor('k'));
   const msg = new TextEncoder().encode('msg');
 

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { KvStoreApp } from '../src/app/kvstore.ts';
-import { keyPairFromSeed, sign, signContext } from '../src/crypto/keys.ts';
+import { DEFAULT_SCHEME, keyPairFromSeed, schemeName, sign, signContext } from '../src/crypto/keys.ts';
 import { makeDuplicateVoteEvidence } from '../src/types/evidence.ts';
 import { genesisState, PROTOCOL_VERSION } from '../src/types/state.ts';
 import { validateBlockStructure } from '../src/consensus/validate.ts';
@@ -83,7 +83,7 @@ describe('engine changes for staking', () => {
   });
 
   it('refuses a genesis with no validators from either side', () => {
-    expect(() => genesisState({ chainId: 'x', genesisTime: 0n, appState: new Uint8Array() }, new Uint8Array(32))).toThrow(/no validators/);
-    expect(() => genesisState({ chainId: 'x', genesisTime: 0n, appState: new Uint8Array() }, new Uint8Array(32), [])).toThrow(/no validators/);
+    expect(() => genesisState({ chainId: 'x', signatureScheme: schemeName(DEFAULT_SCHEME), genesisTime: 0n, appState: new Uint8Array() }, new Uint8Array(32))).toThrow(/no validators/);
+    expect(() => genesisState({ chainId: 'x', signatureScheme: schemeName(DEFAULT_SCHEME), genesisTime: 0n, appState: new Uint8Array() }, new Uint8Array(32), [])).toThrow(/no validators/);
   });
 });

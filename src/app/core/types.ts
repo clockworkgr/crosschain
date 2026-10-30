@@ -21,7 +21,7 @@
 import type { Reader } from '../../codec/reader.ts';
 import type { Writer } from '../../codec/writer.ts';
 import { HASH_SIZE } from '../../crypto/hash.ts';
-import { PUBLIC_KEY_SIZE, addressOf } from '../../crypto/keys.ts';
+import { addressOf, decodePublicKey, isSchemeTag, type SchemeTag } from '../../crypto/keys.ts';
 import { objectId, type ObjectId } from '../../db/id.ts';
 import type { ObjectType } from '../../db/index.ts';
 import { decodeAuthority, encodeAuthority, type Authority } from './authority.ts';
@@ -335,6 +335,8 @@ export interface GlobalProperties {
   fees: FeeSchedule;
   maxTxExpirationMs: bigint;
   staking: StakingParameters;
+  /** The chain's signature scheme (genesis): every account key, consensus key and transaction signature must be of it. */
+  scheme: SchemeTag;
 }
 
 /** One member of the validator set the application last handed to the engine. */
@@ -473,9 +475,13 @@ export const GlobalType: ObjectType<GlobalProperties> = {
     encodeFeeSchedule(w, o.fees);
     w.u64(o.maxTxExpirationMs);
     encodeStakingParameters(w, o.staking);
+    w.u8(o.scheme);
   },
   decode(r, id) {
-    return { id, coreAsset: r.u64(), fees: decodeFeeSchedule(r), maxTxExpirationMs: r.u64(), staking: decodeStakingParameters(r) };
+    const g = { id, coreAsset: r.u64(), fees: decodeFeeSchedule(r), maxTxExpirationMs: r.u64(), staking: decodeStakingParameters(r) };
+    const scheme = r.u8();
+    if (!isSchemeTag(scheme)) throw new Error(`unknown signature scheme ${scheme}`);
+    return { ...g, scheme };
   },
   indices: [],
 };
@@ -497,7 +503,7 @@ export const DynamicType: ObjectType<DynamicProperties> = {
       inflationPpb: r.u64(),
       lastMintTime: r.u64(),
       bonded: r.u64(),
-      active: r.array((r) => ({ validator: r.u64(), publicKey: r.fixed(PUBLIC_KEY_SIZE), power: r.u64() }), 1000),
+      active: r.array((r) => ({ validator: r.u64(), publicKey: decodePublicKey(r), power: r.u64() }), 1000),
       expectedSigners: r.array((r) => r.array((r) => r.fixed(HASH_SIZE), 1000), 3),
     };
   },
@@ -512,7 +518,7 @@ export const ValidatorType: ObjectType<Validator> = {
   },
   decode(r, id) {
     const operator = r.u64();
-    const consensusKey = r.fixed(PUBLIC_KEY_SIZE);
+    const consensusKey = decodePublicKey(r);
     const tokens = r.u64();
     const shares = r.u64();
     const status = r.u8();

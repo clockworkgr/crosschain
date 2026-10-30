@@ -13,7 +13,9 @@ behind the design, [DESIGN.md](../../DESIGN.md) records every decision in the or
 made, with [STAKING.md](../../STAKING.md), [FEES.md](../../FEES.md) and
 [RPC-SYNC-PROOFS.md](../../RPC-SYNC-PROOFS.md) as the detailed specifications it points to.
 [REVIEW-2026-10-28.md](../../REVIEW-2026-10-28.md) records an external review and what each
-finding changed; the tutorial refers to findings by number.
+finding changed; the tutorial refers to findings by number. The test suite is 20 files and 137
+tests; `npm test` runs it under ML-DSA-44 and `CHAIN_SCHEME=secp256k1 npm test` runs it again
+under secp256k1, the other signature scheme a genesis may choose.
 
 ## What a node is made of
 
@@ -47,7 +49,7 @@ finding changed; the tutorial refers to findings by number.
                                                   +----------->|  LMDB (10)  |
                                                                +-------------+
 
-  Underneath everything: deterministic encoding (01), hashing and ML-DSA signatures (02),
+  Underneath everything: deterministic encoding (01), hashing and signatures (02),
   and the shared types: validator sets, votes, blocks, evidence, chain state, genesis (03).
 ```
 
@@ -71,7 +73,8 @@ it and chapter 11 the one real application behind it.
 ## The life of a transaction
 
 1. A wallet builds a transaction: operations with an expiration, prices each operation from
-   the fee schedule, and signs the body with ML-DSA-44 ([14](14-wallet-cli.md), [02](02-crypto.md)).
+   the fee schedule, and signs the body with the chain's signature scheme, ML-DSA-44 or
+   secp256k1 as its genesis says ([14](14-wallet-cli.md), [02](02-crypto.md)).
 2. It sends the bytes to a node's RPC `broadcastTx` ([12](12-rpc.md)).
 3. The node's mempool asks the application `checkTx`: decode, verify the signatures on the
    worker pool, check expiration and replay, resolve the signing keys from the account's
@@ -136,7 +139,7 @@ it and chapter 11 the one real application behind it.
 | compacted sparse Merkle tree for key-based proofs | Jellyfish (Diem) | 09 |
 | light client with bisection and a trusting period | Tendermint | 13 |
 | state sync from a trusted header with chunked snapshots | Cosmos | 07 |
-| post-quantum signatures throughout | ML-DSA-44 (FIPS 204) | 02 |
+| post-quantum signatures by default, classical secp256k1 as the alternative, one scheme per chain chosen by genesis | ML-DSA-44 (FIPS 204); Bitcoin | 02 |
 
 ## Reading order
 
@@ -144,7 +147,8 @@ Bottom up, as the chapters are numbered. Each chapter can be read on its own, bu
 the concepts of the ones before it.
 
 1. [Codec](01-codec.md): one byte representation for everything that is hashed or signed.
-2. [Crypto](02-crypto.md): sha256, ML-DSA-44 with domain separation, the verification pool.
+2. [Crypto](02-crypto.md): sha256, two signature schemes (ML-DSA-44 and secp256k1) behind one
+   tagged key format, domain separation, the verification pool.
 3. [Types](03-types.md): validator sets and proposer selection, votes, blocks, evidence, chain
    state, genesis, transaction proofs.
 4. [Consensus](04-consensus.md): the Tendermint state machine, vote sets, the double-sign
@@ -162,7 +166,8 @@ the concepts of the ones before it.
 12. [RPC](12-rpc.md): JSON-RPC methods, event streams, limits, the client.
 13. [Light client](13-light-client.md): verifying headers and queries with proofs.
 14. [Wallet and CLI](14-wallet-cli.md): the keystore and the command line.
-15. [Tests](15-tests.md): the harness, every suite, and how to write a new test.
+15. [Tests](15-tests.md): the harness, every suite (20 files, 137 tests, run under either
+    signature scheme), and how to write a new test.
 
 Then [benchmarks.md](../benchmarks.md) for what it all costs.
 
@@ -172,7 +177,8 @@ Then [benchmarks.md](../benchmarks.md) for what it all costs.
   `type.n`: `3.0` is the first account, `4.0` the core asset. Ids are dense: the next instance
   of a type is a counter.
 - **Amounts** are `bigint` base units; the core asset has 5 decimals by default, so one token is
-  `100000n`. Hashes, keys and signatures are `Uint8Array`. Times are unix milliseconds as `bigint`.
+  `100000n`. Hashes, keys and signatures are `Uint8Array`; a key or a signature starts with a
+  one-byte tag naming its scheme. Times are unix milliseconds as `bigint`.
 - **Heights and versions.** Height `h` of the chain is version `h` of the database; version 0 is
   genesis.
 - **Encodings.** Everything hashed or signed, and every chain and application record in LMDB,
@@ -188,6 +194,8 @@ Then [benchmarks.md](../benchmarks.md) for what it all costs.
 ## A short glossary
 
 - **Validator**: a node with a consensus key and voting power, allowed to propose and vote.
+- **Signature scheme**: ML-DSA-44 (post-quantum, the default) or secp256k1 (classical, compact);
+  genesis names one, and every key and signature on that chain is of it.
 - **Voting power**: a validator's weight in votes; here, its bonded tokens in whole units.
 - **+2/3**: strictly more than two thirds of the total voting power, the threshold for both
   prevotes and precommits; it guarantees two conflicting decisions would need a third of the

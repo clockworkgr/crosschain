@@ -1,7 +1,7 @@
 /**
  * Command line for running nodes and talking to them over JSON-RPC.
  *
- *   node src/cli.ts init <dir> <validators> [basePort=26656]
+ *   node src/cli.ts init <dir> <validators> [basePort=26656] [--scheme ml-dsa-44|secp256k1]
  *       Writes genesis.json with a funded faucet and one validator per node,
  *       a keystore with the faucet and operator keys, and a directory per
  *       node with its consensus key and config. Prints the keystore passphrase.
@@ -12,7 +12,7 @@
  * testnet keystore are found from it) or an RPC URL, with --keystore <path>,
  * --passphrase-file <path> or CHAIN_PASSPHRASE for signing keys.
  *
- *   keys list | add <name> | import <name> <seedHex> | export <name>
+ *   keys list | add <name> | import <name> <seedHex> | export <name>   (--scheme names the chain's scheme for add and import)
  *   show <target>                       status, validators, accounts
  *   account <target> <name>             an account with balances and a verified name proof
  *   history <target> <account>          what happened to an account
@@ -37,6 +37,7 @@
  * Amounts are whole tokens; validators are named by their operator account.
  * Operation fees are filled in from the chain's schedule (FEES.md) before signing.
  */
+import { schemeName, schemeTag, type SchemeTag } from './crypto/keys.ts';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -135,23 +136,24 @@ async function openKeystore(path: string): Promise<Keystore> {
 
 // ---- init and start ----
 
-function init(dir: string, count: number, basePort: number): void {
+function init(dir: string, count: number, basePort: number, scheme: SchemeTag): void {
   mkdirSync(dir, { recursive: true });
   const pass = process.env.CHAIN_PASSPHRASE ?? 'testnet';
   const ks = Keystore.create(join(dir, 'keystore.json'), pass);
-  const faucet = ks.add('faucet');
-  const seeds = Array.from({ length: count }, () => ({ node: generateSeed(), val: generateSeed() }));
-  const operators = seeds.map((_, i) => ks.add(`op${i}`));
+  const faucet = ks.add('faucet', undefined, scheme);
+  const seeds = Array.from({ length: count }, () => ({ node: generateSeed(scheme), val: generateSeed(scheme) }));
+  const operators = seeds.map((_, i) => ks.add(`op${i}`, undefined, scheme));
   const account = (name: string, publicKey: Uint8Array, balance: string) => ({ name, owner: authorityJson([publicKey]), active: authorityJson([publicKey]), balance });
   const genesis: Genesis = {
     chainId: `chain-${toHex(generateSeed()).slice(0, 8)}`,
+    signatureScheme: schemeName(scheme),
     genesisTime: BigInt(Date.now()),
     consensus: { maxEvidenceAgeMs: BigInt(UNBONDING_MS), version: 1 },
     appState: appGenesisBytes({
       accounts: [account('faucet', faucet.publicKey, '1000000000000'), ...operators.map((k, i) => account(`op${i}`, k.publicKey, '5000000000'))],
       staking: { unbondingPeriodMs: UNBONDING_MS },
       communityPool: 100_000,
-      validators: seeds.map((s, i) => ({ operator: `op${i}`, consensusKey: toHex(keyPairFromSeed(s.val).publicKey), selfBond: 20_000 })),
+      validators: seeds.map((s, i) => ({ operator: `op${i}`, consensusKey: toHex(keyPairFromSeed(s.val, scheme).publicKey), selfBond: 20_000 })),
     }),
   };
   writeFileSync(join(dir, 'genesis.json'), genesisToJson(genesis));
@@ -261,6 +263,12 @@ async function send(rpc: RpcClient, operations: OperationDraft[], signer: KeyPai
   if (!r.ok) process.exitCode = 1;
 }
 
+/** The scheme the chain behind an RPC fixed in its genesis: what a key made for it must be. */
+async function chainScheme(rpc: RpcClient): Promise<SchemeTag> {
+  const s = (await rpc.call('status', {})) as { signatureScheme?: string };
+  return schemeTag(s.signatureScheme ?? 'ml-dsa-44');
+}
+
 async function keyFor(keystorePath: string, name: string): Promise<KeyPair> {
   const ks = await openKeystore(keystorePath);
   return ks.get(name);
@@ -324,17 +332,19 @@ async function keys(): Promise<void> {
   const sub = need(0, 'keys subcommand');
   if ((sub === 'list' || sub === 'export') && !existsSync(path)) throw new Error(`no keystore at ${path}`);
   const ks = await openKeystore(path);
+  // Keys are made for a chain's scheme: --scheme names it (ML-DSA-44 when absent); the chain refuses a key of the other.
+  const scheme = schemeTag(flags.get('scheme') ?? 'ml-dsa-44');
   switch (sub) {
     case 'list':
-      for (const k of ks.list()) console.log(`${k.name.padEnd(16)} ${k.address}`);
+      for (const k of ks.list()) console.log(`${k.name.padEnd(16)} ${k.scheme.padEnd(10)} ${k.address}`);
       break;
     case 'add': {
-      const k = ks.add(need(1, 'name'));
+      const k = ks.add(need(1, 'name'), undefined, scheme);
       console.log(`added ${args[1]} ${toHex(k.address)}`);
       break;
     }
     case 'import': {
-      const k = ks.add(need(1, 'name'), fromHex(need(2, 'seed hex')));
+      const k = ks.add(need(1, 'name'), fromHex(need(2, 'seed hex')), scheme);
       console.log(`imported ${args[1]} ${toHex(k.address)}`);
       break;
     }
@@ -440,7 +450,7 @@ async function verifyTx(rpc: RpcClient, keystorePath: string, hash: string): Pro
 async function main(): Promise<void> {
   switch (cmd) {
     case 'init':
-      init(resolve(args[0] ?? 'testnet'), Number(args[1] ?? 4), Number(args[2] ?? 26656));
+      init(resolve(args[0] ?? 'testnet'), Number(args[1] ?? 4), Number(args[2] ?? 26656), schemeTag(flags.get('scheme') ?? 'ml-dsa-44'));
       return;
     case 'start':
       await start(resolve(need(0, 'node directory')));
@@ -494,7 +504,7 @@ async function main(): Promise<void> {
     case 'create': {
       const name = need(1, 'name');
       const ks = await openKeystore(keystorePath);
-      const key = ks.has(name) ? ks.get(name) : ks.add(name);
+      const key = ks.has(name) ? ks.get(name) : ks.add(name, undefined, await chainScheme(rpc));
       const auth = makeAuthority([key.publicKey]);
       await send(rpc, [{ type: 'accountCreate', registrar: await accountId(rpc, 'faucet'), name, owner: auth, active: auth }], ks.get('faucet'));
       break;
@@ -511,7 +521,7 @@ async function main(): Promise<void> {
       if (!cfg.validatorSeed) throw new Error('this node has no validator key');
       const { precision } = await chainInfo(rpc);
       const operator = need(1, 'operator');
-      await send(rpc, [{ type: 'validatorCreate', operator: await accountId(rpc, operator), consensusKey: keyPairFromSeed(fromHex(cfg.validatorSeed)).publicKey, selfBond: toUnits(need(2, 'self-bond'), precision) }], await keyFor(keystorePath, operator));
+      await send(rpc, [{ type: 'validatorCreate', operator: await accountId(rpc, operator), consensusKey: keyPairFromSeed(fromHex(cfg.validatorSeed), await chainScheme(rpc)).publicKey, selfBond: toUnits(need(2, 'self-bond'), precision) }], await keyFor(keystorePath, operator));
       break;
     }
     case 'delegate': {

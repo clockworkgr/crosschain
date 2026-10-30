@@ -29,7 +29,7 @@ A node is the consensus engine, the mempool, the network, block sync, state sync
 **`NodeConfig`**, field by field:
 
 - `name`: for log lines.
-- `genesis`: the `Genesis` document; its `chainId` becomes the node's.
+- `genesis`: the `Genesis` document; its `chainId` becomes the node's, and its `signatureScheme` (ML-DSA-44 when absent, [chapter 2](02-crypto.md)) is the scheme the node key and the validator key are derived with, the one every key and signature on the chain must use.
 - `dataDir`: a directory, or `null` for memory only.
 - `nodeKeySeed`: seed of the p2p identity key.
 - `validatorSeed`: seed of the consensus key, or `null` for a full node.
@@ -57,12 +57,20 @@ A node is the consensus engine, the mempool, the network, block sync, state sync
   }
 ```
 
-The constructor is private and synchronous. It sets the logger (`cfg.log`, or `makeLogger(cfg.name, cfg.logLevel ?? 'info')`), the verifier (default inline), derives the node key from its seed, creates `dataDir` if given and locks it, opens the environment (`cfg.env`, else `LmdbEnv` under `<dataDir>/lmdb`, else `MemoryEnv`) and remembers whether the node owns it, opens the block store on the `chain` store, creates an empty `EvidencePool`, and builds the `PrivValidator` if there is a validator seed, with a `FileSignStateStore` on disk or a `MemorySignStateStore`:
+The constructor is private and synchronous. It sets the logger (`cfg.log`, or `makeLogger(cfg.name, cfg.logLevel ?? 'info')`), the verifier (default inline), and the scheme every key of this node is made in:
+
+```ts
+    // One scheme per chain, genesis's, for the node identity and the validator key alike.
+    const scheme = schemeTag(cfg.genesis.signatureScheme ?? 'ml-dsa-44');
+    this.nodeKey = keyPairFromSeed(cfg.nodeKeySeed, scheme);
+```
+
+`schemeTag` turns the name genesis wrote into the one-byte tag chapter 2 puts in front of every key, and a name it does not know throws here, before anything is opened. The same `scheme` derives the validator key below, so the node's p2p identity, its votes and, through the application, every account key and transaction signature on the chain are of one scheme; `nodeKey.scheme` is what the node hands state sync in step 4. Then it creates `dataDir` if given and locks it, opens the environment (`cfg.env`, else `LmdbEnv` under `<dataDir>/lmdb`, else `MemoryEnv`) and remembers whether the node owns it, opens the block store on the `chain` store, creates an empty `EvidencePool`, and builds the `PrivValidator` if there is a validator seed, with a `FileSignStateStore` on disk or a `MemorySignStateStore`:
 
 ```ts
     this.privValidator = cfg.validatorSeed
       ? new PrivValidator(
-          keyPairFromSeed(cfg.validatorSeed),
+          keyPairFromSeed(cfg.validatorSeed, scheme),
           cfg.dataDir ? new FileSignStateStore(join(cfg.dataDir, 'priv_validator_state.bin')) : new MemorySignStateStore(),
           this.chainId,
         )
@@ -174,6 +182,7 @@ The headers handler walks downward from the height asked, taking a stored block'
         log: this.log,
         trustHeight: this.cfg.stateSync.trustHeight,
         trustHash: this.cfg.stateSync.trustHash,
+        scheme: this.nodeKey.scheme,
         // The same age the node will hold blocks to: the operator's figure, else the unbonding period the imported state holds.
         evidenceAgeMs: (db) => this.cfg.limits?.maxEvidenceAgeMs ?? getGlobal(db).staking.unbondingPeriodMs,
         transaction: (fn) => this.env.transaction(fn),
@@ -182,7 +191,7 @@ The headers handler walks downward from the height asked, taking a stored block'
     }
 ```
 
-The network is started early so peers can be found; `networkStarted` prevents `start()` from starting it twice. `evidenceAgeMs` tells state sync how far below the snapshot to fetch headers ([chapter 7](07-sync.md)): the operator's `limits.maxEvidenceAgeMs` if one was pinned, else the unbonding period held by the imported state, read through `getGlobal(db)` once the database exists, which is the figure the executor will prune by once the application is open (step 7). `transaction` is `env.transaction`, so the install's writes to the application store and the chain store land as one. A `null` result (no peers, no snapshots) falls through to a normal start from genesis. A thrown error propagates out of `Node.create`.
+The network is started early so peers can be found; `networkStarted` prevents `start()` from starting it twice. `evidenceAgeMs` tells state sync how far below the snapshot to fetch headers ([chapter 7](07-sync.md)): the operator's `limits.maxEvidenceAgeMs` if one was pinned, else the unbonding period held by the imported state, read through `getGlobal(db)` once the database exists, which is the figure the executor will prune by once the application is open (step 7). `scheme` is the node key's, which is genesis's: the validator sets state sync fetches must hold keys of it ([chapter 7](07-sync.md)), or the snapshot is not of the chain this genesis describes, and the chain state it writes records it. `transaction` is `env.transaction`, so the install's writes to the application store and the chain store land as one. A `null` result (no peers, no snapshots) falls through to a normal start from genesis. A thrown error propagates out of `Node.create`.
 
 **5. The application.** `cfg.app` if given; otherwise a `CoreApp` on the env's `app` store. The genesis application state is parsed only if the store is empty (`CoreApp.hasState(kv)`), because a large genesis is streamed from its file once, at first start (DESIGN.md section 7). After state sync the store is not empty, so genesis is not parsed and the app opens at the snapshot height.
 
@@ -450,6 +459,7 @@ The genesis is built in code: a faucet account with a large balance, one operato
 ```ts
 const genesis: Genesis = {
   chainId,
+  signatureScheme: schemeName(DEFAULT_SCHEME),
   genesisTime: BigInt(Date.now()),
   appState: appGenesisBytes({
     accounts: [account('faucet', faucet.publicKey, '1000000000000'), ...operators.map((k, i) => account(`op${i}`, k.publicKey, '5000000000'))],
@@ -460,7 +470,7 @@ const genesis: Genesis = {
 };
 ```
 
-There is no `validators` list at the engine level: the application owns the set (STAKING.md section 2.3). Then the nodes:
+There is no `validators` list at the engine level: the application owns the set (STAKING.md section 2.3). `signatureScheme` is the name of `DEFAULT_SCHEME`, ML-DSA-44 unless `CHAIN_SCHEME` is set in the environment (chapter 2), and every key the script derives with `keyPairFromSeed` follows the same default, so `CHAIN_SCHEME=secp256k1 node scripts/localnet.ts` runs the whole network on secp256k1 keys. Then the nodes:
 
 ```ts
 const hub = new MemoryHub();

@@ -1,6 +1,7 @@
 import type { Reader } from '../codec/reader.ts';
 import { Writer } from '../codec/writer.ts';
 import { HASH_SIZE, ZERO_HASH } from '../crypto/hash.ts';
+import { isSchemeTag, schemeName, schemeOf, schemeTag, type SchemeTag } from '../crypto/keys.ts';
 import { EMPTY } from '../db/merkle.ts';
 import { blockHash, type Block } from './block.ts';
 import type { Genesis } from './genesis.ts';
@@ -32,11 +33,15 @@ export interface ChainState {
   lastValidators: ValidatorSet;
   validators: ValidatorSet;
   nextValidators: ValidatorSet;
+  /** The signature scheme every validator key must use, from genesis; the application holds the same for accounts and transactions. */
+  scheme: SchemeTag;
 }
 
 export function genesisState(genesis: Genesis, appHash: Uint8Array, validatorsOverride?: ValidatorUpdate[]): ChainState {
   const entries = validatorsOverride && validatorsOverride.length > 0 ? validatorsOverride : (genesis.validators ?? []);
   if (entries.length === 0) throw new Error('genesis names no validators and the application supplied none');
+  const scheme = schemeTag(genesis.signatureScheme ?? 'ml-dsa-44');
+  for (const v of entries) if (schemeOf(v.publicKey) !== scheme) throw new Error(`genesis validator key is not a ${schemeName(scheme)} key`);
   const validators = ValidatorSet.create(entries.map((v) => ({ publicKey: v.publicKey, power: v.power })));
   const nextValidators = validators.copy();
   nextValidators.incrementProposerPriority(1);
@@ -51,12 +56,15 @@ export function genesisState(genesis: Genesis, appHash: Uint8Array, validatorsOv
     lastValidators: validators.copy(),
     validators,
     nextValidators,
+    scheme,
   };
 }
 
 /** The state after committing `block`, given the app's response to executing it. */
 export function nextState(state: ChainState, block: Block, updates: ValidatorUpdate[], appHash: Uint8Array, resultsHash: Uint8Array): ChainState {
   if (block.header.height !== state.lastHeight + 1n) throw new Error('nextState: height mismatch');
+  // The application refuses such a key in checkTx; a set that still carried one would halt here rather than sign with it.
+  for (const u of updates) if (schemeOf(u.publicKey) !== state.scheme) throw new Error(`validator update key is not a ${schemeName(state.scheme)} key`);
   const nextNext = state.nextValidators.applyUpdates(updates);
   nextNext.incrementProposerPriority(1);
   return {
@@ -70,6 +78,7 @@ export function nextState(state: ChainState, block: Block, updates: ValidatorUpd
     lastValidators: state.validators,
     validators: state.nextValidators,
     nextValidators: nextNext,
+    scheme: state.scheme,
   };
 }
 
@@ -84,6 +93,7 @@ export function encodeState(w: Writer, s: ChainState): void {
   s.nextValidators.encode(w);
   w.u32(s.version);
   w.fixed(s.lastResultsHash);
+  w.u8(s.scheme);
 }
 
 export function decodeState(r: Reader): ChainState {
@@ -98,5 +108,12 @@ export function decodeState(r: Reader): ChainState {
     nextValidators: ValidatorSet.decode(r),
     version: r.u32(),
     lastResultsHash: r.fixed(HASH_SIZE),
+    scheme: readScheme(r),
   };
+}
+
+function readScheme(r: Reader): SchemeTag {
+  const tag = r.u8();
+  if (!isSchemeTag(tag)) throw new Error(`chain state names unknown signature scheme ${tag}`);
+  return tag;
 }

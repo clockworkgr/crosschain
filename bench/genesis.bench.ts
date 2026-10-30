@@ -7,6 +7,7 @@
  * (which also runs the scale suite). Set BENCH_KEEP=1 to leave the files
  * behind for inspection.
  */
+import { DEFAULT_SCHEME, schemeName } from '../src/crypto/keys.ts';
 import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -37,7 +38,7 @@ export async function run(): Promise<void> {
     const accounts = writeAppGenesis(file, keys.map((k) => toHex(k.publicKey)), MB * 1024 * 1024);
     const size = statSync(file).size;
     fact('application genesis written', `${fmtBytes(size)}, ${accounts.toLocaleString('en-US')} accounts with two keys each, in ${fmtMs(performance.now() - t)}`);
-    const genesis: Genesis = { chainId: CHAIN_ID, genesisTime, appState: new Uint8Array(), appStateFile: 'app-genesis.json' };
+    const genesis: Genesis = { chainId: CHAIN_ID, signatureScheme: schemeName(DEFAULT_SCHEME), genesisTime, appState: new Uint8Array(), appStateFile: 'app-genesis.json' };
     writeFileSync(join(dir, 'genesis.json'), genesisToJson(genesis));
     const loaded = loadGenesisFile(join(dir, 'genesis.json'));
 

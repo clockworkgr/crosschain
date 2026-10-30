@@ -9,7 +9,7 @@ import { calculateFee, decodeTransaction, encodeOperationBody, encodeTransaction
 import { checkFeeSchedule, feeScheduleFromJson, MAX_SHARE_SUPPLY, ProposalType, TYPE, type ChainParameters } from '../src/app/core/types.ts';
 import { encode } from '../src/codec/writer.ts';
 import { toHex } from '../src/crypto/hash.ts';
-import { keyPairFromSeed, type KeyPair } from '../src/crypto/keys.ts';
+import { DEFAULT_SCHEME, keyPairFromSeed, publicKeySize, schemeName, type KeyPair } from '../src/crypto/keys.ts';
 import { InlineVerifier } from '../src/crypto/verifier.ts';
 import { objectId } from '../src/db/id.ts';
 import type { Genesis } from '../src/types/genesis.ts';
@@ -36,6 +36,7 @@ function genesisWith(fees?: FeeScheduleJson): Genesis {
   const acct = (name: string, k: KeyPair, balance: bigint) => ({ name, owner: authorityJson([k.publicKey]), active: authorityJson([k.publicKey]), balance: balance.toString() });
   return {
     chainId,
+    signatureScheme: schemeName(DEFAULT_SCHEME),
     genesisTime,
     appState: appGenesisBytes({
       accounts: [acct('faucet', faucet, T(10_000)), acct('op-a', ops[0]!, T(1000)), acct('op-b', ops[1]!, T(1000))],
@@ -91,13 +92,13 @@ describe('fee schedule', () => {
     const premium: OperationDraft = { type: 'accountCreate', registrar: FAUCET_ID, name: 'alice', owner: oneKey, active: oneKey };
     const cheap: OperationDraft = { ...premium, name: 'alice1' };
     const dataFee = (op: OperationDraft) => (bodyBytes(op) * DEFAULT_FEES.accountCreate.pricePerKbyte) / 1024n;
-    expect(bodyBytes(premium)).toBeGreaterThan(2n * 1312n); // two ML-DSA keys
+    expect(bodyBytes(premium)).toBeGreaterThan(2n * BigInt(publicKeySize(DEFAULT_SCHEME))); // two keys of the chain's scheme
     expect(calculateFee(premium, DEFAULT_FEES)).toBe(DEFAULT_FEES.accountCreate.premiumFee + dataFee(premium));
     expect(calculateFee(cheap, DEFAULT_FEES)).toBe(DEFAULT_FEES.accountCreate.basicFee + dataFee(cheap));
     // More keys, more bytes, more fee.
     const sixteen = makeAuthority(Array.from({ length: 16 }, (_, i) => keyPairFromSeed(seedFor(`fees/k/${i}`)).publicKey));
     const big: OperationDraft = { ...premium, owner: sixteen, active: sixteen };
-    expect(calculateFee(big, DEFAULT_FEES) - calculateFee(premium, DEFAULT_FEES)).toBeGreaterThan((30n * 1312n * 100n) / 1024n);
+    expect(calculateFee(big, DEFAULT_FEES) - calculateFee(premium, DEFAULT_FEES)).toBeGreaterThan((30n * BigInt(publicKeySize(DEFAULT_SCHEME)) * 100n) / 1024n);
     const update: OperationDraft = { type: 'accountUpdate', account: FAUCET_ID, owner: null, active: sixteen };
     expect(calculateFee(update, DEFAULT_FEES)).toBe(DEFAULT_FEES.accountUpdate.fee + (bodyBytes(update) * DEFAULT_FEES.accountUpdate.pricePerKbyte) / 1024n);
 

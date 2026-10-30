@@ -17,7 +17,7 @@
 import type { Reader } from '../codec/reader.ts';
 import { Writer, encode } from '../codec/writer.ts';
 import { compareBytes, bytesEqual, sha256, toHex } from '../crypto/hash.ts';
-import { PUBLIC_KEY_SIZE, addressOf } from '../crypto/keys.ts';
+import { addressOf, decodePublicKey, isPublicKey } from '../crypto/keys.ts';
 
 export interface Validator {
   address: Uint8Array;
@@ -59,7 +59,7 @@ export class ValidatorSet {
   /** Build a fresh set (genesis). Priorities start at zero, then one increment picks the first proposer. */
   static create(entries: { publicKey: Uint8Array; power: bigint }[]): ValidatorSet {
     const vals: Validator[] = entries.map((e) => {
-      if (e.publicKey.length !== PUBLIC_KEY_SIZE) throw new Error('bad public key size');
+      if (!isPublicKey(e.publicKey)) throw new Error('bad public key');
       if (e.power <= 0n) throw new Error('validator power must be positive');
       return { address: addressOf(e.publicKey), publicKey: e.publicKey, power: e.power, priority: 0n };
     });
@@ -194,7 +194,7 @@ export class ValidatorSet {
     let totalAfterUpdates = this.totalPower;
 
     for (const u of updates) {
-      if (u.publicKey.length !== PUBLIC_KEY_SIZE) throw new Error('bad public key size in update');
+      if (!isPublicKey(u.publicKey)) throw new Error('bad public key in update');
       if (u.power < 0n) throw new Error('negative power in update');
       const addr = addressOf(u.publicKey);
       const k = toHex(addr);
@@ -244,7 +244,7 @@ export class ValidatorSet {
   /** Decoding checks what create() checks, plus the order and the proposer index: sets arrive from peers too. */
   static decode(r: Reader): ValidatorSet {
     const vals = r.array((r) => {
-      const publicKey = r.fixed(PUBLIC_KEY_SIZE);
+      const publicKey = decodePublicKey(r);
       const power = r.u64();
       const priority = r.i64();
       if (power <= 0n) throw new Error('validator power must be positive');

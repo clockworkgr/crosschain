@@ -36,7 +36,7 @@ export interface FinalizeBlockRequest {
 
 ### Objects instead of a key-value map
 
-Most chains model state as a map from keys to byte strings. This one follows Graphene (the engine behind BitShares) and models state as typed objects. An object has a numeric type (account is 3, asset is 4) and an instance number assigned from a per-type counter, and the pair is its id: `3.0` is the first account, `4.0` the first asset. [Chapter 09](09-database.md) explains how dense instance numbers let the database keep each type in a plain array and hash it into a complete binary Merkle tree. For this chapter the consequence is that every reference inside the state is an 8-byte id, not a name and not a 1312-byte public key. A transfer names its two accounts and its asset in 24 bytes.
+Most chains model state as a map from keys to byte strings. This one follows Graphene (the engine behind BitShares) and models state as typed objects. An object has a numeric type (account is 3, asset is 4) and an instance number assigned from a per-type counter, and the pair is its id: `3.0` is the first account, `4.0` the first asset. [Chapter 09](09-database.md) explains how dense instance numbers let the database keep each type in a plain array and hash it into a complete binary Merkle tree. For this chapter the consequence is that every reference inside the state is an 8-byte id, not a name and not a public key (1,313 bytes with ML-DSA-44, 34 with secp256k1, scheme tag included). A transfer names its two accounts and its asset in 24 bytes.
 
 `src/app/core/types.ts` declares the object types. Graphene distinguishes "protocol" objects, which transactions reference (accounts, assets, balances, validators, delegations), from "implementation" objects that only the chain maintains (the global and dynamic properties, the recent-transaction records, signing records). The split matters for one thing: the static chain parameters sit in one `global` object and the values that change every block in one `dynamic` object, so a block rehashes one small leaf instead of the whole parameter set.
 
@@ -76,7 +76,7 @@ The largest amount of any asset is `MAX_SHARE_SUPPLY = 10^15`, Graphene's limit.
 
 A transaction is an expiration time, a list of operations and a list of signatures (`src/app/core/tx.ts`). The signed message is the body (expiration and operations) and its sha256 is the transaction id.
 
-ML-DSA-44 signatures do not allow recovering the public key from the signature, and the keys are 1312 bytes, so a signature carries the key's **address** (sha256 of the public key) instead of the key. The node looks the key up in the account the operations require. A signature by any key that no required authority contains is rejected outright, as in BitShares, so a transaction has exactly one valid form and a stranger cannot pad it with signatures.
+The chain's signature scheme is fixed by genesis (`signatureScheme`, ML-DSA-44 when absent; [chapter 2](02-crypto.md)), and every key and signature carries that scheme's tag byte in front of its bytes. ML-DSA-44 signatures do not allow recovering the public key from the signature, and its keys are 1,313 bytes, so a signature carries the key's **address** (sha256 of the tagged public key) instead of the key; the rule is the same on a secp256k1 chain, so one transaction format serves both. The node looks the key up in the account the operations require. A signature by any key that no required authority contains is rejected outright, as in BitShares, so a transaction has exactly one valid form and a stranger cannot pad it with signatures. A signature of the other scheme is refused before any verification work, and so is a key of the other scheme wherever one enters the state: a genesis account or validator, `accountCreate`, `accountUpdate`, `validatorCreate`, `validatorUpdate`. The scheme is held in the committed `global` object, so it is in every app hash, and two nodes whose genesis files name different schemes never agree on a root.
 
 Replay protection is the reason the expiration exists. Most chains give every account a nonce that each transaction must increment, which forces a strict order on everything one account does and makes a multi-account transaction awkward (whose nonce?). BitShares instead remembers the ids of transactions that have been applied until their expiration passes, and refuses a transaction whose id is still remembered. Expired transactions cannot be replayed because they are expired. The window is bounded by `global.maxTxExpirationMs` (default one hour) so the set of remembered ids stays small, and it is pruned at the start of every block. Two unrelated transactions from one account never wait for each other.
 
@@ -116,7 +116,7 @@ The same evaluator serves two callers. `checkTx`, the mempool admission check, r
 
 ### Delegated proof of stake with shares
 
-Staking follows the Cosmos SDK's `x/staking` module. A **validator** object is owned by an operator account and has its own consensus key, the ML-DSA key it signs votes with, which can be rotated. Any account may **delegate** core tokens to a validator; the validator's voting power is the whole-token value of everything delegated to it, including the operator's own self-bond. Validators are the top N candidates by stake (N is `maxValidators`, default 21), recomputed every block; this is the **active set**, and its diff from the previous set is what the application hands the engine as validator updates.
+Staking follows the Cosmos SDK's `x/staking` module. A **validator** object is owned by an operator account and has its own consensus key, the key it signs votes with (of the chain's scheme), which can be rotated. Any account may **delegate** core tokens to a validator; the validator's voting power is the whole-token value of everything delegated to it, including the operator's own self-bond. Validators are the top N candidates by stake (N is `maxValidators`, default 21), recomputed every block; this is the **active set**, and its diff from the previous set is what the application hands the engine as validator updates.
 
 A validator holds `tokens` and `shares`; a delegation holds shares. The exchange rate is `tokens / shares`. When tokens are added by a reward the rate rises and every delegation is worth more; when a slash removes tokens the rate falls and every delegation is worth less. Nothing has to be tracked per delegator: rewards compound automatically and a slash reaches every delegator in one subtraction. Shares are scaled by `SHARE_SCALE = 1000` on first issue so that, at the initial rate, integer division loses at most one base unit per operation, always in the validator's favour. As rewards raise the rate, a share is worth more and the rounding per operation grows with it; a delegation so small that it would be worth no share at all is refused rather than silently absorbed by the other delegators.
 
@@ -159,8 +159,8 @@ A node that joins a chain late can replay every block from genesis or load a sna
 Alice (`3.1`) sends 5,000 base units of the core asset (`4.0`) to Bob (`3.2`), on a chain with the default fee schedule.
 
 1. A wallet builds the draft `{ type: 'transfer', from: 3.1, to: 3.2, asset: 4.0, amount: 5000n }` and calls `withFees` (`src/app/core/client.ts`), which asks `calculateFee` what the schedule requires: `fees.transfer.fee = 100`, scaled by `scale / 10000 = 1`, so `fee: 100n`.
-2. It picks an expiration, say one minute from now, encodes the body (expiration, then the one operation: tag 0, fee, from, to, asset, amount; 32 bytes of operation body), and signs the body with Alice's secret key under the context string `<chainId>/tx`. The signature entry is `{ address: sha256(alicePublicKey), signature }`, 32 + 2420 bytes.
-3. A node receives the bytes and `checkTx` decodes them. `requiredAuthorities` says the transfer needs active(3.1). `signingKeys` collects every key in Alice's active and owner authorities by address and finds the one that matches the signature's address. The signature is verified on the worker pool and cached as "this address signed this body".
+2. It picks an expiration, say one minute from now, encodes the body (expiration, then the one operation: tag 0, fee, from, to, asset, amount; 32 bytes of operation body), and signs the body with Alice's secret key under the context string `<chainId>/tx`. The signature entry is `{ address: sha256(alicePublicKey), signature }`, 32 + 2,421 bytes under ML-DSA-44 (32 + 65 under secp256k1).
+3. A node receives the bytes and `checkTx` decodes them. `requiredAuthorities` says the transfer needs active(3.1). `signingKeys` collects every key in Alice's active and owner authorities by address and finds the one that matches the signature's address; the signature's tag must be the chain's scheme. The signature is verified on the worker pool and cached as "this address signed this body".
 4. `applyChecked` checks the threshold: Alice's active authority is threshold 1 with one key of weight 1, and that key signed, so it is satisfied. It opens a session inside the pending session and calls `applyTransaction`.
 5. `applyTransaction` checks the expiration is after the last block time and within an hour of it, and that the transaction id is not in `recentTx`. For the one operation it computes the required fee (100), sees the stated fee is not lower, and debits Alice 100 (`adjustBalance`). Then `applyOperation` checks the amount is in range, that Alice and Bob exist and the asset exists, debits Alice 5,000 and credits Bob 5,000. After the loop the 100 goes to the community pool and a `recentTx` object with the transaction id is created.
 6. The session is committed into the pending session: the mempool now sees Alice at 5,100 less. The committed view, which queries use, still shows the old balances.
@@ -185,7 +185,7 @@ The validator above double signs. `doubleSignSlashBps` is 500, so `slash` remove
 
 ### Worked example: the fee for a premium account name
 
-Registering `alice` with one ML-DSA key in each authority: `isCheapName('alice')` is false (no digit, dot or hyphen, and it has vowels), so the base is `premiumFee = 5,000`. The encoded operation body (registrar, name, two authorities each holding a 1312-byte key) is 2,673 bytes, so the data fee is `floor(2,673 × 100 / 1024) = 261`. With `scale = 10000` the fee is 5,261 base units. The same registration as `alice1` is a cheap name: `1,000 + 261 = 1,261`. A sixteen-key authority adds about 21 KB and so about 2,000 more. The name is the one place where size is priced, because authorities are the only variable-size operation payload and keys are large.
+Registering `alice` with one key in each authority on an ML-DSA-44 chain: `isCheapName('alice')` is false (no digit, dot or hyphen, and it has vowels), so the base is `premiumFee = 5,000`. The encoded operation body (registrar, name, two authorities each holding a 1,313-byte tagged key) is 2,675 bytes, so the data fee is `floor(2,675 × 100 / 1024) = 261`. With `scale = 10000` the fee is 5,261 base units. The same registration as `alice1` is a cheap name: `1,000 + 261 = 1,261`. A sixteen-key authority adds about 20 KB and so about 1,900 more. On a secp256k1 chain the same body is 117 bytes (two 34-byte keys), the data fee is 11, and the two registrations cost 5,011 and 1,011; sixteen keys add 570 bytes and about 55 more. The name is the one place where size is priced, because authorities are the only variable-size operation payload and keys, under ML-DSA-44, are large.
 
 ### Worked example: a proposal reaching two thirds
 
@@ -253,7 +253,30 @@ export interface FeeSchedule {
 
 **`ChainParameters`** is `{ fees, staking }`, everything a proposal replaces at once. **`encodeChainParameters`**, **`decodeChainParameters`**, **`checkChainParameters`** (fees first, then staking) and **`chainParametersFromJson`** compose the two.
 
-**`GlobalProperties`** (`global`, `1.0`): `coreAsset` (the asset fees are paid in and that is staked), `fees`, `maxTxExpirationMs`, `staking`.
+**`GlobalProperties`** (`global`, `1.0`): `coreAsset` (the asset fees are paid in and that is staked), `fees`, `maxTxExpirationMs`, `staking`, and `scheme`, the chain's signature scheme as a tag, set from the engine genesis by `applyGenesis`: every account key, consensus key and transaction signature must be of it, and because it sits in a committed object it is in every app hash. Its codec writes the tag last and refuses one it does not know:
+
+```ts
+export const GlobalType: ObjectType<GlobalProperties> = {
+  id: TYPE.global,
+  name: 'global',
+  encode(w, o) {
+    w.u64(o.coreAsset);
+    encodeFeeSchedule(w, o.fees);
+    w.u64(o.maxTxExpirationMs);
+    encodeStakingParameters(w, o.staking);
+    w.u8(o.scheme);
+  },
+  decode(r, id) {
+    const g = { id, coreAsset: r.u64(), fees: decodeFeeSchedule(r), maxTxExpirationMs: r.u64(), staking: decodeStakingParameters(r) };
+    const scheme = r.u8();
+    if (!isSchemeTag(scheme)) throw new Error(`unknown signature scheme ${scheme}`);
+    return { ...g, scheme };
+  },
+  indices: [],
+};
+```
+
+A store or a snapshot whose `global` object names a tag the code does not know is refused here rather than read as some default.
 
 **`ActiveValidator`** is `{ validator, publicKey, power }`, one member of the set last handed to the engine.
 
@@ -286,7 +309,7 @@ export interface DynamicProperties {
 
 **`ValidatorStatus`** is `{ candidate: 0, jailed: 1, tombstoned: 2 }`; **`ValidatorStatusValue`** its value type.
 
-**`Validator`**: `operator` (account id), `consensusKey` (1312 bytes), `tokens`, `shares`, `status`, `jailedUntil` (ms), `createdHeight`.
+**`Validator`**: `operator` (account id), `consensusKey` (tagged, of the chain's scheme), `tokens`, `shares`, `status`, `jailedUntil` (ms), `createdHeight`.
 
 **`Delegation`**: `delegator`, `validator`, `shares`.
 
@@ -346,13 +369,13 @@ Every type's canonical encoding, which is what gets hashed into the state root a
 
 | type | fields in order |
 |---|---|
-| global | u64 coreAsset, FeeSchedule, u64 maxTxExpirationMs, StakingParameters |
-| dynamic | u64 height, u64 time, u64 communityPool, u64 inflationPpb, u64 lastMintTime, u64 bonded, array of (u64 validator, 1312-byte publicKey, u64 power), array of arrays of 32-byte addresses |
+| global | u64 coreAsset, FeeSchedule, u64 maxTxExpirationMs, StakingParameters, u8 scheme |
+| dynamic | u64 height, u64 time, u64 communityPool, u64 inflationPpb, u64 lastMintTime, u64 bonded, array of (u64 validator, tagged publicKey, u64 power), array of arrays of 32-byte addresses |
 | account | string name, Authority owner, Authority active, u64 registrar |
 | asset | string symbol, u8 precision, u64 issuer, u64 maxSupply, u64 currentSupply |
 | balance | u64 owner, u64 asset, u64 amount |
 | recentTx | 32-byte txId, u64 expiration |
-| validator | u64 operator, 1312-byte consensusKey, u64 tokens, u64 shares, u8 status, u64 jailedUntil, u64 createdHeight |
+| validator | u64 operator, tagged consensusKey, u64 tokens, u64 shares, u8 status, u64 jailedUntil, u64 createdHeight |
 | delegation | u64 delegator, u64 validator, u64 shares |
 | unbonding | u64 delegator, u64 validator, u64 tokens, u64 creationHeight, u64 completion |
 | redelegation | u64 delegator, u64 source, u64 destination, u64 tokens, u64 creationHeight, u64 completion |
@@ -360,10 +383,11 @@ Every type's canonical encoding, which is what gets hashed into the state root a
 | proposal | u64 proposer, ChainParameters, array of u64 signals, u64 created, u64 expiration |
 | validatorKey | 32-byte address, u64 validator |
 
-An Authority is `u32 threshold, array of (u64 account, u32 weight), array of (1312-byte key, u32 weight)`; a FeeSchedule is `u32 scale` followed by the amounts of `FEE_FIELDS` as u64; the StakingParameters are their nineteen fields in declaration order. An account with one key in each authority therefore encodes to a little over 2.6 KB, and the state is dominated by keys, which is why the README's gigabyte genesis of 193,536 accounts needs about 1.1 GB of memory at rest.
+An Authority is `u32 threshold, array of (u64 account, u32 weight), array of (tagged key, u32 weight)`; a FeeSchedule is `u32 scale` followed by the amounts of `FEE_FIELDS` as u64; the StakingParameters are their nineteen fields in declaration order. A tagged key is 1,313 bytes under ML-DSA-44 and 34 under secp256k1, so an account with one key in each authority encodes to 2,675 bytes on the first kind of chain and 117 on the second; under ML-DSA-44 the state is dominated by keys, which is why the README's gigabyte genesis of 193,536 accounts needs about 1.1 GB of memory at rest.
 
 Encoding details worth knowing:
 
+- Every public key in the state (the active set in `DynamicType`, the consensus key in `ValidatorType`, the keys of an `Authority`) is written as its tagged bytes with `fixed` and read back with `decodePublicKey` (chapter 2), which takes the size from the tag, so one codec serves both schemes; an unknown tag is a decode error.
 - `DynamicType.decode` bounds `active` at 1000 entries (the `maxValidators` ceiling) and `expectedSigners` at three sets of 1000.
 - `ValidatorType.decode` throws `bad validator status N` for a status above 2, so a corrupt store cannot produce a validator in an impossible state.
 - `SigningInfoType.decode` bounds the bitmap at 16,384 bytes, enough for the 100,000-block window limit.
@@ -399,9 +423,22 @@ Note that an empty segment (`a..b`, or a trailing dot) fails the regex because i
 
 Authorities and the two functions that check them. **`KeyAuth`** is `{ publicKey, weight }`, **`AccountAuth`** is `{ account, weight }`, **`Authority`** is `{ threshold, accounts, keys }` with both member lists in ascending canonical order. **`MAX_AUTHORITY_MEMBERS`** is 16 per list and **`MAX_AUTHORITY_DEPTH`** 2.
 
-**`encodeAuthority(w, a)`** writes the threshold as u32, then the accounts as (u64 id, u32 weight) and the keys as (1312 fixed bytes, u32 weight). **`decodeAuthority(r)`** reads the same with both arrays bounded at 16.
+**`encodeAuthority(w, a)`** writes the threshold as u32, then the accounts as (u64 id, u32 weight) and the keys as (the tagged key as fixed bytes, u32 weight). **`decodeAuthority(r)`** reads the same with both arrays bounded at 16, each key through `decodePublicKey`, so a key of either scheme decodes and an unknown tag is a `CodecError`.
 
-**`checkAuthority(a)`** returns a problem or null. It refuses a threshold below 1, an authority with no members, more than 16 members in a list, a weight below 1, a key of the wrong size, members out of order or repeated (`account members must be ascending and distinct`, `key members must be ascending and distinct`), and an authority whose total weight is below its threshold (`authority can never be satisfied`). That last check is what stops an account from locking itself out by mistake.
+**`checkAuthority(a, scheme?)`** returns a problem or null. It refuses a threshold below 1, an authority with no members, more than 16 members in a list, a weight below 1, a key whose tag is unknown or whose length is not its scheme's (`bad public key`), when a scheme is given, a key of another scheme (`key must be a secp256k1 key`, or `ml-dsa-44`), members out of order or repeated (`account members must be ascending and distinct`, `key members must be ascending and distinct`), and an authority whose total weight is below its threshold (`authority can never be satisfied`). That last check is what stops an account from locking itself out by mistake. The key loop:
+
+```ts
+  for (let i = 0; i < a.keys.length; i++) {
+    const k = a.keys[i]!;
+    if (k.weight < 1) return 'member weight must be at least 1';
+    if (!isPublicKey(k.publicKey)) return 'bad public key';
+    if (scheme !== undefined && schemeOf(k.publicKey) !== scheme) return `key must be a ${schemeName(scheme)} key`;
+    if (i > 0 && compareBytes(a.keys[i - 1]!.publicKey, k.publicKey) >= 0) return 'key members must be ascending and distinct';
+    total += k.weight;
+  }
+```
+
+Genesis accounts and the evaluator's `accountCreate` and `accountUpdate` always pass the chain's scheme; the parameter is optional so the function stays usable where no chain is in view.
 
 **`makeAuthority(publicKeys, threshold = 1, accounts = [])`** builds a canonical authority with every member at weight 1, sorting both lists. The tests and the CLI use it.
 
@@ -485,7 +522,7 @@ export function calculateFee(op: OperationDraft, fees: FeeSchedule): bigint {
 The private `dataFee` is BitShares' `calculate_data_fee`: `bytes × pricePerKbyte / 1024`, rounded down, over the encoded body. Signatures are not priced; `FEES.md` explains that a per-signature price would need a transaction-level payer, and operations are the unit of payment.
 
 - **`encodeTxBody(w, tx)`** writes the expiration and the operations. **`txBodyBytes(tx)`** returns those bytes: they are what is signed. **`txIdOf(tx)`** is their sha256.
-- **`encodeTransaction(tx)`** appends the signatures (32-byte address, 2420-byte signature each). **`decodeTransaction(bytes)`** is strict: at most 64 operations and 16 signatures, and the reader rejects trailing bytes, so a transaction has one encoding.
+- **`encodeTransaction(tx)`** appends the signatures (32-byte address, then the tagged signature: 2,421 bytes under ML-DSA-44, 65 under secp256k1). **`decodeTransaction(bytes)`** is strict: at most 64 operations and 16 signatures, each signature read through `decodeSignature` (the tag says how many bytes follow, and an unknown tag is a decode error), the consensus keys of `validatorCreate` and `validatorUpdate` through `decodePublicKey`, and the reader rejects trailing bytes, so a transaction has one encoding.
 
 Note the difference between the transaction id (hash of the body, used for replay protection) and the transaction hash the engine indexes (`txHash` in `src/types/block.ts`, sha256 of the raw bytes including signatures). History entries carry the latter.
 
@@ -497,9 +534,9 @@ The wire layout of a whole transaction, using the codec from the earlier chapter
 | operation count | u32, 4 |
 | each operation | u8 tag, u64 fee, then the body |
 | signature count | u32, 4 |
-| each signature | 32-byte address, 2420-byte signature |
+| each signature | 32-byte address, tagged signature (1 + 2420 bytes under ML-DSA-44, 1 + 64 under secp256k1) |
 
-A transfer body is 32 bytes (four u64 fields), so a signed transfer is 8 + 4 + 1 + 8 + 32 + 4 + 32 + 2420 = 2,509 bytes, the "signed transfer 2.5 KiB" of the README's table, and 1,668 of them fit in the default 4 MiB block. Verifying the one signature costs about 0.8 ms of CPU, which is why the README says signatures set every limit: the engine and the database never come close to theirs at this transaction size.
+A transfer body is 32 bytes (four u64 fields), so a signed transfer is 8 + 4 + 1 + 8 + 32 + 4 + 32 + 2421 = 2,510 bytes on an ML-DSA-44 chain, the "signed transfer 2.5 KiB" of the README's table, and about 1,670 of them fit in the default 4 MiB block; on a secp256k1 chain the same transfer is 154 bytes and about 27,000 fit. Verifying the one signature costs most of a millisecond of CPU under either scheme (chapter 2 has the figures), which is why the README says signatures set every limit: the engine and the database never come close to theirs at this transaction size.
 
 ### src/app/core/client.ts
 
@@ -566,7 +603,7 @@ and so on: the issuer for asset operations, the operator for validator, unjail a
 
 **`feePayerOf(op)`** names the account charged for an operation: the same account whose authority the operation requires. There is no transaction-level payer.
 
-**`applyOperation(ctx, op)`** is the big switch for the account and asset operations; the staking cases fall through to the private `applyStakingOperation`. Private helpers: `checkAmount(amount, what)` throws `${what} must be between 1 and 1000000000000000`; `checkNewAuthority(db, auth)` runs `checkAuthority` and requires every member account to exist.
+**`applyOperation(ctx, op)`** is the big switch for the account and asset operations; the staking cases fall through to the private `applyStakingOperation`. Private helpers: `checkAmount(amount, what)` throws `${what} must be between 1 and 1000000000000000`; `checkNewAuthority(db, auth)` runs `checkAuthority` with the chain's scheme from `getGlobal(db).scheme` and requires every member account to exist.
 
 The transfer case shows the shape of all of them, checks first, then writes:
 
@@ -592,8 +629,8 @@ The rules per operation, with every `TxError` the evaluator can raise:
 | accountUpdate | at least one authority given, account exists, new authorities well formed; replaces the given ones | `nothing to update`, authority problems |
 | assetCreate | valid symbol, precision at most 12, max supply in range, issuer exists, symbol free; creates the asset with `currentSupply: 0n` | symbol problems, `precision must be at most 12`, `max supply must be between ...`, `asset symbol X is taken` |
 | assetIssue | amount in range, not the core asset, issuer owns the asset, recipient exists, supply cap; raises `currentSupply` and credits | `the core asset is minted by the chain, not issued`, `only the issuer of X can issue it`, `issuing N would exceed the max supply of X` |
-| validatorCreate | operator exists, key size, operator has no validator, key never used, self-bond at least `minSelfBond`; debits self-bond plus `validatorCreationFee`, pays the creation fee into the pool, creates the validator; logs `validator created` | `bad consensus key size`, `account already operates a validator`, `consensus key already in use`, `self-bond must be at least N`, `delegation would overflow the validator` |
-| validatorUpdate | validator exists, operator matches, not tombstoned, key size, key never used; replaces the key and records it | `validator X does not exist`, `not the operator of that validator`, `validator is tombstoned`, `bad consensus key size`, `consensus key already in use` |
+| validatorCreate | operator exists, consensus key well formed and of the chain's scheme, operator has no validator, key never used, self-bond at least `minSelfBond`; debits self-bond plus `validatorCreationFee`, pays the creation fee into the pool, creates the validator; logs `validator created` | `consensus key must be a <scheme> key`, `account already operates a validator`, `consensus key already in use`, `self-bond must be at least N`, `delegation would overflow the validator` |
+| validatorUpdate | validator exists, operator matches, not tombstoned, consensus key well formed and of the chain's scheme, key never used; replaces the key and records it | `validator X does not exist`, `not the operator of that validator`, `validator is tombstoned`, `consensus key must be a <scheme> key`, `consensus key already in use` |
 | delegate | delegator exists, validator exists and is not tombstoned (jailed is fine), amount at least `minDelegation`; debits and bonds | `validator is tombstoned`, `delegation must be at least N`, insufficient balance, `delegation is worth no shares at this exchange rate`, overflow |
 | undelegate | delegation exists, shares in range, the operator's self-bond stays at or above `minSelfBond`, fewer than `maxEntries` pending; unbonds and creates an unbonding entry maturing at `time + unbondingPeriodMs` | `no such delegation`, `shares out of range`, `self-bond would fall below the minimum`, `too many pending unbonding entries` |
 | redelegate | distinct validators, destination not tombstoned, delegation exists, shares in range, no pending redelegation into the source for this delegator, fewer than `maxEntries` for the triple, self-bond floor, moved tokens at least `minDelegation`; unbonds from the source, bonds to the destination, records the entry | `source and destination are the same`, `destination is tombstoned`, `no such delegation`, `shares out of range`, `stake still redelegating into the source cannot move again`, `too many pending redelegations`, `self-bond would fall below the minimum`, `redelegation must move at least N` |
@@ -601,7 +638,13 @@ The rules per operation, with every `TxError` the evaluator can raise:
 | proposalCreate | operator matches, validator in the active set, parameters pass `checkChainParameters`; creates the proposal with the proposer's own signal and `expiration = time + proposalLifetimeMs` | `not the operator of that validator`, `only active validators propose`, parameter problems |
 | proposalSignal | operator matches, validator active, proposal exists, not already signalled, fewer than `MAX_SIGNALS` signals so far; appends the id and keeps `signals` sorted | `not the operator of that validator`, `only active validators signal`, `no such proposal`, `already signalled`, `proposal has the maximum number of signals` |
 
-The `assetIssue` refusal of the core asset came from review finding 27: without it the genesis issuer could create stake out of thin air and break the supply invariant that the staking tests check. The undelegate self-bond check reads:
+The `assetIssue` refusal of the core asset came from review finding 27: without it the genesis issuer could create stake out of thin air and break the supply invariant that the staking tests check. The consensus-key check of the two validator operations is one line, the same in both:
+
+```ts
+      if (!isPublicKey(op.consensusKey) || schemeOf(op.consensusKey) !== g.scheme) throw new TxError(`consensus key must be a ${schemeName(g.scheme)} key`);
+```
+
+`isPublicKey` wants a known tag followed by exactly that scheme's key, and `g.scheme` is the chain's from `global`; the engine would refuse a validator update of the other scheme anyway (`nextState` in chapter 3), but refusing it here keeps such a key out of the mempool and out of the state. The undelegate self-bond check reads:
 
 ```ts
       if (op.delegator === v.operator && v.status !== ValidatorStatus.tombstoned && tokensForShares(v, d.shares - op.shares) < p.minSelfBond) {
@@ -980,11 +1023,11 @@ Everything is optional except that a validator must name an account that exists;
 - **`parseAppGenesisStream(source)`** consumes a `Readable` through `stream-json`'s parser with `streamValues: false`. It tracks the nesting depth, and when it sees the top-level key `accounts` followed by `startArray` it assembles each element with its own `Assembler`, converts it on the spot and drops the text; every other token goes to a header assembler. It rejects a non-array `accounts`, a non-object element, a document that ends early and a top-level value that is not an object. A repeated top-level `accounts` key empties the list collected so far, so the last one wins, which is what `JSON.parse` does for the inline parser; the two parsers must agree on every document or a genesis would hash differently depending on its size. Unlike the inline parser it rejects empty input, which is why the next function special-cases it.
 - **`loadAppGenesis(genesis)`** chooses: no `appStateFile` means parse `appState` inline; an empty file is an empty genesis; otherwise stream the file.
 - **`authorityJson(publicKeys, threshold = 1)`** and **`appGenesisBytes(g)`** build genesis documents, for `init` and the tests.
-- **`applyGenesis(db, g, genesisTime)`** creates the objects in an empty database. "Genesis is trusted configuration, so problems are fatal": it throws `Error`, never `TxError`. In order: validate the core asset; create `global` and `dynamic` (height 0, time `genesisTime`, the pool, inflation at the minimum rate, `bonded: 0n`, empty sets); create every account in listing order, each with `registrar: id` (genesis accounts register themselves), checking names and authorities; then check that every member account exists, after all are created, since a member may be listed later; create the core asset as `4.0` with the first account as issuer; refuse a negative balance (`BigInt('-5')` parses without complaint, and a negative amount would both break the supply sum and fail to encode as a u64 at the first root), create a balance for every account with a positive balance and set `currentSupply` to the sum of balances and the pool, refusing anything above the max supply; check each validator's key size and operator name; and hand the validators to `bootstrapValidators`.
+- **`applyGenesis(db, g, genesisTime, scheme)`** creates the objects in an empty database; `scheme` is the tag of the engine genesis's `signatureScheme`, which `CoreApp` passes. "Genesis is trusted configuration, so problems are fatal": it throws `Error`, never `TxError`. In order: validate the core asset; create `global` (with the scheme) and `dynamic` (height 0, time `genesisTime`, the pool, inflation at the minimum rate, `bonded: 0n`, empty sets); create every account in listing order, each with `registrar: id` (genesis accounts register themselves), checking names and authorities, the latter against the chain's scheme; then check that every member account exists, after all are created, since a member may be listed later; create the core asset as `4.0` with the first account as issuer; refuse a negative balance (`BigInt('-5')` parses without complaint, and a negative amount would both break the supply sum and fail to encode as a u64 at the first root), create a balance for every account with a positive balance and set `currentSupply` to the sum of balances and the pool, refusing anything above the max supply; check that each validator's consensus key is a well-formed key of the chain's scheme (`genesis validator X: consensus key must be a <scheme> key`) and that its operator is a genesis account; and hand the validators to `bootstrapValidators`.
 
 ```ts
   const accounts = g.accounts.map((a) => {
-    const problem = checkAccountName(a.name) ?? checkAuthority(a.owner) ?? checkAuthority(a.active);
+    const problem = checkAccountName(a.name) ?? checkAuthority(a.owner, scheme) ?? checkAuthority(a.active, scheme);
     if (problem) throw new Error(`genesis account ${a.name}: ${problem}`);
     return db.create(AccountType, (id) => ({ id, name: a.name, owner: a.owner, active: a.active, registrar: id }));
   });
@@ -1107,7 +1150,7 @@ It imports every `o` entry, sets the counters, recomputes the root at the stored
       const g = opts.appGenesis ?? parseAppGenesis(opts.genesis.appState);
       const t1 = performance.now();
       this.db = new ObjectDatabase(CORE_TYPES, { retainVersions: opts.retainVersions });
-      applyGenesis(this.db, g, opts.genesis.genesisTime);
+      applyGenesis(this.db, g, opts.genesis.genesisTime, schemeTag(opts.genesis.signatureScheme ?? 'ml-dsa-44'));
       const t2 = performance.now();
       this.appHash = this.db.root(0);
       const t3 = performance.now();
@@ -1118,7 +1161,7 @@ It imports every `o` entry, sets the counters, recomputes the root at the stored
     this.pending = this.db.startSession();
 ```
 
-A store with state wins over genesis, so genesis is parsed only once in a node's life; **`CoreApp.hasState(kv)`** lets the node skip parsing it at all. Genesis is applied, hashed as version 0 and persisted immediately. Either way the constructor ends by opening the pending session. The README reports a one-gigabyte genesis (193,536 accounts with two keys each) parsing as a token stream in 6.4 s and building its objects, first root and LMDB write in 8.1 s, and a restart from LMDB at that size in 11.8 s, most of it decoding objects and rebuilding index history.
+A store with state wins over genesis, so genesis is parsed only once in a node's life; **`CoreApp.hasState(kv)`** lets the node skip parsing it at all. Genesis is applied, hashed as version 0 and persisted immediately. The scheme handed to `applyGenesis` is the engine genesis's `signatureScheme`, ML-DSA-44 when absent, turned into its tag by `schemeTag`; from then on the application reads it from the committed `global` object (`chainScheme`, below) and never from the genesis document again, so a reopened store carries its own scheme. Either way the constructor ends by opening the pending session. The README reports a one-gigabyte genesis (193,536 accounts with two keys each) parsing as a token stream in 6.4 s and building its objects, first root and LMDB write in 8.1 s, and a restart from LMDB at that size in 11.8 s, most of it decoding objects and rebuilding index history.
 
 **`initChain(_genesis)`** refuses to run on an application that already has blocks and returns the genesis app hash with the active set as validator updates; when the set is non-empty, the engine uses it in place of its own genesis list (`STAKING.md` section 2.3).
 
@@ -1290,7 +1333,29 @@ The private internals:
 ```
 
   Why a set per (body, key) rather than one hash: ML-DSA signing is randomised by default (the "hedged" variant), so one key produces a different valid signature over the same body every time it signs. Two copies of one transaction with different signature bytes can be in the system at once, one gossiped from a peer and one re-signed by a wallet that retried, and both are valid. With a single slot per signer, verifying the second copy overwrote the record of the first, and a `checkTx` for the first copy that was between its verification and its evaluation then found its own signature "unverified". A set keeps every signature that verified, so neither copy can make the other look bad, and the entry still says only "this key signed this body with these exact bytes".
-- `prewarmSignatures(decoded)` builds one job per uncached signature whose address is among the candidates and caches every success. A signer whose key is not in a required authority yet (it may be added by an earlier transaction of the same block) is skipped here and handled by the per-transaction pass.
+- `chainScheme` (a getter) reads the scheme genesis fixed from the committed global properties:
+
+```ts
+  /** The scheme genesis fixed; part of the committed global properties, so two nodes with other genesis files never agree on a root. */
+  private get chainScheme(): SchemeTag {
+    return getGlobal(this.db).scheme;
+  }
+```
+
+- `prewarmSignatures(decoded)` builds one job per uncached signature whose address is among the candidates and whose tag is the chain's scheme, and caches every success. A signer whose key is not in a required authority yet (it may be added by an earlier transaction of the same block) is skipped here and handled by the per-transaction pass, and so is a signature of another scheme, which that pass refuses:
+
+```ts
+      for (const s of d.tx.signatures) {
+        const address = toHex(s.address);
+        const publicKey = candidates.get(address);
+        if (!publicKey || schemeOf(s.signature) !== this.chainScheme) continue;
+        const sigHash = toHex(sha256(s.signature));
+        if (this.isVerified(txKey, address, sigHash)) continue;
+        jobs.push({ sig: s.signature, msg: body, publicKey, context: this.context });
+        owners.push({ txKey, address, sigHash });
+      }
+```
+
 - `verifySignatures(tx, txId)` returns an error string or null:
 
 ```ts
@@ -1300,6 +1365,7 @@ The private internals:
       seen.add(address);
       const publicKey = candidates.get(address);
       if (!publicKey) return 'signature by a key that no required authority contains';
+      if (schemeOf(s.signature) !== this.chainScheme) return 'signature of another scheme than the chain uses';
       // A cache hit is only for the exact signature bytes seen before.
       const sigHash = toHex(sha256(s.signature));
       if (this.isVerified(txKey, address, sigHash)) continue;
@@ -1313,7 +1379,7 @@ The private internals:
     }
 ```
 
-A transaction with no signatures is `transaction has no signatures`. The cache binds the hash of the signature bytes (review finding 2): before that, a node that had verified a transaction once accepted the same body with a zeroed signature in a block, and nodes that had not split from it. The review test "accepts both valid signatures a key can make over one body, whichever was seen first" signs one body twice with one key, verifies both copies, and checks that each still evaluates after the other.
+A transaction with no signatures is `transaction has no signatures`. A signature tagged with another scheme than the chain's is refused as `signature of another scheme than the chain uses` before any job is built: chapter 2's `verify` would fail it anyway, since the key and the signature would disagree on their tags, but the refusal names the reason and costs no verification work. The cache binds the hash of the signature bytes (review finding 2): before that, a node that had verified a transaction once accepted the same body with a zeroed signature in a block, and nodes that had not split from it. The review test "accepts both valid signatures a key can make over one body, whichever was seen first" signs one body twice with one key, verifies both copies, and checks that each still evaluates after the other.
 
 - `applyChecked(tx, txId, time, height, keep, final)` is synchronous on purpose. It first requires every signature to be in the cache (`unverified signature` otherwise; `verifySignatures` has just run on every path, and because the cache keeps every verified signature of a signer rather than the latest one, a second copy of the transaction verified in between cannot make this one look unverified), then checks thresholds against current state: each owner-required account's owner authority, and each active-required account's active or owner authority (`missing owner authority of X`, `missing active authority of X`). Then:
 
@@ -1342,6 +1408,7 @@ For completeness, every error `app.ts` produces on its own, before the evaluator
 | `account X does not exist` | `signingKeys` | an account the operations require is unknown, so no key can be resolved |
 | `duplicate signature` | `verifySignatures` | two signatures carry the same address |
 | `signature by a key that no required authority contains` | `verifySignatures` | the address is not among the candidate keys of the required accounts, to depth 2 |
+| `signature of another scheme than the chain uses` | `verifySignatures` | the signature's tag is not the scheme genesis fixed (`global.scheme`) |
 | `invalid signature` | `verifySignatures` | the worker pool rejected at least one signature |
 | `unverified signature` | `applyChecked` | a signature is not in the cache; a guard rather than an expected outcome, since `verifySignatures` runs first on every path and the cache keeps every verified signature, so only an eviction of the entry (20,000 other transactions between verification and evaluation) could trigger it |
 | `missing owner authority of X` | `applyChecked` | the signers do not reach X's owner threshold |
@@ -1390,6 +1457,8 @@ A failed `checkTx` leaves nothing behind in the pending session, and a failed tr
 `test/genesis.test.ts`: the inline and the streaming parser produce identical results, key order, a missing `accounts` and a repeated `accounts` key (the last one wins in both) do not matter, malformed streams fail with the expected messages, a negative balance is refused; a genesis in a file reaches the same app hash as an inline one, neither a fresh nor a reopened database keeps the encoded change list (finding 36), constructing without the parsed genesis throws, an empty file is an empty genesis and a missing file is an error.
 
 `test/chain.test.ts` runs the application on a live four-validator network with a full node: a registration gossips to every node, a forged transaction never enters a mempool, a payment reaches every node, a proof from one node verifies against the app hash in the next header on every node, state and name queries verify through `verifyStateQuery`, `verifyKeyQuery` and a light client, a transaction is proven included and successful, and account history on every node shows the faucet's two operations and alice's two receipts, newest first when reversed.
+
+`test/schemes.test.ts` runs the application on the second scheme: a four-validator chain whose genesis names secp256k1 creates an account with a secp256k1 key and refuses an ML-DSA key in an authority (`must be a secp256k1 key`), an ML-DSA consensus key (`consensus key must be a secp256k1 key`) and an ML-DSA signature relabelled with a secp256k1 address (`another scheme`); the rest of the suite runs on whichever scheme `CHAIN_SCHEME` names (chapter 15).
 
 `test/staking-net.test.ts` runs an application-owned validator set on a live network: the engine starts on the set `initChain` built, a delegation raises a validator's power two heights later on every node, a stopped validator is jailed within the window and the chain continues on three, it restarts, catches up, is unjailed by its operator and the set is four again, and a light client that trusted height 2 follows the whole sequence and proves which account stands behind an operator name.
 

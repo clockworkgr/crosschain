@@ -7,7 +7,7 @@
  *
  * The two halves pack into one u64 (16 bits of type, 48 of instance) for the
  * wire, for hashing, and for use as a Map key. Objects reference each other
- * by id. For a chain whose public keys are 1312 bytes that matters: a
+ * by id. For a chain whose public keys can be 1313 bytes that matters: a
  * transfer names its accounts in 16 bytes and the keys stay in state.
  */
 export const MAX_TYPE = 0xffff;

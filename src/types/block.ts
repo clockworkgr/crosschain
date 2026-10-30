@@ -1,7 +1,7 @@
 import type { Reader } from '../codec/reader.ts';
 import { Writer, encode } from '../codec/writer.ts';
 import { HASH_SIZE, ZERO_HASH, sha256 } from '../crypto/hash.ts';
-import { ADDRESS_SIZE, SIGNATURE_SIZE } from '../crypto/keys.ts';
+import { ADDRESS_SIZE, decodeSignature } from '../crypto/keys.ts';
 import { decodeEvidence, encodeEvidence, type DuplicateVoteEvidence } from './evidence.ts';
 
 /**
@@ -36,8 +36,8 @@ export interface Header {
 /**
  * The precommit signatures that finalised a block. `signatures[i]` belongs
  * to validator i of that height's set, or is null if that validator's
- * precommit was not seen. There is no aggregation with ML-DSA, so this is
- * linear in the validator count.
+ * precommit was not seen. Signatures are not aggregated under either scheme,
+ * so this is linear in the validator count.
  */
 export interface Commit {
   height: bigint;
@@ -114,7 +114,7 @@ export function decodeCommit(r: Reader): Commit {
     height: r.u64(),
     round: r.u32(),
     blockHash: r.fixed(HASH_SIZE),
-    signatures: r.array((r) => r.option((r) => r.fixed(SIGNATURE_SIZE)), 10_000),
+    signatures: r.array((r) => r.option(decodeSignature), 10_000),
   };
 }
 

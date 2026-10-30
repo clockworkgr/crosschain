@@ -60,7 +60,7 @@ export function jsonify(value: unknown, key?: string): unknown {
 }
 ```
 
-Notice that the decision "is this bigint an id?" is made by field name, not by type. An `ObjectId` is a `bigint` at runtime (chapter 9: sixteen bits of type, forty-eight of instance, packed in one u64), so nothing else distinguishes it. The list must therefore name every field of every object type that holds an id; a new object type with an id field under a new name would render as a bare integer until the list is extended. Callers that jsonify a lone id pass the key explicitly, as in `jsonify(a.id, 'id')`.
+Notice that the decision "is this bigint an id?" is made by field name, not by type. An `ObjectId` is a `bigint` at runtime (chapter 9: sixteen bits of type, forty-eight of instance, packed in one u64), so nothing else distinguishes it. The list must therefore name every field of every object type that holds an id; a new object type with an id field under a new name would render as a bare integer until the list is extended. Callers that jsonify a lone id pass the key explicitly, as in `jsonify(a.id, 'id')`. Bytes carry no type either: a public key or a signature travels as the hex of its tagged bytes (chapter 2), the scheme byte first, so an ML-DSA-44 key begins `01` and a secp256k1 key `02`, and `fromHex` on the way back hands the decoders the tag they read the size from.
 
 **`parseId(s)`** requires a string and delegates to `idFromString`, which accepts only `"\d+.\d+"`. **`parseBigint(s, what)`** accepts a JSON number only when it is a safe non-negative integer (at most 2^53 − 1, since anything larger has already been rounded by the JSON parser and the value received is not the value sent), or a string of decimal digits; a negative number, a fraction, a hex string or a sign throws. **`parseHex(s, what)`** requires a string and delegates to `fromHex`; **`parseFixedHex(s, size, what)`** additionally requires exactly `size` bytes. These throw plain `Error`s; `server.ts` maps any non-`RpcError` thrown by a method to `-32602`, so a bad parameter is reported as invalid params without each method having to say so.
 
@@ -205,7 +205,7 @@ The complete reference follows. "Costly" means the method spends `costlyCost` (d
 
 | method | parameters | result | errors | costly |
 |---|---|---|---|---|
-| `status` | none | `{ chainId, version (number), latestHeight, latestHash (hex or null), latestTime, appHash, catchingUp (bool), lowestHeight, joinedAt (string or null), peers (number), validatorAddress (hex or null), rpcVersion: 1 }` | none | no |
+| `status` | none | `{ chainId, version (number), signatureScheme ('ml-dsa-44' or 'secp256k1'), latestHeight, latestHash (hex or null), latestTime, appHash, catchingUp (bool), lowestHeight, joinedAt (string or null), peers (number), validatorAddress (hex or null), rpcVersion: 1 }` | none | no |
 | `genesis` | none | the genesis document as `genesisToJson` writes it, with `appStateFile` removed | none | no |
 | `header` | `height?` (default latest) | the header: `chainId, version, height, time, lastBlockHash, lastCommitHash, dataHash, lastResultsHash, validatorsHash, nextValidatorsHash, appHash, evidenceHash, proposerAddress`; below a state-synced node's lowest block, a header it keeps alone | `-32001` no block and no header | no |
 | `block` | `height?` | `{ header, txs: hex[], lastCommit (or null), evidence, commit }` | `-32001` | yes |
@@ -248,7 +248,7 @@ Some methods deserve a closer look.
 
 A node that joined by state sync holds no blocks below its snapshot height until backfill has fetched them, but it does hold the headers of those heights as far back as evidence may reach (chapter 10's header records, written by state sync in chapter 7), and `header` serves them. That is what lets a light client walk backwards from a trusted header through such a node (chapter 13): each step needs only the header below, not its commit. `block` and `commit` need the block itself and stay `-32001` for those heights.
 
-`status` computes `catchingUp` from the peers' reported heights: true when some peer is more than one block ahead. `lowestHeight` is the oldest block the store still has (retention, chapter 10), and `joinedAt` is the height a state-synced node started from, or null for one that replayed from genesis. `rpcVersion: 1` lets a client detect the contract.
+`status` computes `catchingUp` from the peers' reported heights: true when some peer is more than one block ahead. `lowestHeight` is the oldest block the store still has (retention, chapter 10), and `joinedAt` is the height a state-synced node started from, or null for one that replayed from genesis. `signatureScheme` is the name of the scheme the chain state carries (`schemeName(state.scheme)`), the one genesis fixed: a wallet must know it before it makes a key for the chain, and the CLI's `create` and `create-validator` ask `status` for it (chapter 14). `rpcVersion: 1` lets a client detect the contract.
 
 `object` is the only method whose `height` selects the object read:
 
@@ -356,8 +356,8 @@ and gets back, with the hex values shortened here, the shape `jsonify` and the m
     "account": {
       "id": "3.1",
       "name": "alice",
-      "owner": { "threshold": 1, "accounts": [], "keys": [{ "publicKey": "a3f1…", "weight": 1 }] },
-      "active": { "threshold": 1, "accounts": [], "keys": [{ "publicKey": "a3f1…", "weight": 1 }] },
+      "owner": { "threshold": 1, "accounts": [], "keys": [{ "publicKey": "01a3f1…", "weight": 1 }] },
+      "active": { "threshold": 1, "accounts": [], "keys": [{ "publicKey": "01a3f1…", "weight": 1 }] },
       "registrar": "3.0"
     },
     "balances": [{ "asset": "CORE", "assetId": "4.0", "amount": "1250000" }],
@@ -368,7 +368,7 @@ and gets back, with the hex values shortened here, the shape `jsonify` and the m
 }
 ```
 
-Every id is `"type.n"`: `id` and `registrar` are in `ID_KEYS`, `assetId` is produced by `jsonify(b.asset, 'asset')` and the `validator` field by `jsonify(v.id, 'id')`; the amount and the history count are strings because they are bigints; `threshold` and `weight` are numbers because they are numbers in the object. The proof is a `KeyProof` in hex that `keyProofFromBytes` decodes and `verifyKeyProof` checks against header 42's app hash. A refused broadcast comes back in the same envelope with an error instead:
+Every id is `"type.n"`: `id` and `registrar` are in `ID_KEYS`, `assetId` is produced by `jsonify(b.asset, 'asset')` and the `validator` field by `jsonify(v.id, 'id')`; the amount and the history count are strings because they are bigints; `threshold` and `weight` are numbers because they are numbers in the object; the public key is the hex of its tagged bytes, and its first byte, `01`, says this is an ML-DSA-44 chain. The proof is a `KeyProof` in hex that `keyProofFromBytes` decodes and `verifyKeyProof` checks against header 42's app hash. A refused broadcast comes back in the same envelope with an error instead:
 
 ```json
 { "jsonrpc": "2.0", "id": 8, "error": { "code": -32002, "message": "invalid: states a fee of 100, the schedule requires 250" } }
@@ -660,7 +660,7 @@ The server is started in three places: `src/cli.ts` (`start`, on the node's p2p 
 
 `test/review2.test.ts` adds two cases for this chapter. "holds the RPC to its parameter types, seeks listing cursors, and does not wait for a transaction it has already refused" sends `prove` as a string and `limit` as a string and expects `-32602` for each, lists accounts page by page with `after` and checks the pages join up with nothing repeated and nothing skipped, broadcasts a transaction the mempool refuses and then re-broadcasts it in commit mode, which must answer `-32002` at once rather than wait for the timeout, sends a request whose `id` is an object to get `-32600`, and then the notification cases: a `status` request without an `id` is answered 204 with an empty body, and a batch of a notification, a request with `id: 7` and a notification for an unknown method is answered with an array whose only member carries id 7. "refuses a header whose bytes moved between hash fields, and integers a double cannot hold" is about `json.ts`: a header JSON with a 31-byte `appHash` and a 33-byte `evidenceHash` is refused by `headerFromJson`, and `parseBigint` refuses `2 ** 53` as a number while accepting the same value as a string.
 
-`test/chain.test.ts` exercises `node.queryState`, `node.queryAccountName` and `node.queryTx`, which are what the `object`, `account` and `tx` methods serve; see chapter 13 for the cases.
+`test/chain.test.ts` exercises `node.queryState`, `node.queryAccountName` and `node.queryTx`, which are what the `object`, `account` and `tx` methods serve; see chapter 13 for the cases. `test/schemes.test.ts` starts an `RpcServer` on a chain whose genesis names secp256k1 and expects `status` to report `signatureScheme: 'secp256k1'`.
 
 For numbers, `README.md` ("Steady state at that size") reports the RPC on a gigabyte state with 16 clients and an idle chain at 6,000 `account` calls with proof, 6,500 `object` with proof, 9,600 `accountHistory` and 9,200 `status` per second; `broadcastTx` from 16 clients at 2,150 transactions per second over 8 blocks, and 1,460 per second with 8 more clients reading accounts with proofs throughout. The benchmark (`bench/scale.bench.ts`) runs the server with the limits raised out of the way.
 

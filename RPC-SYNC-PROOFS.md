@@ -21,7 +21,7 @@ out of this round; proofs stay ICS23-shaped for the latter.
 | broadcast | `sync` (after checkTx) and `commit` (after inclusion, with the result) |
 | push | Server-Sent Events: blocks, transaction results, account history, validator set changes |
 | exposure | loopback by default, configurable bind, CORS open, body and per-address rate limits |
-| keys | encrypted keystore, scrypt and AES-256-GCM, passphrase on signing, a lock file around every write |
+| keys | encrypted keystore, scrypt and AES-256-GCM, each key recorded with its signature scheme, passphrase on signing, a lock file around every write |
 | CLI | an RPC client; the inbox file and read-only store access are removed; the light client gets an RPC provider |
 | state sync | periodic snapshots every K blocks, last two kept, chunks with range proofs baked in, served over p2p; the headers of the evidence window below the join, installed with the state in one transaction |
 | trust anchor | operator supplies a trusted height and header hash; the light client bisects to the snapshot height and walks the hash chain back for earlier heights |
@@ -132,7 +132,13 @@ price; over either limit the stream request gets HTTP 429.
 
 ### 3.2 Encoding
 
-- bytes: lowercase hex, no prefix; hashes, addresses, public keys, signatures.
+- bytes: lowercase hex, no prefix; hashes, addresses, public keys, signatures. A public
+  key or signature is hex of its tagged bytes, the first byte naming the scheme
+  (DESIGN.md section 5): 1313 or 34 bytes for a key, 2421 or 65 for a signature,
+  under ML-DSA-44 or secp256k1. The binary encodings the RPC passes through as hex
+  (a commit's signatures, a validator set's keys, an authority's keys, a transaction's
+  signatures; likewise a vote, a proposal, the p2p hello and the handshake signatures)
+  read the tag and then that scheme's size, in place of the fixed size they read before.
 - 64-bit integers: decimal strings. Smaller counters: JSON numbers.
 - object ids: `"type.n"`. Times: decimal strings of unix milliseconds.
 - objects: decoded per type with the TypeScript field names; authorities expanded.
@@ -150,8 +156,8 @@ price; over either limit the stream request gets HTTP 429.
 
 | method | parameters | returns |
 |---|---|---|
-| status | | chain id, protocol version, latest height, hash and time, app hash, catching-up flag, lowest retained height, the height joined at by state sync (or null), peer count, validator address if any, `rpcVersion` 1 |
-| genesis | | the genesis document, without `appStateFile`: an application genesis kept in a file is not served |
+| status | | chain id, protocol version, `signatureScheme` (`ml-dsa-44` or `secp256k1`), latest height, hash and time, app hash, catching-up flag, lowest retained height, the height joined at by state sync (or null), peer count, validator address if any, `rpcVersion` 1 |
+| genesis | | the genesis document, `signatureScheme` included when the file names one (absent means `ml-dsa-44`), without `appStateFile`: an application genesis kept in a file is not served |
 | header | height? | header; below the lowest retained block, a header the node keeps alone (section 4.2), where `block` and `commit` answer `-32001` |
 | block | height? | header, transactions (hex), lastCommit, evidence, and the block's own commit |
 | commit | height? | the commit for that height |
@@ -232,12 +238,16 @@ the anchor.
 ### 3.6 Keystore
 
 `keystore.json`: `{ version: 1, kdf: { name: 'scrypt', N: 32768, r: 8, p: 1, salt },
-keys: { [name]: { address, publicKey, iv, ciphertext, tag } } }`. One key is derived
-from the passphrase and the salt; every seed is sealed with AES-256-GCM under it with
-its own IV. The passphrase comes from `--passphrase-file`, the `CHAIN_PASSPHRASE`
-variable, or a hidden prompt. Commands: `keys add <name>`, `keys list`, `keys import
-<name> <seed hex>`, `keys export <name>`. `init` writes the faucet and operator keys
-into the testnet's keystore and prints the passphrase it chose.
+keys: { [name]: { address, publicKey, scheme, iv, ciphertext, tag } } }`. One key is
+derived from the passphrase and the salt; every seed is sealed with AES-256-GCM under
+it with its own IV. `scheme` is `ml-dsa-44` or `secp256k1`, the scheme the seed's key
+pair is derived under; a key sealed before the field existed has none and is read as
+ML-DSA-44. The passphrase comes from `--passphrase-file`, the `CHAIN_PASSPHRASE`
+variable, or a hidden prompt. Commands: `keys add <name> [--scheme <name>]`, `keys
+list` (name, scheme, address), `keys import <name> <seed hex> [--scheme <name>]`,
+`keys export <name>`; `--scheme` is ML-DSA-44 when absent, and a chain refuses a key
+of the other scheme. `init [--scheme <name>]` writes the faucet and operator keys, of
+the chain's scheme, into the testnet's keystore and prints the passphrase it chose.
 
 Every write (`create`, `add`, `remove`) takes a lock file `<keystore>.lock` beside the
 file, created exclusively and retried every 20 ms for up to 5 s (a lock older than
@@ -255,7 +265,9 @@ handle last read or wrote it.
 A client command names a node directory (its RPC is `http://127.0.0.1:<p2p port + 1>` unless
 `rpcListen` says otherwise, and its keystore sits next to the testnet) or a URL; `--rpc <url>`
 sends a directory target's calls elsewhere while keeping its keystore. `create-validator`
-needs the directory, since it reads the consensus key from it. `start` opens the RPC. The
+needs the directory, since it reads the consensus key from it, and derives that key with
+the chain's scheme; `create` makes the new account's key in the chain's scheme too, both
+asking `status` for it. `start` opens the RPC. The
 inbox file, the read-only store opening and the per-account seed files go away. `show`
 reads through the RPC.
 New: `history <account>`, `tx <hash>`, `verify-tx <hash>` (light-client verified),
@@ -318,7 +330,10 @@ directory with a trust anchor:
    50 points and the next is asked. Fetch the exact validator sets, priorities
    included, for H, H+1 and H+2 by height and check them against the headers' set
    hashes and against the proposers the chain used at H and H+1 (any round up to the
-   commit's round, since a re-proposed block keeps its first proposer's name).
+   commit's round, since a re-proposed block keeps its first proposer's name). Every
+   key in the three sets must be of the scheme the node's genesis names, else the
+   join stops with `state sync: a validator key is not a <scheme> key; this is not
+   the chain genesis describes`.
 7. Fetch the headers below H as far back as evidence may reach: a block after H may
    carry evidence of a double sign at any height within the evidence age, and
    applying it takes the validator set and the time of that height, which every
@@ -342,7 +357,8 @@ directory with a trust anchor:
 8. Install, in one transaction across the application and chain stores: the imported
    state, the three sets by hash and by height, block H with its commit, the lowest
    height H, the lowest header height (the lower of an existing marker and the
-   walk's) and the chain state at H (block hash and time from the header). A crash
+   walk's) and the chain state at H (block hash and time from the header, the scheme
+   from genesis). A crash
    leaves either a complete join or nothing, so a restart simply joins again. Then
    hand over to block sync from H+1.
 9. With `backfill` (the default), keep fetching earlier blocks downward one at a
@@ -422,6 +438,7 @@ node `{ versions: 10000, snapshots: 2 }`, archive: no `blocks` and as many
 | parameter | default |
 |---|---|
 | protocol version | 1 |
+| signature scheme | `ml-dsa-44` when genesis names none; `secp256k1` the other choice |
 | rpc bind | 127.0.0.1, p2p port + 1 |
 | rpc body limit | 1 MB |
 | rpc rate | 50/s per address, burst 100, costly calls 5 |
@@ -478,3 +495,13 @@ blocks prunes behind that window (with the evidence window switched off, since i
 would otherwise keep every block); evidence created on one node reaches a proposer
 that never saw the votes; a node with +2/3 precommits and no proposal decides the
 height from a fetched block.
+
+Schemes (`test/schemes.test.ts`, five cases): signing, verifying, tagging and codec
+round trips under each scheme, cross-scheme refusal and unknown tags; the high-S twin
+of a secp256k1 signature refused; the keystore keeping each key's scheme and reading
+an old file as ML-DSA-44; genesis refusing validator keys of the wrong scheme under
+each default; and a four-validator chain on secp256k1 end to end: 65-byte commit
+signatures, `status.signatureScheme`, an account created with a secp256k1 key, and
+refusals of an ML-DSA authority key, an ML-DSA consensus key and an ML-DSA signature
+under a secp256k1 address. The whole suite runs under either scheme with
+`CHAIN_SCHEME`.

@@ -1,6 +1,6 @@
 import type { Reader } from '../codec/reader.ts';
 import { Writer, encode } from '../codec/writer.ts';
-import { SIGNATURE_SIZE } from '../crypto/keys.ts';
+import { decodeSignature } from '../crypto/keys.ts';
 import { blockHash, decodeBlock, encodeBlock, type Block } from './block.ts';
 
 /**
@@ -45,6 +45,6 @@ export function decodeProposal(r: Reader): Proposal {
     round: r.u32(),
     polRound: Number(r.i64()),
     block: decodeBlock(r),
-    signature: r.fixed(SIGNATURE_SIZE),
+    signature: decodeSignature(r),
   };
 }

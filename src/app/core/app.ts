@@ -30,7 +30,7 @@
 import { decode } from '../../codec/reader.ts';
 import { encode } from '../../codec/writer.ts';
 import { bytesEqual, HASH_SIZE, sha256, toHex } from '../../crypto/hash.ts';
-import { signContext } from '../../crypto/keys.ts';
+import { schemeOf, schemeTag, signContext, type SchemeTag } from '../../crypto/keys.ts';
 import type { Verifier, VerifyJob } from '../../crypto/verifier.ts';
 import { decodeHistory, encodeHistory, ObjectDatabase, type Changes, type UndoSession } from '../../db/database.ts';
 import { idToString, type ObjectId } from '../../db/id.ts';
@@ -182,7 +182,7 @@ export class CoreApp implements Application {
       const g = opts.appGenesis ?? parseAppGenesis(opts.genesis.appState);
       const t1 = performance.now();
       this.db = new ObjectDatabase(CORE_TYPES, { retainVersions: opts.retainVersions });
-      applyGenesis(this.db, g, opts.genesis.genesisTime);
+      applyGenesis(this.db, g, opts.genesis.genesisTime, schemeTag(opts.genesis.signatureScheme ?? 'ml-dsa-44'));
       const t2 = performance.now();
       this.appHash = this.db.root(0);
       const t3 = performance.now();
@@ -548,7 +548,7 @@ export class CoreApp implements Application {
       for (const s of d.tx.signatures) {
         const address = toHex(s.address);
         const publicKey = candidates.get(address);
-        if (!publicKey) continue;
+        if (!publicKey || schemeOf(s.signature) !== this.chainScheme) continue;
         const sigHash = toHex(sha256(s.signature));
         if (this.isVerified(txKey, address, sigHash)) continue;
         jobs.push({ sig: s.signature, msg: body, publicKey, context: this.context });
@@ -560,6 +560,11 @@ export class CoreApp implements Application {
     results.forEach((ok, i) => {
       if (ok) this.cacheVerified(owners[i]!.txKey, owners[i]!.address, owners[i]!.sigHash);
     });
+  }
+
+  /** The scheme genesis fixed; part of the committed global properties, so two nodes with other genesis files never agree on a root. */
+  private get chainScheme(): SchemeTag {
+    return getGlobal(this.db).scheme;
   }
 
   private async verifySignatures(tx: Transaction, txId: Uint8Array): Promise<string | null> {
@@ -577,6 +582,7 @@ export class CoreApp implements Application {
       seen.add(address);
       const publicKey = candidates.get(address);
       if (!publicKey) return 'signature by a key that no required authority contains';
+      if (schemeOf(s.signature) !== this.chainScheme) return 'signature of another scheme than the chain uses';
       // A cache hit is only for the exact signature bytes seen before.
       const sigHash = toHex(sha256(s.signature));
       if (this.isVerified(txKey, address, sigHash)) continue;

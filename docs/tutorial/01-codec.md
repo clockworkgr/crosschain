@@ -46,7 +46,7 @@ Three things to notice.
 
 *Big-endian* means the most significant byte comes first. Besides being the conventional network byte order, it has a property the object database depends on: a big-endian unsigned integer sorts the same way as a byte string. `DESIGN.md` section 6 builds index keys from "big-endian integers, strings with a zero terminator, compound keys by concatenation", so that a range scan over bytes is a range scan over numbers.
 
-*Fixed versus length-prefixed.* A hash is always 32 bytes and an ML-DSA-44 signature always 2420 bytes, so there is no point spending 4 bytes saying so; `fixed` writes the raw bytes and the reader is told how many to take. Transactions and strings vary in length and get a `u32` prefix. Which one a field uses is part of the schema: the reader of `fixed` must know the length from context.
+*Fixed versus length-prefixed.* A hash is always 32 bytes, so there is no point spending 4 bytes saying so; `fixed` writes the raw bytes and the reader is told how many to take. Transactions and strings vary in length and get a `u32` prefix. Which one a field uses is part of the schema: the reader of `fixed` must know the length from context. Keys and signatures are a third case: their size depends on the chain's signature scheme ([chapter 2](02-crypto.md)), so each carries a one-byte scheme tag in front of its raw bytes. The writer still emits them with `fixed`, tag included, and the readers are `decodePublicKey` and `decodeSignature` in `src/crypto/keys.ts`, which read the tag and then exactly the number of bytes that scheme needs: a tagged value is self-delimiting without a length prefix, and an unknown tag is a `CodecError`.
 
 *There is no schema language.* The order of fields is the schema, written twice, once in each `encode` function and once in each `decode` function. That is the Graphene approach. It is simple and fast, and the cost is that adding a field to a header changes every header hash. `RPC-SYNC-PROOFS.md` section 2.1 is the record of exactly that happening: two fields were added to the header, and a protocol `version` field was added at the same time so that a node can reject headers from the other layout.
 
@@ -256,6 +256,7 @@ The defaults on `bytes`, `string` and `array` are the outer fence. The real fenc
 | `src/types/block.ts` `decodeBlock` | `evidence` | `array(decodeEvidence, 1000)` |
 | `src/types/block.ts` `decodeBlock` | each transaction | `bytes()` (64 MiB default) |
 | `src/types/validator.ts` `decode` | validators | `array(..., 10_000)` |
+| `src/crypto/keys.ts` `decodePublicKey`, `decodeSignature` | every key and signature | one tag byte, then that scheme's size: 1,312 or 33 for a key, 2,420 or 64 for a signature |
 | `src/types/txproof.ts` `decodeTxProof`, `decodeResultProof` | `siblings` | `array(..., 64)` |
 | `src/types/state.ts` `decodeState` | `chainId` | `string(256)` |
 | `src/p2p/messages.ts` hello fields | chain id, address, user agent | `string(256)` |
@@ -314,13 +315,13 @@ Two bytes where four are needed; one byte left over; a `bytes` length of 4,294,9
 
 Beyond that, the codec is exercised indirectly by every other suite, because every block, vote, validator set, state record and proof goes through it. One test uses it to build *malformed* input on purpose: `test/review.test.ts`, `rejects decoded validator sets with duplicate members, wrong order or a bad proposer index`, hand-encodes validator sets with `encode((w) => w.array(...).i64(...))` to feed `ValidatorSet.decode` a duplicate member, a reversed order and an out-of-range proposer index. That is the pattern to copy when writing a test for any decoder: `encode` lets you write bytes the honest encoder would never produce.
 
-`bench/codec.bench.ts` measures `encodeTransaction`, `decodeTransaction`, `txHash` and `txsRoot` over 500 signed transfers; `README.md` reports that a signed transfer is 2.5 KiB and that 1,668 fit in the default 4 MiB block.
+`bench/codec.bench.ts` measures `encodeTransaction`, `decodeTransaction`, `txHash` and `txsRoot` over 500 signed transfers; under ML-DSA-44 a signed transfer is about 2.5 KiB and `README.md` reports that 1,668 fit in the default 4 MiB block, while under secp256k1 the same transfer is about 150 bytes.
 
 ## Limitations and ideas
 
 Known simplifications:
 
-- Lengths are fixed-width `u32`. A varint would save three bytes on most strings and arrays. The chain does implement a protobuf varint in `src/db/merkle.ts` for ICS23 leaf hashing, but the codec itself does not use it. With 2420-byte signatures dominating every message, the saving would be invisible.
+- Lengths are fixed-width `u32`. A varint would save three bytes on most strings and arrays. The chain does implement a protobuf varint in `src/db/merkle.ts` for ICS23 leaf hashing, but the codec itself does not use it. With 2,421-byte ML-DSA-44 signatures dominating every message, the saving would be invisible; on a secp256k1 chain, whose signatures are 65 bytes, it would at least be measurable.
 - There is no schema or versioning. Changing a field order changes every hash and needs a protocol version bump (the header's `version` field exists for this reason, see `RPC-SYNC-PROOFS.md` section 2.1).
 - `string` and `bytes` always copy, and `TextEncoder`/`TextDecoder` instances are created per call.
 - The reader decodes from a complete buffer; a message larger than memory cannot be streamed. The p2p layer bounds frame sizes instead.
@@ -334,8 +335,8 @@ Exercises:
 4. Write a round-trip property test for `string`: random strings of random Unicode code points. Include unpaired surrogates and check that the writer refuses every one of them with a `RangeError`; then remove that check, find out what `TextEncoder` does with a lone surrogate, and watch the round trip fail.
 5. Implement a canonical JSON encoder (sorted keys, no whitespace, integers as strings) and compare the size and encode time of a block against the binary codec using `bench/codec.bench.ts` as a template.
 6. Replace `fixed`'s `slice` with `subarray`, run the network tests, and reason about whether anything can break. Then make the TCP transport deliver a `subarray` of its receive buffer instead of a copy and see.
-7. Add a `Writer.fixedN(n, b)` that throws unless `b.length === n`, use it for every hash, address and signature field in `src/types/`, and write the test that feeds `encodeHeader` a 31-byte hash.
+7. Add a `Writer.fixedN(n, b)` that throws unless `b.length === n`, use it for every hash and address field in `src/types/` (keys and signatures already carry their size in their tag; decide whether the writer should check them against it too), and write the test that feeds `encodeHeader` a 31-byte hash.
 
 ## Where to next
 
-[Chapter 2](02-crypto.md) hashes and signs the bytes the writer produces: SHA-256, ML-DSA-44 keys with domain-separated contexts, and the worker pool that keeps signature verification off the consensus thread.
+[Chapter 2](02-crypto.md) hashes and signs the bytes the writer produces: SHA-256, the two signature schemes with their tagged keys and domain-separated contexts, and the worker pool that keeps signature verification off the consensus thread.

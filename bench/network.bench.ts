@@ -4,6 +4,7 @@
  * application under a steady stream of signed transfers, then a fifth node
  * catching up through block sync.
  */
+import { DEFAULT_SCHEME, schemeName } from '../src/crypto/keys.ts';
 import { CoreApp } from '../src/app/core/app.ts';
 import { KvStoreApp } from '../src/app/kvstore.ts';
 import { encode } from '../src/codec/writer.ts';
@@ -60,6 +61,7 @@ export async function run(): Promise<void> {
   {
     const genesis: Genesis = {
       chainId: 'bench-engine',
+      signatureScheme: schemeName(DEFAULT_SCHEME),
       genesisTime: BigInt(Date.now()) - 1000n,
       validators: Array.from({ length: 4 }, (_, i) => ({ publicKey: keyPairFromSeed(validatorSeed(i)).publicKey, power: 10n, name: `v${i}` })),
       appState: new TextEncoder().encode('{}'),

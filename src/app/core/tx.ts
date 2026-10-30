@@ -13,14 +13,14 @@
  * operation; wallets use it to fill the field in.
  *
  * Accounts and assets are referenced by object id. A transfer is therefore
- * about 50 bytes plus one 2420-byte signature; the 1312-byte public key is
- * looked up in the sender's account.
+ * about 50 bytes plus one signature (2421 bytes under ML-DSA-44, 65 under
+ * secp256k1, tag included); the public key is looked up in the sender's
+ * account.
  */
 import { decode, type Reader } from '../../codec/reader.ts';
 import { encode, type Writer } from '../../codec/writer.ts';
 import { HASH_SIZE, sha256 } from '../../crypto/hash.ts';
-import { SIGNATURE_SIZE } from '../../crypto/keys.ts';
-import { PUBLIC_KEY_SIZE } from '../../crypto/keys.ts';
+import { decodePublicKey, decodeSignature } from '../../crypto/keys.ts';
 import { decodeAuthority, encodeAuthority, type Authority } from './authority.ts';
 import { isCheapName, MAX_ACCOUNT_NAME, MAX_ASSET_SYMBOL } from './names.ts';
 import { decodeChainParameters, encodeChainParameters, FEE_SCALE_ONE, MAX_SHARE_SUPPLY, type ChainParameters, type FeeSchedule } from './types.ts';
@@ -150,9 +150,9 @@ export function decodeOperation(r: Reader): Operation {
     case 4:
       return { type: 'assetIssue', fee, issuer: r.u64(), asset: r.u64(), to: r.u64(), amount: r.u64() };
     case 5:
-      return { type: 'validatorCreate', fee, operator: r.u64(), consensusKey: r.fixed(PUBLIC_KEY_SIZE), selfBond: r.u64() };
+      return { type: 'validatorCreate', fee, operator: r.u64(), consensusKey: decodePublicKey(r), selfBond: r.u64() };
     case 6:
-      return { type: 'validatorUpdate', fee, operator: r.u64(), validator: r.u64(), consensusKey: r.fixed(PUBLIC_KEY_SIZE) };
+      return { type: 'validatorUpdate', fee, operator: r.u64(), validator: r.u64(), consensusKey: decodePublicKey(r) };
     case 7:
       return { type: 'delegate', fee, delegator: r.u64(), validator: r.u64(), amount: r.u64() };
     case 8:
@@ -219,6 +219,6 @@ export function decodeTransaction(bytes: Uint8Array): Transaction {
   return decode(bytes, (r) => ({
     expiration: r.u64(),
     operations: r.array(decodeOperation, MAX_OPERATIONS),
-    signatures: r.array((r) => ({ address: r.fixed(HASH_SIZE), signature: r.fixed(SIGNATURE_SIZE) }), MAX_SIGNATURES),
+    signatures: r.array((r) => ({ address: r.fixed(HASH_SIZE), signature: decodeSignature(r) }), MAX_SIGNATURES),
   }));
 }

@@ -36,7 +36,7 @@ import type { Verifier } from '../crypto/verifier.ts';
 import { blockBytes, blockHash, commitHash, evidenceHash, type Block, type Commit, type Header } from '../types/block.ts';
 import { txsRoot } from '../types/txproof.ts';
 import { makeDuplicateVoteEvidence } from '../types/evidence.ts';
-import { SIGNATURE_SIZE } from '../crypto/keys.ts';
+import { zeroSignature } from '../crypto/keys.ts';
 import { proposalSignBytes, type Proposal } from '../types/proposal.ts';
 import type { ChainState } from '../types/state.ts';
 import type { ValidatorSet } from '../types/validator.ts';
@@ -561,7 +561,7 @@ export class Consensus {
     }
     const current = this.proposals.get(round);
     if (!this.running || this.decided || block.header.height !== this.height || (current?.valid && bytesEqual(current.hash, hash))) return;
-    const proposal: Proposal = { height: this.height, round, polRound: -1, block, signature: new Uint8Array(SIGNATURE_SIZE) };
+    const proposal: Proposal = { height: this.height, round, polRound: -1, block, signature: zeroSignature(this.d.getState().scheme) };
     this.proposals.set(round, { proposal, valid: true, hash, fetched: true });
     this.evaluateRules();
   }

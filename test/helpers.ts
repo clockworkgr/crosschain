@@ -1,3 +1,4 @@
+import { DEFAULT_SCHEME, schemeName, type SchemeTag } from '../src/crypto/keys.ts';
 import { sha256 } from '../src/crypto/hash.ts';
 import { keyPairFromSeed } from '../src/crypto/keys.ts';
 import { InlineVerifier } from '../src/crypto/verifier.ts';
@@ -42,6 +43,8 @@ export interface TestnetOptions {
   limits?: Partial<ValidationLimits>;
   /** Indices to create but not start. */
   skipStart?: number[];
+  /** The chain's signature scheme; CHAIN_SCHEME from the environment, else ML-DSA-44. */
+  scheme?: SchemeTag;
   /** Handed to the application; JSON, or a function of the validator public keys in index order. */
   appState?: string | ((validatorKeys: Uint8Array[]) => string);
   /** False leaves the engine's validator list out of genesis, so the application must supply the set. */
@@ -71,10 +74,12 @@ export async function makeTestnet(opts: TestnetOptions): Promise<Testnet> {
   const nodeSeed = (i: number) => seedFor(`${chainId}/node/${i}`);
   const addrOf = (i: number) => `node${i}:1`;
 
-  const validatorKeys = Array.from({ length: opts.validators }, (_, i) => keyPairFromSeed(validatorSeed(i)).publicKey);
+  const scheme = opts.scheme ?? DEFAULT_SCHEME;
+  const validatorKeys = Array.from({ length: opts.validators }, (_, i) => keyPairFromSeed(validatorSeed(i), scheme).publicKey);
   const appState = typeof opts.appState === 'function' ? opts.appState(validatorKeys) : (opts.appState ?? '{}');
   const genesis: Genesis = {
     chainId,
+    signatureScheme: schemeName(scheme),
     genesisTime: BigInt(Date.now()) - 1000n,
     validators:
       opts.engineValidators === false

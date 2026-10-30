@@ -1,4 +1,5 @@
 /** LMDB through the key-value interface, and the block store on top of it. */
+import { DEFAULT_SCHEME, signatureSize } from '../src/crypto/keys.ts';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -47,7 +48,13 @@ export async function run(): Promise<void> {
     lastCommit: null,
     evidence: [],
   });
-  const commitFor = (b: Block): Commit => ({ height: b.header.height, round: 0, blockHash: blockHash(b), signatures: [randomBytes(2420), randomBytes(2420), randomBytes(2420), randomBytes(2420)] });
+  // Random bytes under the chain's scheme tag: the store never verifies, but its decoder reads the size from the tag.
+  const fakeSignature = () => {
+    const s = randomBytes(signatureSize(DEFAULT_SCHEME));
+    s[0] = DEFAULT_SCHEME;
+    return s;
+  };
+  const commitFor = (b: Block): Commit => ({ height: b.header.height, round: 0, blockHash: blockHash(b), signatures: [fakeSignature(), fakeSignature(), fakeSignature(), fakeSignature()] });
   const results = txs.map(() => ({ ok: true }));
   const sample = block(0n);
   fact('block with 500 transfers and a 4-signature commit', `${fmtBytes(txs.reduce((s, t) => s + t.length, 0))} of transactions`);

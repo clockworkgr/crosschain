@@ -1,6 +1,7 @@
 /**
- * An encrypted keystore: named ML-DSA seeds sealed with AES-256-GCM under a
- * key derived from a passphrase with scrypt. One derivation per keystore;
+ * An encrypted keystore: named 32-byte seeds, each recorded with the
+ * signature scheme its key is derived under, sealed with AES-256-GCM under
+ * a key derived from a passphrase with scrypt. One derivation per keystore;
  * each seed has its own IV. The file is JSON so it can be inspected, and
  * nothing in it reveals a seed without the passphrase.
  *
@@ -12,11 +13,13 @@ import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'node:
 import { closeSync, existsSync, openSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { writeAtomic } from '../store/files.ts';
 import { fromHex, toHex } from '../crypto/hash.ts';
-import { generateSeed, keyPairFromSeed, SEED_SIZE, type KeyPair } from '../crypto/keys.ts';
+import { DEFAULT_SCHEME, generateSeed, keyPairFromSeed, schemeName, schemeTag, SEED_SIZE, type KeyPair, type SchemeName, type SchemeTag } from '../crypto/keys.ts';
 
 interface SealedKey {
   address: string;
   publicKey: string;
+  /** Absent in files written when there was one scheme: ML-DSA-44. */
+  scheme?: SchemeName;
   iv: string;
   ciphertext: string;
   tag: string;
@@ -76,23 +79,25 @@ export class Keystore {
     return existsSync(path) ? Keystore.open(path, passphrase) : Keystore.create(path, passphrase);
   }
 
-  list(): { name: string; address: string; publicKey: string }[] {
-    return Object.entries(this.file.keys).map(([name, k]) => ({ name, address: k.address, publicKey: k.publicKey }));
+  list(): { name: string; address: string; publicKey: string; scheme: SchemeName }[] {
+    return Object.entries(this.file.keys).map(([name, k]) => ({ name, address: k.address, publicKey: k.publicKey, scheme: k.scheme ?? 'ml-dsa-44' }));
   }
 
   has(name: string): boolean {
     return name in this.file.keys;
   }
 
-  add(name: string, seed: Uint8Array = generateSeed()): KeyPair {
+  /** A key of the given scheme (the chain's); the seed is generated when not supplied. */
+  add(name: string, seed?: Uint8Array, scheme: SchemeTag = DEFAULT_SCHEME): KeyPair {
     if (name === '') throw new Error('a key needs a name');
     if (this.has(name)) throw new Error(`key ${name} already exists`);
+    seed ??= generateSeed(scheme);
     if (seed.length !== SEED_SIZE) throw new Error(`seed must be ${SEED_SIZE} bytes`);
-    const pair = keyPairFromSeed(seed);
+    const pair = keyPairFromSeed(seed, scheme);
     const iv = randomBytes(12);
     const cipher = createCipheriv('aes-256-gcm', this.key, iv);
     const ciphertext = Buffer.concat([cipher.update(seed), cipher.final()]);
-    const sealed: SealedKey = { address: toHex(pair.address), publicKey: toHex(pair.publicKey), iv: iv.toString('hex'), ciphertext: ciphertext.toString('hex'), tag: cipher.getAuthTag().toString('hex') };
+    const sealed: SealedKey = { address: toHex(pair.address), publicKey: toHex(pair.publicKey), scheme: schemeName(scheme), iv: iv.toString('hex'), ciphertext: ciphertext.toString('hex'), tag: cipher.getAuthTag().toString('hex') };
     this.mutate((keys) => {
       if (name in keys) throw new Error(`key ${name} already exists`); // another handle got there first
       keys[name] = sealed;
@@ -111,7 +116,7 @@ export class Keystore {
     } catch {
       throw new Error('wrong passphrase');
     }
-    return keyPairFromSeed(new Uint8Array(seed));
+    return keyPairFromSeed(new Uint8Array(seed), schemeTag(k.scheme ?? 'ml-dsa-44'));
   }
 
   /** The raw seed, for export. */

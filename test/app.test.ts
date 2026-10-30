@@ -10,7 +10,7 @@ import { encode } from '../src/codec/writer.ts';
 import { keyProofFromBytes } from '../src/db/proof.ts';
 import { sha256 } from '../src/crypto/hash.ts';
 import { toHex } from '../src/crypto/hash.ts';
-import { keyPairFromSeed } from '../src/crypto/keys.ts';
+import { DEFAULT_SCHEME, keyPairFromSeed, schemeName } from '../src/crypto/keys.ts';
 import { InlineVerifier } from '../src/crypto/verifier.ts';
 import { objectId } from '../src/db/id.ts';
 import { key } from '../src/db/keys.ts';
@@ -31,6 +31,7 @@ const FAUCET_START = 1_000_000_000n;
 
 const genesis: Genesis = {
   chainId,
+  signatureScheme: schemeName(DEFAULT_SCHEME),
   genesisTime,
   validators: [{ publicKey: keyPairFromSeed(seedFor('val')).publicKey, power: 10n }],
   appState: appGenesisBytes({
