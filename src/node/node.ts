@@ -456,7 +456,14 @@ export class Node {
 
   private onMemoryLevel(level: MemoryLevel, stats: MemoryStats): void {
     if (level === 'warn' || level === 'pressure') void this.gcScheduler.major();
-    if (this.app instanceof CoreApp) this.app.db.setHotLimit(Node.HOT_OBJECTS[level]);
+    if (this.app instanceof CoreApp) {
+      const db = this.app.db;
+      db.setHotLimit(Node.HOT_OBJECTS[level]);
+      // The second dial: from `pressure` on the index trees are dropped and every index read goes to LMDB through
+      // the overlay of the block in progress; back at `ok` they are rebuilt from LMDB. `warn` leaves them as they are.
+      if (level === 'pressure' || level === 'critical') db.dropIndexTrees();
+      else if (level === 'ok') db.rebuildIndexTrees();
+    }
     this.shed(level === 'pressure' || level === 'critical');
     for (const fn of this.memoryListeners) fn(level, stats);
   }

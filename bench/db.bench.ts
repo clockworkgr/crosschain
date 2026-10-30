@@ -1,8 +1,13 @@
 /**
  * The object database on its own: creating and changing objects, the Merkle
  * root per version, lookups through the B+ tree indices, proofs, undo, and
- * the sparse Merkle tree behind authenticated unique indices.
+ * the sparse Merkle tree behind authenticated unique indices. At the end, the
+ * same lookups and scans with the index trees dropped (STATE-PAGING.md
+ * section 4.2): from an in-memory store, and from LMDB as a node reads them.
  */
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { makeAuthority } from '../src/app/core/authority.ts';
 import { AccountType, BalanceType, CORE_TYPES, TYPE } from '../src/app/core/types.ts';
 import { ObjectDatabase } from '../src/db/database.ts';
@@ -10,6 +15,7 @@ import { objectId } from '../src/db/id.ts';
 import { key } from '../src/db/keys.ts';
 import { keyProofToBytes, proofToBytes, verifyKeyProof, verifyObjectProof } from '../src/db/proof.ts';
 import { keyPairFromSeed } from '../src/crypto/keys.ts';
+import { LmdbEnv } from '../src/store/lmdb.ts';
 import { bench, fact, fmtBytes, heapMiB, suite } from './harness.ts';
 import { seed } from './fixtures.ts';
 
@@ -84,4 +90,42 @@ export async function run(): Promise<void> {
     for (let i = 0; i < 100; i++) verifyKeyProof(root, kp);
   });
   fact(`heap after ${db.currentVersion + 1} versions created (the last 100 retained)`, `${heapMiB().toFixed(0)} MiB`);
+
+  // The index tier's fallback: the same reads with the B+ trees dropped. Without an application store the database
+  // keeps the entries in an in-memory map while dropped; a node reads them from LMDB.
+  const lookups = (d: ObjectDatabase) => () => {
+    for (let i = 0; i < 1000; i++) d.lookup(BalanceType, 'byOwnerAsset', key((k) => k.id(objectId(TYPE.account, rnd(N))).id(CORE)));
+  };
+  const scan100 = (d: ObjectDatabase) => () => {
+    let n = 0;
+    for (const _ of d.scan(BalanceType, 'byAsset', key((k) => k.id(CORE)))) if (++n >= 100) break;
+  };
+  await bench('drop the index trees', { iterations: 1, warmup: 0 }, () => db.dropIndexTrees());
+  await bench('lookup by unique index, trees dropped (in-memory store)', { batch: 1000 }, lookups(db));
+  await bench('scan 100 entries of a non-unique index, trees dropped (in-memory store)', { batch: 100 }, scan100(db));
+  await bench('modify 1,000 balances + root, trees dropped (in-memory store)', {}, () => {
+    for (let i = 0; i < 1000; i++) db.modify(BalanceType, objectId(TYPE.balance, rnd(N)), (b) => ({ ...b, amount: b.amount + 1n }));
+    root = db.root();
+  });
+  await bench('rebuild the index trees (in-memory store)', { iterations: 1, warmup: 0 }, () => db.rebuildIndexTrees());
+
+  // The same state over LMDB, as a restarted node holds it: objects imported as bytes, index entries in the store.
+  const dir = mkdtempSync(join(tmpdir(), 'crosschain-dbbench-'));
+  const env = new LmdbEnv(dir);
+  const kv = env.store('app');
+  kv.write((w) => {
+    for (const [k, v] of db.indexEntries()) w.put(k, v);
+  });
+  const paged = new ObjectDatabase(CORE_TYPES, { retainVersions: 100, indexStore: kv, indexTrees: false });
+  for (const [id, bytes] of db.exportObjects()) paged.importObject(id, bytes, true);
+  for (const [t, n] of db.counters()) paged.setCounter(t, n);
+  paged.loadIndexEntries();
+  paged.root(db.currentVersion);
+  paged.dropChanges();
+  await bench('lookup by unique index, trees dropped (LMDB)', { batch: 1000 }, lookups(paged));
+  await bench('scan 100 entries of a non-unique index, trees dropped (LMDB)', { batch: 100 }, scan100(paged));
+  await bench('rebuild the index trees (from LMDB)', { iterations: 1, warmup: 0 }, () => paged.rebuildIndexTrees());
+  await bench('lookup by unique index, trees rebuilt from LMDB', { batch: 1000 }, lookups(paged));
+  await env.close();
+  rmSync(dir, { recursive: true, force: true });
 }

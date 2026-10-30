@@ -17,10 +17,12 @@
  *
  * State lives in memory. The key-value store holds a copy of every object,
  * written incrementally: commit() writes the objects the block changed, the
- * counters that moved, and the height and app hash, in one transaction. On
- * startup everything is read back, the root recomputed and checked against
- * the stored app hash, and the engine replays any blocks the store is
- * behind on.
+ * index entries they added and removed, the counters that moved, and the
+ * height and app hash, in one transaction. On startup everything is read
+ * back (the indices from their entries, without decoding an object), the
+ * root recomputed and checked against the stored app hash, and the engine
+ * replays any blocks the store is behind on. The index entries are also what
+ * the database falls back on when the memory guard drops its index trees.
  *
  * The signature cache remembers which addresses signed a transaction id
  * validly. That fact never changes, so a transaction verified on arrival is
@@ -36,6 +38,7 @@ import { decodeHistory, encodeHistory, ObjectDatabase, type Changes, type UndoSe
 import { idToString, type ObjectId } from '../../db/id.ts';
 import { DbError, type ObjectType } from '../../db/index.ts';
 import { key } from '../../db/keys.ts';
+import { INDEX_PREFIX } from '../../db/indexstore.ts';
 import type { KeyProof, ObjectProof } from '../../db/proof.ts';
 import { MemoryKv, prefixEnd, type KvStore } from '../../store/kv.ts';
 import type { Genesis } from '../../types/genesis.ts';
@@ -60,6 +63,8 @@ export interface CoreAppOptions {
   kv?: KvStore;
   /** How many past heights stay provable. */
   retainVersions?: number;
+  /** Start with the index trees dropped, every index read going to the store (STATE-PAGING.md section 4); default resident. */
+  indexTrees?: boolean;
   /** Export a snapshot every this many blocks; 0 disables. */
   snapshotInterval?: number;
   snapshotsKept?: number;
@@ -69,9 +74,11 @@ export interface CoreAppOptions {
 
 const SIG_CACHE_MAX = 20_000;
 
-// Key layout of the app store: 'm' meta, 'o' id, 'c' type, 'h' version, 'a' account history, 'q' history sequence.
+// Key layout of the app store: 'm' meta, 'o' id, 'c' type, 'h' version, 'a' account history, 'q' history sequence,
+// 'i' index entry (db/indexstore.ts).
 const META_KEY = key((k) => k.u8(0x6d));
 const OBJECT_PREFIX = key((k) => k.u8(0x6f));
+const INDEX_PREFIX_KEY = Uint8Array.of(INDEX_PREFIX);
 const HISTORY_PREFIX = key((k) => k.u8(0x68));
 const objectKey = (id: ObjectId) => key((k) => k.u8(0x6f).u64(id));
 const counterKey = (type: number) => key((k) => k.u8(0x63).u16(type));
@@ -104,15 +111,21 @@ export interface OpenedDatabase {
  * the retention window, so past heights are provable again. Null if the
  * store is empty.
  */
-export function openObjectDatabase(kv: KvStore, types: ObjectType<any>[], retainVersions?: number): OpenedDatabase | null {
+export function openObjectDatabase(kv: KvStore, types: ObjectType<any>[], retainVersions?: number, indexTrees?: boolean): OpenedDatabase | null {
   const m = kv.get(META_KEY);
   if (!m) return null;
   const meta = decode(m, (r) => ({ height: r.u64(), appHash: r.fixed(HASH_SIZE) }));
-  const db = new ObjectDatabase(types, { retainVersions });
+  const db = new ObjectDatabase(types, { retainVersions, indexStore: kv, indexTrees });
+  // A store written before the index entries were (STATE-PAGING.md phase two) has none: the objects are decoded for
+  // their keys as they always were, and the entries written once below. An empty prefix in a store that has objects
+  // means exactly that, because every write of objects carries their entries in the same transaction.
+  const probe = kv.range(INDEX_PREFIX_KEY, prefixEnd(INDEX_PREFIX_KEY));
+  const indexed = !probe.next().done;
+  probe.return?.(undefined); // close the cursor rather than leave it to the collector
   const t0 = performance.now();
   let objects = 0;
   for (const [k, v] of kv.range(OBJECT_PREFIX, prefixEnd(OBJECT_PREFIX))) {
-    db.importObject(decode(k, (r) => (r.u8(), r.u64())), v);
+    db.importObject(decode(k, (r) => (r.u8(), r.u64())), v, indexed);
     objects++;
   }
   for (const t of types) {
@@ -120,8 +133,16 @@ export function openObjectDatabase(kv: KvStore, types: ObjectType<any>[], retain
     if (c) db.setCounter(t.id, Number(decode(c, (r) => r.u64())));
   }
   const t1 = performance.now();
+  // The indices come from their entries, so no object is decoded on the way in. At 192,000 accounts that is about
+  // as fast as decoding each object for its keys was (building the name tree's hashes costs the same either way),
+  // and it is the read a node with dropped trees does anyway.
+  if (indexed && objects > 0) db.loadIndexEntries();
   const appHash = db.root(Number(meta.height));
   if (!bytesEqual(appHash, meta.appHash)) throw new Error('stored objects do not hash to the stored app hash');
+  if (!indexed) {
+    const entries = db.lastChanges!.indices;
+    if (entries.length > 0) kv.write((w) => entries.forEach((c) => w.put(c.key, c.value!)));
+  }
   // That root produced a change list holding the encoded bytes of every object; the store already has them.
   db.dropChanges();
   const t2 = performance.now();
@@ -169,7 +190,7 @@ export class CoreApp implements Application {
     this.snapshotInterval = Math.max(0, opts.snapshotInterval ?? 1000);
     this.snapshotsKept = Math.max(1, opts.snapshotsKept ?? 2);
     this.snapshotChunkObjects = Math.max(1, opts.snapshotChunkObjects ?? 2000);
-    const stored = openObjectDatabase(this.kv, CORE_TYPES, opts.retainVersions);
+    const stored = openObjectDatabase(this.kv, CORE_TYPES, opts.retainVersions, opts.indexTrees);
     if (stored) {
       this.db = stored.db;
       this.height = stored.height;
@@ -181,7 +202,7 @@ export class CoreApp implements Application {
       const t0 = performance.now();
       const g = opts.appGenesis ?? parseAppGenesis(opts.genesis.appState);
       const t1 = performance.now();
-      this.db = new ObjectDatabase(CORE_TYPES, { retainVersions: opts.retainVersions });
+      this.db = new ObjectDatabase(CORE_TYPES, { retainVersions: opts.retainVersions, indexStore: this.kv, indexTrees: opts.indexTrees });
       applyGenesis(this.db, g, opts.genesis.genesisTime, schemeTag(opts.genesis.signatureScheme ?? 'ml-dsa-44'));
       const t2 = performance.now();
       this.appHash = this.db.root(0);
@@ -326,6 +347,7 @@ export class CoreApp implements Application {
     if (kv.get(META_KEY)) throw new Error('the application store is not empty');
     kv.write((w) => {
       for (const [id, bytes] of db.exportObjects()) w.put(objectKey(id), bytes);
+      for (const [k, v] of db.indexEntries()) w.put(k, v);
       for (const [type, next] of db.counters()) w.put(counterKey(type), encode((wr) => wr.u64(BigInt(next))));
       w.put(META_KEY, encode((wr) => wr.u64(height).fixed(appHash)));
     });
@@ -347,6 +369,11 @@ export class CoreApp implements Application {
       for (const c of p.changes.objects) {
         if (c.bytes) w.put(objectKey(c.id), c.bytes);
         else w.del(objectKey(c.id));
+      }
+      // Removals first in the list, so a key that changed hands within the block ends with its new owner.
+      for (const c of p.changes.indices) {
+        if (c.value) w.put(c.key, c.value);
+        else w.del(c.key);
       }
       for (const [type, next] of p.changes.counters) w.put(counterKey(type), encode((wr) => wr.u64(BigInt(next))));
       if (p.changes.history) w.put(historyKey(p.changes.version), encode((wr) => encodeHistory(wr, p.changes.history!)));

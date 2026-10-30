@@ -4,7 +4,8 @@ import { makeAuthority, type Authority } from '../src/app/core/authority.ts';
 import { signedTxBytes, signTransaction, withFees } from '../src/app/core/client.ts';
 import { appGenesisBytes, authorityJson, DEFAULT_FEES } from '../src/app/core/genesis.ts';
 import { calculateFee, encodeTransaction, type Operation, type OperationDraft } from '../src/app/core/tx.ts';
-import { AccountType, AssetType, BalanceType, RecentTxType, TYPE } from '../src/app/core/types.ts';
+import { AccountType, AssetType, BalanceType, CORE_TYPES, RecentTxType, TYPE } from '../src/app/core/types.ts';
+import { chunkFromBytes, exportSnapshot, importSnapshot } from '../src/app/core/snapshot.ts';
 import { decode } from '../src/codec/reader.ts';
 import { encode } from '../src/codec/writer.ts';
 import { keyProofFromBytes } from '../src/db/proof.ts';
@@ -315,5 +316,90 @@ describe('core application', () => {
     expect(() => restarted.proofAt(aliceId, 2n)).toThrow(/not available/);
     const historyKeys = [...store.range(new Uint8Array([0x68]), prefixEnd(new Uint8Array([0x68])))].map(([k]) => Number(k[8]));
     expect(historyKeys).toEqual([4, 5, 6, 7]);
+  });
+});
+
+describe('core application: index entries in the store', () => {
+  const INDEX = Uint8Array.of(0x69);
+  const stored = (kv: MemoryKv) => [...kv.range(INDEX, prefixEnd(INDEX))].map(([k, v]) => `${toHex(k)}=${toHex(v)}`);
+  const live = (app: CoreApp) => [...app.db.indexEntries()].map(([k, v]) => `${toHex(k)}=${toHex(v)}`);
+  /** The store holds exactly the entries the indices hold, and, where the trees are resident, agrees with them entry by entry. */
+  const consistent = (app: CoreApp, kv: MemoryKv) => {
+    expect(stored(kv)).toEqual(live(app));
+    expect(app.db.checkIndexStore()).toEqual([]);
+  };
+
+  it('writes the entries with every commit, reopens from them, and fills in a store that predates them', async () => {
+    const kv = new MemoryKv();
+    const app = makeApp(kv);
+    consistent(app, kv);
+    await block(app, [tx([createOp('alice', makeAuthority([alice.publicKey]))]), tx([createOp('bob', makeAuthority([bob.publicKey]))])]);
+    const aliceId = app.accountByName('alice')!.id;
+    const bobId = app.accountByName('bob')!.id;
+    await block(app, [tx([transferOp(FAUCET_ID, aliceId, 5000n)]), tx([transferOp(FAUCET_ID, bobId, 5000n)])]);
+    await block(app, [tx([transferOp(aliceId, bobId, 10n)], [alice])]);
+    consistent(app, kv);
+    // Recent transaction ids expire and their entries go with them.
+    for (let i = 0; i < 3; i++) await block(app, []);
+    const later = app.lastHeight + 1n;
+    await app.finalizeBlock({ height: later, time: genesisTime + 120_000n, txs: [], proposerAddress: new Uint8Array(32), lastCommitSigners: [], misbehavior: [] });
+    await app.commit();
+    expect(app.db.range(RecentTxType, 'byExpiration', new Uint8Array(0))).toEqual([]);
+    consistent(app, kv);
+
+    // A restart builds the indices from the entries and comes back with the same hash and the same lookups.
+    const reopened = makeApp(kv);
+    expect(toHex(reopened.lastAppHash)).toBe(toHex(app.lastAppHash));
+    expect(reopened.accountByName('bob')!.id).toBe(bobId);
+    expect(reopened.balance(bobId)).toBe(app.balance(bobId));
+    consistent(reopened, kv);
+
+    // A store written before the entries were: they are derived from the objects once and written.
+    const old = new MemoryKv();
+    old.write((w) => {
+      for (const [k, v] of kv.range(new Uint8Array([0]), new Uint8Array([0xff]))) if (k[0] !== 0x69) w.put(k, v);
+    });
+    expect(stored(old)).toEqual([]);
+    const migrated = makeApp(old);
+    expect(toHex(migrated.lastAppHash)).toBe(toHex(app.lastAppHash));
+    expect(stored(old)).toEqual(stored(kv));
+    consistent(migrated, old);
+  });
+
+  it('runs blocks with the trees dropped and rebuilt on the way, with the hashes of an app that never drops them', async () => {
+    const kv = new MemoryKv();
+    const paged = makeApp(kv);
+    const resident = makeApp();
+    const both = async (txs: Uint8Array[]) => {
+      const [a, b] = [await block(paged, txs), await block(resident, txs)];
+      expect(toHex(a.appHash)).toBe(toHex(b.appHash));
+      expect(a.txResults).toEqual(b.txResults);
+    };
+    paged.db.dropIndexTrees();
+    expect(paged.db.memory().indexTrees).toBe('dropped');
+    await both([tx([createOp('alice', makeAuthority([alice.publicKey]))])]);
+    const aliceId = paged.accountByName('alice')!.id;
+    await both([tx([transferOp(FAUCET_ID, aliceId, 5000n)]), tx([createOp('alice', makeAuthority([bob.publicKey]))])]);
+    expect(paged.balance(aliceId)).toBe(5000n);
+    // Checked against the pending session, as the mempool does, while dropped: a name taken in the store is refused.
+    expect((await paged.checkTx(tx([createOp('alice', makeAuthority([carol.publicKey]))]))).error).toMatch(/taken/);
+    paged.db.rebuildIndexTrees();
+    await both([tx([transferOp(aliceId, FAUCET_ID, 7n)], [alice])]);
+    consistent(paged, kv);
+    paged.db.dropIndexTrees();
+    await both([tx([createOp('carol', makeAuthority([carol.publicKey]))])]);
+    expect(stored(kv)).toEqual(live(resident));
+  });
+
+  it('writes the entries of a state imported from a snapshot', async () => {
+    const { app } = await withAlice();
+    const { manifest, chunks } = exportSnapshot(app.db, CORE_TYPES, Number(app.lastHeight), 3);
+    const imported = importSnapshot(manifest, chunks.flat().map(chunkFromBytes), CORE_TYPES, { retainVersions: 4 });
+    const kv = new MemoryKv();
+    CoreApp.writeImportedState(kv, imported, app.lastHeight, app.lastAppHash);
+    expect(stored(kv)).toEqual(live(app));
+    const synced = makeApp(kv);
+    expect(toHex(synced.lastAppHash)).toBe(toHex(app.lastAppHash));
+    consistent(synced, kv);
   });
 });

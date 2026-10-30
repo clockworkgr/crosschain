@@ -22,6 +22,15 @@
  * root() also reports the objects and counters that changed, which is what a
  * persistent store writes, and remembers the previous value of each changed
  * object so a proof can be produced for any version inside the window.
+ *
+ * The secondary indices' entries are also reported per root (indexstore.ts),
+ * so the store holds them beside the objects, and a type's B+ trees can be
+ * dropped and rebuilt (dropIndexTrees, rebuildIndexTrees): while they are
+ * dropped its lookups and scans read the store, with the writes since the
+ * last root laid on top (index.ts). The store the database reads is the one
+ * the application writes, given as `indexStore`; between a root and the
+ * application's write of it (dropChanges) the root's own changes are laid
+ * over that store, so a read never sees an index older than the objects.
  */
 import { decode, type Reader } from '../codec/reader.ts';
 import { encode, type Writer } from '../codec/writer.ts';
@@ -30,11 +39,14 @@ import { instanceOf, objectId, typeOf, type ObjectId } from './id.ts';
 import { Arena, type ArenaStats } from './arena.ts';
 import { deepFreeze } from './freeze.ts';
 import { DbError, TypeIndex, type HotBudget, type ObjectType } from './index.ts';
+import { MemoryIndexStore, overlaid, until, type IndexEntryChange, type IndexStore } from './indexstore.ts';
+import { BPlusTree } from './bptree.ts';
 import { DenseMerkleTree, EMPTY, type TreeRecords } from './merkle.ts';
 import { objectLeaf, typeLeaf, type KeyProof, type ObjectProof } from './proof.ts';
 import { SparseMerkleTree } from './smt.ts';
 
 export { deepFreeze } from './freeze.ts';
+export type { IndexEntryChange, IndexStore } from './indexstore.ts';
 
 type AnyObject = { id: ObjectId };
 
@@ -43,6 +55,19 @@ export interface DatabaseOptions {
   retainVersions?: number;
   /** How many decoded objects the hot caches may hold together (STATE-PAGING.md section 3); unbounded by default. */
   hotObjects?: number;
+  /**
+   * The store that holds the index entries the application writes from each root's change list. Without one, a
+   * database that drops its trees keeps the entries in memory instead (tests, benchmarks, a snapshot import).
+   */
+  indexStore?: IndexStore;
+  /** Start with the B+ trees of the secondary indices dropped, every index read going to the store; default resident. */
+  indexTrees?: boolean;
+}
+
+/** Where `indexTrees` defaults from; the test setup turns it off to run every suite on the fallback (INDEX_TREES=0). */
+let defaultIndexTrees = true;
+export function setDefaultIndexTrees(resident: boolean): void {
+  defaultIndexTrees = resident;
 }
 
 /** What the database holds in memory besides the trees and indices, for the memory guard and status. */
@@ -52,6 +77,8 @@ export interface DatabaseMemory {
   hotLimit: number;
   /** Bytes of past values kept for the retention window. */
   historyBytes: number;
+  /** The secondary indices' B+ trees: all resident, all dropped (reads go to the store), or some of each. */
+  indexTrees: 'resident' | 'dropped' | 'partial';
 }
 
 export interface ObjectChange {
@@ -80,6 +107,12 @@ export interface Changes {
   counters: Map<number, number>;
   /** Null when no history is kept. */
   history: HistoryRecord | null;
+  /**
+   * Index entries added (with their value) and removed (null), as store keys. Removals come first, so a key
+   * passed from one object to another in one version ends with its new owner when they are applied in order.
+   * Empty for a database that keeps no index store (none given and the trees resident).
+   */
+  indices: IndexEntryChange[];
 }
 
 export function encodeHistory(w: Writer, h: HistoryRecord): void {
@@ -166,6 +199,17 @@ export class ObjectDatabase {
   private readonly counterHistory = new Map<number, { v: number; count: number }[]>();
   private readonly lastIndexRoots = new Map<number, Uint8Array[]>();
   private changes: Changes | null = null;
+  /** The application's store of index entries, or null when there is none. */
+  private readonly store: IndexStore | null;
+  /** Without an application store: the index entries in memory, kept only while some type's trees are dropped. */
+  private ownStore: MemoryIndexStore | null = null;
+  /** Index changes of roots the application has not written to its store yet, oldest first, and the same as a map, built when read. */
+  private unwritten: IndexEntryChange[][] = [];
+  private unwrittenMap: BPlusTree<Uint8Array | null> | null = null;
+  /** Whether the objects were imported with their index entries already in the store (a restart), so the first root reports none. */
+  private importsIndexed: boolean | null = null;
+  /** What a dropped index reads: the store as of the last root. */
+  private readonly base: IndexStore;
 
   constructor(types: ObjectType<any>[], opts: DatabaseOptions = {}) {
     this.retain = Math.max(0, opts.retainVersions ?? DEFAULT_RETAIN);
@@ -174,9 +218,23 @@ export class ObjectDatabase {
       refOf: (type, instance) => this.types.get(type)?.refAt(instance) ?? -1,
       relocate: (type, instance, ref) => this.types.get(type)!.relocate(instance, ref),
     });
+    this.store = opts.indexStore ?? null;
+    const resident = opts.indexTrees ?? defaultIndexTrees;
+    if (!resident && !this.store) this.ownStore = new MemoryIndexStore();
+    this.base = {
+      get: (k) => {
+        const v = this.unwrittenEntries()?.get(k);
+        return v !== undefined ? (v ?? undefined) : this.backing()?.get(k);
+      },
+      range: (start, end) => {
+        const stored = this.backing()?.range(start, end) ?? [][Symbol.iterator]();
+        const pending = this.unwrittenEntries();
+        return pending ? overlaid(stored, until(pending.entriesFrom(start), end)) : stored;
+      },
+    };
     for (const t of types) {
       if (this.types.has(t.id)) throw new Error(`duplicate object type ${t.id}`);
-      this.types.set(t.id, new TypeIndex(t, this.retain, this.arena, this.hotBudget));
+      this.types.set(t.id, new TypeIndex(t, this.retain, this.arena, this.hotBudget, this.base, resident));
       this.trees.set(t.id, new DenseMerkleTree(this.retain));
     }
     this.order = [...this.types.keys()].sort((a, b) => a - b);
@@ -214,9 +272,102 @@ export class ObjectDatabase {
     return this.changes;
   }
 
-  /** Forget the last change list once a store has written it; it holds the encoded bytes of every changed object. */
+  /**
+   * Forget the last change list once a store has written it; it holds the encoded bytes of every changed object.
+   * It is also the word that the store now holds the index entries, so dropped indices read them from there.
+   */
   dropChanges(): void {
     this.changes = null;
+    this.unwritten = [];
+    this.unwrittenMap = null;
+  }
+
+  private backing(): IndexStore | null {
+    return this.store ?? this.ownStore;
+  }
+
+  /** The index changes the store has not been given yet, as one map (null: removed), or null when there are none. */
+  private unwrittenEntries(): BPlusTree<Uint8Array | null> | null {
+    if (this.unwritten.length === 0) return null;
+    if (!this.unwrittenMap) {
+      this.unwrittenMap = new BPlusTree();
+      for (const list of this.unwritten) for (const c of list) this.unwrittenMap.set(c.key, c.value);
+    }
+    return this.unwrittenMap;
+  }
+
+  // ---- the index tier ----
+
+  /**
+   * Drop the B+ trees of one type's secondary indices, or of every type's: lookups and scans then read the store,
+   * with the writes since the last root laid over it. Sessions may be open; the overlay starts from what is dirty.
+   */
+  dropIndexTrees(type?: ObjectType<any>): void {
+    if (!this.backing()) {
+      // No application store: one in memory stands in, holding what a store written at every root would hold now,
+      // the entries as of the last root (none before the first). That is the trees as they stand with the writes
+      // since then taken back: a key a write took and released again before the drop must not linger in it.
+      const own = new MemoryIndexStore();
+      if (this.version >= 0) {
+        for (const type of this.order) own.apply(Array.from(this.typeIndexById(type).indexEntries(), ([key, value]) => ({ key, value })));
+        const removed: IndexEntryChange[] = [];
+        const added: IndexEntryChange[] = [];
+        for (const id of this.dirty) {
+          const ti = this.typeIndexById(typeOf(id));
+          const instance = instanceOf(id);
+          ti.diffEntries(instance < ti.nextInstance ? (ti.get(instance) ?? null) : null, this.shadow.get(id) ?? null, removed, added);
+        }
+        own.apply(removed);
+        own.apply(added);
+      }
+      this.ownStore = own;
+    }
+    for (const ti of type ? [this.typeIndex(type) as TypeIndex<AnyObject>] : this.types.values()) {
+      if (!ti.resident) continue;
+      const changed: [AnyObject | null, AnyObject | null][] = [];
+      for (const id of this.dirty) {
+        if (typeOf(id) !== ti.type.id) continue;
+        const instance = instanceOf(id);
+        changed.push([this.shadow.get(id) ?? null, instance < ti.nextInstance ? (ti.get(instance) ?? null) : null]);
+      }
+      ti.dropTrees(changed);
+    }
+  }
+
+  /** Build the dropped B+ trees again from the store (and the overlay), for one type or for all. */
+  rebuildIndexTrees(type?: ObjectType<any>): void {
+    for (const ti of type ? [this.typeIndex(type) as TypeIndex<AnyObject>] : this.types.values()) ti.rebuildTrees();
+    // The in-memory stand-in for a store is only there for dropped trees to fall back on.
+    if (!this.store && [...this.types.values()].every((ti) => ti.resident)) this.ownStore = null;
+  }
+
+  /** Whether a type's index trees are resident. */
+  indexTreesResident(type: ObjectType<any>): boolean {
+    return this.typeIndex(type).resident;
+  }
+
+  /** Every index entry of every type as it stands, as store keys and values: what a store written from scratch holds. */
+  *indexEntries(): IterableIterator<[Uint8Array, Uint8Array]> {
+    for (const type of this.order) yield* this.typeIndexById(type).indexEntries();
+  }
+
+  /**
+   * Check the store's index entries against the resident trees (for tests): every tree entry is in the store with
+   * its value, and the store holds as many entries under each index's prefix as the tree. Empty when consistent.
+   */
+  checkIndexStore(): string[] {
+    if (!this.backing()) throw new DbError('no index store to check');
+    if (this.dirty.size > 0) throw new DbError('the index store can be checked only right after a root');
+    return [...this.types.values()].flatMap((ti) => ti.checkStore(this.base));
+  }
+
+  /**
+   * After importing objects whose index entries the store holds (importObject with `indexed`): fill the sparse
+   * trees, and the B+ trees where resident, from the store's entries instead of decoding every object.
+   */
+  loadIndexEntries(): void {
+    if (!this.store || this.importsIndexed !== true || this.version >= 0) throw new DbError('index entries are loaded from the store only after an indexed import');
+    for (const ti of this.types.values()) ti.loadIndexEntries();
   }
 
   /** Change the hot caches' shared budget at run time (the memory guard's first dial); the excess is evicted at once. */
@@ -226,7 +377,10 @@ export class ObjectDatabase {
   }
 
   memory(): DatabaseMemory {
-    return { arena: this.arena.stats, hotObjects: this.hotBudget.size, hotLimit: this.hotBudget.limit, historyBytes: this.historyBytes };
+    const withIndices = [...this.types.values()].filter((ti) => ti.type.indices.length > 0);
+    const resident = withIndices.filter((ti) => ti.resident).length;
+    const indexTrees = resident === withIndices.length ? 'resident' : resident === 0 ? 'dropped' : 'partial';
+    return { arena: this.arena.stats, hotObjects: this.hotBudget.size, hotLimit: this.hotBudget.limit, historyBytes: this.historyBytes, indexTrees };
   }
 
   // ---- reads ----
@@ -239,14 +393,14 @@ export class ObjectDatabase {
   /** Exact match on a unique index. */
   lookup<T extends AnyObject>(type: ObjectType<T>, index: string, key: Uint8Array): T | null {
     const ti = this.typeIndex(type);
-    const id = ti.index(index).get(key);
+    const id = ti.lookupId(index, key);
     return id === undefined ? null : (ti.get(instanceOf(id)) ?? null);
   }
 
   /** Every object whose index key starts with the prefix, in key order. */
   *scan<T extends AnyObject>(type: ObjectType<T>, index: string, prefix: Uint8Array): IterableIterator<T> {
     const ti = this.typeIndex(type);
-    for (const [, id] of ti.index(index).scan(prefix)) yield ti.get(instanceOf(id))!;
+    for (const [, id] of ti.entries(index, prefix, prefix)) yield ti.get(instanceOf(id))!;
   }
 
   range<T extends AnyObject>(type: ObjectType<T>, index: string, prefix: Uint8Array): T[] {
@@ -256,7 +410,7 @@ export class ObjectDatabase {
   /** Every object whose index key is at or after `start`, in key order; a page of results resumes here. */
   *scanFrom<T extends AnyObject>(type: ObjectType<T>, index: string, start: Uint8Array): IterableIterator<[Uint8Array, T]> {
     const ti = this.typeIndex(type);
-    for (const [k, id] of ti.index(index).scanFrom(start)) yield [k, ti.get(instanceOf(id))!];
+    for (const [k, id] of ti.entries(index, start, null)) yield [k, ti.get(instanceOf(id))!];
   }
 
   nextInstance(type: ObjectType<any>): number {
@@ -452,6 +606,15 @@ export class ObjectDatabase {
     const keepHistory = this.retain > 0 && this.version >= 0;
     const historyIds: ObjectId[] = [];
     const record: HistoryRecord = { trees: [], objects: [], counters: [] };
+    // The index entries this root changes. The first root of a database writes every entry, since the store holds
+    // none of them yet, unless the objects came from a store that does (a restart); after that, each changed
+    // object's committed keys against its new ones. A database with no store to keep (none given, trees resident)
+    // reports none.
+    const removed: IndexEntryChange[] = [];
+    const added: IndexEntryChange[] = [];
+    const first = this.version < 0;
+    const reportIndices = this.backing() !== null;
+    if (reportIndices && first && !this.importsIndexed) for (const type of this.order) for (const [key, value] of this.typeIndexById(type).indexEntries()) added.push({ key, value });
     for (const id of this.dirty) {
       const type = typeOf(id);
       const ti = this.typeIndexById(type);
@@ -472,6 +635,7 @@ export class ObjectDatabase {
         }
         // Encoded once here, however many times it was modified since the last root.
         bytes = pending ? encode((w) => ti.type.encode(w, pending)) : null;
+        if (reportIndices && !first) ti.diffEntries(before ?? null, pending, removed, added, instance);
         ti.flush(instance, bytes);
         if (keepHistory && before !== undefined) {
           const beforeBytes = before ? encode((w) => ti.type.encode(w, before)) : null;
@@ -489,6 +653,14 @@ export class ObjectDatabase {
     }
     this.dirty.clear();
     this.shadow.clear();
+    const indices = removed.length === 0 ? added : removed.concat(added);
+    // The store dropped indices read must say what this root says before the overlays are emptied.
+    if (this.store) {
+      if (indices.length > 0) {
+        this.unwritten.push(indices);
+        if (this.unwrittenMap) for (const c of indices) this.unwrittenMap.set(c.key, c.value);
+      }
+    } else this.ownStore?.apply(indices);
     // Pins are off; each type's hot cache comes back under the budget in one pass.
     for (const ti of this.types.values()) ti.afterRoot();
     if (historyIds.length > 0) this.valueHistoryByVersion.set(version, historyIds);
@@ -525,7 +697,7 @@ export class ObjectDatabase {
     const root = this.top.root(version);
     if (keepHistory && this.top.lastRecords.nodes.length > 0) record.trees.push({ tree: TOP_TREE, records: this.top.lastRecords });
     this.version = version;
-    this.changes = { version, objects, counters, history: keepHistory ? record : null };
+    this.changes = { version, objects, counters, history: keepHistory ? record : null, indices };
     if (this.retain > 0) this.pruneHistory(version - this.retain);
     // Slabs the block left more than half dead are compacted now, while the node idles.
     this.arena.maintain();
@@ -701,12 +873,20 @@ export class ObjectDatabase {
 
   // ---- bulk import and export ----
 
-  /** Load one object into an empty database, before the first root(). Counters are set separately. */
-  importObject(id: ObjectId, bytes: Uint8Array): void {
+  /**
+   * Load one object into an empty database, before the first root(). Counters are set separately. With `indexed`,
+   * the index store already holds the object's index entries (a restart from the application's store): the object
+   * is not decoded at all, and loadIndexEntries() builds the indices from the store once every object is in.
+   */
+  importObject(id: ObjectId, bytes: Uint8Array, indexed = false): void {
     if (this.version >= 0 || this.sessions.length > 0) throw new DbError('import only into a fresh database');
+    if (this.importsIndexed !== null && this.importsIndexed !== indexed) throw new DbError('an import is indexed or not throughout');
+    if (indexed && !this.store) throw new DbError('an indexed import needs the index store');
+    this.importsIndexed = indexed;
     const ti = this.typeIndexById(typeOf(id));
     // Decoded once for its index keys and not kept: the arena holds the bytes, the first root hashes them as they are.
-    ti.importCommitted(decode(bytes, (r) => ti.type.decode(r, id)), bytes);
+    if (indexed) ti.importBytes(instanceOf(id), bytes);
+    else ti.importCommitted(decode(bytes, (r) => ti.type.decode(r, id)), bytes);
     if (instanceOf(id) >= ti.nextInstance) ti.nextInstance = instanceOf(id) + 1;
     this.dirty.add(id);
   }

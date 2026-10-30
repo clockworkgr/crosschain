@@ -124,7 +124,7 @@ export async function run(): Promise<void> {
     const env2 = new LmdbEnv(join(dir, 'lmdb'));
     t = performance.now();
     app = new CoreApp({ genesis: loaded, verifier, kv: env2.store('app'), snapshotInterval: 0, log });
-    fact('restart from LMDB', `${fmtMs(performance.now() - t)} (read and decode ${timings.objects} objects ${timings.importMs} ms, indices and root ${timings.rootMs} ms, history ${timings.historyMs} ms), height ${app.lastHeight}`);
+    fact('restart from LMDB', `${fmtMs(performance.now() - t)} (read ${timings.objects} objects ${timings.importMs} ms, indices and root ${timings.rootMs} ms, history ${timings.historyMs} ms), height ${app.lastHeight}`);
     fact('memory after restart', await memory());
     await env2.close();
   } finally {

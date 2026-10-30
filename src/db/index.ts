@@ -22,19 +22,35 @@
  * id to the key, which makes every entry distinct while keeping all entries
  * for one prefix adjacent, so a range query is a prefix scan.
  *
- * Indices are derived from the objects and are rebuilt when a store is
- * loaded. An index marked `authenticated` (unique only) also keeps a sparse
- * Merkle tree (smt.ts) over its keys, whose root goes into the type's leaf
- * in the state root, so a key can be proven present or absent.
+ * The B+ trees are accelerators over the index entries the store holds
+ * (indexstore.ts, STATE-PAGING.md section 4) and can be dropped. While they
+ * are, a type answers from the store as of the last root, with an overlay on
+ * top: per key, what the writes since that root made of it, an id or null
+ * for a key they released. Every write that would have set or deleted a tree
+ * key sets the overlay instead, undo included, so the overlay is always the
+ * difference between the last root and now, and a lookup is one overlay probe
+ * and at most one store read. When the trees are dropped in the middle of a
+ * block the overlay is built from what is dirty: every committed key of a
+ * dirty object released, then every current key of one taken, in that order,
+ * so a key passed from one object to another ends with its new owner. A root
+ * empties the overlay, since the store (with the root's changes) then says
+ * the same.
+ *
+ * An index marked `authenticated` (unique only) also keeps a sparse Merkle
+ * tree (smt.ts) over its keys, whose root goes into the type's leaf in the
+ * state root, so a key can be proven present or absent. Those trees are
+ * tier three and stay resident whatever happens to the B+ trees.
  */
 import { decode, type Reader } from '../codec/reader.ts';
 import type { Writer } from '../codec/writer.ts';
+import { bytesEqual } from '../crypto/hash.ts';
 import { instanceOf, objectId, type ObjectId } from './id.ts';
 import { KeyWriter } from './keys.ts';
 import { encode } from '../codec/writer.ts';
 import type { Arena } from './arena.ts';
 import { BPlusTree } from './bptree.ts';
 import { deepFreeze } from './freeze.ts';
+import { afterPrefix, EMPTY_VALUE, entryKey, INDEX_HEADER, indexHeader, overlaid, until, type IndexEntryChange, type IndexStore } from './indexstore.ts';
 import { SparseMerkleTree } from './smt.ts';
 
 export class DbError extends Error {
@@ -71,16 +87,61 @@ export interface HotBudget {
   size: number;
 }
 
+/** One secondary index: its definition, where its entries live in the store, and its tree or, while that is dropped, its overlay. */
+interface Secondary<T> {
+  def: IndexDef<T>;
+  /** 'i', type, position: the first bytes of every store key of this index. */
+  header: Uint8Array;
+  tree: BPlusTree<ObjectId> | null;
+  /** While the tree is dropped: per key, what the writes since the last root made of it (null: released). */
+  overlay: BPlusTree<ObjectId | null> | null;
+}
+
+/**
+ * The id a unique entry stores: eight bytes, big-endian, as the sparse trees also hash it. Written byte by byte:
+ * a small typed array lives on the heap until something asks for its buffer, and a DataView would ask.
+ */
+export function idBytes(id: ObjectId): Uint8Array {
+  const b = new Uint8Array(8);
+  const hi = Number(id >> 32n);
+  const lo = Number(id & 0xffffffffn);
+  b[0] = hi >>> 24;
+  b[1] = hi >>> 16;
+  b[2] = hi >>> 8;
+  b[3] = hi;
+  b[4] = lo >>> 24;
+  b[5] = lo >>> 16;
+  b[6] = lo >>> 8;
+  b[7] = lo;
+  return b;
+}
+
+function u64At(b: Uint8Array, o: number): ObjectId {
+  const hi = ((b[o]! << 24) | (b[o + 1]! << 16) | (b[o + 2]! << 8) | b[o + 3]!) >>> 0;
+  const lo = ((b[o + 4]! << 24) | (b[o + 5]! << 16) | (b[o + 6]! << 8) | b[o + 7]!) >>> 0;
+  return (BigInt(hi) << 32n) | BigInt(lo);
+}
+
+/** Index keys of an object written since the last root: as committed (null: it did not exist) and as it stands (null: removed). */
+interface DirtyKeys {
+  committed: Uint8Array[] | null;
+  current: Uint8Array[] | null;
+}
+
 export class TypeIndex<T extends { id: ObjectId }> {
   readonly type: ObjectType<T>;
   nextInstance = 0;
-  readonly secondary = new Map<string, BPlusTree<ObjectId>>();
   /** Sparse trees of the authenticated indices, by name. */
   readonly trees = new Map<string, SparseMerkleTree>();
   /** Names of the authenticated indices, in definition order. */
   readonly authenticated: string[] = [];
   private readonly arena: Arena;
   private readonly budget: HotBudget;
+  /** The store's index entries as of the last root, which a dropped index falls back on. */
+  private readonly base: IndexStore;
+  /** Secondary indices in definition order (an index's position is its place here), and by name. */
+  private readonly secondary: Secondary<T>[] = [];
+  private readonly byName = new Map<string, Secondary<T>>();
   /** Arena reference of each committed instance (-1 when absent) and its encoding's length. */
   private refs = new Float64Array(0);
   private lens = new Uint32Array(0);
@@ -93,20 +154,29 @@ export class TypeIndex<T extends { id: ObjectId }> {
   private readonly pinned = new Set<number>();
   /** Set when an eviction pass found nothing clean left to drop; cleared at the next root, which unpins. */
   private saturated = false;
+  /**
+   * For every pinned instance, its keys at the last root and now. A write computes both anyway (to unindex the old
+   * value and index the new one); kept, they make a root's index changes a comparison instead of a re-encoding.
+   */
+  private readonly dirtyKeys = new Map<number, DirtyKeys>();
 
-  constructor(type: ObjectType<T>, retainVersions: number, arena: Arena, budget: HotBudget) {
+  constructor(type: ObjectType<T>, retainVersions: number, arena: Arena, budget: HotBudget, base: IndexStore, resident = true) {
     this.type = type;
     this.arena = arena;
     this.budget = budget;
-    for (const ix of type.indices) {
-      if (this.secondary.has(ix.name)) throw new Error(`${type.name}: duplicate index ${ix.name}`);
-      this.secondary.set(ix.name, new BPlusTree());
+    this.base = base;
+    if (type.indices.length > 256) throw new Error(`${type.name}: more than 256 indices`);
+    type.indices.forEach((ix, position) => {
+      if (this.byName.has(ix.name)) throw new Error(`${type.name}: duplicate index ${ix.name}`);
+      const s: Secondary<T> = { def: ix, header: indexHeader(type.id, position), tree: resident ? new BPlusTree() : null, overlay: resident ? null : new BPlusTree() };
+      this.secondary.push(s);
+      this.byName.set(ix.name, s);
       if (ix.authenticated) {
         if (!ix.unique) throw new Error(`${type.name}.${ix.name}: only unique indices can be authenticated`);
         this.trees.set(ix.name, new SparseMerkleTree(retainVersions));
         this.authenticated.push(ix.name);
       }
-    }
+    });
   }
 
   /** Replace an authenticated index's tree, after a rebuild with history. */
@@ -181,10 +251,11 @@ export class TypeIndex<T extends { id: ObjectId }> {
     this.saturated = over > 0 && this.hot.size === this.pinned.size;
   }
 
-  /** A root is over: the pins are off, so the budget can be enforced again. */
+  /** A root is over: the pins are off, so the budget can be enforced again, and an overlay has nothing left to say. */
   afterRoot(): void {
     this.saturated = false;
     this.evict();
+    for (const s of this.secondary) s.overlay?.clear();
   }
 
   private decodeAt(instance: number): T {
@@ -228,33 +299,91 @@ export class TypeIndex<T extends { id: ObjectId }> {
     return this.bytesOf(instance);
   }
 
-  index(name: string): BPlusTree<ObjectId> {
-    const m = this.secondary.get(name);
-    if (!m) throw new Error(`${this.type.name}: no index ${name}`);
-    return m;
+  private secondaryIndex(name: string): Secondary<T> {
+    const s = this.byName.get(name);
+    if (!s) throw new Error(`${this.type.name}: no index ${name}`);
+    return s;
   }
 
-  private keysOf(obj: T): [IndexDef<T>, Uint8Array][] {
+  /** An index's B+ tree; it must be resident. */
+  index(name: string): BPlusTree<ObjectId> {
+    const s = this.secondaryIndex(name);
+    if (!s.tree) throw new Error(`${this.type.name}.${name}: the index tree is dropped`);
+    return s.tree;
+  }
+
+  /** Whether the B+ trees are resident (the type's indices are dropped or kept together). */
+  get resident(): boolean {
+    return this.secondary.length === 0 || this.secondary[0]!.tree !== null;
+  }
+
+  /** The id a stored entry names: a unique entry's value, a non-unique key's last eight bytes. */
+  private storedId(s: Secondary<T>, k: Uint8Array, v: Uint8Array): ObjectId {
+    return s.def.unique ? u64At(v, 0) : u64At(k, k.length - 8);
+  }
+
+  private find(s: Secondary<T>, k: Uint8Array): ObjectId | undefined {
+    if (s.tree) return s.tree.get(k);
+    const o = s.overlay!.get(k);
+    if (o !== undefined) return o ?? undefined;
+    const v = this.base.get(entryKey(s.header, k));
+    return v === undefined ? undefined : this.storedId(s, k, v);
+  }
+
+  /** The id under an exact key: a tree walk, or while dropped an overlay probe and a store read. */
+  lookupId(name: string, k: Uint8Array): ObjectId | undefined {
+    return this.find(this.secondaryIndex(name), k);
+  }
+
+  /**
+   * Entries from `start` in key order, all of them to the end of the index, or with `prefix` given only those
+   * that start with it. While dropped: a store cursor merged with the overlay.
+   */
+  entries(name: string, start: Uint8Array, prefix: Uint8Array | null): IterableIterator<[Uint8Array, ObjectId]> {
+    return this.entriesOf(this.secondaryIndex(name), start, prefix);
+  }
+
+  /** Not a generator itself, so a resident scan costs what the tree's iterator costs and nothing on top. */
+  private entriesOf(s: Secondary<T>, start: Uint8Array, prefix: Uint8Array | null): IterableIterator<[Uint8Array, ObjectId]> {
+    if (s.tree) return prefix ? s.tree.scan(prefix) : s.tree.scanFrom(start);
+    return this.fallbackEntries(s, start, prefix);
+  }
+
+  private *fallbackEntries(s: Secondary<T>, start: Uint8Array, prefix: Uint8Array | null): IterableIterator<[Uint8Array, ObjectId]> {
+    const end = prefix ? afterPrefix(prefix) : null;
+    const stored = this.base.range(entryKey(s.header, start), end ? entryKey(s.header, end) : afterPrefix(s.header)!);
+    const self = this;
+    function* fromStore(): IterableIterator<[Uint8Array, ObjectId]> {
+      for (const [k, v] of stored) yield [k.subarray(INDEX_HEADER), self.storedId(s, k, v)];
+    }
+    yield* overlaid(fromStore(), until(s.overlay!.entriesFrom(start), end));
+  }
+
+  private keysOf(obj: T): Uint8Array[] {
     return this.type.indices.map((ix) => {
       const k = new KeyWriter();
       ix.key(obj, k);
       if (!ix.unique) k.id(obj.id);
-      return [ix, k.finish()];
+      return k.finish();
     });
   }
 
-  private checkUnique(obj: T, keys: [IndexDef<T>, Uint8Array][]): void {
-    for (const [ix, k] of keys) {
-      if (!ix.unique) continue;
-      const taken = this.secondary.get(ix.name)!.get(k);
-      if (taken !== undefined && taken !== obj.id) throw new DbError(`${this.type.name}.${ix.name}: key already exists`);
+  private checkUnique(obj: T, keys: Uint8Array[]): void {
+    for (let i = 0; i < keys.length; i++) {
+      const s = this.secondary[i]!;
+      if (!s.def.unique) continue;
+      const taken = this.find(s, keys[i]!);
+      if (taken !== undefined && taken !== obj.id) throw new DbError(`${this.type.name}.${s.def.name}: key already exists`);
     }
   }
 
-  private indexKeys(obj: T, keys: [IndexDef<T>, Uint8Array][]): void {
-    for (const [ix, k] of keys) {
-      this.secondary.get(ix.name)!.set(k, obj.id);
-      this.trees.get(ix.name)?.set(k, encode((w) => w.u64(obj.id)));
+  private indexKeys(obj: T, keys: Uint8Array[]): void {
+    for (let i = 0; i < keys.length; i++) {
+      const s = this.secondary[i]!;
+      const k = keys[i]!;
+      if (s.tree) s.tree.set(k, obj.id);
+      else s.overlay!.set(k, obj.id);
+      this.trees.get(s.def.name)?.set(k, idBytes(obj.id));
     }
   }
 
@@ -265,37 +394,149 @@ export class TypeIndex<T extends { id: ObjectId }> {
     const instance = instanceOf(obj.id);
     if (instance > MAX_INSTANCE) throw new DbError(`${this.type.name}: instance ${instance} is beyond the index`);
     const old = this.get(instance);
-    if (old) this.unindex(old);
+    const oldKeys = old ? this.unindex(old) : null;
+    this.wrote(instance, oldKeys, keys);
     this.pinned.add(instance);
     this.cache(instance, obj);
     this.indexKeys(obj, keys);
+  }
+
+  /** Remember an instance's keys as committed (on its first write since the root) and as they now stand. */
+  private wrote(instance: number, before: Uint8Array[] | null, now: Uint8Array[] | null): void {
+    if (this.secondary.length === 0) return;
+    const d = this.dirtyKeys.get(instance);
+    if (d && this.pinned.has(instance)) d.current = now;
+    else this.dirtyKeys.set(instance, { committed: before, current: now });
   }
 
   /** Load a committed object straight into the arena (import), decoded only to build its index entries. */
   importCommitted(obj: T, bytes: Uint8Array): void {
     const keys = this.keysOf(obj);
     this.checkUnique(obj, keys);
-    const instance = instanceOf(obj.id);
+    this.importBytes(instanceOf(obj.id), bytes);
+    this.indexKeys(obj, keys);
+  }
+
+  /** Load a committed object whose index entries the store already holds (a restart): no decode at all. */
+  importBytes(instance: number, bytes: Uint8Array): void {
     if (instance > MAX_INSTANCE) throw new DbError(`${this.type.name}: instance ${instance} is beyond the index`);
     if (this.has(instance)) throw new DbError(`${this.type.name}: instance ${instance} imported twice`);
     this.ensure(instance);
     this.refs[instance] = this.arena.alloc(this.type.id, instance, bytes);
     this.lens[instance] = bytes.length;
-    this.indexKeys(obj, keys);
   }
 
-  private unindex(obj: T): void {
-    for (const [ix, k] of this.keysOf(obj)) {
-      this.secondary.get(ix.name)!.delete(k);
-      this.trees.get(ix.name)?.delete(k);
+  /**
+   * After importBytes: fill the sparse trees, and the B+ trees when resident, from the store's entries. They come
+   * in key order, which is the B+ tree's cheapest order to grow in.
+   */
+  loadIndexEntries(): void {
+    for (const s of this.secondary) {
+      const smt = this.trees.get(s.def.name);
+      if (!s.tree && !smt) continue;
+      for (const [k, v] of this.base.range(s.header, afterPrefix(s.header)!)) {
+        const key = k.subarray(INDEX_HEADER);
+        s.tree?.set(key, this.storedId(s, k, v));
+        smt?.set(key, v);
+      }
     }
   }
 
+  private unindex(obj: T): Uint8Array[] {
+    const keys = this.keysOf(obj);
+    for (let i = 0; i < keys.length; i++) {
+      const s = this.secondary[i]!;
+      const k = keys[i]!;
+      if (s.tree) s.tree.delete(k);
+      else s.overlay!.set(k, null);
+      this.trees.get(s.def.name)?.delete(k);
+    }
+    return keys;
+  }
+
   erase(obj: T): void {
-    this.unindex(obj);
+    const keys = this.unindex(obj);
     const instance = instanceOf(obj.id);
+    this.wrote(instance, keys, null);
     this.pinned.add(instance);
     this.cache(instance, null);
+  }
+
+  /**
+   * Drop the B+ trees and fall back on the store. `changed` is every object of this type written since the last
+   * root, as its committed value and its current one (null for none): what the overlay must say from now on.
+   */
+  dropTrees(changed: [T | null, T | null][]): void {
+    if (!this.resident) return;
+    for (const s of this.secondary) {
+      s.tree = null;
+      s.overlay = new BPlusTree();
+    }
+    // Every key a write released first, then every key one took, so a key passed between two objects ends taken.
+    for (const [before] of changed) if (before) this.keysOf(before).forEach((k, i) => this.secondary[i]!.overlay!.set(k, null));
+    for (const [, now] of changed) if (now) this.keysOf(now).forEach((k, i) => this.secondary[i]!.overlay!.set(k, now.id));
+  }
+
+  /** Build the B+ trees again from what the fallback reads (the store with the overlay on top) and drop the overlays. */
+  rebuildTrees(): void {
+    if (this.resident) return;
+    const built = this.secondary.map((s) => {
+      const tree = new BPlusTree<ObjectId>();
+      for (const [k, id] of this.entriesOf(s, new Uint8Array(0), null)) tree.set(k, id);
+      return tree;
+    });
+    this.secondary.forEach((s, i) => {
+      s.tree = built[i]!;
+      s.overlay = null;
+    });
+  }
+
+  /**
+   * The index entries a root reports for one object that went from `before` to `after` (null: absent): a
+   * released key is removed, a taken one added, and a key it kept is left alone. The keys the writes recorded
+   * are used when there are any; `after` is then only asked for its id.
+   */
+  diffEntries(before: T | null, after: T | null, removed: IndexEntryChange[], added: IndexEntryChange[], instance?: number): void {
+    if (this.secondary.length === 0) return;
+    const d = instance === undefined ? undefined : this.dirtyKeys.get(instance);
+    const old = d ? d.committed : before ? this.keysOf(before) : null;
+    const now = d ? d.current : after ? this.keysOf(after) : null;
+    for (let i = 0; i < this.secondary.length; i++) {
+      const s = this.secondary[i]!;
+      const o = old?.[i];
+      const n = now?.[i];
+      if (o && n && bytesEqual(o, n)) continue;
+      if (o) removed.push({ key: entryKey(s.header, o), value: null });
+      if (n) added.push({ key: entryKey(s.header, n), value: s.def.unique ? idBytes(after!.id) : EMPTY_VALUE });
+    }
+  }
+
+  /** Every index entry as it stands, as store keys and values, index by index in key order. */
+  *indexEntries(): IterableIterator<[Uint8Array, Uint8Array]> {
+    for (const s of this.secondary) {
+      for (const [k, id] of this.entriesOf(s, new Uint8Array(0), null)) yield [entryKey(s.header, k), s.def.unique ? idBytes(id) : EMPTY_VALUE];
+    }
+  }
+
+  /**
+   * Compare the resident trees with the store (no writes may be pending): every tree entry must be there with
+   * its value, and the store may hold no more entries under the index's prefix than the tree does.
+   */
+  checkStore(store: IndexStore): string[] {
+    const problems: string[] = [];
+    for (const s of this.secondary) {
+      if (!s.tree) continue;
+      const where = `${this.type.name}.${s.def.name}`;
+      for (const [k, id] of s.tree.scanFrom(new Uint8Array(0))) {
+        const v = store.get(entryKey(s.header, k));
+        if (v === undefined) problems.push(`${where}: a key of ${id} is not in the store`);
+        else if (s.def.unique ? !bytesEqual(v, idBytes(id)) : v.length !== 0) problems.push(`${where}: the store has another value for a key of ${id}`);
+      }
+      let stored = 0;
+      for (const _ of store.range(s.header, afterPrefix(s.header)!)) stored++;
+      if (stored !== s.tree.size) problems.push(`${where}: the store holds ${stored} entries, the tree ${s.tree.size}`);
+    }
+    return problems;
   }
 
   /**
@@ -315,11 +556,13 @@ export class TypeIndex<T extends { id: ObjectId }> {
       this.uncache(instance);
     }
     this.pinned.delete(instance);
+    this.dirtyKeys.delete(instance);
   }
 
   /** A root found a pending value equal to the committed one: nothing to write, just unpin. */
   settle(instance: number): void {
     this.pinned.delete(instance);
+    this.dirtyKeys.delete(instance);
     if (this.hot.get(instance) === null) this.uncache(instance);
   }
 
@@ -334,6 +577,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
       if (instance < before) continue;
       this.uncache(instance);
       this.pinned.delete(instance);
+      this.dirtyKeys.delete(instance);
     }
     for (let i = before; i < this.refs.length; i++) this.refs[i] = -1;
     this.nextInstance = before;
@@ -341,8 +585,8 @@ export class TypeIndex<T extends { id: ObjectId }> {
 
   /** Index keys of an object, by index name. */
   keyFor(obj: T, index: string): Uint8Array {
-    for (const [ix, k] of this.keysOf(obj)) if (ix.name === index) return k;
-    throw new Error(`${this.type.name}: no index ${index}`);
+    const i = this.secondary.indexOf(this.secondaryIndex(index));
+    return this.keysOf(obj)[i]!;
   }
 
   clear(): void {
@@ -354,8 +598,12 @@ export class TypeIndex<T extends { id: ObjectId }> {
     this.budget.size -= this.hot.size;
     this.hot.clear();
     this.pinned.clear();
+    this.dirtyKeys.clear();
     this.nextInstance = 0;
-    for (const m of this.secondary.values()) m.clear();
+    for (const s of this.secondary) {
+      s.tree?.clear();
+      s.overlay?.clear();
+    }
   }
 
   get hotSize(): number {

@@ -140,21 +140,26 @@ describe('a node under memory pressure', () => {
     // The first dial: the database's cache of decoded objects is capped, and the excess evicted at once.
     expect(app.db.memory().hotLimit).toBe(10_000);
     expect(app.db.memory().hotObjects).toBeLessThanOrEqual(10_000);
+    // The second: the index trees are dropped, and every index read goes to the store through the overlay.
+    expect(app.db.memory().indexTrees).toBe('dropped');
     expect(watched.mempool.paused).toBe(true);
     expect((await watched.submitTx(tx('set a=1'))).status).toBe('paused');
     await expect(rpc.call('broadcastTx', { tx: '0102', mode: 'sync' })).rejects.toMatchObject({ code: -32004 });
     await expect(rpc.call('block', {})).rejects.toMatchObject({ code: -32004 });
     expect((await fetch(`${server.url}/events`)).status).toBe(503);
     expect(((await fetch(`${server.url}/health`).then((r) => r.json())) as { memory: string }).memory).toBe('pressure');
-    expect(((await rpc.call('status', {})) as { memory: { level: string; shedding: boolean; heapUsed: number } }).memory).toMatchObject({ level: 'pressure', shedding: true, heapUsed: 900 });
+    expect(((await rpc.call('status', {})) as { memory: { level: string; shedding: boolean; heapUsed: number } }).memory).toMatchObject({ level: 'pressure', shedding: true, heapUsed: 900, database: { indexTrees: 'dropped' } });
     // Consensus is not what is shed: the node keeps following the validators.
     const h = watched.height;
+    // Its blocks run against the dropped trees; a hash that differed from the validators' would stop it here.
     await waitFor(() => watched.height >= h + 2n, 15_000, 'the node to keep following the chain while shedding');
 
     heap = 500;
     await waitFor(() => !watched.isShedding, 5_000, 'shedding to end');
     expect(watched.mempool.paused).toBe(false);
     expect(app.db.memory().hotLimit).toBe(Infinity);
+    expect(app.db.memory().indexTrees).toBe('resident');
+    expect(app.accountByName('faucet')?.name).toBe('faucet');
     expect((await watched.submitTx(tx('set a=1'))).status).not.toBe('paused'); // refused by the application, not by the pause
     expect(await rpc.call('block', {})).toBeTruthy();
     // Past the critical level the node reports it; what to do then (the CLI stops) is the caller's.

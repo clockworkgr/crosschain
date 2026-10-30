@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { sha256, toHex } from '../src/crypto/hash.ts';
-import { ObjectDatabase } from '../src/db/database.ts';
+import { ObjectDatabase, type UndoSession } from '../src/db/database.ts';
+import { MemoryKv } from '../src/store/kv.ts';
 import { instanceOf, objectId } from '../src/db/id.ts';
 import { DbError, type ObjectType } from '../src/db/index.ts';
 import { key } from '../src/db/keys.ts';
@@ -127,6 +128,254 @@ describe('object database: arena and hot cache', () => {
       return roots;
     };
     expect(run(0)).toEqual(run(1_000_000));
+  });
+});
+
+/** A small deterministic generator, so a failing sequence can be replayed. */
+function prng(seed: number): (n: number) => number {
+  let s = seed >>> 0;
+  return (n) => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s % n;
+  };
+}
+
+/** Write a root's index changes and objects to a store, as the application's commit does, and tell the database. */
+function persistIndex(db: ObjectDatabase, kv: MemoryKv): void {
+  const changes = db.lastChanges;
+  if (!changes) return;
+  kv.write((w) => {
+    for (const c of changes.indices) {
+      if (c.value) w.put(c.key, c.value);
+      else w.del(c.key);
+    }
+  });
+  db.dropChanges();
+}
+
+const storeEntries = (kv: MemoryKv) => [...kv.range(Uint8Array.of(0x69), Uint8Array.of(0x6a))].map(([k, v]) => `${toHex(k)}=${toHex(v)}`);
+const viewEntries = (db: ObjectDatabase) => [...db.indexEntries()].map(([k, v]) => `${toHex(k)}=${toHex(v)}`);
+
+const NAMES = Array.from({ length: 12 }, (_, i) => `n${i}`);
+/** Everything the indices let a caller observe: every name's lookup, every group's scan, full scans, a cursor from the middle. */
+function observe(db: ObjectDatabase): string {
+  const out: string[] = [];
+  for (const n of [...NAMES, 'spare']) out.push(`${n}:${byName(db, n)?.id ?? '-'}`);
+  for (let g = 0; g < 4; g++) out.push(`g${g}:${inGroup(db, g).join(',')}`);
+  out.push([...db.scan(ItemType, 'byName', new Uint8Array(0))].map((o) => `${o.name}=${o.id}`).join(','));
+  out.push([...db.scanFrom(ItemType, 'byGroup', key((k) => k.u32(2)))].map(([k, o]) => `${toHex(k)}>${o.id}`).join(','));
+  out.push([...db.scanFrom(ItemType, 'byName', key((k) => k.str('n5')))].map(([, o]) => o.name).join(','));
+  return out.join(' ');
+}
+
+/**
+ * Play one random sequence of creates, renames (a unique key changing hands), regroupings, removals, nested sessions
+ * committed or undone, and roots on a database with resident trees and on one that drops and rebuilds its trees at
+ * random moments (sessions open or not). After every step both must show the same indices; every root, the same hash.
+ */
+function playTwins(seed: number, steps: number, store: 'own' | 'injected'): void {
+  const r = prng(seed);
+  const a = new ObjectDatabase([ItemType, CounterType], { indexTrees: true });
+  const kv = new MemoryKv();
+  const b = new ObjectDatabase([ItemType, CounterType], { indexTrees: false, ...(store === 'injected' ? { indexStore: kv } : {}) });
+  const sessions: [UndoSession, UndoSession][] = [];
+  let version = 0;
+  let unwritten = false;
+  const both = (f: (db: ObjectDatabase) => void) => {
+    let ea: unknown = null;
+    let eb: unknown = null;
+    try {
+      f(a);
+    } catch (e) {
+      ea = e;
+    }
+    try {
+      f(b);
+    } catch (e) {
+      eb = e;
+    }
+    expect(eb === null ? null : String(eb), `step outcome, seed ${seed}`).toBe(ea === null ? null : String(ea));
+  };
+  const live = () => [...a.exportObjects()].filter(([id]) => (id >> 48n) === 7n).map(([id]) => id);
+  const log: string[] = [];
+  for (let step = 0; step < steps; step++) {
+    const op = r(20);
+    log.push(`${op}:${sessions.length}:${b.memory().indexTrees}:${unwritten}`);
+    const ids = live();
+    const pick = () => ids[r(ids.length)]!;
+    if (op < 5) {
+      const name = NAMES[r(NAMES.length)]!;
+      const group = r(4);
+      both((db) => mk(db, name, group));
+    } else if (op < 8 && ids.length > 0) {
+      const id = pick();
+      const name = NAMES[r(NAMES.length)]!;
+      both((db) => db.modify(ItemType, id, (o) => ({ ...o, name })));
+    } else if (op < 10 && ids.length > 1) {
+      // A key handed from one object to another inside one block: x gives up its name, y takes it.
+      const x = pick();
+      const y = pick();
+      if (x !== y) {
+        const name = a.get(ItemType, x)!.name;
+        both((db) => db.modify(ItemType, x, (o) => ({ ...o, name: 'spare' })));
+        both((db) => db.modify(ItemType, y, (o) => ({ ...o, name })));
+        both((db) => db.modify(ItemType, x, (o) => ({ ...o, name: `${name}x` })));
+      }
+    } else if (op < 12 && ids.length > 0) {
+      const id = pick();
+      const group = r(4);
+      both((db) => db.modify(ItemType, id, (o) => ({ ...o, group })));
+    } else if (op < 13 && ids.length > 0) {
+      const id = pick();
+      both((db) => db.remove(ItemType, id));
+    } else if (op < 15 && sessions.length < 3) {
+      sessions.push([a.startSession(), b.startSession()]);
+    } else if (op < 17 && sessions.length > 0) {
+      const [sa, sb] = sessions.pop()!;
+      if (r(2) === 0) {
+        sa.undo();
+        sb.undo();
+      } else {
+        sa.commit();
+        sb.commit();
+      }
+    } else if (op < 18) {
+      // The dial: drop or rebuild in the middle of whatever is going on.
+      if (b.memory().indexTrees === 'resident') b.dropIndexTrees();
+      else b.rebuildIndexTrees();
+    } else if (sessions.length === 0) {
+      version++;
+      // The application writes each root before it takes the next, sometimes at once, sometimes some steps later:
+      // reads in between must see the root's own changes.
+      if (unwritten) persistIndex(b, kv);
+      expect(toHex(b.root(version)), `root ${version}, seed ${seed}`).toBe(toHex(a.root(version)));
+      unwritten = store === 'injected';
+      if (unwritten && r(2) === 0) {
+        persistIndex(b, kv);
+        unwritten = false;
+        expect(storeEntries(kv), `store at ${version}, seed ${seed}`).toEqual(viewEntries(a));
+      }
+    }
+    expect(observe(b), `step ${step}, seed ${seed} ${log.slice(-12).join(' ')}`).toBe(observe(a));
+  }
+}
+
+describe('object database: index entries and dropped index trees', () => {
+  it('reports every index entry a root adds and removes, so a store written from them equals the trees', () => {
+    const kv = new MemoryKv();
+    const db = new ObjectDatabase([ItemType, CounterType], { indexStore: kv, indexTrees: true });
+    const a = mk(db, 'alice', 1);
+    const b = mk(db, 'bob', 1);
+    mk(db, 'carol', 2);
+    db.root(1);
+    // The first root writes every entry: three names, three group keys (with the id appended).
+    expect(db.lastChanges!.indices.length).toBe(6);
+    persistIndex(db, kv);
+    expect(storeEntries(kv)).toEqual(viewEntries(db));
+    expect(db.checkIndexStore()).toEqual([]);
+    // A unique key changing hands in one block: alice gives up her name and bob takes it; removals come first.
+    db.modify(ItemType, a.id, (o) => ({ ...o, name: 'ann' }));
+    db.modify(ItemType, b.id, (o) => ({ ...o, name: 'alice', group: 3 }));
+    db.root(2);
+    const changes = db.lastChanges!.indices;
+    const firstAdd = changes.findIndex((c) => c.value !== null);
+    expect(changes.slice(firstAdd).every((c) => c.value !== null)).toBe(true);
+    expect(changes.length).toBe(6); // alice, bob and bob's group key out; ann, alice (bob's now) and the new group key in
+    persistIndex(db, kv);
+    expect(storeEntries(kv)).toEqual(viewEntries(db));
+    expect(db.checkIndexStore()).toEqual([]);
+    // A value-only change touches no index entry; an object created and removed before a root, none either.
+    db.modify(ItemType, a.id, (o) => ({ ...o, value: 5n }));
+    const gone = mk(db, 'ephemeral', 0);
+    db.remove(ItemType, gone.id);
+    db.root(3);
+    expect(db.lastChanges!.indices).toEqual([]);
+    // The check notices a store that lost an entry or holds one too many.
+    const k0 = kv.range(Uint8Array.of(0x69), Uint8Array.of(0x6a)).next().value![0];
+    kv.write((w) => w.del(k0));
+    expect(db.checkIndexStore().length).toBeGreaterThan(0);
+  });
+
+  it('answers lookups and merged scans from the store and the overlay while the trees are dropped', () => {
+    const kv = new MemoryKv();
+    const db = new ObjectDatabase([ItemType, CounterType], { indexStore: kv, indexTrees: true });
+    const a = mk(db, 'a', 1);
+    const b = mk(db, 'b', 1);
+    const c = mk(db, 'c', 2);
+    db.root(1);
+    persistIndex(db, kv);
+    db.dropIndexTrees();
+    expect(db.memory().indexTrees).toBe('dropped');
+    expect(byName(db, 'b')?.id).toBe(b.id);
+    expect(inGroup(db, 1)).toEqual(['a', 'b']);
+    // A pending insert appears in order, a pending removal is skipped.
+    const d = mk(db, 'bb', 1);
+    db.remove(ItemType, a.id);
+    expect(inGroup(db, 1)).toEqual(['b', 'bb']);
+    expect([...db.scan(ItemType, 'byName', new Uint8Array(0))].map((o) => o.name)).toEqual(['b', 'bb', 'c']);
+    expect(byName(db, 'a')).toBeNull();
+    // A key removed and taken again by another object yields the new owner, in the scan as in the lookup.
+    db.modify(ItemType, c.id, (o) => ({ ...o, name: 'a' }));
+    expect(byName(db, 'a')?.id).toBe(c.id);
+    expect(byName(db, 'c')).toBeNull();
+    expect([...db.scan(ItemType, 'byName', new Uint8Array(0))].map((o) => `${o.name}${instanceOf(o.id)}`)).toEqual(['a2', 'b1', 'bb3']);
+    // Uniqueness is checked against the overlay and the store alike.
+    expect(() => mk(db, 'b', 0)).toThrow(DbError);
+    expect(() => mk(db, 'a', 0)).toThrow(DbError);
+    expect(mk(db, 'c', 0).name).toBe('c'); // released by the rename above
+    // An object created and removed before the root leaves nothing behind.
+    const e = mk(db, 'e', 2);
+    db.remove(ItemType, e.id);
+    expect(byName(db, 'e')).toBeNull();
+    expect(inGroup(db, 2)).toEqual(['a']);
+    // Undo of a session while dropped puts the overlay back as it was.
+    const before = observe(db);
+    const s = db.startSession();
+    db.modify(ItemType, b.id, (o) => ({ ...o, name: 'z', group: 3 }));
+    db.remove(ItemType, d.id);
+    mk(db, 'b', 0);
+    expect(byName(db, 'b')?.name).toBe('b');
+    expect(inGroup(db, 3)).toEqual(['z']);
+    s.undo();
+    expect(observe(db)).toBe(before);
+    // Between the root and the store's write, the dropped indices read the root's own changes.
+    db.root(2);
+    expect(byName(db, 'a')?.id).toBe(c.id);
+    expect(inGroup(db, 1)).toEqual(['b', 'bb']);
+    persistIndex(db, kv);
+    expect(byName(db, 'a')?.id).toBe(c.id);
+    expect(storeEntries(kv)).toEqual(viewEntries(db));
+    db.rebuildIndexTrees();
+    expect(db.memory().indexTrees).toBe('resident');
+    expect(db.checkIndexStore()).toEqual([]);
+    expect(observe(db)).toBe(before);
+    expect(d.id).toBe(objectId(7, 3));
+  });
+
+  it('drops and rebuilds with the same roots and lookups as resident trees, under random writes and sessions', () => {
+    for (let seed = 1; seed <= 12; seed++) playTwins(seed, 400, seed % 2 === 0 ? 'own' : 'injected');
+  });
+
+  it('round-trips a drop and a rebuild in the middle of a block without changing a root or a lookup', () => {
+    const run = (dial: boolean) => {
+      const db = new ObjectDatabase([ItemType, CounterType]);
+      const roots: string[] = [];
+      const seen: string[] = [];
+      for (let v = 1; v <= 6; v++) {
+        for (let i = 0; i < 10; i++) mk(db, `v${v}-${i}`, i % 3);
+        if (dial) db.dropIndexTrees(ItemType);
+        if (v > 1) {
+          db.modify(ItemType, objectId(7, 3 * v), (o) => ({ ...o, name: `moved${v}`, group: 3 }));
+          db.remove(ItemType, objectId(7, 3 * v + 1));
+        }
+        seen.push(observe(db));
+        if (dial && v % 2 === 0) db.rebuildIndexTrees(ItemType);
+        roots.push(toHex(db.root(v)));
+        seen.push(observe(db), viewEntries(db).join());
+      }
+      return { roots, seen };
+    };
+    expect(run(true)).toEqual(run(false));
   });
 });
 
