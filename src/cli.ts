@@ -61,6 +61,7 @@ import { keyProofFromBytes } from './db/proof.ts';
 import { LightClient } from './light/client.ts';
 import { RpcProvider } from './light/rpc-provider.ts';
 import { Node } from './node/node.ts';
+import { heapLimitFlag } from './node/memory.ts';
 import { TcpTransport } from './p2p/tcp.ts';
 import { RpcClient } from './rpc/client.ts';
 import { commitFromJson, headerFromJson, txQueryFromJson } from './rpc/json.ts';
@@ -185,8 +186,9 @@ function init(dir: string, count: number, basePort: number, scheme: SchemeTag): 
  * node schedule collections after commits, and a larger young generation means fewer of the small ones.
  */
 function startUnderHeapLimit(): boolean {
-  const configured = process.execArgv.some((a) => a.startsWith('--max-old-space-size')) || /max-old-space-size/.test(process.env.NODE_OPTIONS ?? '');
-  if (configured || process.env.CROSSCHAIN_CHILD) return false;
+  // A limit the operator set, on the command line or in NODE_OPTIONS and in any spelling V8 takes, is left alone: the
+  // child's own flag would override it.
+  if (heapLimitFlag() !== null || process.env.CROSSCHAIN_CHILD) return false;
   const heapMb = flags.has('heap') ? Number(flags.get('heap')) : Math.floor((totalmem() / 2 ** 20) * 0.75);
   if (!Number.isInteger(heapMb) || heapMb < 256) throw new Error('--heap takes a size in MiB, at least 256');
   console.log(`start: running the node under a ${heapMb} MiB heap limit (--heap <MiB> changes it), collections scheduled after commits`);
@@ -223,9 +225,31 @@ async function start(nodeDir: string): Promise<void> {
     snapshotInterval: cfg.snapshotInterval,
   });
   const app = node.app as CoreApp;
+  let rpc: RpcServer | null = null;
+  let stopping = false;
+  // Consensus and block sync stop at once, and the block being applied finishes its writes, while the RPC server
+  // stops beside them; a request still running then has a second (none at `critical`) before its connection is cut,
+  // so no client can keep a node that must stop running.
+  const shutdown = async (code = 0) => {
+    if (stopping) return;
+    stopping = true;
+    await Promise.all([node.stop(), rpc?.stop(code === 3 ? 0 : 1000)]);
+    await env.close();
+    await verifier.close();
+    process.exit(code);
+  };
+  process.on('SIGINT', () => void shutdown());
+  process.on('SIGTERM', () => void shutdown());
+  // Past the critical level the next step is V8 aborting the process; stopping cleanly first keeps the stores
+  // consistent and tells the supervisor, through the exit code, that the node needs a larger heap. Registered before
+  // the node starts, so a heap already critical at the first sample is acted on too.
+  node.onMemory((level) => {
+    if (level === 'critical') void shutdown(3);
+  });
   await node.start();
+  if (stopping) return;
   const [host, port] = (cfg.rpcListen ?? `127.0.0.1:${Number(cfg.listenAddr.split(':')[1]) + 1}`).split(':');
-  const rpc = new RpcServer(node, { host, port: Number(port), log });
+  rpc = new RpcServer(node, { host, port: Number(port), log });
   await rpc.start();
 
   setInterval(() => {
@@ -243,24 +267,6 @@ async function start(nodeDir: string): Promise<void> {
       gc: `${gc.collections} pauses, ${gc.totalMs.toFixed(0)} ms, longest ${gc.maxMs.toFixed(1)} ms`,
     });
   }, 5000).unref();
-
-  let stopping = false;
-  const shutdown = async (code = 0) => {
-    if (stopping) return;
-    stopping = true;
-    await rpc.stop();
-    await node.stop();
-    await env.close();
-    await verifier.close();
-    process.exit(code);
-  };
-  process.on('SIGINT', () => void shutdown());
-  process.on('SIGTERM', () => void shutdown());
-  // Past the critical level the next step is V8 aborting the process; stopping cleanly first keeps the stores
-  // consistent and tells the supervisor, through the exit code, that the node needs a larger heap.
-  node.onMemory((level) => {
-    if (level === 'critical') void shutdown(3);
-  });
 }
 
 // ---- client helpers ----

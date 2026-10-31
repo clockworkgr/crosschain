@@ -7,7 +7,7 @@
  *               pool (see verifier.ts).
  *   secp256k1   ECDSA over the Bitcoin curve, RFC 6979 deterministic, low-S
  *               signatures only (a high-S twin of a valid signature is
- *               refused, so a signed object has exactly one encoding).
+ *               refused, so no one but the signer can make a second one).
  *               Public key 33 B compressed, signature 64 B compact.
  *
  * Genesis names the chain's scheme. Every public key, secret key and signature
@@ -21,7 +21,7 @@ import { randomBytes } from 'node:crypto';
 import { ml_dsa44 } from '@noble/post-quantum/ml-dsa.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { CodecError, type Reader } from '../codec/reader.ts';
-import { sha256 } from './hash.ts';
+import { sha256, toHex } from './hash.ts';
 
 export const SEED_SIZE = 32;
 export const ADDRESS_SIZE = 32;
@@ -39,6 +39,8 @@ interface SchemeImpl {
   readonly secretKeySize: number;
   readonly signatureSize: number;
   validSeed(seed: Uint8Array): boolean;
+  /** Whether raw bytes of the right size are a key the scheme can verify with. */
+  validPublicKey(raw: Uint8Array): boolean;
   keygen(seed: Uint8Array): { publicKey: Uint8Array; secretKey: Uint8Array };
   sign(msg: Uint8Array, secretKey: Uint8Array, context: Uint8Array): Uint8Array;
   verify(sig: Uint8Array, msg: Uint8Array, publicKey: Uint8Array, context: Uint8Array): boolean;
@@ -51,6 +53,8 @@ const mlDsa44: SchemeImpl = {
   secretKeySize: 2560,
   signatureSize: 2420,
   validSeed: () => true,
+  // Every byte string of the size decodes to a key (a seed and packed coefficients); none is refused.
+  validPublicKey: () => true,
   keygen: (seed) => ml_dsa44.keygen(seed),
   // Deterministic signing (no extra entropy): the same message signed twice yields identical bytes.
   sign: (msg, secretKey, context) => ml_dsa44.sign(msg, secretKey, { context, extraEntropy: false }),
@@ -70,6 +74,9 @@ const secp: SchemeImpl = {
   signatureSize: 64,
   // A 32-byte seed is the secret key itself; the few values at or beyond the curve order are not keys.
   validSeed: (seed) => secp256k1.utils.isValidSecretKey(seed),
+  // A compressed point: x below the field prime, and on the curve. Without this an account authority or a validator
+  // could be given a key nothing can ever sign for.
+  validPublicKey: (raw) => secp256k1.utils.isValidPublicKey(raw, true),
   keygen: (seed) => {
     if (!secp256k1.utils.isValidSecretKey(seed)) throw new Error('seed is not a valid secp256k1 secret key');
     return { publicKey: secp256k1.getPublicKey(seed, true), secretKey: seed.slice() };
@@ -96,11 +103,23 @@ export function schemeName(tag: SchemeTag): SchemeName {
 }
 
 /**
- * The scheme keyPairFromSeed and generateSeed use when none is given: ML-DSA-44,
- * or CHAIN_SCHEME from the environment, so the whole test suite and the local
- * network can run under either scheme. A node always passes its genesis scheme.
+ * The scheme keyPairFromSeed and generateSeed use when none is given: ML-DSA-44, unless an entry point that wants
+ * another set it (useSchemeFromEnvironment). A node always passes its genesis scheme.
  */
-export const DEFAULT_SCHEME: SchemeTag = process.env.CHAIN_SCHEME ? schemeTag(process.env.CHAIN_SCHEME) : Scheme.mlDsa44;
+export let DEFAULT_SCHEME: SchemeTag = Scheme.mlDsa44;
+
+export function setDefaultScheme(tag: SchemeTag): void {
+  DEFAULT_SCHEME = impl(tag).tag;
+}
+
+/**
+ * Take the default scheme from CHAIN_SCHEME, so the test suite, the benchmarks and the local network can run under
+ * either scheme. Only those entry points call it: a node follows its genesis, and a stray or mistyped CHAIN_SCHEME in
+ * its environment must not stop it from starting.
+ */
+export function useSchemeFromEnvironment(): void {
+  if (process.env.CHAIN_SCHEME) setDefaultScheme(schemeTag(process.env.CHAIN_SCHEME));
+}
 
 /** Tagged sizes: the tag byte plus the raw key or signature. */
 export function publicKeySize(tag: SchemeTag): number {
@@ -124,10 +143,25 @@ export function schemeOf(bytes: Uint8Array): SchemeTag | null {
   return s ? s.tag : null;
 }
 
-/** A known tag followed by exactly that scheme's key. */
+/** Keys found valid lately, so a key seen again (a validator set read back, one genesis key on many accounts) costs a lookup. */
+const validKeys = new Set<string>();
+const VALID_KEYS_MAX = 8192;
+
+/**
+ * A known tag followed by exactly that scheme's key, and a key the scheme accepts (a point on the curve, for
+ * secp256k1): what every place a key enters the chain checks, genesis, account authorities, validator sets and their
+ * updates, and the p2p handshake.
+ */
 export function isPublicKey(bytes: Uint8Array): boolean {
   const s = schemeOf(bytes);
-  return s !== null && bytes.length === publicKeySize(s);
+  if (s === null || bytes.length !== publicKeySize(s)) return false;
+  if (s === Scheme.mlDsa44) return true; // nothing to check, and a key too large to be worth remembering
+  const hex = toHex(bytes);
+  if (validKeys.has(hex)) return true;
+  if (!impl(s).validPublicKey(bytes.subarray(1))) return false;
+  if (validKeys.size >= VALID_KEYS_MAX) validKeys.delete(validKeys.values().next().value!);
+  validKeys.add(hex);
+  return true;
 }
 
 export function isSignature(bytes: Uint8Array): boolean {

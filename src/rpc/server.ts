@@ -111,10 +111,19 @@ export class RpcServer {
     });
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Stop listening and close every connection. One in the middle of a request is given `graceMs` to finish and is
+   * then cut: a client that sends its body slowly, or never, must not hold up a node that is stopping, least of all
+   * one stopping because its heap is full.
+   */
+  async stop(graceMs = 1000): Promise<void> {
     for (const s of this.streams) s.res.end();
     this.streams.clear();
-    await new Promise<void>((resolve) => this.server.close(() => resolve()));
+    const closed = new Promise<void>((resolve) => this.server.close(() => resolve()));
+    this.server.closeIdleConnections();
+    const cut = setTimeout(() => this.server.closeAllConnections(), graceMs);
+    await closed;
+    clearTimeout(cut);
   }
 
   private allow(remote: string, cost: number): boolean {

@@ -15,6 +15,7 @@
  * missing blocks, checking that the app hash comes out the same.
  */
 import { toHex } from '../crypto/hash.ts';
+import { schemeName, schemeTag } from '../crypto/keys.ts';
 import type { Application, FinalizeBlockRequest, Misbehavior, TxResult } from '../app/types.ts';
 import { StaleHeightError } from '../consensus/consensus.ts';
 import type { EvidencePool } from '../consensus/evidence.ts';
@@ -67,6 +68,10 @@ export class BlockExecutor {
       deps.log('info', 'initialised from genesis', { chainId: state.chainId, validators: state.validators.size });
     } else if (state.chainId !== genesis.chainId) {
       throw new Error(`data directory is for chain ${state.chainId}, genesis is for ${genesis.chainId}`);
+    } else if (state.scheme !== schemeTag(genesis.signatureScheme ?? 'ml-dsa-44')) {
+      // The node and validator keys are derived under genesis's scheme; under another one they are other keys, and
+      // the validator would no longer be one of the set it was in.
+      throw new Error(`data directory is for a ${schemeName(state.scheme)} chain, genesis names ${genesis.signatureScheme ?? 'ml-dsa-44'}`);
     }
     const exec = new BlockExecutor(deps, state);
     await exec.replayToApp();

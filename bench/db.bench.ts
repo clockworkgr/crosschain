@@ -79,10 +79,12 @@ export async function run(): Promise<void> {
     root = db.root();
   });
   let next = A;
-  await bench('create 1,000 accounts + root (1,000 SMT inserts)', {}, () => {
+  // A fixed number of iterations (one warmup and five measured), so every row after this one runs on the same state.
+  await bench('create 1,000 accounts + root (1,000 SMT inserts)', { warmup: 1, iterations: 5, minIterations: 5 }, () => {
     for (let i = 0; i < 1000; i++) db.create(AccountType, (id) => ({ id, name: `acct${next++}`, owner: auth, active: auth, registrar: id }));
     root = db.root();
   });
+  fact('state for the rows below', `${N.toLocaleString('en-US')} balances and ${db.nextInstance(AccountType).toLocaleString('en-US')} accounts`);
   const kp = db.proveKey(AccountType, 'byName', key((k) => k.str('acct7')));
   fact('name proof (SMT + type leg)', `${fmtBytes(keyProofToBytes(kp).length)}`);
   await bench('name proof', { batch: 100 }, () => {

@@ -198,9 +198,11 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   aborts with no chance to stop cleanly, and V8's default is a few gigabytes whatever
   the machine has. The node samples the heap every second and holds one of four levels
   by how full it is: `ok`; `warn` at 70% of the limit, which starts a major collection;
-  `pressure` at 85%, which sheds load: the mempool is paused (nothing new admitted,
-  announced transactions not fetched, what is pooled stays and is still reaped), costly
-  RPC methods and new event streams are refused, the signature cache is dropped, while
+  `pressure` at 85%, which sheds load: the mempool is paused (nothing new admitted, a
+  check already under way when the pause begins refused too, announced transactions not
+  fetched, what is pooled stays and is still reaped), costly RPC methods and new event
+  streams are refused, the signature cache is dropped (a transaction being verified keeps
+  the signers it found, so a block's results do not depend on when that happens), while
   consensus and block sync keep running on whatever is pooled, since a validator that
   stopped voting would be jailed; `critical` at 95%, on which the CLI stops the node
   cleanly and exits with code 3, so a supervisor restarts it with a larger limit instead
@@ -239,7 +241,9 @@ a drop the node waits until ten samples have been seen (ten seconds at the defau
 interval), then rebuilds a tier only when its estimated heap fits under the warn line
 beside the highest of those ten samples, the index trees first. The estimate
 (`rebuildEstimate()`) counts 210 bytes of heap per index entry and 1,000 per sparse tree
-leaf, which is what dropping them gave back at that size within a few percent. What does
+leaf, which is what dropping them gave back at that size within a few percent, and for the
+sparse trees as much again per leaf for what the rebuild reads and throws away, plus 500
+bytes per record of a retained version, each of which the rebuild builds a node for. What does
 not fit stays dropped, the node running on the fallbacks at `ok`, and the guard asks again
 at every sample while the level is `ok`, logging once what it is waiting for (`memory:
 staying paged until the heap has room to rebuild`). The limit the guard measures against
@@ -248,7 +252,8 @@ is the old generation's: V8's `heap_size_limit` adds the young generation's rese
 fill, and a process aborts when the old generation is full; with `--heap 744` the levels'
 lines taken from 936 MiB put `pressure` past the abort, and a node under load died without
 shedding anything, so `memoryStats()` takes the limit from `--max-old-space-size` when the
-process was started with it (in `node`'s own arguments or `NODE_OPTIONS`). The mempool
+process was started with it, read as Node reads it: `NODE_OPTIONS` (with its quoting) first,
+then `node`'s own arguments, the last one winning, in either spelling V8 takes. The mempool
 stays paused at `pressure` although admission through the fallbacks is correct, because
 admission is what grows the heap under load: every pooled transaction pins the objects it
 touches decoded in the pending session, and a full mempool held about 330 MiB more live
@@ -395,15 +400,19 @@ ids make adding one unusually easy.
   instance u32, length u32) followed by the encoding. A type's primary index is a table
   of references into it (slab and offset packed into one number, -1 for absent) and of
   lengths. Slabs are never written in place: a new encoding is a new entry and the old
-  one is counted dead; after a root, a slab more than half dead is compacted, its live
-  entries copied into the current slab (the header names the owner, which says whether
-  an entry is still current) and its buffer released, at most two slabs per root. Over
+  one is counted dead; after a root, every slab with nothing live is released without
+  copying, and a slab more than half dead is compacted, its live entries copied into the
+  current slab (the header names the owner, which says whether an entry is still current)
+  and its buffer released, copying at most what the root's block wrote (at least 16 MiB),
+  which keeps reclaiming level with the writes. A released slab's number is reused with a
+  new generation, so references stay exact. Over
   the arena sits a hot cache of decoded, frozen objects per type, under one budget all
   types share: a read answers from it or decodes from the arena (about a microsecond for
   an account) and caches the result. Eviction is CLOCK: a hit sets the instance's
-  touched bit, a fresh decode enters with it clear, and a hand sweeping the instances
-  clears the bits it finds set and evicts the first clean entry whose bit is clear, so a
-  one-time read goes first and a scan does not wash out a block's working set. Objects
+  touched bit, a fresh decode enters with it clear, and a hand sweeping the cached
+  entries sends one whose bit is set to the back with the bit cleared and evicts clean
+  ones whose bit is clear until the budget is met, so a one-time read goes first and a
+  scan does not wash out a block's working set. Objects
   written since the last root are pinned in the cache, decoded, and never evicted; a
   removal is a tombstone there. root() encodes each dirty object once, hashes the bytes,
   writes them to the arena and unpins the object, so a transaction that fails and is
@@ -564,12 +573,17 @@ ids make adding one unusually easy.
   from the index entries in key order (`loadIndexEntries`; the sparse trees too when
   the store has no nodes), and computes the root, which must equal the stored app hash.
   A root read from stored trees equals the stored hash by construction, so the open
-  also hashes every object and compares it with its leaf (`checkLeaves`, about an
-  eighth of the restart), and a corrupt object store still fails at startup rather than
-  when something reads the object (`object <id> does not hash to its leaf in the stored
-  tree`). `checkLeaves: false` skips the check and `fromTrees: false` recomputes the
-  trees from the objects, the old path, about twice as slow: at 192,000 accounts the
-  restart went from 8.4 to 5.2 s (4.6 without the leaf check). A store written before
+  also checks what it read (`checkLeaves`): every dense node against its children and
+  every sparse node against the hash its parent gives it, every object hashed and
+  compared with its leaf, and each tree's non-empty leaves counted against its objects;
+  and it checks the index entries against the objects, each object decoded once for its
+  keys (`checkIndexEntries`), since the app hash does not cover an unauthenticated index.
+  A corrupt store then fails at startup rather than when something reads it (`object
+  <id> does not hash to its leaf in the stored tree`, `the stored tree has n leaves for m
+  objects`, `the stored entry for object <id> is missing`). `checkLeaves: false` and
+  `checkIndexEntries: false` skip the checks and `fromTrees: false` recomputes the trees
+  from the objects, the old path: at 192,000 accounts the restart went from 8.4 to 5.2 s
+  with the trees on disk, and the full checks take it to 6.5 s (STATE-PAGING.md 5.3). A store written before
   the entries or the chunks existed has no `'i'` or `'t'` prefix; opening it computes
   what is missing from the objects and writes it once. Then the engine replays the
   blocks after the stored height through the existing info() handshake. Nothing

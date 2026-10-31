@@ -22,7 +22,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { bytesEqual, toHex } from '../crypto/hash.ts';
-import { addressOf, isPublicKey, sign, signContext, type KeyPair } from '../crypto/keys.ts';
+import { addressOf, isPublicKey, schemeOf, sign, signContext, type KeyPair } from '../crypto/keys.ts';
 import type { Verifier } from '../crypto/verifier.ts';
 import type { Logger } from '../util/log.ts';
 import { NONCE_SIZE, RejectCode, decodeMessage, encodeMessage, handshakeSignBytes, type Hello, type Message, type MessageType } from './messages.ts';
@@ -241,6 +241,9 @@ export class Network {
   private vetHello(h: Hello): { code: number; reason: string } | null {
     if (h.chainId !== this.cfg.chainId) return { code: RejectCode.WrongChain, reason: 'wrong chain id' };
     if (!isPublicKey(h.publicKey)) return { code: RejectCode.Invalid, reason: 'bad public key' };
+    // The handshake is signed under the chain's scheme (DESIGN.md); a node keyed under the other runs another chain
+    // whatever its chain id says, and is refused before anything is signed or verified for it.
+    if (schemeOf(h.publicKey) !== this.cfg.nodeKey.scheme) return { code: RejectCode.WrongChain, reason: "peer key is not of the chain's signature scheme" };
     if (bytesEqual(h.publicKey, this.cfg.nodeKey.publicKey)) return { code: RejectCode.Self, reason: 'connected to self' };
     const until = this.bannedIds.get(toHex(addressOf(h.publicKey)));
     if (until !== undefined && until > Date.now()) return { code: RejectCode.NotAccepting, reason: 'banned' };

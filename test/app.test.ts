@@ -17,6 +17,9 @@ import { objectId } from '../src/db/id.ts';
 import { key } from '../src/db/keys.ts';
 import { keyProofToBytes, proofToBytes, verifyKeyProof, verifyObjectProof } from '../src/db/proof.ts';
 import { MemoryKv, prefixEnd } from '../src/store/kv.ts';
+import { entryKey, indexHeader } from '../src/db/indexstore.ts';
+import { chunkKey } from '../src/db/merkle.ts';
+import { nodeHeader } from '../src/db/smt.ts';
 import type { Genesis } from '../src/types/genesis.ts';
 import { seedFor } from './helpers.ts';
 
@@ -451,7 +454,8 @@ describe('core application: index entries in the store', () => {
       w.put(key((k) => k.u8(0x6f).u64(aliceId)), kv.get(key((k) => k.u8(0x6f).u64(bobId)))!);
     });
     expect(() => openObjectDatabase(tampered, CORE_TYPES, { retainVersions: 4, checkLeaves: true })).toThrow(/does not hash to its leaf/);
-    expect(() => openObjectDatabase(tampered, CORE_TYPES, { retainVersions: 4, fromTrees: false })).toThrow(/do not hash to the stored app hash/);
+    // Recomputed from the objects, the root gives it away (alice's bytes are bob's, so the name check would too).
+    expect(() => openObjectDatabase(tampered, CORE_TYPES, { retainVersions: 4, fromTrees: false, checkIndexEntries: false })).toThrow(/do not hash to the stored app hash/);
     // The reopened app keeps producing the hashes of one that never stopped.
     const txs = [tx([transferOp(bobId, aliceId, 3n)], [bob])];
     const [r1, r2] = [await block(reopened, txs), await block(twin, txs)];
@@ -503,5 +507,74 @@ describe('core application: index entries in the store', () => {
     paged.db.rebuildTrees();
     paged.db.rebuildIndexTrees();
     consistent(paged, kv);
+  });
+});
+
+describe('core application: a damaged store is refused at restart', () => {
+  /** A copy of a store with one change made to it. */
+  const damaged = (kv: MemoryKv, change: (w: { put(k: Uint8Array, v: Uint8Array): void; del(k: Uint8Array): void }) => void) => {
+    const copy = new MemoryKv();
+    copy.write((w) => {
+      for (const [k, v] of kv.range(new Uint8Array([0]), new Uint8Array([0xff]))) w.put(k, v);
+    });
+    copy.write(change);
+    return copy;
+  };
+  const MODES = [{}, { trees: false }, { indexTrees: false }, { trees: false, indexTrees: false }];
+  const objectKey = (id: bigint) => key((k) => k.u8(0x6f).u64(id));
+
+  async function store() {
+    const kv = new MemoryKv();
+    const app = makeApp(kv);
+    await block(app, [tx([createOp('alice', makeAuthority([alice.publicKey]))]), tx([createOp('bob', makeAuthority([bob.publicKey]))])]);
+    const aliceId = app.accountByName('alice')!.id;
+    const bobId = app.accountByName('bob')!.id;
+    await block(app, [tx([transferOp(FAUCET_ID, aliceId, 5000n)]), tx([transferOp(FAUCET_ID, bobId, 5000n)])]);
+    for (const opts of MODES) expect(toHex(openObjectDatabase(kv, CORE_TYPES, { retainVersions: 4, ...opts })!.appHash)).toBe(toHex(app.lastAppHash));
+    return { kv, app, aliceId, bobId };
+  }
+  const refused = (kv: MemoryKv, pattern: RegExp, modes: object[] = MODES) => {
+    for (const opts of modes) expect(() => openObjectDatabase(kv, CORE_TYPES, { retainVersions: 4, ...opts }), JSON.stringify(opts)).toThrow(pattern);
+  };
+
+  it('refuses an object missing while its leaf is still there', async () => {
+    const { kv, app } = await store();
+    const faucetBalance = app.db.lookup(BalanceType, 'byOwnerAsset', key((k) => k.id(FAUCET_ID).id(app.coreAsset)))!.id;
+    // Its index entries go with it, so only the tree still says it exists.
+    const gone = damaged(kv, (w) => {
+      w.del(objectKey(faucetBalance));
+      w.del(entryKey(indexHeader(TYPE.balance, 0), key((k) => k.id(FAUCET_ID).id(app.coreAsset))));
+      w.del(entryKey(indexHeader(TYPE.balance, 1), key((k) => k.id(app.coreAsset).id(faucetBalance))));
+    });
+    refused(gone, /leaves for/);
+  });
+
+  it('refuses index entries that are missing, extra or name another object', async () => {
+    const { kv, app, aliceId, bobId } = await store();
+    const byOwnerAsset = entryKey(indexHeader(TYPE.balance, 0), key((k) => k.id(FAUCET_ID).id(app.coreAsset)));
+    const allModes = [...MODES, { fromTrees: false }];
+    refused(damaged(kv, (w) => w.del(byOwnerAsset)), /missing/, allModes);
+    refused(damaged(kv, (w) => w.put(entryKey(indexHeader(TYPE.account, 0), key((k) => k.str('alice'))), encode((w) => w.u64(bobId)))), /object \d+'s/, allModes);
+    refused(damaged(kv, (w) => w.put(entryKey(indexHeader(TYPE.balance, 1), key((k) => k.id(app.coreAsset).id(objectId(TYPE.balance, 99)))), new Uint8Array(0))), /entries for/, allModes);
+    refused(damaged(kv, (w) => w.put(byOwnerAsset, encode((w) => w.u64(aliceId).u8(0)))), /malformed/, allModes);
+  });
+
+  it('refuses a dense tree node that is not the hash of its children, and a sparse node that does not hash to its parent', async () => {
+    const { kv } = await store();
+    // Three balances: a tree of height two, whose inner level holds the node over the faucet's and alice's.
+    const inner = chunkKey(TYPE.balance, 1, 0);
+    const flipped = kv.get(inner)!.slice();
+    flipped[0]! ^= 1;
+    refused(damaged(kv, (w) => w.put(inner, flipped)), /not the hash of its children/);
+    // A leaf of the name tree with its value changed, and an inner node with a child hash changed.
+    const nodes = [...kv.range(nodeHeader(TYPE.account, 0), nodeHeader(TYPE.account, 1))];
+    const [leafKey, leaf] = nodes.find(([, v]) => v[0] === 1)!;
+    const leafChanged = leaf.slice();
+    leafChanged[leafChanged.length - 1]! ^= 1;
+    refused(damaged(kv, (w) => w.put(leafKey, leafChanged)), /does not hash to what its parent says/);
+    const [innerKey, innerNode] = nodes.find(([k, v]) => v[0] === 0 && k[k.length - 1]! > 0)!;
+    const innerChanged = innerNode.slice();
+    innerChanged[1]! ^= 1;
+    refused(damaged(kv, (w) => w.put(innerKey, innerChanged)), /does not hash to what its parent says|missing from the store/);
   });
 });

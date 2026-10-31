@@ -8,6 +8,7 @@
  * guard's level, each tier's mode, the heap), one per guard message, and a
  * summary at the end.
  */
+import './scheme.ts';
 import { join } from 'node:path';
 import { CoreApp } from '../src/app/core/app.ts';
 import { signedTxBytes, withFees } from '../src/app/core/client.ts';
@@ -105,14 +106,21 @@ let lastRefused = 0;
 let lastGc = node.gcScheduler.stats();
 const levels: string[] = [];
 node.onMemory((level) => levels.push(level));
+// Windows end by the clock, and report the time they actually took: a sleep runs late by whatever held the event
+// loop (a collection, a commit), and rates taken from the nominal seconds would count that time as free.
+const runStart = performance.now();
+let lastAt = runStart;
+const seconds1 = (ms: number) => Math.round(ms / 100) / 10;
 for (let s = WINDOW_S; s <= seconds; s += WINDOW_S) {
-  await sleep(WINDOW_S * 1000);
+  await sleep(Math.max(0, runStart + s * 1000 - performance.now()));
+  const now = performance.now();
   const d = app.db.memory();
   const m = memoryStats();
   const gc = node.gcScheduler.stats();
   emit({
     event: 'window',
-    s,
+    s: seconds1(now - runStart),
+    ms: Math.round(now - lastAt),
     blocks: blocks - lastBlocks,
     txs: committed - lastTxs,
     refused: refused - lastRefused,
@@ -131,9 +139,10 @@ for (let s = WINDOW_S; s <= seconds; s += WINDOW_S) {
   lastTxs = committed;
   lastRefused = refused;
   lastGc = gc;
+  lastAt = now;
 }
 clearInterval(feeder);
-emit({ event: 'summary', blocks, txs: committed, pagedBlocks: paged.blocks, pagedTxs: paged.txs, submitted, refused, levels: levels.join(' ') });
+emit({ event: 'summary', seconds: seconds1(performance.now() - runStart), blocks, txs: committed, pagedBlocks: paged.blocks, pagedTxs: paged.txs, submitted, refused, levels: levels.join(' ') });
 await node.stop();
 await env.close();
 // The verifier is not closed: checks of transfers still in flight would fail with it, and exiting ends its workers.

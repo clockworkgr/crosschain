@@ -116,7 +116,13 @@ export class Keystore {
     } catch {
       throw new Error('wrong passphrase');
     }
-    return keyPairFromSeed(new Uint8Array(seed), schemeTag(k.scheme ?? 'ml-dsa-44'));
+    // The cipher vouches for the seed but not for the scheme beside it: a record whose scheme was changed or lost
+    // would derive another key under the same name, while list() and publicKeyOf() still give the recorded one.
+    const pair = keyPairFromSeed(new Uint8Array(seed), schemeTag(k.scheme ?? 'ml-dsa-44'));
+    if (toHex(pair.publicKey) !== k.publicKey.toLowerCase() || toHex(pair.address) !== k.address.toLowerCase()) {
+      throw new Error(`key ${name} does not derive the public key and address recorded for it; the keystore entry is damaged`);
+    }
+    return pair;
   }
 
   /** The raw seed, for export. */

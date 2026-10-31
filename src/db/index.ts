@@ -13,9 +13,10 @@
  * recently used: a hit sets the instance's touched bit, a fresh decode enters
  * with it clear (so a one-time read is the first to go, and a scan of the
  * state does not wash out what a block works on), and when the budget is
- * spent a hand sweeps the type's instances, clearing bits it finds set and
- * evicting the first clean entry it finds clear. A hit costs one byte store;
- * an eviction costs a few map lookups; nothing is ever sorted.
+ * spent a hand sweeps the type's cached entries, oldest first, sending one
+ * whose bit is set (or that is pinned) to the back with the bit cleared and
+ * evicting the first clean one it finds clear. A hit costs one byte store;
+ * an eviction costs a few map operations; nothing is ever sorted.
  *
  * Every secondary index is a key encoder (keys.ts) plus an ordered byte map
  * (bptree.ts). A unique index maps key to id. A non-unique index appends the
@@ -150,11 +151,13 @@ export class TypeIndex<T extends { id: ObjectId }> {
   /** Arena reference of each committed instance (-1 when absent) and its encoding's length. */
   private refs = new Float64Array(0);
   private lens = new Uint32Array(0);
-  /** Decoded objects by instance; null is a tombstone for a removal the arena has not seen. */
+  /**
+   * Decoded objects by instance; null is a tombstone for a removal the arena has not seen. The map's order is CLOCK's
+   * ring: the hand starts at the front, and an entry it spares goes to the back.
+   */
   private readonly hot = new Map<number, T | null>();
-  /** CLOCK's second-chance bit per instance, and where its hand is. */
+  /** CLOCK's second-chance bit per instance. */
   private touched = new Uint8Array(0);
-  private hand = 0;
   /** Instances written since the last root: never evicted. */
   private readonly pinned = new Set<number>();
   /** Set when an eviction pass found nothing clean left to drop; cleared at the next root, which unpins. */
@@ -236,33 +239,37 @@ export class TypeIndex<T extends { id: ObjectId }> {
   }
 
   /**
-   * Over budget: sweep this type's instances with the clock hand, giving a touched entry a second chance and
-   * evicting the first clean one that has not been touched since the hand last passed. Pinned objects stay
-   * whatever the budget. The sweep is bounded, and a type that cannot find victims (its cache all pinned, as
-   * while a genesis is built) marks itself saturated and does no more work until the next root unpins.
+   * Over budget: sweep this type's cached entries with the clock hand, giving a touched one a second chance and
+   * evicting clean ones that have not been touched since the hand last passed, until the budget is met. The hand
+   * walks the entries, not the instances, so the cost follows what is cached however far apart its instances lie.
+   * Pinned objects stay whatever the budget, and go to the back so the next sweep does not walk them again first. Each
+   * entry is passed at most twice (once to clear its bit, once to evict it), and a type that cannot find victims (its
+   * cache all pinned, as while a genesis is built) marks itself saturated and does no more work until the next root
+   * unpins.
    */
   evict(): void {
     let over = this.budget.size - this.budget.limit;
     if (over <= 0) return;
-    const n = this.refs.length;
-    if (n === 0 || this.hot.size === this.pinned.size) {
+    if (this.hot.size === this.pinned.size) {
       this.saturated = true;
       return;
     }
-    // The sweep is bounded per call; what it does not manage now, the next call continues from the hand.
-    for (let scanned = 0, cap = Math.min(2 * n, 2 * over + 256); over > 0 && scanned < cap; scanned++) {
-      const i = this.hand;
-      this.hand = i + 1 >= n ? 0 : i + 1;
-      if (!this.hot.has(i) || this.pinned.has(i)) continue;
-      if (this.touched[i]) {
+    let visits = 2 * this.hot.size;
+    for (const [i, value] of this.hot) {
+      if (over <= 0 || visits-- <= 0) break;
+      if (this.pinned.has(i) || this.touched[i]) {
         this.touched[i] = 0;
+        // To the back of the ring; iteration reaches it again after the rest.
+        this.hot.delete(i);
+        this.hot.set(i, value);
         continue;
       }
       this.hot.delete(i);
       this.budget.size--;
       over--;
+      if (this.hot.size === this.pinned.size) break;
     }
-    // Saturated means nothing clean is left to evict, not that this window found none.
+    // Saturated means nothing clean is left to evict, not that this pass found none.
     this.saturated = over > 0 && this.hot.size === this.pinned.size;
   }
 
@@ -454,10 +461,49 @@ export class TypeIndex<T extends { id: ObjectId }> {
       const smt = sparse ? this.trees.get(s.def.name) : undefined;
       if (!s.tree && !smt) continue;
       for (const [k, v] of this.base.range(s.header, afterPrefix(s.header)!)) {
+        this.checkShape(s, k, v);
         const key = k.subarray(INDEX_HEADER);
         s.tree?.set(key, this.storedId(s, k, v));
         smt?.set(key, v);
       }
+    }
+  }
+
+  /** A stored entry must at least look like one: a unique index's value is an id, a non-unique key ends in one and has no value. */
+  private checkShape(s: Secondary<T>, k: Uint8Array, v: Uint8Array): void {
+    if (s.def.unique ? v.length !== 8 : v.length !== 0 || k.length < INDEX_HEADER + 8) throw new DbError(`${this.type.name}.${s.def.name}: a stored index entry is malformed`);
+  }
+
+  /**
+   * After loadIndexEntries on a restart: the stored entries must be exactly those the objects make. Every committed
+   * object is decoded (and not cached) for its keys, and each key must be stored naming that object; then each index
+   * must hold as many entries as there are objects, which rules out an extra one. Throws on the first fault.
+   */
+  checkEntries(): void {
+    if (this.secondary.length === 0) return;
+    for (let instance = 0; instance < this.refs.length; instance++) {
+      const ref = this.refs[instance]!;
+      if (ref < 0) continue;
+      const id = objectId(this.type.id, instance);
+      const keys = this.keysOf(decode(this.arena.read(ref), (r) => this.type.decode(r, id)));
+      for (let i = 0; i < keys.length; i++) {
+        const s = this.secondary[i]!;
+        let found: ObjectId | undefined;
+        if (s.tree) found = s.tree.get(keys[i]!);
+        else {
+          const k = entryKey(s.header, keys[i]!);
+          const v = this.base.get(k);
+          if (v !== undefined) this.checkShape(s, k, v);
+          found = v === undefined ? undefined : this.storedId(s, k, v);
+        }
+        if (found !== id) throw new DbError(`${this.type.name}.${s.def.name}: the stored entry for object ${id} is ${found === undefined ? 'missing' : `object ${found}'s`}`);
+      }
+    }
+    for (const s of this.secondary) {
+      let stored = 0;
+      if (s.tree) stored = s.tree.size;
+      else for (const [k, v] of this.base.range(s.header, afterPrefix(s.header)!)) (this.checkShape(s, k, v), stored++);
+      if (stored !== this.committedCount) throw new DbError(`${this.type.name}.${s.def.name}: the store holds ${stored} entries for ${this.committedCount} objects`);
     }
   }
 
@@ -594,15 +640,17 @@ export class TypeIndex<T extends { id: ObjectId }> {
     for (let i = 0; i < this.nextInstance; i++) if (this.has(i)) yield i;
   }
 
-  /** Undo of a session that created objects: forget everything from `before` on. */
+  /**
+   * Undo of a session that created objects: forget the instances from `before` up to the counter, which are the ones
+   * it created. Nothing else is touched, so the cost is what the session created, whatever is cached or allocated.
+   * None of them was ever written to the arena (that happens at a root, with no session open), so no reference is set.
+   */
   truncate(before: number): void {
-    for (const instance of [...this.hot.keys()]) {
-      if (instance < before) continue;
+    for (let instance = before; instance < this.nextInstance; instance++) {
       this.uncache(instance);
       this.pinned.delete(instance);
       this.dirtyKeys.delete(instance);
     }
-    for (let i = before; i < this.refs.length; i++) this.refs[i] = -1;
     this.nextInstance = before;
   }
 
@@ -617,7 +665,6 @@ export class TypeIndex<T extends { id: ObjectId }> {
     this.refs = new Float64Array(0);
     this.lens = new Uint32Array(0);
     this.touched = new Uint8Array(0);
-    this.hand = 0;
     this.budget.size -= this.hot.size;
     this.hot.clear();
     this.pinned.clear();

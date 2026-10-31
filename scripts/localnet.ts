@@ -5,7 +5,7 @@
  *
  *   node scripts/localnet.ts [validators=4] [seconds=30]
  */
-import { DEFAULT_SCHEME, schemeName } from '../src/crypto/keys.ts';
+import { DEFAULT_SCHEME, schemeName, useSchemeFromEnvironment } from '../src/crypto/keys.ts';
 import { CoreApp } from '../src/app/core/app.ts';
 import { makeAuthority } from '../src/app/core/authority.ts';
 import { signedTxBytes, withFees } from '../src/app/core/client.ts';
@@ -22,6 +22,8 @@ import type { Genesis } from '../src/types/genesis.ts';
 import { makeLogger } from '../src/util/log.ts';
 import { RpcServer } from '../src/rpc/server.ts';
 
+// CHAIN_SCHEME=secp256k1 runs the network on secp256k1 keys.
+useSchemeFromEnvironment();
 const count = Number(process.argv[2] ?? 4);
 const seconds = Number(process.argv[3] ?? 30);
 const chainId = 'localnet';

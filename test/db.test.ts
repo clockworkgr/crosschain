@@ -129,6 +129,54 @@ describe('object database: arena and hot cache', () => {
     };
     expect(run(0)).toEqual(run(1_000_000));
   });
+
+  it('keeps the budget when the cached objects sit far apart among the instances, as after churn', () => {
+    // Objects at instances 1,000,000 and up, and the most recent hundred of ten thousand: long runs of instances with
+    // nothing cached lie between the ones that are.
+    const sparse = new ObjectDatabase([CounterType]);
+    for (let i = 1_000_000; i < 1_001_000; i++) sparse.importObject(objectId(3, i), encode((w) => w.u64(BigInt(i))));
+    sparse.root();
+    for (let i = 1_000_000; i < 1_001_000; i++) sparse.get(CounterType, objectId(3, i));
+    expect(sparse.memory().hotObjects).toBe(1000);
+    sparse.setHotLimit(10);
+    expect(sparse.memory().hotObjects).toBe(10);
+    const churned = new ObjectDatabase([CounterType], { hotObjects: 0, retainVersions: 0 });
+    for (let i = 0; i < 10_000; i++) churned.create(CounterType, (id) => ({ id, n: BigInt(i) }));
+    churned.root(0);
+    for (let i = 0; i < 9900; i++) churned.remove(CounterType, objectId(3, i));
+    churned.root(1);
+    churned.setHotLimit(Infinity);
+    for (let i = 9900; i < 10_000; i++) churned.get(CounterType, objectId(3, i));
+    expect(churned.memory().hotObjects).toBe(100);
+    churned.setHotLimit(0);
+    expect(churned.memory().hotObjects).toBe(0);
+    // Reads keep it there: each fresh decode makes room for itself at once.
+    for (let i = 9900; i < 10_000; i++) expect(churned.get(CounterType, objectId(3, i))?.n).toBe(BigInt(i));
+    expect(churned.memory().hotObjects).toBe(0);
+  });
+
+  it('undoes a session in proportion to what it created, not to the objects already cached', () => {
+    const undoMs = (cached: number) => {
+      const db = new ObjectDatabase([CounterType], { retainVersions: 0 });
+      for (let i = 0; i < cached; i++) db.create(CounterType, (id) => ({ id, n: BigInt(i) }));
+      db.root();
+      const t0 = performance.now();
+      for (let i = 0; i < 2000; i++) {
+        const s = db.startSession();
+        db.create(CounterType, (id) => ({ id, n: 0n }));
+        s.undo();
+      }
+      const ms = performance.now() - t0;
+      expect(db.nextInstance(CounterType)).toBe(cached);
+      expect(db.memory().hotObjects).toBe(cached);
+      return ms;
+    };
+    undoMs(1000); // warm up
+    const small = Math.min(undoMs(1000), undoMs(1000));
+    const large = Math.min(undoMs(200_000), undoMs(200_000));
+    // Two hundred times the cached objects: a cost that followed them would be a hundred times as large.
+    expect(large).toBeLessThan(5 * small + 5);
+  });
 });
 
 /** A small deterministic generator, so a failing sequence can be replayed. */
@@ -534,13 +582,34 @@ describe('object database: trees on disk and dropped trees', () => {
         seen.push(proofsAt(db, Math.max(0, v - 2), ['v0-1', 'v0-2', `v${v}-7`]));
       }
       // What rebuilding would take comes from the objects, not from what was resident when the trees went: a leaf of
-      // the name tree per live item (1,800 created, 250 removed).
-      expect(db.rebuildEstimate().trees).toBe(opts.trees ? 0 : 1550 * 1000);
+      // the name tree per live item (1,800 created, 250 removed), kept and thrown away, and on top the nodes of the
+      // retained versions.
+      if (opts.trees) expect(db.rebuildEstimate().trees).toBe(0);
+      else expect(db.rebuildEstimate().trees).toBeGreaterThan(1550 * 2000);
       return seen;
     };
     const resident = run({ trees: true, store: false });
     expect(run({ trees: false, store: false })).toEqual(resident);
     expect(run({ trees: false, store: true })).toEqual(resident);
+  });
+
+  it('estimates a rebuild of the sparse trees with the versions it must build as well as the current one', () => {
+    const estimate = (versions: number) => {
+      const kv = new MemoryKv();
+      const db = new ObjectDatabase([ItemType], { indexStore: kv, retainVersions: 40, hotObjects: 0, trees: false, indexTrees: false });
+      let ids: bigint[] = [];
+      // Each version replaces the whole key set, so each retained one is a tree of its own to build.
+      for (let v = 0; v < versions; v++) {
+        for (const id of ids) db.remove(ItemType, id);
+        ids = Array.from({ length: 500 }, (_, i) => mk(db, `v${v}-${i}`, 0).id);
+        db.root(v);
+        writeChanges(kv, [...db.lastChanges!.indices, ...db.lastChanges!.trees]);
+        db.dropChanges();
+      }
+      return db.rebuildEstimate().trees;
+    };
+    // The same 500 live keys either way; thirty versions behind them make a rebuild build thirty trees' worth of nodes.
+    expect(estimate(30)).toBeGreaterThan(15 * estimate(1));
   });
 });
 

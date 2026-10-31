@@ -41,18 +41,58 @@ export interface MemoryStats {
 }
 
 /**
+ * NODE_OPTIONS split as Node splits it: at spaces, with double quotes grouping and, inside them, a backslash taking
+ * the next character as it is.
+ */
+export function splitNodeOptions(options: string): string[] {
+  const out: string[] = [];
+  let arg = '';
+  let started = false;
+  let quoted = false;
+  for (let i = 0; i < options.length; i++) {
+    let c = options[i]!;
+    if (c === '\\' && quoted && i + 1 < options.length) c = options[++i]!;
+    else if (c === ' ' && !quoted) {
+      if (started) out.push(arg);
+      arg = '';
+      started = false;
+      continue;
+    } else if (c === '"') {
+      quoted = !quoted;
+      started = true;
+      continue;
+    }
+    arg += c;
+    started = true;
+  }
+  if (started) out.push(arg);
+  return out;
+}
+
+/**
+ * The --max-old-space-size the process runs under, in MiB, or null when none was given. Node reads NODE_OPTIONS
+ * first and its command line after, so a flag on the command line wins, and the last of several wins; V8 takes the
+ * flag with dashes or underscores alike. Shared with the CLI's `start`, which must not put a limit of its own over
+ * one the operator set.
+ */
+export function heapLimitFlag(execArgv: readonly string[] = process.execArgv, nodeOptions: string = process.env.NODE_OPTIONS ?? ''): number | null {
+  const flags = [...splitNodeOptions(nodeOptions), ...execArgv];
+  let mib: number | null = null;
+  for (const f of flags) {
+    const m = /^--max[-_]old[-_]space[-_]size=(\d+)$/.exec(f);
+    if (m) mib = Number(m[1]);
+  }
+  return mib;
+}
+
+/**
  * The old generation's limit in bytes, when the process was started with one (--max-old-space-size, as the CLI does).
  * V8's heap_size_limit adds the young generation's reserve to it (three semi-spaces, 192 MiB with 64 MiB ones), which
  * long-lived objects never fill: the process aborts when the old generation is full, so on a heap of 744 MiB the
  * levels' lines, taken from 936 MiB, would sit past the point of the abort and `pressure` would never come.
  */
 function oldGenerationLimit(): number | null {
-  const flags = [...process.execArgv, ...(process.env.NODE_OPTIONS ?? '').split(/\s+/)];
-  let mib: number | null = null;
-  for (const f of flags) {
-    const m = /^--max[-_]old[-_]space[-_]size=(\d+)$/.exec(f);
-    if (m) mib = Number(m[1]);
-  }
+  const mib = heapLimitFlag();
   return mib === null ? null : mib * 1048576;
 }
 

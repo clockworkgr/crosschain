@@ -9,17 +9,32 @@
  * encoding; a reference is the slab number and the offset of the header,
  * packed into one number. Slabs are filled by a bump allocator and never
  * written in place: a new encoding of an object is a new entry, the old one
- * is counted dead, and a slab that is more than half dead is compacted after
- * a root by copying its live entries into the current slab and releasing it.
- * The header is what makes compaction possible: it names the owner, which
- * says whether the entry is still its current value.
+ * is counted dead, and after a root a slab with nothing live left is released
+ * outright, and one that is more than half dead is compacted by copying its
+ * live entries into the current slab and releasing it. The header is what
+ * makes compaction possible: it names the owner, which says whether the entry
+ * is still its current value.
+ *
+ * A released slab's number is given to the next slab, with its generation
+ * counted up, so slab numbers stay as few as the slabs alive at once and a
+ * reference stays exact: 24 bits of offset (a slab is at most 16 MiB), 16 of
+ * slot and 13 of generation make 53, all a double holds without rounding. The
+ * generation is what refuses a stale reference into a slot used again; it
+ * wraps after 8,192 reuses of one slot, which is harmless because the owner
+ * never keeps a reference into a released slab (compaction moves them all).
  */
 export const HEADER = 10;
 const FIRST_SLAB = 256 * 1024;
 const MAX_SLAB = 16 * 1024 * 1024;
 /** The largest encoding an entry can hold. */
 export const MAX_ENTRY = MAX_SLAB - HEADER;
-const SLAB_SHIFT = 2 ** 32;
+/** A reference: (generation * SLOTS + slot) * OFFSETS + offset, below 2^53 so it is exact. */
+const OFFSETS = 2 ** 24;
+const SLOTS = 2 ** 16;
+const GENERATIONS = 2 ** 13;
+const SLAB_IDS = SLOTS * GENERATIONS;
+/** Whatever a root wrote, compaction may copy at least this much after it: what two half-dead full slabs hold. */
+const MIN_COPY = MAX_SLAB;
 
 /** Who holds references: asked whether an entry is still current, and told where it moved. */
 export interface ArenaOwner {
@@ -28,15 +43,21 @@ export interface ArenaOwner {
 }
 
 interface Slab {
-  /** Null once the slab has been compacted away; its number stays taken so older references never alias. */
+  /** Null once the slab has been released; the slot then waits in the free list for the next slab. */
   buf: Uint8Array | null;
   used: number;
   dead: number;
+  /** Counted up each time the slot is given a new slab, so a reference into an older one is refused. */
+  generation: number;
 }
 
-export const packRef = (slab: number, offset: number): number => slab * SLAB_SHIFT + offset;
-export const slabOf = (ref: number): number => Math.floor(ref / SLAB_SHIFT);
-export const offsetOf = (ref: number): number => ref % SLAB_SHIFT;
+/** A reference from a slab number (its generation and slot, generation * 2^16 + slot) and an offset; refused if either does not fit. */
+export function packRef(slab: number, offset: number): number {
+  if (!(slab >= 0 && slab < SLAB_IDS && offset >= 0 && offset < OFFSETS)) throw new RangeError(`slab ${slab}, offset ${offset}: not a reference`);
+  return slab * OFFSETS + offset;
+}
+export const slabOf = (ref: number): number => Math.floor(ref / OFFSETS);
+export const offsetOf = (ref: number): number => ref % OFFSETS;
 
 export interface ArenaStats {
   /** Slabs holding bytes, their capacity, the bytes written into them, and the bytes among those that are dead. */
@@ -48,8 +69,12 @@ export interface ArenaStats {
 
 export class Arena {
   private readonly slabs: Slab[] = [];
+  /** Slots whose slab was released, for the next slabs to take. */
+  private readonly spare: number[] = [];
   private current = -1;
   private created = 0;
+  /** Bytes alloc() wrote since the last maintain(), compaction's own copies not counted: what the root's block wrote. */
+  private written = 0;
   private readonly owner: ArenaOwner;
 
   constructor(owner: ArenaOwner) {
@@ -75,12 +100,46 @@ export class Arena {
     // The first slab is small so a tiny database costs little; each next doubles up to the maximum.
     const size = Math.max(need, Math.min(MAX_SLAB, FIRST_SLAB * 2 ** this.created));
     this.created++;
-    this.slabs.push({ buf: new Uint8Array(size), used: 0, dead: 0 });
+    const slot = this.spare.pop();
+    if (slot !== undefined) {
+      const s = this.slabs[slot]!;
+      s.buf = new Uint8Array(size);
+      s.generation = (s.generation + 1) % GENERATIONS;
+      this.current = slot;
+      return;
+    }
+    if (this.slabs.length >= SLOTS) throw new RangeError(`the arena holds at most ${SLOTS} slabs at once`);
+    this.slabs.push({ buf: new Uint8Array(size), used: 0, dead: 0, generation: 0 });
     this.current = this.slabs.length - 1;
+  }
+
+  private refAt(slot: number, offset: number): number {
+    return packRef(this.slabs[slot]!.generation * SLOTS + slot, offset);
+  }
+
+  private slabFor(ref: number): Slab | undefined {
+    const id = slabOf(ref);
+    const slab = this.slabs[id % SLOTS];
+    return slab && slab.generation === Math.floor(id / SLOTS) ? slab : undefined;
+  }
+
+  private release(slot: number): number {
+    const slab = this.slabs[slot]!;
+    const size = slab.buf!.length;
+    slab.buf = null;
+    slab.used = 0;
+    slab.dead = 0;
+    this.spare.push(slot);
+    return size;
   }
 
   /** Store an encoding; returns its reference. */
   alloc(type: number, instance: number, bytes: Uint8Array): number {
+    this.written += HEADER + bytes.length;
+    return this.put(type, instance, bytes);
+  }
+
+  private put(type: number, instance: number, bytes: Uint8Array): number {
     if (bytes.length > MAX_ENTRY) throw new RangeError(`an encoding of ${bytes.length} bytes does not fit the arena (at most ${MAX_ENTRY})`);
     const need = HEADER + bytes.length;
     if (this.current < 0 || this.slabs[this.current]!.used + need > this.slabs[this.current]!.buf!.length) this.newSlab(need);
@@ -99,11 +158,11 @@ export class Arena {
     buf[at + 9] = bytes.length & 0xff;
     buf.set(bytes, at + HEADER);
     slab.used += need;
-    return packRef(this.current, at);
+    return this.refAt(this.current, at);
   }
 
   private header(ref: number): { buf: Uint8Array; at: number; type: number; instance: number; length: number } {
-    const slab = this.slabs[slabOf(ref)];
+    const slab = this.slabFor(ref);
     if (!slab?.buf) throw new RangeError('reference into a released slab');
     const buf = slab.buf;
     const at = offsetOf(ref);
@@ -121,35 +180,42 @@ export class Arena {
 
   /** Count an entry dead; its bytes are reclaimed by compaction. */
   free(ref: number): void {
-    const slab = this.slabs[slabOf(ref)]!;
-    slab.dead += HEADER + this.header(ref).length;
+    const length = this.header(ref).length;
+    this.slabFor(ref)!.dead += HEADER + length;
   }
 
   /**
-   * Compact up to `maxSlabs` slabs that are more than half dead, copying their live entries
-   * into the current slab and telling the owner where they went. Returns the bytes released.
+   * After a root: release every slab with nothing live left, which costs no copying however many there are, and
+   * compact slabs that are more than half dead, copying their live entries into the current slab and telling the
+   * owner where they went, until the bytes copied reach what alloc() wrote since the last call (at least MIN_COPY).
+   * Each compacted slab gives back more than it copies, so reclaiming keeps pace with any rate of writes and a
+   * backlog drains, while the pause stays in proportion to the block's own writes. Returns the bytes released.
    */
-  maintain(maxSlabs = 2): number {
+  maintain(): number {
     let released = 0;
-    let done = 0;
-    for (let s = 0; s < this.slabs.length && done < maxSlabs; s++) {
+    for (let s = 0; s < this.slabs.length; s++) {
+      const slab = this.slabs[s]!;
+      if (s !== this.current && slab.buf && slab.used > 0 && slab.dead >= slab.used) released += this.release(s);
+    }
+    const budget = Math.max(MIN_COPY, this.written);
+    let copied = 0;
+    for (let s = 0; s < this.slabs.length && copied < budget; s++) {
       const slab = this.slabs[s]!;
       if (s === this.current || !slab.buf || slab.used === 0 || slab.dead * 2 <= slab.used) continue;
       const buf = slab.buf;
       for (let at = 0; at < slab.used; ) {
-        const h = this.header(packRef(s, at));
-        if (this.owner.refOf(h.type, h.instance) === packRef(s, at)) {
-          const moved = this.alloc(h.type, h.instance, buf.subarray(at + HEADER, at + HEADER + h.length));
+        const ref = this.refAt(s, at);
+        const h = this.header(ref);
+        if (this.owner.refOf(h.type, h.instance) === ref) {
+          const moved = this.put(h.type, h.instance, buf.subarray(at + HEADER, at + HEADER + h.length));
           this.owner.relocate(h.type, h.instance, moved);
+          copied += HEADER + h.length;
         }
         at += HEADER + h.length;
       }
-      released += buf.length;
-      slab.buf = null;
-      slab.used = 0;
-      slab.dead = 0;
-      done++;
+      released += this.release(s);
     }
+    this.written = 0;
     return released;
   }
 }

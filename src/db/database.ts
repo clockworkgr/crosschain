@@ -215,6 +215,16 @@ const DEFAULT_TREE_CHUNKS = 256;
  */
 const INDEX_ENTRY_HEAP = 210;
 const SPARSE_LEAF_HEAP = 1000;
+/**
+ * What rebuilding a sparse tree allocates besides what it keeps: per current leaf, the two nodes or so it reads from
+ * the store and the keys it reads them by, about 1,000 bytes that the collector takes back afterwards; and per
+ * record of a retained version, the node built for that version with its reads, about 500 bytes (a fifth of it
+ * kept). Measured as the heap allocated by a rebuild before a collection, at 50,000 leaves and at 1,000 leaves with
+ * thirty versions of churn behind them. The guard compares the estimate with the heap's headroom, which garbage takes
+ * up as well, so it counts what is allocated, not only what stays.
+ */
+const SPARSE_LEAF_GARBAGE = 1000;
+const SPARSE_HISTORY_NODE_HEAP = 500;
 /** Unbounded: with memory to spare every decoded object stays, and the node runs as it did before the arena. The memory guard caps it. */
 const DEFAULT_HOT = Infinity;
 
@@ -443,14 +453,19 @@ export class ObjectDatabase {
 
   /**
    * After importing objects whose index entries the store holds (importObject with `indexed`): fill the sparse
-   * trees, and the B+ trees where resident, from the store's entries instead of decoding every object.
+   * trees, and the B+ trees where resident, from the store's entries instead of decoding every object. With `check`
+   * (the default), the entries must then be exactly the ones the objects make: no entry missing, none extra and none
+   * naming another object. Nothing in the app hash covers an unauthenticated index, so without this a damaged entry
+   * would quietly send a lookup, and the writes that follow it, to the wrong object. It decodes every object of a
+   * type with indices, once, keeping none.
    */
-  loadIndexEntries(): void {
+  loadIndexEntries(check = true): void {
     if (!this.store || this.importsIndexed !== true || this.version >= 0) throw new DbError('index entries are loaded from the store only after an indexed import');
     // The sparse trees come from the entries unless their nodes are already in place: loaded, or in the store a
     // dropped tree reads.
     const sparse = this.treesResident ? !this.treesLoaded : !this.treesStored;
     for (const ti of this.types.values()) ti.loadIndexEntries(sparse);
+    if (check) for (const ti of this.types.values()) ti.checkEntries();
   }
 
   // ---- the tree tier ----
@@ -492,7 +507,9 @@ export class ObjectDatabase {
   /**
    * About how many bytes of heap rebuilding what is dropped would take, per tier (0 for a resident one): every
    * committed object has one entry in each of its type's indices and one leaf in each authenticated index's sparse
-   * tree. The memory guard rebuilds only what fits.
+   * tree, and a sparse tree also builds a node for each record its retained versions hold, the subtrees they share
+   * with a newer version built once; the reads and keys a rebuild throws away count too (SPARSE_LEAF_GARBAGE). The
+   * memory guard rebuilds only what fits.
    */
   rebuildEstimate(): { indexTrees: number; trees: number } {
     let entries = 0;
@@ -505,8 +522,11 @@ export class ObjectDatabase {
       }
       leaves += ti.committedCount * ti.authenticated.length;
     }
+    let history = 0;
+    if (!this.treesResident) for (const smt of this.sparseTrees()) history += smt.historyNodes;
+    const trees = leaves * (SPARSE_LEAF_HEAP + SPARSE_LEAF_GARBAGE) + history * SPARSE_HISTORY_NODE_HEAP;
     // A dropped tier never reads zero, however empty, so that zero means nothing is dropped.
-    return { indexTrees: dropped ? Math.max(1, entries * INDEX_ENTRY_HEAP) : 0, trees: this.treesResident ? 0 : Math.max(1, leaves * SPARSE_LEAF_HEAP) };
+    return { indexTrees: dropped ? Math.max(1, entries * INDEX_ENTRY_HEAP) : 0, trees: this.treesResident ? 0 : Math.max(1, trees) };
   }
 
   /** Every dense chunk and sparse node as of the last root, as store keys and values: what a store written from scratch holds. */
@@ -518,16 +538,26 @@ export class ObjectDatabase {
   /**
    * After importing objects whose trees the store holds as of the version about to be rooted (a restart): take the
    * trees from the store instead of computing them, so the first root hashes no object and inserts no key, and
-   * reports nothing. With `checkLeaves`, every imported object is still hashed and compared with its leaf.
+   * reports nothing. With `checkLeaves`, what is taken is checked first, resident or dropped: every dense node above
+   * a leaf must be the hash of its children and every sparse node must hash to what its parent says, so the root the
+   * caller compares with the app hash commits to every leaf; every imported object must hash to its leaf; and each
+   * type's tree must have no more non-empty leaves than objects, so no leaf has lost its object.
    */
   loadTrees(checkLeaves = false): void {
     if (!this.store || this.importsIndexed !== true || this.version >= 0) throw new DbError('trees are loaded from the store only after an indexed import');
     if (this.treesResident) {
       for (const tree of this.denseTrees()) tree.load(this.treeBase);
-      for (const smt of this.sparseTrees()) smt.load(this.treeBase);
+      for (const smt of this.sparseTrees()) smt.load(this.treeBase, checkLeaves);
     }
     if (checkLeaves) {
       for (const type of this.order) this.trees.get(type)!.resize(this.typeIndexById(type).nextInstance);
+      this.top.verify();
+      for (const type of this.order) {
+        const ti = this.typeIndexById(type);
+        const leaves = this.trees.get(type)!.verify();
+        if (leaves !== ti.committedCount) throw new DbError(`${ti.type.name}: the stored tree has ${leaves} leaves for ${ti.committedCount} objects`);
+      }
+      if (!this.treesResident) for (const smt of this.sparseTrees()) smt.verifyStored();
       for (const id of this.dirty) {
         const ti = this.typeIndexById(typeOf(id));
         const bytes = ti.bytesOf(instanceOf(id));

@@ -170,8 +170,8 @@ describe('a node under memory pressure', () => {
     const estimate = app.db.rebuildEstimate();
     expect(estimate.indexTrees).toBeGreaterThan(0);
     expect(estimate.trees).toBeGreaterThan(0);
-    limit = 4 * (estimate.indexTrees + estimate.trees);
-    heap = Math.floor(0.64 * limit); // 6% of the limit to the warn line: a quarter of what rebuilding would take
+    limit = 4 * Math.min(estimate.indexTrees, estimate.trees);
+    heap = Math.floor(0.64 * limit); // 6% of the limit to the warn line: a quarter of what rebuilding either tier would take
     await waitFor(() => !watched.isShedding, 5_000, 'shedding to end');
     expect(watched.memoryLevel).toBe('ok');
     expect(watched.mempool.paused).toBe(false);
@@ -179,6 +179,7 @@ describe('a node under memory pressure', () => {
     await sleep(100);
     expect(app.db.memory()).toMatchObject({ indexTrees: 'dropped', trees: 'dropped' });
     // With room, the next sample rebuilds them.
+    limit = 4 * (estimate.indexTrees + estimate.trees);
     heap = Math.floor(0.2 * limit);
     await waitFor(() => app.db.memory().trees === 'resident', 5_000, 'the trees to be rebuilt');
     expect(app.db.memory().indexTrees).toBe('resident');

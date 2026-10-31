@@ -451,9 +451,14 @@ export class Node {
     return this.executor.state.lastHeight;
   }
 
-  /** Called on every change of the memory guard's level; the CLI stops the node on `critical`. */
+  /**
+   * Called on every change of the memory guard's level; the CLI stops the node on `critical`. A listener added once
+   * the guard is sampling is told the level it is at, unless that is `ok`: a node already critical at its first
+   * sample would otherwise never be reported, since a level that stays the same fires nothing.
+   */
   onMemory(fn: (level: MemoryLevel, stats: MemoryStats) => void): void {
     this.memoryListeners.push(fn);
+    if (this.started && this.memoryGuard.level !== 'ok') fn(this.memoryGuard.level, this.memoryGuard.stats);
   }
 
   get memoryLevel(): MemoryLevel {

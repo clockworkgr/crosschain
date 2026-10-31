@@ -443,7 +443,7 @@ schemes: two different addresses, and neither key verifies the other's signature
 names a key's scheme, `isPublicKey` refuses a truncated key, and a key or a signature whose
 first byte is `9` or `0` throws `unknown signature scheme`.
 
-**`it('refuses the high-S twin of a secp256k1 signature, so a signed object has one encoding')`**.
+**`it('refuses the high-S twin of a secp256k1 signature, so no one but the signer can make a second valid one')`**.
 ECDSA admits two `s` values for every signature, `s` and `n - s`; the test rebuilds the twin
 from the curve order (`secp256k1.Point.Fn.ORDER`) and expects it refused while the original
 verifies. Without low-S enforcement anyone relaying a transaction could rewrite its signature

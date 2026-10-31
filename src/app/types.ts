@@ -14,6 +14,14 @@
 import type { Genesis } from '../types/genesis.ts';
 import type { ValidatorUpdate } from '../types/validator.ts';
 
+export interface CheckTxOptions {
+  /**
+   * Asked after the check's last wait, just before the transaction would go into the pending state: why the caller no
+   * longer takes it (the mempool paused or filled while it was checked), or null. A refusal leaves nothing behind.
+   */
+  admit?: () => string | null;
+}
+
 export interface CheckTxResult {
   ok: boolean;
   error?: string;
@@ -54,7 +62,7 @@ export interface InitChainResult {
 
 export interface Application {
   initChain(genesis: Genesis): Promise<InitChainResult>;
-  checkTx(tx: Uint8Array): Promise<CheckTxResult>;
+  checkTx(tx: Uint8Array, opts?: CheckTxOptions): Promise<CheckTxResult>;
   finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult>;
   commit(): Promise<void>;
   info(): Promise<{ lastHeight: bigint; lastAppHash: Uint8Array }>;

@@ -29,12 +29,15 @@
  * The signature cache remembers which addresses signed a transaction id
  * validly. That fact never changes, so a transaction verified on arrival is
  * not verified again when its block is applied. Authority thresholds, which
- * do depend on state, are always rechecked.
+ * do depend on state, are always rechecked. The cache only saves work: the
+ * signers a transaction is applied with are the ones its own verification
+ * found, cached or not, so the cache being dropped or trimmed while that
+ * verification awaits the pool cannot change a result.
  */
 import { decode } from '../../codec/reader.ts';
 import { encode } from '../../codec/writer.ts';
 import { bytesEqual, HASH_SIZE, sha256, toHex } from '../../crypto/hash.ts';
-import { schemeOf, schemeTag, signContext, type SchemeTag } from '../../crypto/keys.ts';
+import { schemeName, schemeOf, schemeTag, signContext, type SchemeTag } from '../../crypto/keys.ts';
 import type { Verifier, VerifyJob } from '../../crypto/verifier.ts';
 import { decodeHistory, encodeHistory, ObjectDatabase, type Changes, type UndoSession } from '../../db/database.ts';
 import { idToString, type ObjectId } from '../../db/id.ts';
@@ -46,7 +49,7 @@ import type { KeyProof, ObjectProof } from '../../db/proof.ts';
 import { MemoryKv, prefixEnd, type KvStore } from '../../store/kv.ts';
 import type { Genesis } from '../../types/genesis.ts';
 import { silentLogger, type Logger } from '../../util/log.ts';
-import type { Application, CheckTxResult, FinalizeBlockRequest, FinalizeBlockResult, InitChainResult, TxResult } from '../types.ts';
+import type { Application, CheckTxOptions, CheckTxResult, FinalizeBlockRequest, FinalizeBlockResult, InitChainResult, TxResult } from '../types.ts';
 import { authoritySatisfied, collectKeys, type AuthorityLookup } from './authority.ts';
 import { applyTransaction, getDynamic, getGlobal, pruneExpiredTxs, requiredAuthorities, TxError } from './evaluate.ts';
 import { beginBlock, endBlock } from './staking.ts';
@@ -77,7 +80,16 @@ export interface CoreAppOptions {
   log?: Logger;
 }
 
+/** Transaction bodies the signature cache holds at most. */
 const SIG_CACHE_MAX = 20_000;
+/** Signatures it holds at most across those bodies, so the bound is on memory and not only on bodies. */
+const SIG_CACHE_SIGNATURES = 40_000;
+/**
+ * Signatures it keeps per signer and body. A key can make any number of valid signatures over one body (a fresh
+ * nonce each), and each verifies once and is then refused in execution without paying a fee; without a cap one
+ * body would hold them all.
+ */
+const SIG_CACHE_VARIANTS = 4;
 
 // Key layout of the app store: 'm' meta, 'o' id, 'c' type, 'h' version, 'a' account history, 'q' history sequence,
 // 'i' index entry (db/indexstore.ts), 't' dense tree chunk (db/merkle.ts), 'n' sparse tree node (db/smt.ts).
@@ -124,11 +136,19 @@ export interface OpenOptions {
    */
   fromTrees?: boolean;
   /**
-   * With the trees from the store, hash every object and compare it with its leaf (the default): the root then still
-   * proves that the objects are the ones the app hash commits to, as it did when the trees were computed from them.
-   * Off, a restart is about an eighth faster and a corrupt object goes unnoticed until something reads it.
+   * With the trees from the store, check them before use (the default): every stored node against its children,
+   * every object against its leaf, and every non-empty leaf against an object. The root then still proves that the
+   * objects are the ones the app hash commits to, as it did when the trees were computed from them. Off, a restart is
+   * faster and a corrupt object or tree node goes unnoticed until something reads it.
    */
   checkLeaves?: boolean;
+  /**
+   * With the index entries from the store, check them against the objects (the default): each object decoded for its
+   * keys, every key stored and naming it, and no entry over. The app hash does not cover an unauthenticated index, so
+   * this is the only thing that catches a damaged entry before a lookup goes to the wrong object. Off, a restart
+   * decodes no object at all.
+   */
+  checkIndexEntries?: boolean;
 }
 
 /**
@@ -171,8 +191,8 @@ export function openObjectDatabase(kv: KvStore, types: ObjectType<any>[], opts: 
     if (opts.fromTrees ?? true) db.loadTrees(opts.checkLeaves ?? true);
     else db.assumeStoredTrees();
   }
-  // The indices come from their entries, so no object is decoded on the way in.
-  if (indexed && objects > 0) db.loadIndexEntries();
+  // The indices come from their entries rather than from inserting every key, and are checked against the objects.
+  if (indexed && objects > 0) db.loadIndexEntries(opts.checkIndexEntries ?? true);
   const appHash = db.root(Number(meta.height));
   if (!bytesEqual(appHash, meta.appHash)) throw new Error('stored objects do not hash to the stored app hash');
   const missing = [...(indexed ? [] : db.lastChanges!.indices), ...(treesStored ? [] : db.lastChanges!.trees)];
@@ -206,6 +226,8 @@ export class CoreApp implements Application {
   private pending: UndoSession | null = null;
   /** tx id hex to address hex to the hashes of every signature by that signer over that body that verified. */
   private readonly sigCache = new Map<string, Map<string, Set<string>>>();
+  /** Signature hashes held across sigCache, for its bound. */
+  private sigCacheSignatures = 0;
   private toPersist: { changes: Changes; meta: Meta; history: [ObjectId, HistoryEntry][] } | null = null;
   private staleHistory: number[] = [];
   private readonly recorder = new HistoryRecorder();
@@ -227,6 +249,10 @@ export class CoreApp implements Application {
     const stored = openObjectDatabase(this.kv, CORE_TYPES, { retainVersions: opts.retainVersions, indexTrees: opts.indexTrees, trees: opts.trees });
     if (stored) {
       this.db = stored.db;
+      // The state holds the scheme genesis fixed, and the node derives its keys from the genesis it was given: the two
+      // must name the same one.
+      const scheme = getGlobal(this.db).scheme;
+      if (scheme !== schemeTag(opts.genesis.signatureScheme ?? 'ml-dsa-44')) throw new Error(`the application state is for a ${schemeName(scheme)} chain, genesis names ${opts.genesis.signatureScheme ?? 'ml-dsa-44'}`);
       this.height = stored.height;
       this.appHash = stored.appHash;
       this.staleHistory = stored.staleHistory;
@@ -264,15 +290,19 @@ export class CoreApp implements Application {
   /** Serialises checkTx's state-touching part behind a block in progress. */
   private applying: Promise<void> | null = null;
 
-  async checkTx(bytes: Uint8Array): Promise<CheckTxResult> {
+  async checkTx(bytes: Uint8Array, opts: CheckTxOptions = {}): Promise<CheckTxResult> {
     const d = this.decode(bytes);
     if ('error' in d) return { ok: false, error: d.error };
     while (this.applying) await this.applying;
-    const sigError = await this.verifySignatures(d.tx, d.txId);
-    if (sigError) return { ok: false, error: sigError };
+    const signed = await this.verifySignatures(d.tx, d.txId);
+    if (typeof signed === 'string') return { ok: false, error: signed };
     // A block may have started while the pool verified; its state must be the one checked against.
     while (this.applying) await this.applying;
-    const r = this.applyChecked(d.tx, d.txId, this.lastTime, this.height + 1n, this.pending !== null, false);
+    // Nor is a transaction the mempool would now refuse applied: its writes would stay in the pending state, and
+    // the transactions checked after it would be checked against them.
+    const refused = opts.admit?.() ?? null;
+    if (refused !== null) return { ok: false, error: refused };
+    const r = this.applyChecked(d.tx, d.txId, signed, this.lastTime, this.height + 1n, this.pending !== null, false);
     return r.ok ? { ok: true } : { ok: false, error: r.error };
   }
 
@@ -303,13 +333,13 @@ export class CoreApp implements Application {
           continue;
         }
         // Keys are resolved against the state as it stands after the transactions before this one, on every node alike.
-        const sigError = await this.verifySignatures(d.tx, d.txId);
-        if (sigError) {
-          txResults.push({ ok: false, error: sigError });
+        const signed = await this.verifySignatures(d.tx, d.txId);
+        if (typeof signed === 'string') {
+          txResults.push({ ok: false, error: signed });
           continue;
         }
         this.recorder.beginTx(txHash(req.txs[i]!), i);
-        const r = this.applyChecked(d.tx, d.txId, req.time, req.height, true, true);
+        const r = this.applyChecked(d.tx, d.txId, signed, req.time, req.height, true, true);
         this.recorder.endTx(r.ok);
         txResults.push(r);
       }
@@ -565,10 +595,16 @@ export class CoreApp implements Application {
   /** Forget every verified signature (load shedding); each is verified again when next seen. */
   dropSignatureCache(): void {
     this.sigCache.clear();
+    this.sigCacheSignatures = 0;
   }
 
+  /** Oldest bodies first, until both bounds hold. */
   private trimCache(): void {
-    while (this.sigCache.size > SIG_CACHE_MAX) this.sigCache.delete(this.sigCache.keys().next().value!);
+    while (this.sigCache.size > SIG_CACHE_MAX || this.sigCacheSignatures > SIG_CACHE_SIGNATURES) {
+      const [txKey, verified] = this.sigCache.entries().next().value!;
+      for (const hashes of verified.values()) this.sigCacheSignatures -= hashes.size;
+      this.sigCache.delete(txKey);
+    }
   }
 
   /** The public keys the required authorities hold right now, by address, or why they cannot be found. */
@@ -589,13 +625,17 @@ export class CoreApp implements Application {
     if (!verified) {
       verified = new Map();
       this.sigCache.set(txKey, verified);
-      this.trimCache();
     }
     // A set, never a replacement: two valid signatures by one key over one body can be in flight at once
-    // (signing is randomised), and a later verification must not make an earlier one look unverified.
+    // (signing is randomised), and a later one should not cost the earlier its cache entry. Past a few the oldest
+    // goes; a transaction in flight holds its own verified signers, so that costs at most a second verification.
     let hashes = verified.get(address);
     if (!hashes) verified.set(address, (hashes = new Set()));
+    if (hashes.has(sigHash)) return;
+    if (hashes.size >= SIG_CACHE_VARIANTS) hashes.delete(hashes.values().next().value!);
+    else this.sigCacheSignatures++;
     hashes.add(sigHash);
+    this.trimCache();
   }
 
   private isVerified(txKey: string, address: string, sigHash: string): boolean {
@@ -638,7 +678,12 @@ export class CoreApp implements Application {
     return getGlobal(this.db).scheme;
   }
 
-  private async verifySignatures(tx: Transaction, txId: Uint8Array): Promise<string | null> {
+  /**
+   * The addresses that validly signed the transaction, or why it is refused. The set is the caller's to apply the
+   * transaction with: what the cache says when the transaction is applied does not matter, since load shedding can
+   * clear it, and trimming shrink it, while this awaits the pool.
+   */
+  private async verifySignatures(tx: Transaction, txId: Uint8Array): Promise<Set<string> | string> {
     if (tx.signatures.length === 0) return 'transaction has no signatures';
     const candidates = this.signingKeys(tx);
     if (typeof candidates === 'string') return candidates;
@@ -646,6 +691,7 @@ export class CoreApp implements Application {
     const jobs: VerifyJob[] = [];
     const jobKeys: [string, string][] = [];
     const seen = new Set<string>();
+    const signed = new Set<string>();
     const body = txBodyBytes(tx);
     for (const s of tx.signatures) {
       const address = toHex(s.address);
@@ -656,26 +702,29 @@ export class CoreApp implements Application {
       if (schemeOf(s.signature) !== this.chainScheme) return 'signature of another scheme than the chain uses';
       // A cache hit is only for the exact signature bytes seen before.
       const sigHash = toHex(sha256(s.signature));
-      if (this.isVerified(txKey, address, sigHash)) continue;
+      if (this.isVerified(txKey, address, sigHash)) {
+        signed.add(address);
+        continue;
+      }
       jobs.push({ sig: s.signature, msg: body, publicKey, context: this.context });
       jobKeys.push([address, sigHash]);
     }
     if (jobs.length > 0) {
       const results = await this.verifier.verify(jobs);
       if (results.some((ok) => !ok)) return 'invalid signature';
-      for (const [address, sigHash] of jobKeys) this.cacheVerified(txKey, address, sigHash);
+      for (const [address, sigHash] of jobKeys) {
+        signed.add(address);
+        this.cacheVerified(txKey, address, sigHash);
+      }
     }
-    return null;
+    return signed;
   }
 
-  /** Thresholds against current state, then the state changes, in a nested session. Synchronous on purpose. */
-  private applyChecked(tx: Transaction, txId: Uint8Array, time: bigint, height: bigint, keep: boolean, final: boolean): TxResult {
-    const txKey = toHex(txId);
-    const signed = new Set<string>();
-    for (const s of tx.signatures) {
-      const a = toHex(s.address);
-      if (this.isVerified(txKey, a, toHex(sha256(s.signature)))) signed.add(a);
-    }
+  /**
+   * Thresholds against current state, then the state changes, in a nested session. Synchronous on purpose.
+   * `signed` is what verifySignatures returned for this transaction.
+   */
+  private applyChecked(tx: Transaction, txId: Uint8Array, signed: ReadonlySet<string>, time: bigint, height: bigint, keep: boolean, final: boolean): TxResult {
     if (signed.size !== tx.signatures.length) return { ok: false, error: 'unverified signature' };
     const required = requiredAuthorities(tx.operations);
     for (const id of required.owner) {

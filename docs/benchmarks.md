@@ -421,8 +421,10 @@ several); the genesis rows at 191,896 accounts under secp256k1 (56 MB):
 | of which import / indices and root | 3,899 / 1,119 ms | 281 to 298 / 4,462 to 4,508 ms |
 | heap after a restart | 585 MiB | 572 MiB (array buffers 79 to 90 MiB) |
 
-The fallback, from the db suite at 100,000 balances and 21,000 accounts (per 1,000 lookups and
-per 100 scanned entries, the same runs):
+The fallback, from the db suite at 100,000 balances and 24,000 or more accounts (the suite then
+ran its account-creation row as many times as its time budget allowed, at least four; it now runs
+it a fixed six times, prints the state, 26,000 accounts, and the rows that follow run on that;
+per 1,000 lookups and per 100 scanned entries, the same runs):
 
 | | resident | dropped, in-memory store | dropped, LMDB |
 |---|---:|---:|---:|
@@ -481,7 +483,15 @@ The three ways to reopen the same store, in one run: the trees from their chunks
 with every object hashed against its leaf (the default) 5.18 s, the same without the leaf
 check 4.56 s, the trees computed from the objects 8.46 s.
 
-Dropped trees, from the db suite (100,000 balances and 21,000 accounts, the trees over LMDB;
+Since then a restart checks the stored trees and index entries in full (STATE-PAGING.md 5.3:
+every dense node against its children, every sparse node against its parent's hash, every
+non-empty leaf against an object, every index entry against the objects). The same three
+reopens, before and after in one session: 5.08 to 6.48 s (indices, trees and root 1,351 to
+2,597 ms), 4.46 to 5.05 s (732 to 1,195 ms; the index entry check still runs) and 8.22 to
+8.90 s. The index entry check, which decodes every object once, is about 0.46 s of that and
+the tree check about 0.78 s.
+
+Dropped trees, from the db suite (100,000 balances and 24,000 or more accounts, as above, the trees over LMDB;
 means, and medians where a first cold iteration pulls the mean):
 
 | | resident | dropped |
@@ -539,6 +549,11 @@ limit in MiB).
 In all: 107 blocks and 59,128 transfers in 40 s (1,478 a second, against 1,700 to 1,800 in the
 first eight seconds), 79 of the blocks and 44,036 of the transfers committed with the Merkle
 trees dropped, and no abort.
+
+The rates in this section were taken over the nominal 40 seconds. A window's sleep runs late by
+whatever holds the event loop (collections, commits), so the run took longer than that and the
+rates are somewhat high; the suite now ends each window by the clock, prints the time each
+window and the whole run actually took, and divides by those.
 
 The same node run over three states and five heap limits, each limit a multiple of the state's
 resident heap (the first run of each size at the default 1.25, which is also how the resident

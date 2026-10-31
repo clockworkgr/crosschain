@@ -60,7 +60,7 @@ describe('signature schemes', () => {
     expect(() => decode(new Uint8Array([0, 1, 2, 3]), decodeSignature)).toThrow(/unknown signature scheme 0/);
   });
 
-  it('refuses the high-S twin of a secp256k1 signature, so a signed object has one encoding', () => {
+  it('refuses the high-S twin of a secp256k1 signature, so no one but the signer can make a second valid one', () => {
     const ctx = signContext('chain', 'tx');
     const kp = keyPairFromSeed(seedFor('schemes/lowS'), Scheme.secp256k1);
     const sig = sign(msg, kp.secretKey, ctx);
@@ -77,14 +77,15 @@ describe('signature schemes', () => {
     try {
       const path = join(dir, 'keystore.json');
       const ks = Keystore.create(path, 'pw');
-      const ml = ks.add('ml');
+      // ML-DSA-44 whatever CHAIN_SCHEME says, since the file is made to look like one from before secp256k1 below.
+      const ml = ks.add('ml', undefined, Scheme.mlDsa44);
       const ec = ks.add('ec', undefined, Scheme.secp256k1);
       const again = Keystore.open(path, 'pw');
       expect(again.get('ml').scheme).toBe(ml.scheme);
       expect(again.get('ec').scheme).toBe(Scheme.secp256k1);
       expect(toHex(again.get('ec').publicKey)).toBe(toHex(ec.publicKey));
       expect(again.list().map((k) => [k.name, k.scheme])).toEqual([
-        ['ml', ml.scheme === Scheme.mlDsa44 ? 'ml-dsa-44' : 'secp256k1'],
+        ['ml', 'ml-dsa-44'],
         ['ec', 'secp256k1'],
       ]);
       // A file from before there were two schemes names none; its keys are ML-DSA-44.

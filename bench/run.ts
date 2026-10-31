@@ -10,6 +10,7 @@
  * process on one machine; the network suite runs four validators in that
  * process, so it measures the engine and the application, not the wire.
  */
+import './scheme.ts';
 import { machine, summaryMarkdown } from './harness.ts';
 
 const suites: Record<string, () => Promise<void>> = {

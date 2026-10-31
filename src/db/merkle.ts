@@ -592,6 +592,57 @@ export class DenseMerkleTree {
     }
   }
 
+  /**
+   * Check a tree taken from a store (loaded, or dropped onto it) before anything trusts it, its size set first: every
+   * non-empty node above the leaves is the hash of its two children, every non-empty node below the top has a
+   * non-empty parent, every chunk is a whole number of hashes, and nothing lies outside the tree's size. The top node
+   * is the caller's to compare with what it is committed to; with these it commits to every leaf. Throws on the first
+   * fault; returns the number of non-empty leaves, for the caller to compare with the objects. One hash per non-empty
+   * inner node, and each chunk read at most four times (itself, as a parent and as one of two children).
+   */
+  verify(): number {
+    const h = this.height;
+    const source = this.source;
+    const chunkAt = (k: number, c: number): Uint8Array | undefined => (source ? source.get(chunkKey(this.id, k, c)) : this.levels[k]?.get(c));
+    const at = (buf: Uint8Array | undefined, slot: number): Uint8Array => (buf && slot * HASH_SIZE < buf.length ? buf.subarray(slot * HASH_SIZE, (slot + 1) * HASH_SIZE) : EMPTY);
+    let leaves = 0;
+    const visit = (k: number, c: number, buf: Uint8Array): void => {
+      const where = `tree ${this.id}, level ${k}, chunk ${c}`;
+      if (buf.length % HASH_SIZE !== 0 || buf.length > CHUNK_BYTES) throw new Error(`${where}: not a whole chunk of hashes`);
+      let left: Uint8Array | undefined;
+      let right: Uint8Array | undefined;
+      let parent: Uint8Array | undefined;
+      let read = false;
+      for (let slot = 0; slot * HASH_SIZE < buf.length; slot++) {
+        if (emptyAt(buf, slot * HASH_SIZE)) continue;
+        const j = c * CHUNK + slot;
+        if (k > h || j >= this.nodesAt(k)) throw new Error(`${where}: node ${j} lies outside a tree of ${this.size} leaves`);
+        if (!read) {
+          read = true;
+          if (k > 0) {
+            left = chunkAt(k - 1, 2 * c);
+            right = chunkAt(k - 1, 2 * c + 1);
+          }
+          if (k < h) parent = chunkAt(k + 1, Math.floor(c / 2));
+        }
+        if (k === 0) leaves++;
+        else {
+          const child = slot < CHUNK / 2 ? left : right;
+          const first = (2 * slot) % CHUNK;
+          if (!bytesEqual(buf.subarray(slot * HASH_SIZE, (slot + 1) * HASH_SIZE), innerHash(at(child, first), at(child, first + 1)))) throw new Error(`${where}: node ${j} is not the hash of its children`);
+        }
+        if (k < h && isEmpty(at(parent, (c % 2) * (CHUNK / 2) + (slot >> 1)))) throw new Error(`${where}: node ${j} has an empty parent`);
+      }
+    };
+    if (source) {
+      for (const [key, value] of source.range(treePrefix(this.id), treePrefixEnd(this.id))) {
+        if (key.length !== 10) throw new Error(`tree ${this.id}: a chunk key of ${key.length} bytes`);
+        visit(key[3]!, ((key[4]! << 8) | key[5]!) * 2 ** 32 + (((key[6]! << 24) | (key[7]! << 16) | (key[8]! << 8) | key[9]!) >>> 0), value);
+      }
+    } else this.levels.forEach((level, k) => level?.forEach((buf, c) => visit(k, c, buf)));
+    return leaves;
+  }
+
   /** Every chunk as it stands, as store keys and values: what a store written from scratch holds. */
   *entries(): IterableIterator<[Uint8Array, Uint8Array]> {
     if (this.source) {

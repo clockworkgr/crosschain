@@ -58,23 +58,33 @@ table of references, and a hot cache of decoded objects over it.
 - **Arena** (`src/db/arena.ts`): slabs of bytes, the first 256 KiB and each next one twice
   the last up to 16 MiB, filled by a bump allocator. An entry is a 10-byte header (type u16,
   instance u32, length u32) followed by the encoding. Freeing an entry only counts its bytes
-  dead; a slab whose dead bytes exceed half its used bytes is compacted after a root: its live
-  entries are copied into the current slab, their owners are told the new references, and the
-  slab's buffer is released. At most two slabs are compacted per root, so the pause is
-  bounded by 16 MiB of copying. An encoding larger than a slab is refused (no object is: the
+  dead. After a root, a slab with nothing live left is released outright, with no copying,
+  however many there are; a slab whose dead bytes exceed half its used bytes is compacted: its
+  live entries are copied into the current slab, their owners are told the new references,
+  and the slab's buffer is released. Compaction copies at most what the root's block wrote
+  into the arena (and at least 16 MiB), so the pause stays in proportion to the block, and
+  since a compacted slab gives back more than it copies, reclaiming keeps up with any rate of
+  writes and a backlog drains. An encoding larger than a slab is refused (no object is: the
   largest, the dynamic properties with a thousand validators, is under 2 MiB).
 - **References**: per type, a `Float64Array` of slab-and-offset packed into one number
   (-1 for absent) and a `Uint32Array` of lengths, both growing by doubling with the instance
-  counter.
+  counter. A released slab's number goes to the next slab with its generation counted up, so
+  the numbers stay as few as the slabs alive at once: 24 bits of offset, 16 of slot and 13 of
+  generation fit the 53 bits a double holds exactly, and `packRef` refuses anything beyond. The
+  generation refuses a stale reference into a reused slot.
 - **Hot cache**: per type, a `Map` from instance to decoded object, evicted by CLOCK: a hit
   sets the instance's touched bit, a fresh decode enters with it clear (so a one-time read is
   the first to go and a scan of the state does not wash out a block's working set), and when
-  the budget is spent a hand sweeps the type's instances, clearing bits it finds set and
-  evicting the first clean entry it finds clear. A hit is one byte store, an eviction a few
-  map lookups, and nothing is ever sorted; a type whose cache is all pinned (a genesis being
+  the budget is spent a hand sweeps the type's cached entries in the map's order, sending
+  one whose bit is set (or that is pinned) to the back with the bit cleared and evicting
+  clean ones it finds clear until the budget is met, each entry passed at most twice; it walks
+  what is cached, not the instances, so cached objects far apart among the instances cost no
+  more. A hit is one byte store, an eviction a few map operations, and nothing is ever sorted; a type whose cache is all pinned (a genesis being
   built) marks itself saturated and does nothing until the next root. Dirty objects (written
   since the last root) are pinned and never evicted; tombstones (`null`) mark removals the
-  arena has not seen yet. The budget `hotObjects` is shared by all types and unbounded by
+  arena has not seen yet. Undoing a session that created objects forgets only the instances
+  it created, from its starting counter up, so a failed transaction costs what it did, not
+  what is cached. The budget `hotObjects` is shared by all types and unbounded by
   default, so a node with memory to spare keeps every decoded object and runs as it did;
   `setHotLimit(n)` changes it at run time, and the memory guard does: 100,000 at `warn`,
   10,000 at `pressure`, unbounded again at `ok` (section 7).
@@ -170,8 +180,14 @@ As built (`src/db/indexstore.ts`):
   cheapest order to grow in) and the sparse trees from the same entries. Measured at 192,000
   accounts this is as fast as decoding every object for its keys was, within a few percent
   (both are dominated by hashing the name tree; 4.4), and it is the read a node with dropped
-  trees does anyway, so it is the one kept. A store written before phase two has no 'i'
-  prefix; opening one decodes the objects for their keys as before and writes the entries once.
+  trees does anyway, so it is the one kept. The entries are then checked against the objects
+  (`checkIndexEntries`, the default): every object is decoded once for its keys, without being
+  cached, each key must be stored naming that object, and each index must hold no more entries
+  than there are objects. The app hash covers only the authenticated indices, so without the
+  check a damaged entry would send a lookup, and the writes after it, to the wrong object; at
+  192,000 accounts it costs about 0.46 s of a restart (5.3). A store written before phase two
+  has no 'i' prefix; opening one decodes the objects for their keys as before and writes the
+  entries once.
 - **Checked.** `checkIndexStore()` (for tests) compares the resident trees with the store:
   every tree entry is there with its value, and the count of keys under each index's prefix
   equals the tree's size.
@@ -377,9 +393,12 @@ As built:
   `openObjectDatabase` does that by default and checks the root against the stored app hash
   as before. That root equals the stored hash by construction unless the store is
   inconsistent, so by itself it would no longer prove that the objects hash to it; the default
-  therefore also hashes every object and compares it with its leaf (`checkLeaves`, about an
-  eighth of the restart), which keeps the property the old path had: a corrupt object store
-  fails at startup, not when something reads the object. `checkLeaves: false` skips it, and
+  therefore checks what it took (`checkLeaves`), resident or dropped: every dense node above
+  the leaves must be the hash of its children and lie inside the tree, every sparse node's
+  encoding must hash to what its parent says, every object must hash to its leaf, and each
+  type's tree must have as many non-empty leaves as there are objects, so no leaf has lost its
+  object. With the root compared to the app hash that keeps the property the old path had: a
+  corrupt store fails at startup, not when something reads it. `checkLeaves: false` skips it, and
   `fromTrees: false` recomputes the trees from the objects (the old path, about twice as
   slow; 5.3). A store written before phase four
   has no 't' prefix: opening it recomputes the trees and writes them once, as phase two did
@@ -413,6 +432,14 @@ and nodes with every object hashed against its leaf (the default) 5.18 s, the sa
 the leaf check 4.56 s, the trees computed from the objects 8.46 s. What is left of a restart is mostly the history (3.5 s at
 height 1): rebuilding the sparse trees' past versions replays every account, which the
 store does not hold in a form to load; that is not changed here.
+
+Checking the trees and the index entries in full (every dense and sparse node, every leaf
+against an object, every index entry against the objects), measured the same way in one run
+before and after: the default reopen went from 5.08 to 6.48 s (indices, trees and root 1,351
+to 2,597 ms), the reopen without the leaf check, which still checks the index entries, from
+4.46 to 5.05 s (732 to 1,195 ms), and the reopen that computes the trees from the objects
+from 8.22 to 8.90 s. So the index entry check is about 0.46 s and the tree check about
+0.78 s on top of the 0.62 s the leaf check already took.
 
 The genesis writes about 600,000 sparse nodes (the name tree of 192,000 leaves and their
 inner nodes) and 25 MiB of chunks: 120 MiB more of LMDB, 0.7 s more to write, a quarter of a
@@ -491,7 +518,12 @@ As built (`src/node/node.ts`, `onMemoryLevel`):
   first. The estimate comes from the database (`rebuildEstimate()`): every committed object
   has one entry in each index of its type and one leaf in each authenticated index's sparse
   tree, at 210 and 1,000 bytes of heap, which is what dropping them gave back at 192,000
-  accounts, within a few percent. What it is compared with is not one sample: right after
+  accounts, within a few percent. A sparse tree's rebuild also builds every retained
+  version (a node for each record its past versions hold, the subtrees they share with a
+  newer one built once) and throws away the nodes and keys it reads, which the heap the guard
+  measures holds until a collection; so a leaf counts 2,000 bytes and each record 500, what a
+  rebuild allocated before a collection at 50,000 leaves and at 1,000 leaves with thirty
+  versions of churn behind them (the second had read 1 MB, for 52 MB allocated). What it is compared with is not one sample: right after
   a major collection the heap reads a few hundred MiB lower than it will a second later,
   and a rebuild judged on such a sample flapped just the same. The node waits until ten
   samples have been seen since the drop (ten seconds at the default interval) and compares
@@ -632,10 +664,10 @@ paging, so the operator knows whether to add memory or a faster disk.
 |---|---|
 | hotObjects | unbounded; the guard caps it at 100,000 (`warn`) and 10,000 (`pressure`) |
 | slab size | 256 KiB first, doubling to 16 MiB |
-| compaction | a slab with dead bytes over half its used bytes, at most two per root |
+| compaction | every slab with nothing live, without copying; then slabs with dead bytes over half their used bytes, copying at most what the root wrote (at least 16 MiB) |
 | entry header | 10 bytes: type u16, instance u32, length u32 |
 | treeChunks | 256 dense tree chunks cached while the trees are dropped (at most 8 MiB) |
-| rebuild estimate | 210 bytes of heap per index entry, 1,000 per sparse tree leaf |
+| rebuild estimate | 210 bytes of heap per index entry; 2,000 per sparse tree leaf (1,000 kept, 1,000 thrown away) and 500 per node record of a retained version |
 
 ## 11. Tests
 

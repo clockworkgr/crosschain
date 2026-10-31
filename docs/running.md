@@ -89,17 +89,20 @@ of physical memory, or the `--heap` figure in MiB (a whole number, at least 256)
 the node under a N MiB heap limit (--heap <MiB> changes it), collections scheduled after
 commits`, passes `SIGINT` and `SIGTERM` on to the child, whose shutdown runs once however many
 it gets, and exits with the child's code. When `--max-old-space-size` is already in effect (in
-`node`'s own arguments or in `NODE_OPTIONS`), or `CROSSCHAIN_CHILD` is set, it runs in place
-instead. The node then reads `config.json` and the `genesis.json` in the parent directory, opens
+`node`'s own arguments or in `NODE_OPTIONS`, quoted or not, with dashes or V8's underscores),
+or `CROSSCHAIN_CHILD` is set, it runs in place instead. The node then reads `config.json` and the `genesis.json` in the parent directory, opens
 LMDB under `nodeN/data/lmdb` (the application state comes back from the store with its indices
-and trees, every object checked against its leaf; section 12), connects to the seeds, and serves
+and trees, every tree node, leaf and index entry checked against the objects; section 12), connects to the seeds, and serves
 RPC on the configured address.
 Every five seconds it logs a status line: height, peers, mempool size, consensus round, active
 validator count, the community pool, `heap=<used>/<limit> MiB` (the limit being the
 `--max-old-space-size` figure, section 12), `memory=<level>` (the memory
 guard's level, section 12) and `gc=<n> pauses, <total> ms, longest <max> ms` (every garbage
 collection V8 ran since start). `SIGINT` or `SIGTERM` shuts down cleanly; so does the guard's
-`critical` level, with exit code 3, so a supervisor can restart the node with a larger `--heap`.
+`critical` level, with exit code 3, so a supervisor can restart the node with a larger `--heap`,
+including when the heap is already that full at the guard's first sample. Shutting down stops
+consensus and block sync at once and lets the block being applied finish its writes; RPC
+requests still open get a second (none at `critical`) before their connections are closed.
 Logs go to stderr; `LOG=debug` shows every proposal, vote and timeout, `LOG=warn` only problems.
 
 Blocks are produced as soon as more than two thirds of the voting power is connected: with four
@@ -215,7 +218,8 @@ Environment: `LOG` sets the log level (`debug`, `info`, `warn`, `error`); `CHAIN
 the keystore passphrase. `CHAIN_SCHEME` is read only by the local network script, the tests and
 the benchmarks (section 2); a node follows the scheme its genesis names. `CROSSCHAIN_CHILD` is
 set by `start` for the child process it runs the node in (section 3.2); `NODE_OPTIONS` with a
-`--max-old-space-size` of your own makes `start` run in place under that limit.
+`--max-old-space-size` of your own (or `--max_old_space_size`) makes `start` run in place under
+that limit.
 
 Data lives under `nodeN/data`: the LMDB environment in `lmdb` holds two stores, `chain` (blocks,
 commits, validator sets, results, the transaction index, the headers a state-synced node keeps
@@ -580,7 +584,8 @@ node's answer, unproven.
   (130 to 175 MiB for the index trees and 190 to 220 MiB for the Merkle trees at 192,000
   accounts) that a node which rebuilt them at the first `ok` sample went straight back to
   `pressure`, over and over. So the node waits ten samples after a drop, then rebuilds a tier
-  when its estimated heap (210 bytes per index entry, 1,000 per name-tree leaf) fits under the
+  when its estimated heap (210 bytes per index entry, 2,000 per name-tree leaf and 500 per
+  record of a past version it must build again) fits under the
   `warn` line beside the highest of those ten samples, the index trees first (`memory: index
   trees rebuilt`, `memory: Merkle trees rebuilt`); what does not fit stays dropped, the node
   running on the store at `ok`, and the guard says once what it is waiting for (`memory:
@@ -662,3 +667,5 @@ node's answer, unproven.
 | `data directory ... is in use` | another node has the directory open (its pid is in `data/LOCK`); stop it first |
 | `stored objects do not hash to the stored app hash` | the application store is corrupt or from another version; stop the node, delete `data/lmdb` only and resync, keeping `data/priv_validator_state.bin`, the double-sign guard |
 | `object <id> does not hash to its leaf in the stored tree` | the same, found earlier: at startup the Merkle trees came back from their stored chunks and nodes, every object was hashed against the leaf the tree holds for it, and one did not match. The fix is the row above |
+| `the stored tree has n leaves for m objects`, `... is not the hash of its children`, `sparse tree node ... does not hash to what its parent says` | the same: a stored object is missing while its tree still holds its leaf, or a stored tree node is damaged. The fix is the row above |
+| `<type>.<index>: the stored entry for object <id> is missing` (or `is object <id>'s`, `the store holds n entries for m objects`, `a stored index entry is malformed`) | the same: the stored index entries do not match the objects, which the app hash cannot show for an index it does not cover. The fix is the row above |

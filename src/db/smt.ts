@@ -114,6 +114,19 @@ function encodingOf(n: Node): Uint8Array {
   return n.leaf ? leafEncoding(n.leaf.keyHash, n.leaf.value) : innerEncoding(n.left?.hash ?? EMPTY, n.right?.hash ?? EMPTY);
 }
 
+/**
+ * A node read from the store, against the hash its parent gives it: a well-formed encoding that hashes to it, a leaf
+ * whose key lies on the path to it, an inner node with a child. The hash then pins the node down, so a tree checked
+ * this way from a trusted root holds what was committed.
+ */
+function checkNode(e: Uint8Array, hash: Uint8Array, path: Uint8Array, depth: number, where: string): void {
+  if (e[0] === LEAF ? e.length < 33 : e[0] !== INNER || e.length !== 65) throw new Error(`${where}: not a node encoding`);
+  if (!bytesEqual(hashOfEncoding(e), hash)) throw new Error(`${where} does not hash to what its parent says`);
+  if (e[0] === LEAF) {
+    for (let d = 0; d < depth; d++) if (bit(e, 8 + d) !== bit(path, d)) throw new Error(`${where}: a leaf off its key's path`);
+  } else if (isEmpty(childOf(e, 0)) && isEmpty(childOf(e, 1))) throw new Error(`${where}: an inner node with no children`);
+}
+
 function hashOfEncoding(e: Uint8Array): Uint8Array {
   return e[0] === LEAF ? leafHash(e.subarray(1, 33), e.subarray(33)) : innerHash(e.subarray(1, 33), e.subarray(33, 65));
 }
@@ -240,6 +253,8 @@ export class SparseMerkleTree {
   /** Per node key (as a string): before version v the node was enc (null: absent). Ascending by v. */
   private readonly history = new Map<string, { v: number; enc: Uint8Array | null }[]>();
   private readonly historyByVersion = new Map<number, string[]>();
+  /** How many records `history` holds: about the nodes a rebuild makes for the versions before the last commit. */
+  private historyCount = 0;
   /** The nodes the commit in progress wrote, by key. */
   private work: Map<string, NodeWrite> | null = null;
 
@@ -259,6 +274,11 @@ export class SparseMerkleTree {
 
   get resident(): boolean {
     return this.source === null;
+  }
+
+  /** While dropped: the records of past versions, each about one node a rebuild makes besides the current tree's. */
+  get historyNodes(): number {
+    return this.historyCount;
   }
 
   /** The store a dropped tree reads, for a tree that replaces it. */
@@ -428,6 +448,7 @@ export class SparseMerkleTree {
         let entries = this.history.get(s);
         if (!entries) this.history.set(s, (entries = []));
         entries.push({ v, enc: a ? encodingOf(a) : null });
+        this.historyCount++;
         keys.push(s);
       });
       if (keys.length > 0) this.historyByVersion.set(v, keys);
@@ -463,22 +484,56 @@ export class SparseMerkleTree {
     this.roots.clear();
     this.history.clear();
     this.historyByVersion.clear();
+    this.historyCount = 0;
     for (const [v, n] of built) this.versions.set(v, n);
     this.root = root;
   }
 
-  /** A fresh tree takes its nodes from a store that holds them (a restart), instead of inserting every key. */
-  load(source: TreeSource): void {
+  /**
+   * A fresh tree takes its nodes from a store that holds them (a restart), instead of inserting every key. With
+   * `check`, every node's encoding must hash to what its parent says it is, so the root, which the caller compares
+   * with what it is committed to, commits to every node; one hash per node.
+   */
+  load(source: TreeSource, check = true): void {
     if (this.version >= 0 || this.source || this.root) throw new Error('nodes are loaded only into a fresh resident tree');
     const e = source.get(nodeKey(this.header, EMPTY, 0));
-    this.root = e ? this.build((k) => source.get(k) ?? null, new Uint8Array(32), 0, hashOfEncoding(e), null) : null;
+    this.root = e ? this.build((k) => source.get(k) ?? null, new Uint8Array(32), 0, hashOfEncoding(e), null, check) : null;
+  }
+
+  /**
+   * The check load() makes, for a tree dropped onto a store that a restart did not write: walk every node from the
+   * stored root, each one's encoding hashing to what its parent says, and each leaf on its own key's path, without
+   * keeping any. Returns the number of leaves.
+   */
+  verifyStored(): number {
+    const source = this.source;
+    if (!source || this.version >= 0) throw new Error('only a dropped tree not yet committed is checked against its store');
+    const e = source.get(nodeKey(this.header, EMPTY, 0));
+    if (!e) return 0;
+    const walk = (path: Uint8Array, depth: number, hash: Uint8Array): number => {
+      const enc = source.get(nodeKey(this.header, path, depth));
+      const where = `sparse tree node at depth ${depth}`;
+      if (!enc) throw new Error(`${where} is missing from the store`);
+      checkNode(enc, hash, path, depth, where);
+      if (enc[0] === LEAF) return 1;
+      let n = 0;
+      for (const side of [0, 1]) {
+        const child = childOf(enc, side);
+        if (isEmpty(child)) continue;
+        setBit(path, depth, side);
+        n += walk(path, depth + 1, child.slice());
+      }
+      return n;
+    };
+    return walk(new Uint8Array(32), 0, hashOfEncoding(e));
   }
 
   /** Build the subtree at a path whose hash is known, reusing `same` (the node at that path in another version) where the hash matches. */
-  private build(read: (key: Uint8Array) => Uint8Array | null, path: Uint8Array, depth: number, hash: Uint8Array, same: Node | null): Node {
+  private build(read: (key: Uint8Array) => Uint8Array | null, path: Uint8Array, depth: number, hash: Uint8Array, same: Node | null, check = false): Node {
     if (same && bytesEqual(same.hash, hash)) return same;
     const e = read(nodeKey(this.header, path, depth));
     if (!e) throw new Error('a sparse tree node is missing from the store');
+    if (check) checkNode(e, hash, path, depth, `sparse tree node at depth ${depth}`);
     if (e[0] === LEAF) return { hash: hash.slice(), leaf: { keyHash: e.slice(1, 33), value: e.slice(33) } };
     const l = childOf(e, 0);
     const r = childOf(e, 1);
@@ -486,11 +541,11 @@ export class SparseMerkleTree {
     let right: Node | null = null;
     if (!isEmpty(l)) {
       setBit(path, depth, 0);
-      left = this.build(read, path, depth + 1, l.slice(), same && !same.leaf ? same.left : null);
+      left = this.build(read, path, depth + 1, l.slice(), same && !same.leaf ? same.left : null, check);
     }
     if (!isEmpty(r)) {
       setBit(path, depth, 1);
-      right = this.build(read, path, depth + 1, r.slice(), same && !same.leaf ? same.right : null);
+      right = this.build(read, path, depth + 1, r.slice(), same && !same.leaf ? same.right : null, check);
     }
     return { hash: hash.slice(), left, right };
   }
@@ -543,6 +598,7 @@ export class SparseMerkleTree {
         let entries = this.history.get(s);
         if (!entries) this.history.set(s, (entries = []));
         entries.push({ v: version, enc: w.before });
+        this.historyCount++;
         keys.push(s);
       }
     }
@@ -558,7 +614,10 @@ export class SparseMerkleTree {
       if (v > min) continue;
       for (const s of list) {
         const entries = this.history.get(s)!;
-        while (entries.length > 0 && entries[0]!.v <= min) entries.shift();
+        while (entries.length > 0 && entries[0]!.v <= min) {
+          entries.shift();
+          this.historyCount--;
+        }
         if (entries.length === 0) this.history.delete(s);
       }
       this.historyByVersion.delete(v);

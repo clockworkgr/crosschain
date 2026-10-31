@@ -247,6 +247,7 @@ export class ValidatorSet {
       const publicKey = decodePublicKey(r);
       const power = r.u64();
       const priority = r.i64();
+      if (!isPublicKey(publicKey)) throw new Error('bad public key');
       if (power <= 0n) throw new Error('validator power must be positive');
       return { address: addressOf(publicKey), publicKey, power, priority };
     }, 10_000);

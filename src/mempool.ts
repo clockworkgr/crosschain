@@ -93,18 +93,27 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
     if (this.txs.size >= this.opts.maxTxs) return { status: 'full', hash };
     // Mark before the await so a concurrent duplicate is not checked twice.
     this.remember(key);
+    // The application asks this again after its last wait, so a transaction refused here is not applied to its
+    // pending state either.
+    const admit = () => this.pausedReason ?? (this.txs.size >= this.opts.maxTxs ? 'mempool full' : null);
     let res: Awaited<ReturnType<Application['checkTx']>>;
     try {
-      res = await this.app.checkTx(tx);
+      res = await this.app.checkTx(tx, { admit });
     } catch (e) {
       this.cache.delete(key); // nothing was decided about it; the next submission checks again
       throw e;
     }
-    if (!res.ok) return { status: 'invalid', hash, error: res.error };
+    // Load shedding may have begun while it was checked: it is refused as one arriving now would be, neither pooled
+    // nor gossiped, and forgotten, so it is checked again once the node admits again.
+    if (this.pausedReason !== null) {
+      this.cache.delete(key);
+      return { status: 'paused', hash, error: this.pausedReason };
+    }
     if (this.txs.size >= this.opts.maxTxs) {
       this.cache.delete(key); // the pool filled while we checked; let the sender try again rather than hear "seen"
       return { status: 'full', hash };
     }
+    if (!res.ok) return { status: 'invalid', hash, error: res.error };
     this.txs.set(key, tx);
     this.emit('tx', hash, tx, source);
     return { status: 'added', hash };
