@@ -32,6 +32,9 @@ const emit = (o: Record<string, unknown>) => console.log(JSON.stringify(o));
 const [dir, accountsArg, secondsArg] = process.argv.slice(2);
 const N = Number(accountsArg);
 const seconds = Number(secondsArg ?? 40);
+/** How many transfers the feeder keeps ahead of the chain (about two blocks by default), and how often a window is reported. */
+const AHEAD = Number(process.env.BENCH_PAGING_AHEAD ?? 1000);
+const WINDOW_S = Number(process.env.BENCH_PAGING_WINDOW ?? 2);
 const t0 = performance.now();
 const verifier = new WorkerVerifier();
 const env = new LmdbEnv(join(dir!, 'lmdb'));
@@ -83,7 +86,7 @@ const expiration = BigInt(Date.now()) + 3_600_000n;
 const rnd = () => Math.floor(Math.random() * N);
 // Keep about two blocks' worth ahead of the chain; a transfer refused while the mempool is paused is not retried.
 const feeder = setInterval(() => {
-  if (submitted - committed - refused >= 1000) return;
+  if (submitted - committed - refused >= AHEAD) return;
   for (let i = 0; i < 200; i++) {
     const from = rnd();
     let to = rnd();
@@ -98,15 +101,36 @@ const feeder = setInterval(() => {
 }, 20);
 let lastBlocks = 0;
 let lastTxs = 0;
+let lastRefused = 0;
+let lastGc = node.gcScheduler.stats();
 const levels: string[] = [];
 node.onMemory((level) => levels.push(level));
-for (let s = 2; s <= seconds; s += 2) {
-  await sleep(2000);
+for (let s = WINDOW_S; s <= seconds; s += WINDOW_S) {
+  await sleep(WINDOW_S * 1000);
   const d = app.db.memory();
   const m = memoryStats();
-  emit({ event: 'window', s, blocks: blocks - lastBlocks, txs: committed - lastTxs, level: node.memoryLevel, objects: d.objects, indexTrees: d.indexTrees, trees: d.trees, heap: MiB(m.heapUsed), limit: MiB(m.heapLimit) });
+  const gc = node.gcScheduler.stats();
+  emit({
+    event: 'window',
+    s,
+    blocks: blocks - lastBlocks,
+    txs: committed - lastTxs,
+    refused: refused - lastRefused,
+    mempool: node.mempool.size,
+    level: node.memoryLevel,
+    objects: d.objects,
+    indexTrees: d.indexTrees,
+    trees: d.trees,
+    heap: MiB(m.heapUsed),
+    limit: MiB(m.heapLimit),
+    gcPauses: gc.collections - lastGc.collections,
+    gcMs: Math.round(gc.totalMs - lastGc.totalMs),
+    gcMax: Math.round(gc.maxMs * 10) / 10,
+  });
   lastBlocks = blocks;
   lastTxs = committed;
+  lastRefused = refused;
+  lastGc = gc;
 }
 clearInterval(feeder);
 emit({ event: 'summary', blocks, txs: committed, pagedBlocks: paged.blocks, pagedTxs: paged.txs, submitted, refused, levels: levels.join(' ') });

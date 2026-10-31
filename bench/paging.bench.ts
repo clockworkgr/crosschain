@@ -35,8 +35,8 @@ import { LmdbEnv } from '../src/store/lmdb.ts';
 import { fact, fmtMs, suite } from './harness.ts';
 import { buildBigState, CHAIN_ID, MB, memory, POOL, type BigState } from './bigstate.ts';
 
-/** How long the node runs under its heap limit. */
-const NODE_SECONDS = 40;
+/** How long the node runs under its heap limit; BENCH_PAGING_SECONDS lengthens it for a stress run. */
+const NODE_SECONDS = Number(process.env.BENCH_PAGING_SECONDS ?? 40);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const MiB = (n: number) => `${(n / 1048576).toFixed(0)} MiB`;
 
@@ -89,13 +89,15 @@ export async function run(): Promise<void> {
       const opened = lines.find((l) => l.event === 'opened');
       fact('node: heap limit (--max-old-space-size)', `${heapMb} MiB, 1.25 times the resident heap of the state; the node opened its store in ${opened?.ms} ms with ${opened?.heap} MiB of heap`);
       for (const w of lines.filter((l) => l.event === 'window')) {
-        fact(`node, ${String(w.s).padStart(2)} s`, `${w.blocks} blocks, ${w.txs} transfers; ${w.level}, objects ${w.objects}, index trees ${w.indexTrees}, Merkle trees ${w.trees}; heap ${w.heap} of ${w.limit} MiB`);
+        fact(`node, ${String(w.s).padStart(3)} s`, `${w.blocks} blocks, ${w.txs} transfers, ${w.refused} refused, mempool ${w.mempool}; ${w.level}, objects ${w.objects}, index trees ${w.indexTrees}, Merkle trees ${w.trees}; heap ${w.heap} of ${w.limit} MiB; gc ${w.gcPauses} pauses, ${w.gcMs} ms, longest so far ${w.gcMax} ms`);
       }
       for (const l of lines.filter((l) => l.event === 'log')) fact(`node log at ${l.s} s`, `${l.msg}${l.heap ? ` (${l.heap})` : ''}${l.needs ? ` (needs ${l.needs}, room ${l.room})` : ''}`);
       const sum = lines.find((l) => l.event === 'summary');
       if (sum) fact(`node: ${NODE_SECONDS} s in all`, `${sum.blocks} blocks, ${sum.txs} transfers (${(Number(sum.txs) / NODE_SECONDS).toFixed(0)}/s); ${sum.pagedBlocks} blocks holding ${sum.pagedTxs} transfers committed with the Merkle trees dropped; ${sum.submitted} submitted, ${sum.refused} refused; levels: ${sum.levels || 'none'}`);
       else fact('node: did not finish', `exit code ${code}`);
     }
+    // A stress run wants the node alone; BENCH_PAGING_MODES=0 skips the database modes below.
+    if (process.env.BENCH_PAGING_MODES === '0') return;
     // The state as the node left it, reopened from the store.
     const env = new LmdbEnv(join(dir, 'lmdb'));
     const app = new CoreApp({ genesis, verifier, kv: env.store('app'), snapshotInterval: 0 });

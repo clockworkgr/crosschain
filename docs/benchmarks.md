@@ -13,6 +13,7 @@ npm run bench:genesis          # the genesis and scale suites on a 1 GB genesis:
 BENCH_GENESIS_MB=100 npm run bench:genesis   # a smaller genesis
 CHAIN_SCHEME=secp256k1 BENCH_GENESIS_MB=56 npm run bench -- paging   # the paging suite: that state under the memory guard's modes (section 4.13)
 BENCH_PAGING_HEAP=700 CHAIN_SCHEME=secp256k1 BENCH_GENESIS_MB=56 npm run bench -- paging   # with the node's heap limit set in MiB
+BENCH_PAGING_SECONDS=600 BENCH_PAGING_WINDOW=20 BENCH_PAGING_AHEAD=4000 BENCH_PAGING_MODES=0 ... npm run bench -- paging   # a stress run: ten minutes, 20 s windows, 4,000 transfers kept ahead, node only
 BENCH_KEEP=1 npm run bench:genesis           # keep the generated files and stores for inspection
 BENCH_LOG=debug npm run bench -- network     # log the late-joining node of the network suite
 CHAIN_SCHEME=secp256k1 npm run bench         # every suite on secp256k1 keys; ML-DSA-44 without it
@@ -577,6 +578,29 @@ through `pressure`, the four smallest touched `critical` (where `start` would ha
 node cleanly; the benchmark's node only reports it), and admission was refused for most of the
 run, 86,000 of 106,000 submissions at 1.25. The 350 to 800 transfers a second there are that
 refusal, not slow blocks. A small state wants a heap sized to the load, not to the state.
+
+A stress run holds the same node at its ceiling for ten minutes instead of forty seconds, on the
+192,000-account state, the mempool kept 1,000 transfers ahead (4,000 in one run), reported every
+20 seconds with GC pauses:
+
+| heap limit | depth | transfers/s over 10 min | refused | blocks with Merkle trees dropped | shedding episodes | longest GC pause |
+|---|---:|---:|---:|---:|---:|---:|
+| 1,488 MiB (2.5×) | 1,000 | 1,055 | 0.3% | 573 of 1,397 | 6 | 222 ms |
+| 595 MiB (1.0×) | 1,000 | 939 | 21% | 1,633 of 1,642 | 3 | 117 ms |
+| 595 MiB (1.0×) | 4,000 | 903 | 36% | 1,342 of 1,355 | 12 | 121 ms |
+| 476 MiB (0.8×) | 1,000 | 815 | 46% | 1,664 of 1,664 | 136 | 239 ms |
+
+No run died. Sustained throughput converges on about 900 transfers a second whatever the heap;
+what the heap decides is how much load is refused to hold it there. The 2.5× node ran resident
+for six minutes and then paged too, because each transfer leaves a recent-transaction-id object
+until it expires (the feeder signs with one-hour expirations), half a million of them per run,
+growth no dial sheds; it also slows blocks resident or paged. At 1.0× the node settled at `warn`
+after four minutes, with nothing refused at about 880 transfers a second; a deeper feed only
+brought `pressure` back every one to two minutes for the same average. At 0.8× it never settled:
+shedding toggled every few seconds and refused nearly half of all submissions. The weak point is
+the mempool pause, which refuses in bursts of 20,000 to 46,000 transfers rather than throttling;
+a mempool limit that tightens with the guard's level would turn that into steady backpressure.
+GC stayed under 4 s of pause per 20 s throughout.
 
 Then the database alone, in the parent process after the node session (so with a full history
 window): blocks of 500 random transfers, six per mode, checked through `checkTx` first as
