@@ -84,7 +84,7 @@ private static derive(passphrase: string, kdf: KeystoreFile['kdf']): Buffer {
   }
 ```
 
-A name that is not empty and not taken, a seed of the right size (generated for the scheme when none is given: `generateSeed(scheme)` skips the few 32-byte values that are not secp256k1 keys), the key pair derived in that scheme, a fresh IV per seed; the seed is sealed before the lock is taken, so the key generation and the encryption are not done while other writers wait, and the insertion happens under the lock against the keys on disk at that moment. The second `already exists` check is the one that matters between handles: this handle's `has` saw the file as it last read it, and a name another handle added since is only visible under the lock. The empty name is refused for two reasons: `keys add ''` would store a key that no later command can name, and the empty string is the one name that a truthiness test in `open` would have skipped, leaving a keystore whose only key never checked the passphrase. `add` is both "generate" and "import": the CLI's `keys import` passes a seed, `keys add` lets the default generate one, and both pass the scheme `--scheme` names. The record keeps that scheme's name beside the public key, so `get` can derive the same key again. `DEFAULT_SCHEME` is ML-DSA-44 unless `CHAIN_SCHEME` is set in the environment; the CLI never relies on the default and always passes a scheme.
+A name that is not empty and not taken, a seed of the right size (generated for the scheme when none is given: `generateSeed(scheme)` skips the few 32-byte values that are not secp256k1 keys), the key pair derived in that scheme, a fresh IV per seed; the seed is sealed before the lock is taken, so the key generation and the encryption are not done while other writers wait, and the insertion happens under the lock against the keys on disk at that moment. The second `already exists` check is the one that matters between handles: this handle's `has` saw the file as it last read it, and a name another handle added since is only visible under the lock. The empty name is refused for two reasons: `keys add ''` would store a key that no later command can name, and the empty string is the one name that a truthiness test in `open` would have skipped, leaving a keystore whose only key never checked the passphrase. `add` is both "generate" and "import": the CLI's `keys import` passes a seed, `keys add` lets the default generate one, and both pass the scheme `--scheme` names. The record keeps that scheme's name beside the public key, so `get` can derive the same key again. `DEFAULT_SCHEME` is ML-DSA-44 unless an entry point set another, as the tests do from `CHAIN_SCHEME` ([chapter 2](02-crypto.md)); the CLI never relies on the default and always passes a scheme.
 
 **`get(name)`** is the inverse and the passphrase check:
 
@@ -100,11 +100,17 @@ get(name: string): KeyPair {
   } catch {
     throw new Error('wrong passphrase');
   }
-  return keyPairFromSeed(new Uint8Array(seed), schemeTag(k.scheme ?? 'ml-dsa-44'));
+  // The cipher vouches for the seed but not for the scheme beside it: a record whose scheme was changed or lost
+  // would derive another key under the same name, while list() and publicKeyOf() still give the recorded one.
+  const pair = keyPairFromSeed(new Uint8Array(seed), schemeTag(k.scheme ?? 'ml-dsa-44'));
+  if (toHex(pair.publicKey) !== k.publicKey.toLowerCase() || toHex(pair.address) !== k.address.toLowerCase()) {
+    throw new Error(`key ${name} does not derive the public key and address recorded for it; the keystore entry is damaged`);
+  }
+  return pair;
 }
 ```
 
-`decipher.final()` is where GCM verifies the tag; any failure is reported as a wrong passphrase, which is also what a corrupted ciphertext looks like. The returned `KeyPair` holds the seed, both keys and the address, regenerated from the seed each time in the scheme the record names. A record without one is from a keystore written when there was one scheme, and is read as ML-DSA-44, so an old file keeps every key it had; `test/schemes.test.ts` deletes the field from a record and checks exactly that.
+`decipher.final()` is where GCM verifies the tag; any failure is reported as a wrong passphrase, which is also what a corrupted ciphertext looks like. The returned `KeyPair` holds the seed, both keys and the address, regenerated from the seed each time in the scheme the record names, and checked against the public key and address the record holds: the cipher vouches for the seed but not for the scheme written beside it, so a record whose scheme was changed would otherwise give another key under the same name, and `get` refuses it as damaged instead. A record without one is from a keystore written when there was one scheme, and is read as ML-DSA-44, so an old file keeps every key it had; `test/schemes.test.ts` deletes the field from a record and checks exactly that.
 
 **`seedOf(name)`** returns the raw seed for export. **`remove(name)`** deletes the name under the lock (it has no CLI command). **`publicKeyOf(name)`** reads the stored public key without decrypting.
 
@@ -156,7 +162,7 @@ The invariants: nothing in the file reveals a seed without the passphrase; the s
 
 Purpose: one file, one process, one command per run. The header comment is the usage text, and `main` is a `switch`. It uses Node's `process.argv` directly and no argument library.
 
-**`NodeFiles`** is the shape of a node directory's `config.json`: `name`, `listenAddr` (p2p), `rpcListen`, `seeds` (the other nodes), `nodeKeySeed`, `validatorSeed` (null for a full node), and the optional `stateSync { trustHeight, trustHash, backfill }`, `retain { blocks, versions, snapshots }` and `snapshotInterval` that chapter 7 and chapter 10 describe. **`UNBONDING_MS`** is seven days, used both for the genesis staking parameters and for the consensus `maxEvidenceAgeMs`.
+**`NodeFiles`** is the shape of a node directory's `config.json`: `name`, `listenAddr` (p2p), `rpcListen`, `seeds` (the other nodes), `nodeKeySeed`, `validatorSeed` (null for a full node), and the optional `stateSync { trustHeight, trustHash, backfill }`, `retain { blocks, versions, snapshots, memoryVersions }`, `indexTrees` and `snapshotInterval` that chapter 7 and chapter 10 describe (`memoryVersions`, how many of the provable versions stay in memory, and `indexTrees`, `'memory'` or `'store'`, whether the application's secondary indices are kept as trees in the heap or read from LMDB, are in [chapter 8](08-node.md)). **`UNBONDING_MS`** is seven days, used both for the genesis staking parameters and for the consensus `maxEvidenceAgeMs`.
 
 **Argument handling.** Everything after the script name is split into `flags` (`--name value` pairs) and `positional` words; `cmd` is the first positional and `args` the rest. **`need(i, what)`** returns `args[i]` or throws `` `missing ${what}` ``. **`target(arg)`** turns the first argument into an `RpcClient`, a keystore path and maybe a node directory:
 
@@ -207,8 +213,9 @@ const genesis: Genesis = {
 
 ```ts
 function startUnderHeapLimit(): boolean {
-  const configured = process.execArgv.some((a) => a.startsWith('--max-old-space-size')) || /max-old-space-size/.test(process.env.NODE_OPTIONS ?? '');
-  if (configured || process.env.CROSSCHAIN_CHILD) return false;
+  // A limit the operator set, on the command line or in NODE_OPTIONS and in any spelling V8 takes, is left alone: the
+  // child's own flag would override it.
+  if (heapLimitFlag() !== null || process.env.CROSSCHAIN_CHILD) return false;
   const heapMb = flags.has('heap') ? Number(flags.get('heap')) : Math.floor((totalmem() / 2 ** 20) * 0.75);
   if (!Number.isInteger(heapMb) || heapMb < 256) throw new Error('--heap takes a size in MiB, at least 256');
   console.log(`start: running the node under a ${heapMb} MiB heap limit (--heap <MiB> changes it), collections scheduled after commits`);
@@ -222,9 +229,18 @@ function startUnderHeapLimit(): boolean {
 }
 ```
 
-The heap limit is three quarters of physical memory (`os.totalmem`) unless `--heap <MiB>` names another, and a figure that is not a whole number of at least 256 is refused before anything starts. The child gets `--max-old-space-size` for the limit, `--max-semi-space-size=64` for a larger young generation (fewer minor collections, each of which pauses the thread), `--expose-gc` so the scheduler can ask for collections after commits, then whatever flags the parent itself ran with, the script and its arguments, with `CROSSCHAIN_CHILD` in its environment so that it does not wrap itself again. The other escape is a `--max-old-space-size` already in `node`'s own arguments or in `NODE_OPTIONS`: the operator chose a limit, and the wrapper steps aside (then `--expose-gc` is the operator's to add; without it the scheduler logs once that collections run when V8 decides). The parent's only jobs afterwards are to pass `SIGINT` and `SIGTERM` to the child (a terminal's interrupt reaches both processes anyway, and the child's `shutdown` runs once however many signals it gets) and to exit with the child's code, or 1 when a signal killed it. The printed line is all an operator sees of this.
+The heap limit is three quarters of physical memory (`os.totalmem`) unless `--heap <MiB>` names another, and a figure that is not a whole number of at least 256 is refused before anything starts. The child gets `--max-old-space-size` for the limit, `--max-semi-space-size=64` for a larger young generation (fewer minor collections, each of which pauses the thread), `--expose-gc` so the scheduler can ask for collections after commits, then whatever flags the parent itself ran with, the script and its arguments, with `CROSSCHAIN_CHILD` in its environment so that it does not wrap itself again. The other escape is a `--max-old-space-size` already in `node`'s own arguments or in `NODE_OPTIONS`, found by `heapLimitFlag` from `src/node/memory.ts` ([chapter 8](08-node.md)), the same function the memory guard reads its limit with, so the flag is recognised with dashes or underscores as V8 takes it: the operator chose a limit, and the wrapper steps aside (then `--expose-gc` is the operator's to add; without it the scheduler logs once that collections run when V8 decides). The parent's only jobs afterwards are to pass `SIGINT` and `SIGTERM` to the child (a terminal's interrupt reaches both processes anyway, and the child's `shutdown` runs once however many signals it gets) and to exit with the child's code, or 1 when a signal killed it. The printed line is all an operator sees of this.
 
-**`start(nodeDir)`** returns at once in the parent (`if (startUnderHeapLimit()) return`) and otherwise assembles a node: the config and the genesis one directory up, a `WorkerVerifier` (chapter 2's thread pool), a logger at `LOG` level, an `LmdbEnv` under `data/lmdb`, then `Node.create` with the TCP transport, seeds, state-sync anchor and retention from the config. After `node.start()` it opens an `RpcServer` on `rpcListen` and logs a status line every five seconds:
+**`start(nodeDir)`** first reads its other flag:
+
+```ts
+  const arenaMb = flags.has('arena') ? Number(flags.get('arena')) : null;
+  if (arenaMb !== null && !(Number.isInteger(arenaMb) && arenaMb >= 16)) throw new Error('--arena takes a size in MiB, at least 16');
+```
+
+`--arena <MiB>` bounds the object database's arena, the slabs of encoded objects ([chapter 9](09-database.md)). It is a flag and not something the memory guard decides because the slabs are `ArrayBuffer`s outside the V8 heap, which is all the guard measures: `--heap` bounds the heap, `--arena` the largest thing beside it. Sixteen MiB is the least because the slab being filled, 16 MiB at most, is never released. The check comes before the wrapper, so a bad figure is refused in the parent, and the flag reaches the child with the rest of the arguments. Without it the arena holds every object, as before.
+
+`start` then returns at once in the parent (`if (startUnderHeapLimit()) return`) and otherwise assembles a node: the config and the genesis one directory up, a `WorkerVerifier` (chapter 2's thread pool), a logger at `LOG` level, an `LmdbEnv` under `data/lmdb`, then `Node.create` with the TCP transport, seeds, state-sync anchor, retention and `indexTrees` from the config, and `arenaBytes` (the flag times 2^20, or undefined). The shutdown function and the memory listener (below) are registered before `node.start()`, so a heap already critical at the guard's first sample is acted on too. Because the child always runs under `--max-old-space-size`, the node also tells the application how much heap there is to open the stored state into, and a state whose trees do not fit is opened paged ([chapter 8](08-node.md), [chapter 11](11-application.md)); the line `loaded application state` then ends with `paged=` and what was left in the store. After `node.start()`, unless the node is already stopping, it opens an `RpcServer` on `rpcListen` and logs a status line every five seconds:
 
 ```ts
   setInterval(() => {
@@ -237,22 +253,25 @@ The heap limit is three quarters of physical memory (`os.totalmem`) unless `--he
       round: node.consensus.round,
       validators: app.dynamic().active.length,
       pool: app.dynamic().communityPool,
-      heap: `${Math.round(m.heapUsed / 2 ** 20)}/${Math.round(m.heapLimit / 2 ** 20)} MiB`,
+      heap: `${Math.round(heapInUse(m) / 2 ** 20)}/${Math.round(m.heapLimit / 2 ** 20)} MiB`,
       memory: node.memoryLevel,
       gc: `${gc.collections} pauses, ${gc.totalMs.toFixed(0)} ms, longest ${gc.maxMs.toFixed(1)} ms`,
     });
   }, 5000).unref();
 ```
 
-Height, peers, mempool size, round, active validators and the community pool as before, then the guard's last sample as `heap=<used>/<limit> MiB` (the limit V8 reports includes the young generation, so `--heap 512` shows as about 704), the guard's level as `memory=`, and the collections V8 has run since start with their total and longest pause as `gc=`. On a one-node testnet under `--heap 512` the line read `heap=17/704 MiB memory=ok gc=5 pauses, 1 ms, longest 0.3 ms` after five blocks: one scheduled minor collection per commit. Shutdown is one function with an exit code:
+Height, peers, mempool size, round, active validators and the community pool as before, then the guard's last sample as `heap=<used>/<limit> MiB`, the guard's level as `memory=`, and the collections V8 has run since start with their total and longest pause as `gc=`. Both heap figures are the old generation's, the ones the guard takes its levels from ([chapter 8](08-node.md)): the limit is the `--max-old-space-size` the child runs under, so `--heap 512` shows as 512 and not as the 704 V8's own `heap_size_limit` would say with the young generation's reserve added, and the use is `heapInUse(m)`, the sample's `heapOld`, which leaves out the garbage the young generation holds between two minor collections. On a one-node testnet under `--heap 512` the line read `heap=17/512 MiB memory=ok gc=5 pauses, 1 ms, longest 0.2 ms` after five blocks: one scheduled minor collection per commit. Shutdown is one function with an exit code:
 
 ```ts
+  let rpc: RpcServer | null = null;
   let stopping = false;
+  // Consensus and block sync stop at once, and the block being applied finishes its writes, while the RPC server
+  // stops beside them; a request still running then has a second (none at `critical`) before its connection is cut,
+  // so no client can keep a node that must stop running.
   const shutdown = async (code = 0) => {
     if (stopping) return;
     stopping = true;
-    await rpc.stop();
-    await node.stop();
+    await Promise.all([node.stop(), rpc?.stop(code === 3 ? 0 : 1000)]);
     await env.close();
     await verifier.close();
     process.exit(code);
@@ -260,13 +279,14 @@ Height, peers, mempool size, round, active validators and the community pool as 
   process.on('SIGINT', () => void shutdown());
   process.on('SIGTERM', () => void shutdown());
   // Past the critical level the next step is V8 aborting the process; stopping cleanly first keeps the stores
-  // consistent and tells the supervisor, through the exit code, that the node needs a larger heap.
+  // consistent and tells the supervisor, through the exit code, that the node needs a larger heap. Registered before
+  // the node starts, so a heap already critical at the first sample is acted on too.
   node.onMemory((level) => {
     if (level === 'critical') void shutdown(3);
   });
 ```
 
-`SIGINT` and `SIGTERM` stop everything in order, RPC, node, LMDB, verifier, and exit 0; the `stopping` flag makes a second signal harmless, and two do arrive under the wrapper, the terminal's and the one the parent passes on. The guard's `critical` level, 95% of the heap limit, takes the same path with exit code 3: the alternative is V8 aborting the process at the limit with the stores wherever the last write left them, and a distinct code lets a supervisor tell "restart me with a larger `--heap`" from a crash. The guard has already logged the reason and the remedy by then (`memory: heap at the limit; stopping before the process aborts (raise --max-old-space-size or --heap)`), and the node has already shed what it could at the `pressure` level; what remains is a state that does not fit, which no amount of shedding changes.
+`SIGINT` and `SIGTERM` stop the node and the RPC server side by side (the server gives a request still running one second before it cuts the connection, and none at `critical`, so a slow client cannot keep a node that must stop running; `rpc` is null until the server exists), then LMDB and the verifier, and exit 0; the `stopping` flag makes a second signal harmless, and two do arrive under the wrapper, the terminal's and the one the parent passes on. The guard's `critical` level, 95% of the heap limit, takes the same path with exit code 3: the alternative is V8 aborting the process at the limit with the stores wherever the last write left them, and a distinct code lets a supervisor tell "restart me with a larger `--heap`" from a crash. The guard has already logged the reason and the remedy by then (`memory: heap at the limit; stopping before the process aborts (raise --max-old-space-size or --heap)`), and the node has already shed what it could at the `pressure` level; what remains is a state that does not fit, which no amount of shedding changes.
 
 **Client helpers.**
 
@@ -353,7 +373,7 @@ It asks for the proof at `latest - 1` because the header that commits to height 
 | command | arguments | what it does | RPC calls |
 |---|---|---|---|
 | `init` | `<dir> [validators=4] [basePort=26656] [--scheme ml-dsa-44\|secp256k1]` | writes `genesis.json` naming the scheme, `keystore.json` (faucet and `opN` keys made for it, passphrase printed) and `nodeN/config.json` for each validator | none |
-| `start` | `<nodeDir> [--heap <MiB>]` | runs the node, in a child process under a heap limit of three quarters of memory or the given size, over TCP with LMDB and its RPC on `rpcListen`; `LOG` sets the level; exits 3 when the heap nears the limit | serves them |
+| `start` | `<nodeDir> [--heap <MiB>] [--arena <MiB>]` | runs the node, in a child process under a heap limit of three quarters of memory or the given size, over TCP with LMDB and its RPC on `rpcListen`; `--arena` bounds the encoded objects kept in memory outside the heap (at least 16 MiB; all of them by default), the rest read from the store; `LOG` sets the level; exits 3 when the heap nears the limit | serves them |
 | `keys list` | `[--keystore path]` | one line per key: name, scheme and address; fails if the file does not exist | none |
 | `keys add` | `<name> [--scheme s]` | generates a seed for the scheme (ML-DSA-44 when absent), seals it, prints the address | none |
 | `keys import` | `<name> <seedHex> [--scheme s]` | seals a given 32-byte seed as a key of the scheme (ML-DSA-44 when absent) | none |
@@ -420,7 +440,7 @@ The CLI has no automated test. `RPC-SYNC-PROOFS.md` section 6 lists "every CLI c
 - The passphrase prompt hides echo by patching `stdout.write`, which works for a plain terminal and not necessarily elsewhere.
 - `light.json` is per keystore directory, not per chain: pointing the same keystore at a different chain would fail at `LightClient.trust` with a chain id error, which is the right outcome but an unhelpful message.
 - The keystore lock waits five seconds and treats a lock older than thirty as abandoned. Those are generous for a write that takes milliseconds, but a machine suspended with the lock held could have it removed from under it; the atomic write still leaves a whole file either way.
-- `start` always wraps itself unless `--max-old-space-size` is already set or `CROSSCHAIN_CHILD` is in the environment; there is no flag to run in place, and a `--heap` below 256 MiB is refused rather than clamped.
+- `start` always wraps itself unless `--max-old-space-size` is already set or `CROSSCHAIN_CHILD` is in the environment; there is no flag to run in place, and a `--heap` below 256 MiB is refused rather than clamped. `--arena` is a fixed figure for the life of the process: nothing adjusts it to the memory the machine has left.
 
 Exercises:
 

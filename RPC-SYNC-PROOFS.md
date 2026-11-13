@@ -80,8 +80,39 @@ own. Only the operations of transactions that succeeded are recorded; a failed
 transaction has no effect and is found through the transaction index. Stored in the
 application's own store, next to the objects:
 
-- `'a' || accountId || sequence u64 -> entry`, with `sequence` counting up per
-  account from 0, and `'q' || accountId -> next sequence`.
+- One log in block order: `'l' || place u64 -> account u64, sequence u64, prev u64,
+  skip u64, entry`. `place` grows by one per entry, so a block's entries are
+  consecutive keys at the end of the log. `sequence` counts up per account from 0.
+  `prev` is the place of the account's previous entry, and `skip` the place of its
+  entry whose sequence is this one's with its lowest set bit cleared (entry 12 points
+  at 8, 8 at 0, 7 at 6); each is `0xffffffffffffffff` where there is no such entry.
+- `'p' || accountId -> count u64, place of the newest entry u64`, the account's head,
+  and `'L' -> the log's length u64, covered u64`, where `covered` is how many of the
+  log's entries the stored heads account for: the place in the log of the oldest
+  change whose head is still waiting to be written, or the length when none waits.
+- The heads are keyed by account, so writing them at every block would be scattered
+  writes again. The heads a block changes wait in memory, in 64 slices of the account
+  numbers (`HistoryLog.SLICES`), and every block that has entries writes the waiting
+  heads of one slice, the next in turn: a block writes neighbours in the store, no
+  single block carries the whole batch, and a head is written within 64 such blocks
+  of its change. A slice spans one account number at first, and the span doubles
+  (slices 2i and 2i+1 becoming slice i) whenever an account number beyond the last
+  slice turns up. All the slices are written at once only when 50,000 heads wait
+  (`HistoryLog.HEADS_HELD`), or when a store with the earlier layout is moved into
+  the log. The log is their journal: a log opened after a stop reads the entries
+  from `covered` to the end, each of which names its account and sequence, and has
+  the waiting heads back.
+- An account is read from its newest entry backwards: the skip pointer while it does
+  not pass the sequence wanted, else the previous entry, so any entry is found in
+  about log² steps and a page from the old end of a long history does not walk the
+  whole of it. Writing an entry finds its `skip` target by the same walk.
+- The entries were first stored as `'a' || accountId || sequence u64 -> entry` with
+  `'q' || accountId -> next sequence`. A block of transfers names accounts all over
+  the state, so those keys dirtied a store page for every account a block named,
+  where appending to the log writes a few pages a block. A store written with the earlier layout
+  is moved into the log the first time it is opened, by height and with each
+  account's entries in their order, and the old keys are removed in the same write
+  (`HistoryLog.migrate`, `src/app/core/history.ts`).
 - `entry = { height, position (u32, 0xffffffff for a virtual entry), opIndex (u32),
   kind (u8), txHash (option), data (bytes) }` where `data` is the encoded operation,
   or the encoded virtual operation. There is no result in the entry: every recorded
@@ -518,13 +549,32 @@ refusals of an ML-DSA authority key, an ML-DSA consensus key and an ML-DSA signa
 under a secp256k1 address. The whole suite runs under either scheme with
 `CHAIN_SCHEME`.
 
-Memory (`test/memory.test.ts`, four cases): the guard moving through its levels with
+Account history (`test/history.test.ts`, four cases): blocks of entries over several
+accounts appended to the log and every account paged out of it, oldest first and
+newest first, from a range of starting points and limits, against a model, also by a
+log opened on the store later; a history of 5,000 entries whose old end is reached in
+fewer than a hundred reads, written with fewer than three reads an entry, its keys
+consecutive in the store; blocks of 300 entries over 6,400 accounts, each block writing
+the heads of one stretch of the account numbers and fewer than it changed, a log opened
+on the store at any block knowing every account's count, and the stored heads never
+more than 64 blocks of entries behind the log; and a store written with the earlier layout moved into the
+log when it is opened, with the same sequences, the old keys gone, and new entries
+following the moved ones.
+
+Memory (`test/memory.test.ts`, six cases): the guard moving through its levels with
 hysteresis on injected samples, several levels in one sample, the reported sequence and
-the threshold check; the scheduler's decisions with an injected collector (a minor
+the threshold check; its levels taken from the old generation's use when a sample
+carries it; the scheduler's decisions with an injected collector (a minor
 collection per commit, a major one on growth measured from the last, the fraction cap,
 nothing without a collector); the observer counting real collections after garbage is
-allocated; and a full node in a two-validator testnet whose guard is fed invented
-samples: at 90% of the limit it sheds (the mempool paused, `submitTx` `paused`,
-`broadcastTx` and `block` `-32004`, `/events` 503, `/health` and `status` reporting
-`pressure`) while still following the chain, at 50% it resumes, and at 99% it reports
-`critical`.
+allocated; a full node in a two-validator testnet whose guard is fed invented
+samples: at 75% of the limit (`warn`) it sheds nothing, drops its index trees and trims
+its history window to two versions, the Merkle trees staying resident; at 90%
+(`pressure`) it sheds (the mempool's limit lowered to a tenth, `submitTx` `full` and
+`broadcastTx` `-32004` at that limit, `block` `-32004`, `/events` 503, `/health` and
+`status` reporting `pressure`) and drops the Merkle trees while still following the
+chain, at 40% it resumes, waits before it considers a rebuild and then says once that
+it stays paged, and at 99% it reports `critical`; and a node with
+`retain.memoryVersions` 3 and `indexTrees: 'store'` keeping three past versions in memory,
+proving a height six back from the store and finding an account by name with its index
+trees left in the store.

@@ -87,11 +87,13 @@ export async function run(): Promise<void> {
       });
       const code = await new Promise<number | null>((resolve) => child.on('exit', (c) => resolve(c)));
       const opened = lines.find((l) => l.event === 'opened');
-      fact('node: heap limit (--max-old-space-size)', `${heapMb} MiB, 1.25 times the resident heap of the state; the node opened its store in ${opened?.ms} ms with ${opened?.heap} MiB of heap`);
+      fact('node: heap limit (--max-old-space-size)', `${heapMb} MiB, ${(heapMb / (resident.heap / 1048576)).toFixed(2)} times the resident heap of the state; the node opened its store in ${opened?.ms} ms with ${opened?.heap} MiB of heap`);
       for (const w of lines.filter((l) => l.event === 'window')) {
-        fact(`node, ${String(w.s).padStart(5)} s`, `${w.blocks} blocks, ${w.txs} transfers (${((1000 * Number(w.txs)) / Number(w.ms)).toFixed(0)}/s over ${w.ms} ms), ${w.refused} refused, mempool ${w.mempool}; ${w.level}, objects ${w.objects}, index trees ${w.indexTrees}, Merkle trees ${w.trees}; heap ${w.heap} of ${w.limit} MiB; gc ${w.gcPauses} pauses, ${w.gcMs} ms, longest so far ${w.gcMax} ms`);
+        fact(`node, ${String(w.s).padStart(5)} s`, `${w.blocks} blocks, ${w.txs} transfers (${((1000 * Number(w.txs)) / Number(w.ms)).toFixed(0)}/s over ${w.ms} ms), ${w.refused} refused, mempool ${w.mempool}; ${w.level}, objects ${w.objects}, index trees ${w.indexTrees}, Merkle trees ${w.trees}; heap ${w.heap} of ${w.limit} MiB (and ${w.young} MiB in the young generation), array buffers ${w.arrayBuffers} MiB (arena ${w.arena} MiB, ${w.stored} objects left in the store), rss ${w.rss} MiB; gc ${w.gcPauses} pauses, ${w.gcMs} ms, longest so far ${w.gcMax} ms`);
       }
       for (const l of lines.filter((l) => l.event === 'log')) fact(`node log at ${l.s} s`, `${l.msg}${l.heap ? ` (${l.heap})` : ''}${l.needs ? ` (needs ${l.needs}, room ${l.room})` : ''}`);
+      const proofs = lines.find((l) => l.event === 'proofs');
+      if (proofs) fact('node: an account proof after the run', `${proofs.newestMs} ms at the newest height (${proofs.height}), ${proofs.middleMs} ms halfway back, ${proofs.oldestMs} ms at the oldest provable (${proofs.oldest}); history window ${proofs.history}, ${proofs.window} versions kept in memory`);
       const sum = lines.find((l) => l.event === 'summary');
       // The rate is over the time the run took by the clock, not the seconds it was asked for.
       if (sum) fact(`node: ${sum.seconds} s in all (${NODE_SECONDS} asked)`, `${sum.blocks} blocks, ${sum.txs} transfers (${(Number(sum.txs) / Number(sum.seconds)).toFixed(0)}/s); ${sum.pagedBlocks} blocks holding ${sum.pagedTxs} transfers committed with the Merkle trees dropped; ${sum.submitted} submitted, ${sum.refused} refused; levels: ${sum.levels || 'none'}`);

@@ -33,7 +33,7 @@
  *
  * and a root reports the chunks it changed (takeChunks), so the store holds
  * every tree as of every root. A tree can then be dropped: its chunks are
- * released and every read goes to the store through a small LRU of chunks
+ * released and every read goes to the store through an LRU of chunks
  * the database's trees share (ChunkCache). A root over a dropped tree reads
  * each changed leaf's path, a chunk per level, works on private copies of
  * the chunks it changes, and hands those back to the cache when it is done,
@@ -131,12 +131,18 @@ export class ChunkCache {
     return this.slots++;
   }
 
+  /** The key last moved to the end: a root reads a node and its sibling, mostly from one chunk, and need not move it twice. */
+  private newest = -1;
+
   get(key: number): Uint8Array | undefined {
     const v = this.map.get(key);
     if (v !== undefined) {
       this.hits++;
-      this.map.delete(key);
-      this.map.set(key, v);
+      if (key !== this.newest) {
+        this.map.delete(key);
+        this.map.set(key, v);
+        this.newest = key;
+      }
     } else this.misses++;
     return v;
   }
@@ -144,15 +150,18 @@ export class ChunkCache {
   set(key: number, v: Uint8Array): void {
     this.map.delete(key);
     this.map.set(key, v);
+    this.newest = key;
     this.trim();
   }
 
   trim(): void {
     while (this.map.size > this.limit) this.map.delete(this.map.keys().next().value!);
+    if (this.map.size === 0) this.newest = -1;
   }
 
   clear(): void {
     this.map.clear();
+    this.newest = -1;
   }
 
   get size(): number {
@@ -250,6 +259,22 @@ export interface TreeRecords {
   sizeBefore: number | null;
 }
 
+/**
+ * What the store's history records say of one tree as of a version the window in memory no longer holds
+ * (ObjectDatabase, "past versions from the store"): the leaf count then, if a later version changed it, and for
+ * each node asked about that a later version overwrote, its hash then. A node not in it is what it is now.
+ */
+export interface PastTree {
+  size: number | null;
+  /** By nodePosition(level, index). */
+  nodes: Map<number, Uint8Array>;
+}
+
+/** One number for a node's level and index, as the chunks have. */
+export function nodePosition(k: number, j: number): number {
+  return k * LEVEL_SPAN + j;
+}
+
 export class DenseMerkleTree {
   /**
    * levels[k] maps chunk index to a buffer of CHUNK node hashes: every chunk while the tree is resident; while it
@@ -277,10 +302,14 @@ export class DenseMerkleTree {
   private size = 0;
   private sizeAtLastRoot = 0;
   private dirty = new Set<number>();
+  /** How many past versions are recorded for the store, and how many of them are kept in memory just now (setWindow). */
   private readonly retain: number;
+  private window: number;
   private version = -1;
-  /** The oldest version this tree can describe: where it was built, lowered as history is loaded. */
+  /** The oldest version this tree can describe: where it was built, lowered as history is loaded, raised when the window is trimmed. */
   private floor = 0;
+  /** How many entries `history` holds, for estimates. */
+  private historyCount = 0;
   private readonly history: Map<number, HistoryEntry[]>[] = [];
   private readonly historyByVersion = new Map<number, [number, number][]>();
   /** Before version v the leaf count was size. */
@@ -290,7 +319,26 @@ export class DenseMerkleTree {
 
   constructor(retainVersions = 0, id = 0) {
     this.retain = Math.max(0, retainVersions);
+    this.window = this.retain;
     this.id = id;
+  }
+
+  /** Entries the window of past versions holds: one per node a retained version overwrote. */
+  get historyEntries(): number {
+    return this.historyCount;
+  }
+
+  /**
+   * Keep only the last `versions` past versions in memory from now on (never more than the tree was made to retain).
+   * Lowering it forgets the older ones at once and they stay forgotten: raising it again lets the window grow back
+   * one root at a time. The records each root hands to the store are not affected.
+   */
+  setWindow(versions: number): void {
+    this.window = Math.max(0, Math.min(this.retain, versions));
+    if (this.version < 0) return;
+    const min = this.version - this.window;
+    if (min > this.floor) this.floor = min;
+    this.prune(min);
   }
 
   get leafCount(): number {
@@ -307,7 +355,7 @@ export class DenseMerkleTree {
 
   /** The oldest version a path can still be produced for. */
   get lowestVersion(): number {
-    return Math.max(this.floor, this.retain > 0 ? this.version - this.retain : this.version);
+    return Math.max(this.floor, this.version - this.window);
   }
 
   /** Number of chunks allocated across all levels, for tests and diagnostics. */
@@ -428,6 +476,7 @@ export class DenseMerkleTree {
     const last = entries[entries.length - 1];
     if (last && last.v >= v) return false;
     entries.push({ v, h });
+    this.historyCount++;
     let list = this.historyByVersion.get(v);
     if (!list) this.historyByVersion.set(v, (list = []));
     list.push([k, j]);
@@ -492,7 +541,9 @@ export class DenseMerkleTree {
     this.nextVersion = null;
     this.records = { nodes: this.pendingRecords, sizeBefore };
     this.pendingRecords = [];
-    if (this.retain > 0) this.prune(version - this.retain);
+    // What a trimmed window forgot stays forgotten when the window is widened again.
+    if (version - this.window > this.floor) this.floor = version - this.window;
+    if (this.retain > 0) this.prune(version - this.window);
     else this.sizes.length = 0; // nothing but the current version is askable, and its size is `size`
     // Read while a dropped tree still holds the chunks this root wrote; they go to the cache below.
     const root = this.rootAt(version);
@@ -659,42 +710,59 @@ export class DenseMerkleTree {
     }
   }
 
-  /** Leaf count as of a version. */
-  sizeAt(version: number): number {
+  /**
+   * Leaf count as of a version. With `past`, the version is older than the window in memory and the store's
+   * records answer for it, here and in nodeAt, rootAt and pathAt.
+   */
+  sizeAt(version: number, past?: PastTree): number {
+    if (past) return past.size ?? this.size;
     for (const s of this.sizes) if (s.v > version) return s.size;
     return this.size;
   }
 
-  private checkVersion(version: number): void {
+  private checkVersion(version: number, past?: PastTree): void {
     if (this.dirty.size > 0) throw new Error('tree has unhashed changes; call root() first');
-    if (version > this.version || version < this.lowestVersion) throw new RangeError(`version ${version} is not available (have ${this.lowestVersion}..${this.version})`);
+    if (version > this.version || (!past && version < this.lowestVersion)) throw new RangeError(`version ${version} is not available (have ${this.lowestVersion}..${this.version})`);
   }
 
   /** Node j at level k as of a version. */
-  nodeAt(k: number, j: number, version: number): Uint8Array {
-    if (j >= this.nodesAt(k, this.sizeAt(version))) return EMPTY;
+  nodeAt(k: number, j: number, version: number, past?: PastTree): Uint8Array {
+    if (j >= this.nodesAt(k, this.sizeAt(version, past))) return EMPTY;
+    if (past) return past.nodes.get(nodePosition(k, j)) ?? this.rawNode(k, j);
     const entries = this.history[k]?.get(j);
     if (entries) for (const e of entries) if (e.v > version) return e.h;
     return this.rawNode(k, j);
   }
 
-  rootAt(version: number): Uint8Array {
-    this.checkVersion(version);
-    const size = this.sizeAt(version);
-    return size === 0 ? EMPTY : this.nodeAt(heightFor(size), 0, version).slice();
+  rootAt(version: number, past?: PastTree): Uint8Array {
+    this.checkVersion(version, past);
+    const size = this.sizeAt(version, past);
+    return size === 0 ? EMPTY : this.nodeAt(heightFor(size), 0, version, past).slice();
   }
 
   /** Sibling hashes from leaf i to the root as of a version: the inclusion proof. */
-  pathAt(i: number, version: number): Uint8Array[] {
-    this.checkVersion(version);
-    const size = this.sizeAt(version);
+  pathAt(i: number, version: number, past?: PastTree): Uint8Array[] {
+    this.checkVersion(version, past);
+    const size = this.sizeAt(version, past);
     if (i >= size) throw new RangeError(`leaf ${i} beyond size ${size} at version ${version}`);
     const out: Uint8Array[] = [];
     let j = i;
     for (let k = 0; k < heightFor(size); k++) {
-      out.push(this.nodeAt(k, j % 2 === 0 ? j + 1 : j - 1, version).slice());
+      out.push(this.nodeAt(k, j % 2 === 0 ? j + 1 : j - 1, version, past).slice());
       j = Math.floor(j / 2);
     }
+    return out;
+  }
+
+  /**
+   * The nodes rootAt and, with a leaf, pathAt may read at any past version: the tree was never larger than it is,
+   * so its root was the first node of some level up to today's, and the leaf's path the siblings up to there.
+   */
+  pastPositions(leaf?: number): number[] {
+    const out: number[] = [];
+    const h = heightFor(this.size);
+    for (let k = 0; k <= h; k++) out.push(nodePosition(k, 0));
+    if (leaf !== undefined) for (let k = 0, j = leaf; k < h; k++, j = Math.floor(j / 2)) out.push(nodePosition(k, j % 2 === 0 ? j + 1 : j - 1));
     return out;
   }
 
@@ -703,20 +771,25 @@ export class DenseMerkleTree {
   }
 
   /** The siblings that fold leaves [from, to) to the root as of a version; see rootFromRange. */
-  rangeProofAt(from: number, to: number, version: number): Uint8Array[] {
-    this.checkVersion(version);
-    const size = this.sizeAt(version);
+  rangeProofAt(from: number, to: number, version: number, past?: PastTree): Uint8Array[] {
+    this.checkVersion(version, past);
+    const size = this.sizeAt(version, past);
     if (from < 0 || from >= to || to > size) throw new RangeError(`range [${from}, ${to}) outside size ${size}`);
-    const out: Uint8Array[] = [];
+    return this.rangeSiblings(from, to, heightFor(size)).map(([k, j]) => this.nodeAt(k, j, version, past).slice());
+  }
+
+  /** The nodes (level, index) beside the range [from, to) on its way up `height` levels, in the order a range proof lists them. */
+  private rangeSiblings(from: number, to: number, height: number): [number, number][] {
+    const out: [number, number][] = [];
     let a = from;
     let b = to;
-    for (let k = 0; k < heightFor(size); k++) {
+    for (let k = 0; k < height; k++) {
       if (a % 2 === 1) {
-        out.push(this.nodeAt(k, a - 1, version).slice());
+        out.push([k, a - 1]);
         a -= 1;
       }
       if ((b - 1) % 2 === 0) {
-        out.push(this.nodeAt(k, b, version).slice());
+        out.push([k, b]);
         b += 1;
       }
       a /= 2;
@@ -725,14 +798,24 @@ export class DenseMerkleTree {
     return out;
   }
 
+  /** As pastPositions, for rangeProofAt: the nodes beside the range up to today's height. */
+  pastRangePositions(from: number, to: number): number[] {
+    return this.rangeSiblings(from, to, heightFor(this.size)).map(([k, j]) => nodePosition(k, j));
+  }
+
   /** Drop history that only serves versions at or below minVersion. */
   prune(minVersion: number): void {
     for (const [v, list] of this.historyByVersion) {
       if (v > minVersion) continue;
       for (const [k, j] of list) {
         const byIndex = this.history[k]!;
-        const entries = byIndex.get(j)!;
-        while (entries.length > 0 && entries[0]!.v <= minVersion) entries.shift();
+        // Several versions pruned at once: an earlier one's pass may already have emptied this node's entries.
+        const entries = byIndex.get(j);
+        if (!entries) continue;
+        while (entries.length > 0 && entries[0]!.v <= minVersion) {
+          entries.shift();
+          this.historyCount--;
+        }
         if (entries.length === 0) byIndex.delete(j);
       }
       this.historyByVersion.delete(v);

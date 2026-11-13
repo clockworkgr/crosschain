@@ -19,7 +19,7 @@ Requires Node 24 (it runs TypeScript directly; there is no build step).
 
 ```sh
 npm install
-npm test                      # 160 tests, about a minute; CHAIN_SCHEME=secp256k1 runs them on secp256k1 keys, INDEX_TREES=0 or TREES=0 with the database's index or Merkle trees dropped
+npm test                      # 203 tests, about a minute; CHAIN_SCHEME=secp256k1 runs them on secp256k1 keys, INDEX_TREES=0 or TREES=0 with the database's index or Merkle trees dropped
 node scripts/localnet.ts 4 30 # 4 validators in one process for 30 seconds, driving the app from a faucet, RPC on :26657
 ```
 
@@ -28,7 +28,7 @@ A real testnet over TCP, one terminal per node:
 ```sh
 export CHAIN_PASSPHRASE=testnet               # the keystore passphrase init prints
 node src/cli.ts init ./testnet 4              # genesis, keystore, 4 node directories (p2p 26656, 26658, ...; RPC one port up); --scheme secp256k1 for that scheme
-node src/cli.ts start ./testnet/node0         # repeat for node1..node3; --heap <MiB> sets the heap limit (three quarters of memory otherwise)
+node src/cli.ts start ./testnet/node0         # repeat for node1..node3; --heap <MiB> sets the heap limit (three quarters of memory otherwise), --arena <MiB> bounds the encoded objects kept in memory
 node src/cli.ts show ./testnet/node1          # status, validators and accounts over the node's RPC
 node src/cli.ts create ./testnet/node0 alice  # the faucet registers alice; her key goes into the keystore
 node src/cli.ts transfer ./testnet/node2 faucet alice 12.5   # whole tokens; waits for inclusion
@@ -56,11 +56,16 @@ unless `--heap <MiB>` says otherwise, with a memory guard that pages the state a
 fills: it caps the object database's cache of decoded objects, then drops the secondary
 indices' B+ trees and the Merkle trees, whose entries, chunks and nodes LMDB holds at every
 height, so lookups, scans, roots and proofs read through the store, slower, and rebuilds them
-when the heap has room; it sheds load as well (the mempool, costly RPC calls, new event
-streams, the signature cache) and stops the node cleanly with exit code 3 before V8 would
+once the heap has had room for as long as it took to fill; it cuts the window of past versions kept in memory to the last two
+(the store keeps the whole window, and a proof or query at an older height is read from the
+store's history records, slower and at no cost in memory); it lowers the mempool's limit in steps and sheds load as
+well (costly RPC calls, new event streams, the signature cache) and stops the node cleanly with exit code 3 before V8 would
 abort it, and garbage collections are scheduled in the idle moment after each commit. The
 five-second status line, `status` and `/health` report the heap, the guard's level and the
-collection pauses, and `status` which tiers of the state are resident.
+collection pauses, and `status` which tiers of the state are resident. A stored state whose
+trees do not fit the heap is opened paged, with them left in the store and its past heights
+proven from the store's history records, and `--arena <MiB>`
+holds the encoded objects in memory within a byte budget, the rest read from the store.
 
 Set `LOG=debug` to watch every proposal, vote and timeout. Node state is kept in an
 LMDB environment under each node's data directory; of the four runtime dependencies,
@@ -120,7 +125,7 @@ with two ML-DSA-44 keys each, named by `appStateFile`), loads it, and measures t
 | object proof + verify / name proof + verify | 40,000 / 46,000 per second; 3.4 KiB and 932 B |
 | a block of 500 transfers | 25 ms to finalize, 10 ms to commit |
 | snapshot export | 3.5 s |
-| restart from LMDB | 11.8 s (decode 5.0 s, root 3.2 s, rebuilding index history 3.7 s), measured before the trees were stored; a restart now takes the trees and indices from the store and checks every object against its leaf, which took the 192,000-account secp256k1 run from 8.4 to 5.2 s (docs/benchmarks.md section 4.12) |
+| restart from LMDB | 11.8 s (decode 5.0 s, root 3.2 s, rebuilding index history 3.7 s), measured before the trees were stored; a restart now takes the trees and indices from the store and checks every object against its leaf, which took the 192,000-account secp256k1 run from 8.4 to 5.2 s (docs/benchmarks.md section 4.12); the past versions of the sparse trees, 3.5 s of that 5.2 s when they were rebuilt by replaying every account, now come from the store's history records, and the same restart takes 2.91 s (read 0.31 s; indices, trees and root with every check 2.59 s; history 2 ms), 1.46 s without the leaf check and 5.41 s when the trees are computed from the objects, with 381 MiB of heap after it where there were 572 |
 
 Memory is dominated by the keys themselves (ML-DSA-44 keys; under secp256k1 the same accounts
 hold a fortieth as many key bytes): a 1 GB genesis is about 1.1 GB of heap and
@@ -133,7 +138,9 @@ whose depth grows with the log of the state, as does the length of a proof. A re
 cost more than the first load in this run because the store was read object by object and
 the authenticated name index built twice, once live and once to recover past versions; the
 live build is gone now that the trees and indices come back from the store, and the
-past-version rebuild is what remains.
+past-version rebuild went after it: the past versions are taken from the nodes each
+commit overwrote, which the history records in the store hold, and the replay of every
+account remains only as the fallback for records written before those nodes were kept.
 
 ### Steady state at that size
 
@@ -152,7 +159,7 @@ state-sync pipeline run locally into a fresh store.
 | blocks of 300 transactions of 8 transfers each, random accounts | per block: admit 50 ms, finalize 93 ms, commit 43 ms; 17,700 transfers/s applied |
 | growth over 8 such blocks | 36 MiB of LMDB; heap in use grew 85 MiB (the process's heap-used difference across the blocks, not an isolated measure of the version history) |
 | object proof / name proof at a past height, with verification | 37,000 / 43,000 per second |
-| account history, newest 20 entries | 930,000 per second |
+| account history, newest 20 entries | 1,020,000 per second |
 | state sync pipeline, local, 201 chunks, 504 MiB: export, read and verify chunks, rebuild, write, open | 37 s in all (export 4.6 s, read and verify 3.5 s, rebuild and check roots 10.3 s, write 4.2 s, open 14.1 s); no peer transfer or header verification |
 | memory with the original and the synced state both loaded | 1.3 GB of heap plus 1.1 GB of key buffers |
 
@@ -165,9 +172,14 @@ state and the opened store).
 
 A `paging` suite runs the 192,000-account secp256k1 state under the memory guard: a node
 under a heap limit of 1.25 times its resident state kept committing for 40 seconds with
-every tier dropped for most of it, 107 blocks and 59,128 transfers without an abort, and
-with the cache capped and both tiers dropped the database runs on 40 to 50% of its
-resident heap at 5 to 20% less throughput (docs/benchmarks.md section 4.13).
+its index trees and all but two versions of its history paged out for most of it, 124
+blocks and 69,492 transfers without an abort,
+and with the cache capped and both tiers dropped the database runs on 40 to 50% of its
+resident heap at the throughput it has resident, within a tenth; a loaded node is in fact
+about a tenth faster with its index trees in the store than with them in memory, how much
+of the history window it keeps in memory changes its heap and its pauses but not its rate,
+and a quarter of the resident heap was enough under that load
+(docs/benchmarks.md section 4.13).
 
 ## Reading order
 

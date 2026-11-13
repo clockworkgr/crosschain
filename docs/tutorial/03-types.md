@@ -82,7 +82,7 @@ The private constant `PRIORITY_WINDOW = 2n` is Tendermint's `PriorityWindowSizeF
 
 **`class ValidatorSet`** holds `validators` (sorted; "Index = position here"), `totalPower`, and a private `proposerIndex`. The constructor is private; sets are made by `create`, `applyUpdates`, `copy` and `decode`. It sums the powers and throws if the sum exceeds `MAX_TOTAL_POWER`, 2^60: priorities swing by a few multiples of the total and are stored as `i64`, so a larger total could overflow them, and the bound is the same one Tendermint applies. Because every way of building a set passes through the constructor, an application update that would push the total past the limit throws instead of corrupting proposer selection.
 
-**`static create(entries)`** builds the genesis set. It checks each public key with `isPublicKey` from [chapter 2](02-crypto.md) (a known scheme tag followed by exactly that scheme's key) and each power positive, derives addresses, rejects duplicates through the private `assertUnique` (keyed by hex address), sorts, and then performs one increment so the set has a proposer:
+**`static create(entries)`** builds the genesis set. It checks each public key with `isPublicKey` from [chapter 2](02-crypto.md) (a known scheme tag followed by exactly that scheme's key, which for secp256k1 must also be a point on the curve) and each power positive, derives addresses, rejects duplicates through the private `assertUnique` (keyed by hex address), sorts, and then performs one increment so the set has a proposer:
 
 ```ts
   static create(entries: { publicKey: Uint8Array; power: bigint }[]): ValidatorSet {
@@ -202,6 +202,7 @@ The private **`rescalePriorities(diffMax)`** finds the spread between the highes
       const publicKey = decodePublicKey(r);
       const power = r.u64();
       const priority = r.i64();
+      if (!isPublicKey(publicKey)) throw new Error('bad public key');
       if (power <= 0n) throw new Error('validator power must be positive');
       return { address: addressOf(publicKey), publicKey, power, priority };
     }, 10_000);

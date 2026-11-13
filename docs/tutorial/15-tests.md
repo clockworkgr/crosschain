@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-two files, 160 cases, about 5,170 lines counting the shared harness
-in `test/helpers.ts` and the setup file. The whole suite takes about a minute (70.9 s, all
+`test/**/*.test.ts`: twenty-four files, 203 cases, about 6,500 lines counting the shared harness
+in `test/helpers.ts` and the setup file. The whole suite takes about two minutes (111.5 s, all
 passing, on the run this chapter was checked against, under the default ML-DSA-44 keys); nearly
 all of that time is the network scenarios, which run real consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (159 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (202 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -21,10 +21,12 @@ schemes from a key pair up to a chain running on the second one; `network`, `con
 `recovery` and `engine` run the engine on the toy key-value application, and `memory` covers the
 memory guard and the collection scheduler, its node case on the core application so that the
 guard's dials on the object database show; `chain`, `app`, `staking`, `staking-net`, `fees` and
-`genesis` cover the core application; `txproof`, `light`, `rpc` and
+`genesis` cover the core application, and `history` the log its account history is stored in; `txproof`, `light`, `rpc` and
 `sync` cover proofs, clients and catching up; `review` holds one regression test per finding of
-the external review and the later cases of the same kind, and `review2` five more that each
-span several layers. Files run one after another, never in parallel, for a reason explained
+the external review and the later cases of the same kind, `review2` five more that each
+span several layers, and `review3` the twelve regressions of the review of the paging and
+scheme work (the memory guard, the node and the signature schemes), which this chapter lists
+by title at the end of the suites. Files run one after another, never in parallel, for a reason explained
 below.
 
 ## The harness
@@ -329,15 +331,20 @@ not share. Within a file, tests already run sequentially.
 
 ### `test/setup.ts`
 
-Run before every test file, it is the whole of the two environment switches:
+Run before every test file, it is the whole of the three environment switches:
 
 ```ts
+import { useSchemeFromEnvironment } from '../src/crypto/keys.ts';
 import { setDefaultIndexTrees, setDefaultTrees } from '../src/db/database.ts';
+
+useSchemeFromEnvironment();
 
 if (process.env.INDEX_TREES === '0') setDefaultIndexTrees(false);
 if (process.env.TREES === '0') setDefaultTrees(false);
 ```
 
+`useSchemeFromEnvironment()` sets `DEFAULT_SCHEME` from `CHAIN_SCHEME` when the variable is set
+([chapter 2](02-crypto.md)); the node code never reads it.
 `setDefaultIndexTrees(false)` makes every `ObjectDatabase` constructed afterwards start with its
 secondary indices' B+ trees dropped, unless its options say otherwise, so every lookup and scan
 in the run reads the index store with the overlay of the writes since the last root on top;
@@ -356,7 +363,7 @@ then walks every case by its exact title.
 
 ### test/units.test.ts
 
-Ten unit tests on the smallest pieces: the codec ([01](01-codec.md)), keys and the worker
+Eleven unit tests on the smallest pieces: the codec ([01](01-codec.md)), keys and the worker
 verifier ([02](02-crypto.md)), the validator set ([03](03-types.md)), the signing guard
 ([04](04-consensus.md)) and the mempool ([05](05-mempool-executor.md)). Nothing here starts a
 node.
@@ -421,6 +428,16 @@ from ever producing the evidence that would slash it.
 same bytes again are `'seen'`, `bad` (no `=`) is `'invalid'`, 100 bytes is `'too-large'`,
 `b=2` is `'added'`. `reap(1_000_000)` returns `['a=1', 'b=2']` in arrival order; `reap(8)` fits
 only one. After `update([tx('a=1')])`, the committed transaction is gone and `size` is 1.
+
+**`it('remembers the last transactions it saw, the newest taking the oldest one\'s place')`**.
+A `Mempool` with `cacheSize: 3`. Three transactions are `'added'` and then committed through
+`update`, which takes them out of the pool; submitted again each is `'seen'`, because the
+cache of hashes outlives the pool, so gossip need not bring a committed transaction again.
+Seven more transactions are added, which takes the cache round its ring more than twice:
+`d=6`, `d=5` and `d=4` are `'seen'`, and `mp.seen(...)` is false for `d=3` and for `a=1`. The
+cache keeps exactly the last `cacheSize` hashes, each new one taking the place of the oldest
+([chapter 5](05-mempool-executor.md) has the ring and why it replaced an array shifted for
+every transaction).
 
 ### test/schemes.test.ts
 
@@ -498,10 +515,12 @@ height 4, resolve an unknown hash to `null`, find height 9 `null`, and find no s
 
 ### test/arena.test.ts
 
-Two tests on `src/db/arena.ts` ([the database chapter](09-database.md)), the slabs of encoded
+Six tests on `src/db/arena.ts` ([the database chapter](09-database.md)), the slabs of encoded
 bytes under the object database, with no database at all: an `owner()` helper plays the
-database's part, holding one reference per `type/instance` in a `Map` and taking relocations
-into it, and `bytesOf(n, fill)` makes an encoding of `n` bytes all equal to `fill`.
+database's part, holding one reference per `type/instance` in a `Map`, taking relocations
+into it, and, when the arena says an entry's slab was released, deleting the reference and
+noting the entry in a list `gone`; `bytesOf(n, fill)` makes an encoding of `n` bytes all equal
+to `fill`.
 
 **`it('stores encodings across growing slabs and reads them back')`**. Six entries of 1, 100,
 1,000, 100,000, 300,000 and 5 bytes, each filled with its own byte, read back with their length
@@ -518,13 +537,36 @@ bytes. `maintain()` releases nothing while that slab is still the current one, t
 entries go to. A 256 KiB entry forces a second slab, and then `maintain()` returns 262,144, the
 bytes released: every live entry was copied into slab 1 beside the big one, the owner was given
 its new reference, and it reads back byte for byte as before, while slab 0 is gone (`stats.slabs`
-is 1, and a read at slab 0 throws `/released/`). A new entry then gets a reference above slab 0:
-slab numbers are never reused, so a stale reference into a released slab fails rather than
-reading a newer entry.
+is 1, and a read at slab 0 throws `/released/`). A new entry then takes the released slab's
+slot with a new generation (its slab number is 2^16, generation 1 of slot 0), so the stale
+reference into the old slab 0 is still refused rather than reading the newer entry.
+
+The group `arena reclamation` has three cases, listed here by title: "releases every fully
+dead slab at a root without copying from it, however many there are" (three slab-sized objects
+rewritten at eight roots; `maintain()` asks the owner about no entry and leaves nothing dead),
+"compacts as much as a root wrote, so a backlog of half-dead slabs does not grow" (a hundred
+one-megabyte entries, three in five rewritten; one `maintain()` does all there is to do) and
+"reuses the numbers of released slabs, so references stay small and exact however long the
+node runs" (forty roots of slab-sized writes use fewer than eight slots, a stale reference is
+refused by its generation, and `packRef` is exact at its limits and refuses beyond them).
+
+**`it('releases whole slabs down to a byte limit, unread ones first, and tells the owner of every live entry')`**
+(describe `arena as a cache`). Twelve entries of 200,000 bytes fill four slabs of 256 KiB,
+512 KiB, 1 MiB and 2 MiB with one, two, five and four entries. Entry 1 is freed and dropped
+from the owner, so the second slab holds one dead entry and one live one. `shrink(capacity)`
+returns 0: nothing to do while the arena fits. Entry 2 is read, which marks the second slab,
+and `shrink(capacity - 1)` returns 262,144 with `gone` equal to `['1/0']`: the first slab went,
+the read one was passed over. A limit of 2.5 MiB then releases the third slab, 1 MiB, and
+`gone` gains entries 3 to 7; entry 2 still reads. Entry 2 is read again and `shrink(0)`
+releases the second slab all the same, on the second pass, reporting entry 2 and not the dead
+entry 1. One slab is left, the current one, which is never released; the owner holds entries 8
+to 11 and each still reads. A new entry of 1,900,000 bytes then opens a slab in a spare slot,
+and `stats.slabs` is 2. This is `Arena.shrink`, the arena as a cache over a store
+(STATE-PAGING.md section 3.4).
 
 ### test/db.test.ts
 
-Thirty tests on the object database and the trees beneath it ([the database
+Forty-three tests on the object database and the trees beneath it ([the database
 chapter](09-database.md)). The fixture defines two object types: `ItemType` (type id 7) with
 a unique, authenticated index `byName` and a non-unique `byGroup`, and `CounterType` (type id
 3) with no indices. `fresh()` makes a database over both, `mk` creates an item, `byName` and
@@ -630,8 +672,9 @@ missed, and after a final `rebuildTrees()` every proof in the window still agree
 of 300 creates and, from the second on, 50 removes, on a database with resident trees, one with
 `trees: false` and no store, and one with `trees: false` over a `MemoryKv` written after every
 root: the same roots and the same `proofsAt` two versions back each time. `rebuildEstimate().trees`
-is `1550 * 1000` for the two dropped databases (a leaf of the name tree per live item, 1,800
-created and 250 removed, at 1,000 bytes each) and 0 for the resident one: what rebuilding would
+is more than `1550 * 2000` for the two dropped databases (a leaf of the name tree per live item, 1,800
+created and 250 removed, at 1,000 bytes kept and 1,000 thrown away each, and on top the nodes of
+the retained versions) and 0 for the resident one: what rebuilding would
 take comes from the objects, not from what was resident when the trees went.
 
 **`it('assigns dense ids and serves unique and range lookups')`** (describe `object database`).
@@ -753,6 +796,15 @@ root, which the tree kept.
 each adding `a_i` and deleting `a_{i-2}`. Versions 3 to 5: `rootAt` matches, `proveAt` shows
 `a_i` present with its value and `a_{i-2}` absent; `rootAt(2)` throws `/not available/`.
 
+**`it('counts the nodes its past versions hold while resident, and gives them up with the window')`**.
+A resident tree retaining 4 versions takes eight commits, each adding one key and listing its
+changes (`commit(i, true)`, the records taken with `takeRecords()`). `historyNodes` is then at
+least 4: four past versions, each retained commit having replaced at least the root.
+`setWindow(1)` leaves fewer, at least 1, and `setWindow(0)` leaves 0. A second tree whose four
+commits do not list their changes counts 0. This is the figure `historyEstimate()` takes for a
+resident sparse tree ([09](09-database.md)), so that what the node notes when it trims the
+window at `warn` includes the sparse trees' past versions.
+
 **`it('gives the roots and proofs of a resident tree, writing back only the nodes it changed')`**
 (describe `sparse merkle tree: dropped`). Two trees retaining three versions, keyed under the
 node header of type 9, over a key space of 120 names so that leaves split and collapse often.
@@ -771,9 +823,125 @@ rename `n_{v-2}` to `r_{v-2}` and remove the object from four versions earlier. 
 exports the objects and counters into a fresh database, checks its root at version 7 matches,
 loads every version's `HistoryRecord` with `loadHistory` and calls `rebuildIndexVersions`. For
 every version in the window, the rebuilt key proofs are byte-identical to the recorded ones, and
-so are the object proofs. The history records are captured by the `keyProofBytes` helper into a
+so are the object proofs. This is the replay of every key, which a restart now uses only as
+its fallback (`restoreIndexVersions`, tested under `past versions from the store` below); the
+case keeps it tested on its own. The history records are captured by the `keyProofBytes` helper into a
 module-level `histories` array as a side effect of each call; the comment `// filled below`
 marks it.
+
+**`` it(`forgets the older versions at once, answers the same for the ones it keeps, and grows back (trees ...)`) ``**
+(describe `object database: a trimmed history window`). Two cases from one loop, with the
+Merkle trees resident and with them dropped. Two databases with `retainVersions: 8` and no
+history store, `whole` and `trimmed`, take the same step at every version: forty creates, and from version 1 ten
+removes and a modify among the previous version's items, and the counter object set to the
+version. After versions 0 to 12 the roots agree, `trimmed.lowestVersion` is 4 and
+`historyEstimate()` is above zero. Then `trimmed.setHistoryWindow(2)`: `memory()` reports
+`history: 'trimmed'`, `historyWindow: 2` and `lowestVersion: 10`, the estimate has fallen,
+`proofsAt` for versions 10, 11 and 12 is the same string as `whole`'s, and `proofAt`, `getAt`
+and `proveKeyAt` at version 9 each throw `/not available/`. Versions 13 to 15: the roots agree,
+`trimmed.lastChanges.history` equals `whole`'s at each (the record for the store is complete
+whatever the window), `lowestVersion` is `v - 2`, the three versions in the window prove the
+same, and `rootAt(v - 3)` throws. `lastStaleVersion` is 7, counted from the retention of 8.
+Then `setHistoryWindow(Infinity)`: `memory()` says `resident` with a window of 8 but
+`lowestVersion` is still 13, and through versions 16 to 26 it is `max(13, v - 8)`, every
+version from there to `v` proving as `whole` does, until both databases report the same lowest
+version. Last, the window is set to 3 and the trees are dropped (in the dropped run, rebuilt):
+versions 23 to 26 still prove the same, and after version 27, versions 24 to 27. This is
+`setHistoryWindow` and the `setWindow` of both kinds of tree, with the fix to the three prune
+loops for several versions pruned at once. The refusals at version 9 are those of a database
+that has only its window in memory; the next describe gives it the store's records.
+
+**`` it(`answers for every version the store has a record of, whatever the window in memory holds (trees ...)`) ``**
+(describe `object database: past versions from the store`). Again two cases from one loop,
+trees resident and dropped. The describe's own `persist(db, kv)` does what the application's
+commit does for history: it writes the last root's index and tree changes to a `MemoryKv`,
+puts the root's history record under `historyKey(version)` (`0x68` and the version), deletes
+the record of `db.lastStaleVersion`, and calls `dropChanges()`. `step` is the step of the
+trimmed-window test with one thing added: from version 2 a name passes from one item to
+another, so that a sparse tree leaf changes hands within one version. `whole` has
+`retainVersions: 8` and no store; `paged` has the same retention, the `MemoryKv` as its index
+store and `historyStore: (v) => kv.get(historyKey(v))`. The check `same(v)` requires that
+`paged.lowestVersion` equals `whole`'s, that for every version from there to `v` `proofsAt`
+gives the same string and six items read with `getAt` have the same values, and that
+`rootAt` one version below the lowest throws `/not available/`. After versions 0 to 12,
+`paged.setHistoryWindow(2)` and then `setHistoryWindow(0)`: each time `memory()` reports
+`history: 'trimmed'`, the window asked for and `lowestVersion: 4`, which trimming has not
+moved, the estimate has fallen, and `same(12)` holds, every proof below the window coming
+from the records in the store. Versions 13 to 16: `same(v)` is checked before `persist` as
+well as after, so a root whose record the store does not have yet is answered from the
+pending change list. Then `setHistoryWindow(Infinity)` and versions 17 to 22: the window in
+memory takes over from the records one version at a time and `same(v)` holds throughout,
+also across a `dropTrees()` (or, in the dropped run, a `rebuildTrees()`) at version 19. Last,
+the record of version 20 is deleted from the store behind the database's back and the window
+set to 0: `rootAt(21)` is still `whole`'s, since no record at or below 21 is needed for it,
+and `rootAt(19)` and `proofAt` of an item at version 19 each throw
+`/no history record of version 20/`. The database keeps the list of the versions that have a
+record and scans exactly those, so a record the store does not return is a refusal and not
+an answer from what is left, in which whatever version 20 overwrote would be read as it is
+now. This is `past()` and `scanHistory` of [chapter 9](09-database.md).
+
+**`` it(`gives a reopened database its sparse trees' past versions from the records, or by replay without them (trees ...)`) ``**.
+Two more cases from the same loop. A database with `retainVersions: 8`, the `MemoryKv` as its
+index store and its history store, takes versions 0 to 12 with `persist` after each. Then,
+once for `'records'` and once for `'replay'`, the test does what a restart does on a copy of
+the store: a fresh database over the copy imports the exported objects as indexed
+(`importObject(id, bytes, true)`), takes the counters, loads the trees and the index entries
+from the store (`loadTrees(true)`, `loadIndexEntries(true)`), computes the root of version
+12, which must be the first database's, and calls `dropChanges()`. The records of versions 5
+to 12 are decoded from the store and given to `loadHistory`; in the `'replay'` pass the
+record of version 9 is given with `nodes: null`, as a record written before the sparse nodes
+were kept. `restoreIndexVersions()` must return `'records'` in the first pass and `'replay'`
+in the second: one record without its list and nothing is taken from the records. Either
+way `lowestVersion` is the first database's, and for every version from there to 12
+`proofsAt` gives the same string and the six items read with `getAt` have the same values.
+Then the reopened database goes on: a third database with no store runs versions 0 to 15,
+and from version 13 the reopened one takes the same step with the same root, persists, and
+proves every version of the window as the third does, with `rootAt` one below the lowest
+throwing `/not available/`, so the past versions it was given move out of the window as
+they should. This is `restoreIndexVersions` and `SparseMerkleTree.loadVersions` of
+[chapter 9](09-database.md), with resident trees (each older version built against the next
+newer one) and with dropped ones (the records kept as the tree's own history).
+
+**`it('reads a record written before the sparse tree nodes were kept, and refuses to prove a key from it')`**.
+A database with a history store runs versions 0 to 3, and after each `persist` the test
+overwrites the stored record with the bytes an earlier build wrote: the same record encoded
+with `nodes: null`, less its last byte, so that it ends after the counters. The root at
+version 1 and the counter object's proof at version 1 are noted, then `setHistoryWindow(0)`.
+`decodeHistory` of the stored record of version 2 gives `nodes: null`. `rootAt(1)` and the
+counter's proof are what they were: the dense trees, the objects and the counters are in the
+old records, and `CounterType` has no authenticated index, so its proof needs no sparse tree
+node. `proveKeyAt` on `byName` and `proofAt` of an item, whose type leaf carries the root of
+`byName`, each throw `/not available/`.
+
+**`it('reads released objects from the store, gives the same roots and proofs, and takes written objects back')`**
+(describe `object database: an arena within a byte limit`). `persistObjects(db, kv)` writes a
+root's objects under `0x6f` keys and its index and tree changes to a `MemoryKv`, as the
+application does, then calls `dropChanges()`; `objectStore(kv)` reads one object back by id.
+`whole` has no store; `bounded` has the store as `indexStore` and `objectStore`, `arenaBytes: 0`
+and `hotObjects: 50`. Six versions of 4,000 items with 40 bytes of padding in their names, and
+from version 1 three hundred removes and three hundred modifies that also move the item to
+group 9. At each version the roots agree; `setArenaLimit(0)` called before the store has the
+root leaves `storedObjects` unchanged, since the bytes are nowhere else; after
+`persistObjects`, the proofs at the current version are the same string as `whole`'s. At the
+end `arenaLimit` is 0, the arena is one slab, more than 15,000 objects are stored, and `whole`
+reports `arenaLimit: Infinity, storedObjects: 0`. Every read agrees: eight ids by `get`, a
+name by lookup, group 9 by scan, a past value by `getAt`, `exportObjects()` and
+`encodeSnapshot`. In both databases a session modifies one stored object and removes another
+and is undone, then one is renamed and one removed for good; the root at version 6 agrees and
+`storedObjects` is down by exactly two. After the write the removed one reads `null`, the
+renamed one is found by its new name, and the proofs agree. `setArenaLimit(Infinity)` releases
+nothing more, and with one object deleted from the store its `get` throws
+`/neither in the arena nor in the store/`.
+
+**`it('ignores the limit without a store to read from')`**. A database with `arenaBytes: 0` and
+no object store: 12,000 items, a root, `dropChanges()` and `setArenaLimit(0)` leave
+`storedObjects: 0`, `arenaLimit: Infinity` and more than one slab.
+
+Three earlier cases of this file are not described above; by title: "keeps the budget when the
+cached objects sit far apart among the instances, as after churn", "undoes a session in
+proportion to what it created, not to the objects already cached" (both under `object
+database: arena and hot cache`) and "estimates a rebuild of the sparse trees with the versions
+it must build as well as the current one".
 
 ### test/network.test.ts
 
@@ -866,8 +1034,9 @@ set to 3; the commit two heights later has three signature slots.
 
 ### test/recovery.test.ts
 
-Two tests on what survives a restart and on evidence ([05](05-mempool-executor.md),
-[04](04-consensus.md)), again on the key-value application.
+Three tests on what survives a restart, on how a block reaches the store and on evidence
+([05](05-mempool-executor.md), [04](04-consensus.md)), the first and the last on the key-value
+application and the second on the core application.
 
 **`it('a validator restarted from disk resumes with its state, key guard and app intact')`**.
 Node 0 alone gets a data directory. After a transaction lands, node 0 stops at `stoppedAt`; the
@@ -877,6 +1046,26 @@ back from LMDB and `app.json`. After starting it catches up five heights, and wi
 a commit on node 1 carries its signature at its index: the restarted validator is voting again,
 which it could only do if its sign state (the double-sign guard, `priv_validator_state.bin`)
 came back consistent with what it had signed. Its block at the catch-up height matches node 1's.
+
+**`it("saves a block and the application's state in one store transaction when the node holds the application, and in two otherwise")`**.
+The executor saves a block and has the application commit inside one transaction of the
+environment when the node created the application itself, and one after the other when the
+application was handed in ([05](05-mempool-executor.md), `doApply`). The test sees which by
+wrapping a `MemoryEnv` in a `KvEnv` of its own, `noting()`: its `transaction(fn)` counts the
+call and keeps a depth while `fn` runs, and every store it hands out records, at each `write`,
+the store's name and `inside` or `alone` according to that depth. A one-validator chain of the
+core application (one faucet account, no inflation) is made unstarted, and `run(env, app)`
+makes node 0 over the given environment, starts it, waits for height 3 and stops it. First
+with `app` undefined, so the node builds its own `CoreApp` on the environment's `app` store: at
+least six writes were made inside a transaction, there were exactly half as many transactions
+as such writes, and they alternate `chain inside`, `app inside`, the chain's writes first, as
+the persistence order has them. Exactly one application write was made outside a transaction,
+the one that stored genesis. Then with a `CoreApp` constructed by the test over a separate
+`MemoryKv`: the environment saw no transaction at all, and every write it saw, at least three,
+is `chain alone`, since that application's store is not in the environment and the executor
+was given no `transaction`. In memory the two orders leave the same state, which is why the
+test looks at the calls; on LMDB the first is one flush to the device per block and the second
+two.
 
 **`it('double-sign evidence is built, included in a block, and handed to the app')`**. The test
 holds validator 3's key (`keyPairFromSeed(net.validatorSeed(3))`) and forges two prevotes at the
@@ -919,9 +1108,9 @@ empty application set.
 
 ### test/memory.test.ts
 
-Four tests on the memory guard and the collection scheduler of `src/node/memory.ts`
-([08](08-node.md)): three unit tests under `describe('memory guard')`, where the heap is
-whatever the test says it is, and one network test under `describe('a node under memory
+Six tests on the memory guard and the collection scheduler of `src/node/memory.ts`
+([08](08-node.md)): four unit tests under `describe('memory guard')`, where the heap is
+whatever the test says it is, and two network tests under `describe('a node under memory
 pressure')`, on the core application so that the guard's dial on the object database can be
 checked, with an `RpcServer` stopped before the testnet in `afterEach`. The `stats`
 helper makes a sample from a heap-used figure against a limit of 1,000:
@@ -941,6 +1130,18 @@ sequence is exactly `['warn', 'pressure', 'critical', 'pressure', 'warn', 'ok', 
 and the guard's `stats` is the last sample. Thresholds that do not rise (`warnAt: 0.9,
 pressureAt: 0.8`) throw `/thresholds/`, and a real `memoryStats()` reports a limit above the
 heap in use.
+
+**`it('takes its levels from the old generation when the sample gives it, whatever the young generation holds')`**.
+The samples here carry `heapOld` beside the helper's fields, as a process under
+`--max-old-space-size` reports them. With `heapUsed` at 990 of 1,000 and `heapOld` at 100,
+`check()` is `ok`: 99% by the whole heap, 10% by the old generation, and the guard goes by
+the second. With `heapOld` at 860 it is `pressure`, and the logged fields carry
+`level: 'pressure'` and `heap: '0/0 MiB'`, the figures being bytes here. A sample of 400 MiB
+used and 300 MiB old against a limit of 1,000 MiB brings it back to `ok` with
+`heap: '300/1000 MiB'` in the log: the log reports the figure the level was taken from.
+`heapInUse` of that sample is the 300 MiB, and of a sample without `heapOld`, `stats(7)`, it
+is `heapUsed`, 7. Last the process's own sample: `memoryStats().heapOld` is undefined exactly
+when `heapLimitFlag()` is null, and when present it is no more than `heapUsed`.
 
 **`it('schedules a minor collection after every commit and a major one once the heap has grown enough')`**.
 A `GcScheduler` with an injected `gc` that records `type/execution` and returns a promise for
@@ -964,16 +1165,29 @@ what V8 does on its own as well as what the scheduler asks for.
 of the core application (`appFor` makes a `CoreApp`, and the application genesis holds one
 faucet account and no inflation): two validators and a full node that is created but not
 started, then made again with
-`net.makeNode(2, { memory: { stats: () => stats(heap, limit), intervalMs: 20 } })`, so its
-guard samples an invented heap against an invented limit fifty times a second; an `onMemory`
+`net.makeNode(2, { memory: { stats: () => stats(heap, limit), intervalMs: 20 }, log: (_level, msg) => void logged.push(msg) })`, so its
+guard samples an invented heap against an invented limit fifty times a second, and `logged` holds
+every message the node logs; an `onMemory`
 listener records the levels and an `RpcServer` is opened on it. At height 2 the level is `ok`,
 the database's `hotLimit` is `Infinity`, and `status.memory` is `{ level: 'ok', shedding: false }`.
-The heap is set to 900, 90% of the limit: within 5 s `isShedding` is true, the level is
+The heap is set to 750, 75% of the limit: within 5 s the level is `warn`, `isShedding` is
+false, and `memory()` reports `indexTrees: 'dropped'`, `trees: 'resident'` and
+`history: 'trimmed'` with `historyWindow: 2`. At `warn` the node pages what its blocks do not
+need and sheds nothing: the `hotLimit` is 100,000, `mempool.currentLimit` is `maxTxs / 2`, and
+`block`, a costly method, still answers.
+Then the heap is set to 900, 90% of the limit: within 5 s `isShedding` is true, the level is
 `pressure`, the `hotLimit` is 10,000 and the cache holds no more than that (the first dial: the
-cache of decoded objects capped, the excess evicted at once), `memory().indexTrees` and
-`memory().trees` are both `dropped` (the second and third: every index read goes to the store
-through the overlay, every root and proof reads its paths from the store), `mempool.paused` is
-true, `submitTx` answers `paused`, `broadcastTx` and `block` over the RPC reject with `-32004`,
+cache of decoded objects capped, the excess evicted at once), `memory().indexTrees` is still
+`dropped` and `memory().trees` now is too (every index read goes to the store
+through the overlay, every root and proof reads its paths from the store), `memory()` still reports
+`history: 'trimmed'` with `historyWindow: 2` (the window of past versions cut to
+the last two, as from `warn`), `mempool.paused` is false and `mempool.currentLimit` is `maxTxs / 10` (the
+limit follows the level; the pool is not paused), and with the limit set to zero by the test
+`submitTx` answers `full` and `broadcastTx` over the RPC rejects with `-32004` (the server
+serves broadcasts while the node sheds and the mempool's limit is the throttle: a full pool is
+"try again", not a bad transaction); the test puts the limit back, and the same broadcast
+rejects with `-32002`, taken to the application, which refuses the bytes; `block`, a costly
+method the server does refuse while the node sheds, rejects with `-32004`;
 `GET /events` is 503, `/health` reports `memory: 'pressure'`, and `status.memory` is
 `{ level: 'pressure', shedding: true, heapUsed: 900, database: { objects: 'capped', indexTrees: 'dropped', trees: 'dropped' } }`.
 Then the claims that matter: the node advances two more heights while shedding, because
@@ -981,18 +1195,37 @@ consensus and block sync are not what is shed, and its blocks ran against the dr
 a hash that differed from the validators' would have stopped it there; and an object proof of
 the faucet at its height, read from the dropped trees, is byte for byte the proof a validator
 with its trees resident makes at the same height. Then the heap eases, but not far enough: the
-limit is set to four times what `rebuildEstimate()` says the two tiers would take (both
-estimates are above zero) and the heap to 64% of it, 6% below the warn line, a quarter of what
-rebuilding needs. Within 5 s shedding ends, the level is `ok`, the pool is resumed and the
-`hotLimit` is `Infinity` again, and 100 ms later, five samples, both tiers are still `dropped`:
+limit is set to four times what `rebuildEstimate()` says the cheaper of the two tiers would
+take (both estimates are above zero) and the heap to 40% of it. That leaves 30% of the limit to
+the warn line, which would hold the cheaper tier's 25%, and 10% to half the limit, which holds
+neither: the room a rebuild is given is what is left to half the limit (`Node.REBUILD_FILL`),
+so a node that rebuilt here would be measuring to the warn line. Within 5 s shedding ends, the level is `ok`, the mempool's limit is `maxTxs` again and the
+`hotLimit` is `Infinity` again, and 100 ms later, five samples, both tiers are still `dropped`
+and the line `memory: staying paged` has not been logged: nothing is even considered yet,
+because the node waits at `ok` for as many samples as it had run before the drop (a few
+seconds of them here), a load that filled the heap once being likely to fill it again. Within
+30 s the wait is over, the node finds no room and logs the line; 200 ms and ten samples later
+it has still logged it exactly once, and both tiers are still `dropped`:
 the node runs on the fallbacks at `ok` rather than take the heap straight back up. At 20% of the
-limit the next samples rebuild them, `trees` and then `indexTrees` read `resident`,
-`accountByName('faucet')` answers from the rebuilt index, `submitTx` answers something other
-than `paused` (the test's key-value transaction is refused by the core application, not by the
-pause), and `block` answers. At 99% the `critical` level is reported; what to do then (the CLI
+limit the next samples rebuild them, `trees` and then `indexTrees` read `resident`, and with both
+back and room left `memory().history` reads `resident` again within 5 s (the window is let
+grow back last), `accountByName('faucet')` answers from the rebuilt index, `submitTx` answers
+something other than `full` (the test's key-value transaction is refused by the core
+application, not by the limit), and `block` answers. At 99% the `critical` level is reported; what to do then (the CLI
 stops the node) is the caller's, not the node's. The sequence seen is exactly
-`['pressure', 'ok', 'critical']`: 10% to 90% is straight to `pressure` and 90% to 64% straight
-to `ok`, one sample crossing several thresholds each way.
+`['warn', 'pressure', 'ok', 'critical']`: 90% to 40% is straight to `ok` and 20% to 99% straight
+to `critical`, one sample crossing several thresholds each way.
+
+**`it('keeps as many past versions in memory as retain.memoryVersions says, proves the older ones from the store, and leaves the index trees there when told to')`**.
+One validator of the core application, created but not started and then made again with
+`net.makeNode(0, { retain: { memoryVersions: 3 }, indexTrees: 'store' })`. At height 8 its database reports
+`history: 'trimmed'` with `historyWindow: 3`, with no guard level involved. With
+`indexTrees: 'store'` the secondary indices are read from the store from the start:
+`memory().indexTrees` is `dropped`, `accountByName('faucet')` finds the account, and 300 ms
+later the trees are still `dropped`, since nothing waits to be rebuilt. The provable
+window is the store's, not the memory's: `lowestProvableHeight` is at least six heights
+below the latest, `proofAt` gives a proof of the faucet account at the height six back, and
+`rootAt` gives a 32-byte root there, both read from the store's history records.
 
 ### test/chain.test.ts
 
@@ -1038,7 +1271,7 @@ to the transfer's.
 
 ### test/app.test.ts
 
-Sixteen unit tests on `CoreApp` ([11](11-application.md)) with no network: one genesis
+Twenty-two unit tests on `CoreApp` ([11](11-application.md)) with no network: one genesis
 validator, a faucet with one billion base units, zero inflation and no block reward, so every
 balance is predictable. `block(app, txs)` calls `finalizeBlock` then `commit` with
 `blockTime(h) = genesisTime + 1000n * h`. `tx(ops, keys, expiration)` signs with
@@ -1129,6 +1362,26 @@ and `b` the same hash. After four more blocks the window slides: the lowest prov
 height 2 throws, and the history keys in the store (prefix `0x68`) are exactly versions
 `[4, 5, 6, 7]`.
 
+**`it('keeps the whole history window in the store while the one in memory is trimmed, so a restart has it back')`**.
+App `a` on a `MemoryKv` and app `whole` in memory, both with `retainVersions: 4` from
+`makeApp`, take the same six blocks: alice's registration, then five transfers to her. After
+the third block the test calls `a.db.setHistoryWindow(1)`, as the node does from `warn` on
+with a window of two. At height 6 `a.db.memory()` reports `history: 'trimmed'` with
+`historyWindow: 1`, and `a.lowestProvableHeight` is 2, the same as `whole`'s: for heights 2 to
+6 alice's object proof and her name proof are byte for byte `whole`'s, those below height 5
+read from the store's history records, and `proofAt(aliceId, 1n)` throws `/not available/` as
+it does for `whole`. The history keys in `a`'s store are `[3, 4, 5, 6]`: `persist` deletes by
+`lastStaleVersion`, the edge of the configured window, not by what memory holds. A `CoreApp`
+restarted on that store with a logger that keeps the fields of `loaded application state`
+shows `indexVersions: 'records'` and `provableFrom: 2` there: the sparse trees' past versions
+came from the records, with no account replayed. It reports `lowestProvableHeight: 2n`, and
+for heights 2 to 6 its proofs are again `whole`'s, this time from the window it read back.
+Then the store is damaged: the history record of version 4 is deleted. An app opened on it
+has `lowestProvableHeight: 4n`, since only records 5 and 6 are unbroken up to the current
+height; alice's proofs at heights 4 to 6 are `whole`'s, `proofAt(aliceId, 3n)` throws
+`/not available/` rather than being answered from record 3 without record 4, and after one
+more block the history keys are `[5, 6, 7]`: the record below the gap went with that commit.
+
 The second group shares one check, `consistent(app, kv)`: the store's `'i'` keys equal
 `db.indexEntries()`, `db.checkIndexStore()` reports nothing (every resident tree entry is in
 the store with its value, and the store holds no more entries under an index's prefix than the
@@ -1181,6 +1434,95 @@ from alice is consistent. Then a `checkTx` registering dave leaves pending write
 mempool's session, `dropTrees()` is turned in the middle of them, a block registering carol
 agrees, and the store's trees equal the resident twin's; both tiers rebuilt, the store is
 consistent.
+
+The third group, `describe('core application: a store opened without room for it')`, shares a
+`run(reopen)` helper: an app on a `MemoryKv` and a resident twin take two blocks (alice and
+bob registered, then 5,000 to alice), the store is reopened by the function given, its
+`lastAppHash` must equal the twin's, and `both(txs)` applies a block to the reopened app and
+the twin and compares the app hash, the results and, for every height from the reopened app's
+`lowestProvableHeight` to its last, alice's object proof and the name proofs of `alice` and
+`carol`.
+
+**`it('opens with the trees left in the store and no history window when the heap has no room, and runs on')`**.
+Reopened with `heapRoom: 0` and `retainVersions: 4`. `memory()` shows `trees: 'dropped'` and
+`indexTrees: 'dropped'`: with no room neither estimate fits. The window was not read back,
+so the one in memory starts at height 2, where the store was opened, and is whole
+(`history: 'resident'`, `historyWindow: 4`). Yet `lowestProvableHeight` is 0 like the twin's,
+and for heights 0 to 2 alice's object proof and her name proof are byte for byte the twin's:
+`openObjectDatabase` told the database of the records it left in the store
+(`noteStoredHistory`), and the heights before 2 are read from them. A transfer signed by alice and then carol's
+registration match the twin through `both`, the lowest provable height still 0, and alice's
+balance agrees. The history keys in the store are `[1, 2, 3, 4]`, the records it did not read
+among them, and after an empty block `[2, 3, 4, 5]`: they age out as usual. A fourth app on
+the same store with `heapRoom: 2 ** 30` reports `lowestProvableHeight: 1n` and proves heights
+1 to 5 as the twin does. And `openObjectDatabase` with `heapRoom: 0, indexTrees: true, trees:
+true` returns `paged: []` with both tiers `resident`: a tier named explicitly is opened as
+asked. This is the open path of STATE-PAGING.md section 9.1.
+
+**`it('leaves the objects in the store when the arena has no room for them, and reads them from there')`**.
+Reopened with `arenaBytes: 0`. `memory().storedObjects` is above 5 and `arena.used` is 0:
+every object was left in the store. The history window was read (`lowestProvableHeight: 0n`)
+and `accountByName('bob')` answers, decoded from the store. After the same two blocks through
+`both`, `arena.used` is above zero and `storedObjects` is lower than before but not zero: what
+the blocks wrote is in the arena again, the rest still only in the store. Alice's balance and
+`exportObjects()` of the whole state equal the twin's.
+
+A fourth group, `describe('core application: a damaged store is refused at restart')`, is not
+described here; its three cases, by title: "refuses an object missing while its leaf is still
+there", "refuses index entries that are missing, extra or name another object" and "refuses a
+dense tree node that is not the hash of its children, and a sparse node that does not hash to
+its parent's".
+
+### test/history.test.ts
+
+Four unit tests on `HistoryLog` of `src/app/core/history.ts` ([11](11-application.md)), the
+log the account history is stored in, each over a `MemoryKv` with no application. `account(n)`
+is the object id `2.n` and `entry(height, n)` an operation entry whose `position` is `n`, so a
+test can tell entries apart by position. `blocks(count, perBlock)` makes that many blocks of
+entries over five accounts, two entries in three going to account 0, and returns beside them
+a model: for each account the entries it should have, in order.
+
+**`it('pages an account oldest first and newest first, whatever the other accounts wrote between its entries')`**.
+Forty blocks of thirteen entries are appended, one `kv.write` each. Then, for the log that
+wrote them and for a second `HistoryLog` opened on the same store, every account's `total` is
+the model's length, and `read` is compared with a slice of the model for every `from` in 0, 1,
+2, 7, 64, the last sequence, one past it and five past that, and every `limit` in 0, 1, 3, 100
+and 1,000, oldest first and newest first, by sequence and position. An account that never
+appeared reads as no entries and a total of 0. A third log opened on the store appends one
+more entry for account 0, which is then its newest, and its total is one more.
+
+**`it('reaches the old end of a long history in a few dozen reads, and appends a block with a few pages of writes')`**.
+The store is wrapped so that every `get` is counted. Fifty blocks of a hundred entries, all
+of account 1, are written with fewer than 15,000 reads: an entry reads its account's head
+and, on average, one older entry for its skip pointer. Reading two entries oldest first from
+sequence 0, 1, 1,234, 2,047, 2,048, 4,095 and 4,998 returns the right positions in fewer than
+100 reads each, where following `prev` alone from the newest would take thousands. Last, the
+`'l'` keys (prefix `0x6c`) are exactly 0 to 4,999 in
+the store's order: a block's entries are consecutive keys at the end of the log.
+
+**`it('writes the heads a slice of the accounts at a time, and has the waiting ones back after a stop')`**.
+The store is wrapped so that every put of a `'p'` key (prefix `0x70`) is noted with its
+account number. Two hundred blocks of 300 entries are appended, the accounts taken from all
+over a range of 6,400 in no order (`n * 2654435761 % 6400`), and the test keeps its own count
+per account. After each block the head writes of that block span fewer than 128 account
+numbers: one slice, a sixty-fourth of the range, the slices being 128 wide once account 6,399
+has been seen. At every 37th block and at the last a second `HistoryLog` is opened on the
+store, as after a stop at that block: its `total` is the test's count for every account, the
+waiting heads read back from the entries, and it reads account 0's entries in full. Over the
+run fewer than 30,000 heads are written for 60,000 changes, since a head changed several
+times while it waits is written once, and no block writes as many as 300. At the end the two
+numbers under `'L'` are read from the store: the length is 60,000, and `covered` is no more
+than 64 blocks of entries (19,200) behind it, so the journal a restart reads is short.
+
+**`it('moves a store written before the log into it the first time it is opened')`**. A store
+is filled as the earlier layout had it, an entry under `0x61`, account and sequence, and a
+count under `0x71` and account, from the model of twelve blocks of nine entries. A
+`HistoryLog` opened on it reads every account with the model's sequences, heights and
+positions, oldest first, and its two newest entries newest first; no key with either old
+prefix is left; and the heights of the stored `'l'` entries, read at byte 32 of each value,
+after the account, the sequence and the two pointers, are in ascending order. A log opened
+again moves nothing, and an entry it appends for account 0 gets the sequence after the moved
+ones.
 
 ### test/staking.test.ts
 
@@ -1907,6 +2249,27 @@ Four validators reach height 6; a fifth node with `retain: { blocks: 2 }` syncs 
 lowest stored height is still 1 and block 1 loads, because every block within the seven-day
 evidence age of the latest is kept whatever the retention floor says. The sync test's pruning
 node sets `maxEvidenceAgeMs: 0n` for exactly this reason.
+
+### test/review3.test.ts
+
+Twelve regressions for the findings of the review of the paging and scheme commits: the memory
+guard, the node and the signature schemes. They are listed here by group and title, without
+the walk-through the other suites have. `the signature cache`: "keeps a block result the same
+when shedding clears the cache while the block verifies" and "holds a bounded number of
+signatures however many valid variants of one body arrive". `the heap limit`: "is the one Node
+applies: the command line over NODE_OPTIONS, quoted options, either spelling" and "set by the
+operator in any spelling keeps `start` from putting its own over it". `a node at the critical
+level`: "tells a listener added after its first sample the level it is already at" and "stops
+its RPC server even while a client holds a request open". `a mempool paused while transactions
+are being checked`: "refuses the checks that finish after the pause, without pooling,
+gossiping or remembering them" (the pause is now the node's `critical` level only, but the
+mempool's handling of it is what this case holds). `secp256k1 public keys`: "are refused
+wherever a key enters the chain unless they are points on the curve". `a restart with another
+scheme in genesis`: "is refused, by the application state and by the chain state alike". `the
+p2p handshake`: "connects peers of the chain scheme and refuses a peer keyed under the other
+one, in either direction". `a keystore entry whose scheme was changed`: "fails to open rather
+than give another key under the same name". `CHAIN_SCHEME`: "is not read by the node code, so a
+stray value cannot stop a node from starting".
 
 ## Writing a new test
 

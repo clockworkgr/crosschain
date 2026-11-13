@@ -9,7 +9,11 @@
  * lives decoded in the cache, pinned, until root() encodes it once and writes
  * it to the arena; a removal is a tombstone there until then. A read answers
  * from the cache or decodes from the arena, about a microsecond for an
- * account. Eviction is CLOCK, the second-chance approximation of least
+ * account. When the arena is kept within a byte limit (arena.ts) an object's
+ * committed bytes may be only in the store: its reference is then STORED,
+ * and a read fetches the bytes from the store instead, decodes them into the
+ * cache, and leaves the arena alone; the object is back in the arena when it
+ * is next written. Eviction is CLOCK, the second-chance approximation of least
  * recently used: a hit sets the instance's touched bit, a fresh decode enters
  * with it clear (so a one-time read is the first to go, and a scan of the
  * state does not wash out what a block works on), and when the budget is
@@ -80,6 +84,13 @@ export interface ObjectType<T extends { id: ObjectId }> {
   indices: IndexDef<T>[];
 }
 
+/** What the reference table holds for an instance with no committed encoding, and for one whose encoding is only in the store. */
+const ABSENT = -1;
+const STORED = -2;
+
+/** Where committed encodings are read from when the arena does not hold them: the application's store, by id. */
+export type ObjectFetch = (id: ObjectId) => Uint8Array | undefined;
+
 /** The largest instance a JavaScript array can index; ids allow 48 bits, the primary index does not. */
 export const MAX_INSTANCE = 2 ** 32 - 2;
 
@@ -148,7 +159,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
   private readonly secondary: Secondary<T>[] = [];
   private readonly byName = new Map<string, Secondary<T>>();
   private readonly retain: number;
-  /** Arena reference of each committed instance (-1 when absent) and its encoding's length. */
+  /** Arena reference of each committed instance (ABSENT when there is none, STORED when its bytes are only in the store) and its encoding's length. */
   private refs = new Float64Array(0);
   private lens = new Uint32Array(0);
   /**
@@ -167,11 +178,15 @@ export class TypeIndex<T extends { id: ObjectId }> {
    * value and index the new one); kept, they make a root's index changes a comparison instead of a re-encoding.
    */
   private readonly dirtyKeys = new Map<number, DirtyKeys>();
-  /** Objects the arena holds a committed encoding for: each has one entry in every index, for estimates. */
+  /** Objects with a committed encoding, in the arena or only in the store: each has one entry in every index, for estimates. */
   committedCount = 0;
+  /** How many of them are only in the store. */
+  storedCount = 0;
+  private readonly fetch: ObjectFetch | null;
 
-  constructor(type: ObjectType<T>, retainVersions: number, arena: Arena, budget: HotBudget, base: IndexStore, resident = true) {
+  constructor(type: ObjectType<T>, retainVersions: number, arena: Arena, budget: HotBudget, base: IndexStore, resident = true, fetch: ObjectFetch | null = null) {
     this.type = type;
+    this.fetch = fetch;
     this.retain = retainVersions;
     this.arena = arena;
     this.budget = budget;
@@ -205,7 +220,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
   private ensure(instance: number): void {
     if (instance < this.refs.length) return;
     const size = Math.max(instance + 1, this.refs.length * 2, 16);
-    const refs = new Float64Array(size).fill(-1);
+    const refs = new Float64Array(size).fill(ABSENT);
     refs.set(this.refs);
     this.refs = refs;
     const lens = new Uint32Array(size);
@@ -216,9 +231,24 @@ export class TypeIndex<T extends { id: ObjectId }> {
     this.touched = touched;
   }
 
-  /** The arena reference of an instance's committed encoding, or -1. */
+  /** The arena reference of an instance's committed encoding; negative when the arena holds none. */
   refAt(instance: number): number {
-    return instance < this.refs.length ? this.refs[instance]! : -1;
+    return instance < this.refs.length ? this.refs[instance]! : ABSENT;
+  }
+
+  /** The arena released the slab an instance's bytes were in: from now on they are read from the store. */
+  released(instance: number): void {
+    this.refs[instance] = STORED;
+    this.storedCount++;
+  }
+
+  /** The committed encoding of an instance that has one: a view into the arena, or the store's copy. */
+  private committedBytes(instance: number): Uint8Array {
+    const ref = this.refs[instance]!;
+    if (ref >= 0) return this.arena.read(ref);
+    const bytes = this.fetch?.(objectId(this.type.id, instance));
+    if (!bytes) throw new DbError(`${this.type.name} ${instance}: its bytes are neither in the arena nor in the store`);
+    return bytes;
   }
 
   /** Compaction moved an entry. */
@@ -281,8 +311,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
   }
 
   private decodeAt(instance: number): T {
-    const bytes = this.arena.read(this.refs[instance]!);
-    return deepFreeze(decode(bytes, (r) => this.type.decode(r, objectId(this.type.id, instance))));
+    return deepFreeze(decode(this.committedBytes(instance), (r) => this.type.decode(r, objectId(this.type.id, instance))));
   }
 
   get(instance: number): T | undefined {
@@ -293,7 +322,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
       this.budget.hits++;
       return v ?? undefined;
     }
-    if (this.refAt(instance) < 0) return undefined;
+    if (this.refAt(instance) === ABSENT) return undefined;
     this.budget.misses++;
     const obj = this.decodeAt(instance);
     this.cache(instance, obj);
@@ -302,7 +331,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
 
   has(instance: number): boolean {
     if (this.hot.has(instance)) return this.hot.get(instance) !== null;
-    return this.refAt(instance) >= 0;
+    return this.refAt(instance) !== ABSENT;
   }
 
   /** The value written since the last root (null for a removal), or undefined when nothing is pending. */
@@ -310,10 +339,9 @@ export class TypeIndex<T extends { id: ObjectId }> {
     return this.pinned.has(instance) ? this.hot.get(instance) : undefined;
   }
 
-  /** The committed encoding, a view into the arena; undefined when the arena holds none. */
+  /** The committed encoding, a view into the arena or the store's copy; undefined when there is none. */
   bytesOf(instance: number): Uint8Array | undefined {
-    const ref = this.refAt(instance);
-    return ref < 0 ? undefined : this.arena.read(ref);
+    return this.refAt(instance) === ABSENT ? undefined : this.committedBytes(instance);
   }
 
   /** The current encoding: a pending value's, or the committed bytes. Null for a removal, undefined when absent. */
@@ -451,6 +479,17 @@ export class TypeIndex<T extends { id: ObjectId }> {
     this.committedCount++;
   }
 
+  /** Load a committed object as importBytes does, but leave its bytes in the store: the arena is full enough. */
+  importStored(instance: number): void {
+    if (instance > MAX_INSTANCE) throw new DbError(`${this.type.name}: instance ${instance} is beyond the index`);
+    if (this.has(instance)) throw new DbError(`${this.type.name}: instance ${instance} imported twice`);
+    if (!this.fetch) throw new DbError(`${this.type.name}: no store to leave an object's bytes in`);
+    this.ensure(instance);
+    this.refs[instance] = STORED;
+    this.committedCount++;
+    this.storedCount++;
+  }
+
   /**
    * After importBytes: fill the B+ trees when resident, and the sparse trees unless `sparse` is false (their nodes
    * were loaded from the store), from the store's entries. They come in key order, which is the B+ tree's cheapest
@@ -482,10 +521,9 @@ export class TypeIndex<T extends { id: ObjectId }> {
   checkEntries(): void {
     if (this.secondary.length === 0) return;
     for (let instance = 0; instance < this.refs.length; instance++) {
-      const ref = this.refs[instance]!;
-      if (ref < 0) continue;
+      if (this.refs[instance]! === ABSENT) continue;
       const id = objectId(this.type.id, instance);
-      const keys = this.keysOf(decode(this.arena.read(ref), (r) => this.type.decode(r, id)));
+      const keys = this.keysOf(decode(this.committedBytes(instance), (r) => this.type.decode(r, id)));
       for (let i = 0; i < keys.length; i++) {
         const s = this.secondary[i]!;
         let found: ObjectId | undefined;
@@ -610,17 +648,16 @@ export class TypeIndex<T extends { id: ObjectId }> {
    */
   flush(instance: number, bytes: Uint8Array | null): void {
     const old = this.refAt(instance);
-    if (old >= 0) {
-      this.arena.free(old);
-      this.committedCount--;
-    }
+    if (old >= 0) this.arena.free(old);
+    else if (old === STORED) this.storedCount--;
+    if (old !== ABSENT) this.committedCount--;
     this.ensure(instance);
     if (bytes) {
       this.committedCount++;
       this.refs[instance] = this.arena.alloc(this.type.id, instance, bytes);
       this.lens[instance] = bytes.length;
     } else {
-      this.refs[instance] = -1;
+      this.refs[instance] = ABSENT;
       this.lens[instance] = 0;
       this.uncache(instance);
     }
@@ -671,6 +708,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
     this.dirtyKeys.clear();
     this.nextInstance = 0;
     this.committedCount = 0;
+    this.storedCount = 0;
     for (const s of this.secondary) {
       s.tree?.clear();
       s.overlay?.clear();

@@ -11,14 +11,18 @@ Everything in this chapter is reached through five methods, declared in `src/app
 ```ts
 export interface Application {
   initChain(genesis: Genesis): Promise<InitChainResult>;
-  checkTx(tx: Uint8Array): Promise<CheckTxResult>;
+  checkTx(tx: Uint8Array, opts?: CheckTxOptions): Promise<CheckTxResult>;
   finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult>;
+  /**
+   * Persist the block just finalized. An application that keeps its state in the engine's store environment does
+   * its writes before its first await, so that they join the transaction the engine saves the block in (executor.ts).
+   */
   commit(): Promise<void>;
   info(): Promise<{ lastHeight: bigint; lastAppHash: Uint8Array }>;
 }
 ```
 
-The file's header gives the call order: `initChain` once on a fresh data directory; `checkTx` for every transaction entering the mempool and again for everything still pending after each commit; `finalizeBlock` once per committed block with all its transactions; `commit` immediately after, to persist; `info` on startup so consensus can replay blocks the application missed. A `finalizeBlock` request carries what the staking rules need to know about the block besides its transactions:
+The file's header gives the call order: `initChain` once on a fresh data directory; `checkTx` for every transaction entering the mempool and again for everything still pending after each commit; `finalizeBlock` once per committed block with all its transactions; `commit` immediately after, to persist; `info` on startup so consensus can replay blocks the application missed. `CheckTxOptions` has one field, `admit`, a function the mempool passes so that the application can ask, after its last wait and just before the transaction would go into the pending state, whether the pool still takes it (it may have paused or filled meanwhile); it returns the reason for a refusal, or null. A `finalizeBlock` request carries what the staking rules need to know about the block besides its transactions:
 
 ```ts
 export interface FinalizeBlockRequest {
@@ -144,7 +148,7 @@ Chain parameters, the fee schedule and the staking rules together as `ChainParam
 
 ### Account history with virtual operations
 
-Users want to see what happened to their account, which the state alone does not say (a balance is a number, not a list of transfers). The application records, outside the state root, one history entry per operation for every account the operation names. Things the chain does on its own, a reward, a slash, a jailing, a matured unbonding, produce **virtual** entries with no transaction behind them. BitShares keeps the same kind of record. Entries are collected during `finalizeBlock` and written by `commit`, keyed by account and a per-account sequence number.
+Users want to see what happened to their account, which the state alone does not say (a balance is a number, not a list of transfers). The application records, outside the state root, one history entry per operation for every account the operation names. Things the chain does on its own, a reward, a slash, a jailing, a matured unbonding, produce **virtual** entries with no transaction behind them. BitShares keeps the same kind of record. Entries are collected during `finalizeBlock` and written by `commit` to the end of one log in block order, each entry carrying its account's sequence number and pointing back at earlier entries of the same account.
 
 ### State snapshots in chunks with range proofs
 
@@ -644,7 +648,7 @@ The `assetIssue` refusal of the core asset came from review finding 27: without 
       if (!isPublicKey(op.consensusKey) || schemeOf(op.consensusKey) !== g.scheme) throw new TxError(`consensus key must be a ${schemeName(g.scheme)} key`);
 ```
 
-`isPublicKey` wants a known tag followed by exactly that scheme's key, and `g.scheme` is the chain's from `global`; the engine would refuse a validator update of the other scheme anyway (`nextState` in chapter 3), but refusing it here keeps such a key out of the mempool and out of the state. The undelegate self-bond check reads:
+`isPublicKey` wants a known tag followed by exactly that scheme's key, and for secp256k1 a key that is a point on the curve ([chapter 2](02-crypto.md)), and `g.scheme` is the chain's from `global`; the engine would refuse a validator update of the other scheme anyway (`nextState` in chapter 3), but refusing it here keeps such a key out of the mempool and out of the state. The undelegate self-bond check reads:
 
 ```ts
       if (op.delegator === v.operator && v.status !== ValidatorStatus.tombstoned && tokensForShares(v, d.shares - op.shares) < p.minSelfBond) {
@@ -693,7 +697,7 @@ Expiration, replay, then per operation: fee check, fee debit, a note to the hist
 
 ### src/app/core/history.ts
 
-Account history entries and the recorder that collects them during a block.
+Account history entries, the recorder that collects them during a block, and the log they are stored in.
 
 **`HistoryKind`** names the entry kinds: `operation` 0, `reward` 1, `slash` 2, `jail` 3, `unjail` 4, `tombstone` 5, `unbondingMatured` 6, `redelegationMatured` 7, `forcedUnbond` 8. **`VIRTUAL`** (`0xffffffff`) is the transaction position of an entry with no transaction.
 
@@ -757,6 +761,213 @@ export interface HistoryEntry {
 `reset(height)` starts a block; `beginTx(hash, position)` and `endTx(ok)` bracket a transaction so that a failed transaction's entries, including a virtual `unjail` it produced before failing, are dropped (review finding 28). `beginOp(index)` is called by `applyTransaction` before each operation, so a virtual entry raised inside a transaction carries the transaction's position and the index of the operation that caused it; an `unjail` in the third operation is recorded against operation 2, not operation 0 (review finding 42). Outside a transaction, during `beginBlock`, there is no transaction hash, `opIndex` is 0 and virtual entries go straight to `entries`.
 
 The application writes `entries` at commit; they are derived data outside the state root, and a node that state-synced has history only from its snapshot height.
+
+**`HistoryLog`** is how the entries are stored. The obvious layout gives every entry a key made of its account and its sequence number, so that an account's history is one range of the store, and the store was first written that way. Its cost is in the writes. A block of transfers names accounts all over the state, so its entries landed all over the key space, one store page dirtied for every account the block named, and that was most of what made the application's commit grow over a long run. A log has the opposite shape: every entry takes the next place in one sequence shared by all accounts, so a block's entries are consecutive keys at the end of the log and a block writes a few pages however many accounts it names. Graphene keeps its account history the same way. What a log has to give back is the reading, because an account's entries are now scattered through it. So each entry carries its account, its sequence number within the account, and two pointers to earlier entries of the same account.
+
+```ts
+// Keys of the log in the application's store: 'l' entry by its place in the log, 'p' an account's count and newest
+// entry, 'L' the log's length and how much of it the stored 'p' entries cover. 'a' and 'q' are the layout before it (entry by account and sequence, count by account).
+const logKey = (index: bigint) => key((k) => k.u8(0x6c).u64(index));
+const headKey = (account: ObjectId) => key((k) => k.u8(0x70).u64(account));
+const LENGTH_KEY = key((k) => k.u8(0x4c));
+const OLD_ENTRIES = key((k) => k.u8(0x61));
+const OLD_COUNTS = key((k) => k.u8(0x71));
+const NONE = 0xffff_ffff_ffff_ffffn;
+
+/** Where an entry's two pointers lead: the places in the log of its account's previous entry and of an older one. */
+interface Links {
+  prev: bigint;
+  skip: bigint;
+}
+
+interface Head {
+  count: bigint;
+  last: bigint;
+}
+
+interface LogRecord extends Links {
+  account: ObjectId;
+  sequence: bigint;
+  entry: HistoryEntry;
+}
+```
+
+`'l'` and a u64 hold one entry at its place in the log; the u64 is big-endian, so the store's order is the log's order. `'p'` and an account hold that account's head (`Head`): how many entries it has and the place of its newest. `'L'` holds the log's length, which is the place the next entry will take, and a second number explained with the heads below. A stored entry is 32 bytes of account, sequence, `prev` and `skip`, then the `HistoryEntry` as encoded above; `decodeLinks` reads the 32 bytes alone and `decodeRecord` the whole. `NONE` is a pointer with nothing to point at.
+
+`prev` is the place of the account's entry before this one. Following it from the head reads the newest entries at one store read each, which is all a wallet showing recent activity needs. With `prev` alone the old end of a long history would be expensive: the first entry of an account with 5,000 would be 5,000 reads away. `skip` is the place of the account's entry whose sequence number is this one's with its lowest set bit cleared: entry 12 (binary 1100) points at 8 (1000), 8 at 0, and 7 (111) at 6 (110). Entry 0 has neither pointer. The walk that uses them is `locate`:
+
+```ts
+  /**
+   * From an entry of an account at `index` with sequence `sequence`, the place of its entry `target`, an older one
+   * or itself: the skip pointer while it does not pass the target, else the previous entry.
+   */
+  private locate(index: bigint, sequence: bigint, target: bigint, links: (index: bigint) => Links): bigint {
+    while (sequence > target) {
+      const l = links(index);
+      const skipped = sequence & (sequence - 1n);
+      if (skipped >= target) {
+        index = l.skip;
+        sequence = skipped;
+      } else {
+        index = l.prev;
+        sequence -= 1n;
+      }
+    }
+    return index;
+  }
+```
+
+From an entry at `index` whose sequence is `sequence`, it returns the place of the same account's entry `target`. `sequence & (sequence - 1n)` clears the lowest set bit, so `skipped` is where the skip pointer leads; the walk takes it when that does not pass the target, and steps to the previous entry otherwise. From entry 13 to entry 5: 13 (1101) skips to 12, 12 skips to 8, 8 would skip to 0 and pass 5, so it steps to 7, 7 skips to 6, 6 would skip to 4, so it steps to 5. Five reads where `prev` alone takes eight, and the difference grows with the length: any entry of an account is found from its newest in about log² steps. The caller passes `links`, the function that reads an entry's two pointers, because `append` has to look at entries the store does not show yet.
+
+```ts
+export class HistoryLog {
+  static readonly SLICES = 64;
+  static readonly HEADS_HELD = 50_000;
+  private readonly kv: KvStore;
+  private length: bigint;
+  /** Every head changed by the log's first `covered` entries is stored; the heads changed since wait in `slices`. */
+  private covered: bigint;
+  /** The waiting heads by slice of the account numbers, and per slice the place in the log of its oldest waiting change. */
+  private slices: Map<ObjectId, Head>[] = Array.from({ length: HistoryLog.SLICES }, () => new Map());
+  private since: bigint[] = new Array<bigint>(HistoryLog.SLICES).fill(0n);
+  /** How many account numbers a slice spans: doubled whenever an account beyond the last slice turns up. */
+  private width = 1;
+  private held = 0;
+  /** The slice the next block writes. */
+  private turn = 0;
+
+  constructor(kv: KvStore) {
+    this.kv = kv;
+    const v = kv.get(LENGTH_KEY);
+    [this.length, this.covered] = v ? decode(v, (r) => [r.u64(), r.u64()]) : [0n, 0n];
+    for (let index = this.covered; index < this.length; index++) {
+      const e = decodeLinks(new Reader(this.stored(index)));
+      this.wait(e.account, { count: e.sequence + 1n, last: index });
+    }
+    this.migrate();
+  }
+```
+
+The heads are the one part still keyed by account, so writing each at the block that changes it would put the scattered writes back; the class comment gives it as about half of what the old layout cost. They wait in memory instead. The first version of the log kept them in one map and wrote all of them together every 64 blocks, which kept the ordinary block cheap and made the 64th carry the whole batch, its commit visibly longer than the others. The waiting heads are now divided, and each block writes a part. Measured at 192,000 accounts with blocks of 500 transfers (docs/benchmarks.md section 4.13), a block then writes about 760 to 1,000 heads and its commit takes 15.1 ms at the first fifty blocks and 19.4 ms at blocks 351 to 400, at the median, against 13.4 and 17.0 ms when the heads were written together. The work is the same in total, the means of the two overlapping; what is gone is the one block in fifty that took about 100 ms longer.
+
+The account numbers are cut into `SLICES` slices, 64 of them, each a run of `width` consecutive account numbers. `slices[i]` is the map of the heads waiting in slice i, `held` is how many wait in all, and `turn` is the slice the next block will write. Every block that has entries writes the waiting heads of one slice and moves `turn` on by one, so after 64 such blocks every slice has had its turn and a head is in the store within 64 blocks of its change. A slice's heads are neighbours in the store, because `'p'` keys sort by account number, so the block's head writes land on a few pages, as its entries do. And a head changed five times while it waits is written once.
+
+What makes waiting safe is the log itself. Every entry names its account and its sequence, so the heads can be read back out of the entries, provided the log knows where to start. That is `covered`, the second number under `'L'`: every head changed by the log's first `covered` entries is in the store. `since[i]` is the place in the log of the oldest change waiting in slice i, and `covered` is the smallest `since` over the slices that have something waiting, or the log's length when nothing waits (`append`, below). The constructor reads the entries from `covered` to the end in order and gives each one's head to `wait`: "count is this sequence plus one, newest is this place". A later entry of the same account overwrites an earlier one, and the waiting heads are as they were when the node stopped. Some of the entries read again belong to heads that were already stored, in slices whose turn came after the oldest waiting change; reading them does no harm, since what they give is what the store already says or something newer. The log is the heads' journal. The constructor ends with `migrate()`, described last.
+
+```ts
+  private slice(account: ObjectId): number {
+    return Math.min(HistoryLog.SLICES - 1, Math.floor(instanceOf(account) / this.width));
+  }
+
+  /** Keep a head, changed by the entry at `head.last`, until its slice's turn. */
+  private wait(account: ObjectId, head: Head): void {
+    while (instanceOf(account) >= this.width * HistoryLog.SLICES) {
+      // Twice the width: slices 2i and 2i + 1 become slice i.
+      const merged = Array.from({ length: HistoryLog.SLICES }, () => new Map<ObjectId, Head>());
+      const since = new Array<bigint>(HistoryLog.SLICES).fill(0n);
+      this.slices.forEach((waiting, i) => {
+        if (waiting.size === 0) return;
+        const to = i >> 1;
+        if (merged[to]!.size === 0 || this.since[i]! < since[to]!) since[to] = this.since[i]!;
+        for (const [a, h] of waiting) merged[to]!.set(a, h);
+      });
+      this.slices = merged;
+      this.since = since;
+      this.width *= 2;
+    }
+    const i = this.slice(account);
+    const waiting = this.slices[i]!;
+    if (waiting.size === 0) this.since[i] = head.last;
+    if (!waiting.has(account)) this.held++;
+    waiting.set(account, head);
+  }
+
+  private store(w: KvWriter, i: number): void {
+    const waiting = this.slices[i]!;
+    for (const [account, head] of waiting) w.put(headKey(account), encode((wr) => wr.u64(head.count).u64(head.last)));
+    this.held -= waiting.size;
+    waiting.clear();
+  }
+```
+
+`slice(account)` is the account's instance number divided by `width`, and anything past the end goes to the last slice. `width` starts at 1, so at first slice i is account i alone. That cannot stay: the range of account numbers is not known when the log is made, and it grows. So `wait` first checks whether the account lies beyond the last slice, at `width * SLICES` or more, and while it does, doubles the width. Doubling merges neighbours: slices 2i and 2i + 1 become slice i (`i >> 1`), their maps poured together, and the merged slice's `since` is the smaller of the two, taken only from slices that had something waiting. The upper half of the slices is then empty and takes the new accounts. With 6,400 accounts the width settles at 128 (64 slices of 128 cover 8,192), which is why the test below expects a block's head writes to span fewer than 128 account numbers. After that `wait` puts the head in its slice. If the slice was empty this head is its oldest waiting change, so `since[i]` is set to `head.last`, the place of the entry that changed it; `held` goes up only for an account that was not already waiting.
+
+`store(w, i)` puts every head of slice i into the write `w`, 16 bytes each under `'p'` and the account, takes them off `held` and empties the slice. It does not touch `since[i]`: an empty slice's `since` is not looked at, and the next head to wait there sets it.
+
+```ts
+  /** How many entries the account has, and the place in the log of its newest. */
+  private head(account: ObjectId): Head {
+    const waiting = this.slices[this.slice(account)]!.get(account);
+    if (waiting) return waiting;
+    const v = this.kv.get(headKey(account));
+    return v ? decode(v, (r) => ({ count: r.u64(), last: r.u64() })) : { count: 0n, last: NONE };
+  }
+```
+
+`head(account)` looks in the account's slice first and then in the store, and an account with neither has a count of 0 and `NONE` for its newest.
+
+**`append(w, entries)`** adds a block's entries as part of the store write `w` that the application's `persist` has open:
+
+```ts
+  /** Append a block's entries, in the order they were recorded, as part of the write `w`; with `flush`, the waiting heads too. */
+  append(w: KvWriter, entries: Iterable<[ObjectId, HistoryEntry]>, flush = false): void {
+    // The store may not show this write's own entries yet, so what the block has added so far is kept here.
+    const heads = new Map<ObjectId, Head>();
+    const added = new Map<bigint, Links>();
+    const links = (index: bigint): Links => added.get(index) ?? decodeLinks(new Reader(this.stored(index)));
+    const start = this.length;
+    for (const [account, entry] of entries) {
+      const head = heads.get(account) ?? this.head(account);
+      const sequence = head.count;
+      const l: Links = { prev: head.last, skip: sequence === 0n ? NONE : this.locate(head.last, sequence - 1n, sequence & (sequence - 1n), links) };
+      const index = this.length++;
+      added.set(index, l);
+      w.put(logKey(index), encode((wr) => (wr.u64(account).u64(sequence).u64(l.prev).u64(l.skip), encodeHistoryEntry(wr, entry))));
+      heads.set(account, { count: sequence + 1n, last: index });
+    }
+    if (this.length === start) return;
+    for (const [account, head] of heads) this.wait(account, head);
+    if (flush || this.held >= HistoryLog.HEADS_HELD) for (let i = 0; i < HistoryLog.SLICES; i++) this.store(w, i);
+    else this.store(w, this.turn);
+    this.turn = (this.turn + 1) % HistoryLog.SLICES;
+    this.covered = this.length;
+    this.slices.forEach((waiting, i) => {
+      if (waiting.size > 0 && this.since[i]! < this.covered) this.covered = this.since[i]!;
+    });
+    w.put(LENGTH_KEY, encode((wr) => wr.u64(this.length).u64(this.covered)));
+  }
+```
+
+For each entry the account's head comes from `heads` if the block has already written for that account, and from `head(account)` otherwise. The sequence number is the count, `prev` is the head's newest place, and `skip` is found by `locate`, starting at the previous entry (sequence less one) and looking for the sequence with the lowest bit cleared. For an odd sequence that target is the previous entry itself and nothing is read; the class comment puts the average at one read. The entry takes the place `this.length++` and the head moves on. Two maps exist because the store may not show the write's own puts until the write completes: `heads` holds the heads as this block has moved them, and `added` the pointers of the entries this block has added, which `links` consults before the store. A block with no entries writes nothing and does not use up a turn. Otherwise the block's heads go to `wait`, each into its slice, and then one slice is stored: the one whose turn it is, which need not hold any of this block's accounts. Two cases store all 64 at once. One is `flush`, which only `migrate` passes. The other is `HEADS_HELD`: should 50,000 heads ever wait, the block writes them all rather than let the memory and the journal grow. `turn` then moves to the next slice, wrapping after the last.
+
+`covered` is worked out afresh at every block. It starts at the log's length, which is right when nothing waits, and is lowered to the smallest `since` among the slices that still hold heads. Take three blocks with a width of 1. Block one changes the heads of accounts 0 and 5 with entries 0 and 1; slice 0 is stored, slice 5 waits with `since` 1, and `covered` is 1. Block two changes account 9 with entry 2; slice 1 is stored, which is empty, and `covered` stays 1, the oldest waiting change being still account 5's. A stop now loses nothing: the log opened next reads entries 1 and 2 and has the heads of accounts 5 and 9 waiting again. The sixth block with entries has slice 5's turn: account 5's head is stored, and `covered` moves up to 2, where account 9 still waits, its slice's turn being the tenth block's. `'L'` is written with both numbers at every block. So a block writes its entries, consecutive at the end of the log, the waiting heads of one stretch of the account numbers, and one small value.
+
+**`read(account, from, limit, reverse)`** is what `accountHistory` returns, and **`total(account)`** is the count from the head:
+
+```ts
+  /** An account's entries, oldest first from sequence `from`, or newest first, skipping the newest `from`, when reversed. */
+  read(account: ObjectId, from: bigint, limit: number, reverse: boolean): { entries: (HistoryEntry & { sequence: bigint })[]; total: bigint } {
+    const head = this.head(account);
+    const total = head.count;
+    const entries: (HistoryEntry & { sequence: bigint })[] = [];
+    // The newest sequence wanted; the entries are read from it backwards either way.
+    let sequence = reverse ? total - 1n - from : (from + BigInt(limit) < total ? from + BigInt(limit) : total) - 1n;
+    const lowest = reverse ? 0n : from;
+    if (limit <= 0 || from < 0n || sequence < lowest) return { entries, total };
+    let index = this.locate(head.last, total - 1n, sequence, (i) => decodeLinks(new Reader(this.stored(i))));
+    for (; sequence >= lowest && entries.length < limit; sequence--) {
+      const r = decode(this.stored(index), decodeRecord);
+      entries.push({ ...r.entry, sequence });
+      index = r.prev;
+    }
+    if (!reverse) entries.reverse();
+    return { entries, total };
+  }
+```
+
+Both directions are read the same way: work out the newest sequence wanted, `locate` it from the head, then follow `prev` down. Newest first, the newest wanted is `total − 1 − from` and the walk may go down to 0. Oldest first, the page is the sequences from `from` to `from + limit − 1`, or to the newest if the account has fewer, and it stops at `from`; the entries come out newest first and are reversed at the end. With ten entries, `from` 2 and a limit of 3: the newest wanted is 4, `locate` goes from 9 to 4 (9 skips to 8, 8 would skip to 0 and pass, so 7, 7 skips to 6, 6 skips to 4), entries 4, 3 and 2 are read, and the result is 2, 3, 4. A limit of zero or less, a negative `from`, or a `from` past the end gives no entries and the total. Each entry is returned with its `sequence`, which a client passes back as `from` to page on.
+
+**`migrate()`** (private) is for a store written with the earlier layout, `'a'`, account and sequence for an entry and `'q'` and account for a count. The first time such a store is opened every old entry is read, the list is sorted by height, then account, then sequence, appended to the log through `append` with `flush` set, so the heads are stored with it and not left waiting, and the old keys are deleted, all in one write. Each account's entries keep their order, so they keep their sequence numbers. Every entry is held in memory for it, once; the next open finds no old keys and returns.
 
 ### src/app/core/staking.ts
 
@@ -1097,12 +1308,12 @@ Absent instances (removed objects) are `EMPTY` leaves, so the dense tree's shape
 
 The application itself: sessions, the signature cache, blocks, persistence, snapshots and queries. Its header states the concurrency rule the whole file rests on: "Signature verification is the only asynchronous step, because it goes to the worker pool. Everything that touches the database is synchronous and happens after any await, so the undo sessions nest cleanly even though checkTx calls overlap each other and a finalizeBlock."
 
-**`CoreAppOptions`**: `genesis` (the engine's `Genesis`), optional `appGenesis` (already parsed, required when it lives in a file), `verifier` (the worker pool or the inline one), optional `kv` (default an in-memory store), `retainVersions`, `indexTrees` and `trees` (start the database with its secondary indices' B+ trees, or its Merkle trees, dropped and reading the store, STATE-PAGING.md sections 4 and 5; both default to resident, and the test setup turns them off for a whole run), `snapshotInterval` (default 1000; 0 disables), `snapshotsKept` (default 2), `snapshotChunkObjects` (default 2000), `log`.
+**`CoreAppOptions`**: `genesis` (the engine's `Genesis`), optional `appGenesis` (already parsed, required when it lives in a file), `verifier` (the worker pool or the inline one), optional `kv` (default an in-memory store), `retainVersions`, `indexTrees` and `trees` (start the database with its secondary indices' B+ trees, or its Merkle trees, dropped and reading the store, STATE-PAGING.md sections 4 and 5; both default to resident, and the test setup turns them off for a whole run), `arenaBytes` (the most bytes the database's arena of encoded objects may take, the rest being read from the store, STATE-PAGING.md section 3.4; unbounded by default), `heapRoom` (the bytes of heap the index trees, the Merkle trees and the history window may take when a store is opened: a tier estimated to need more is left dropped and the history window is then not read back, so a state too large for the heap opens paged instead of running out while it loads; unset, every tier is opened as `indexTrees` and `trees` say), `snapshotInterval` (default 1000; 0 disables), `snapshotsKept` (default 2), `snapshotChunkObjects` (default 2000), `log`.
 
 The store's key layout, from the constants at the top of the file:
 
 ```ts
-// Key layout of the app store: 'm' meta, 'o' id, 'c' type, 'h' version, 'a' account history, 'q' history sequence,
+// Key layout of the app store: 'm' meta, 'o' id, 'c' type, 'h' version, 'l' 'p' 'L' the account history's log (history.ts),
 // 'i' index entry (db/indexstore.ts), 't' dense tree chunk (db/merkle.ts), 'n' sparse tree node (db/smt.ts).
 const META_KEY = key((k) => k.u8(0x6d));
 const OBJECT_PREFIX = key((k) => k.u8(0x6f));
@@ -1116,17 +1327,18 @@ const CHUNK_PREFIX_KEY = Uint8Array.of(CHUNK_PREFIX);
 | `o` | object id u64 | the object's encoding |
 | `c` | type u16 | next instance counter |
 | `h` | version u64 | the database history record for that version |
-| `a` | account u64, sequence u64 | a history entry |
-| `q` | account u64 | the account's next history sequence |
+| `l` | place in the log u64 | an account history entry: account u64, sequence u64, `prev` u64, `skip` u64, then the entry |
+| `p` | account u64 | the account's head: its count of history entries u64 and the place of its newest u64 |
+| `L` | none | the log's length u64 and how many of its entries the stored heads cover u64 |
 | `i` | type u16, index position u8, key bytes (and the id u64 for a non-unique index) | the id u64 for a unique index, empty for a non-unique one |
 | `t` | tree u16 (a type id, or 0 for the tree over the types), level u8, chunk u48 | a dense Merkle tree chunk: up to 1,024 hashes, trailing empties cut off |
 | `n` | type u16, index position u8, path bits packed, depth u8 | a sparse Merkle tree node: `0x00` and two child hashes, or `0x01`, a key hash and the 8-byte id |
 | `s` | height u64 | a snapshot manifest |
 | `k` | height u64, type u16, chunk u32 | a snapshot chunk |
 
-The three middle prefixes are the database's own, defined in `src/db/indexstore.ts`, `src/db/merkle.ts` and `src/db/smt.ts` and explained in [chapter 09](09-database.md); the application only writes what the database's change list says and lends the database the store to read them back from. They are what makes the store hold every tier of the state, not only the objects: a restart no longer rebuilds the indices by decoding every object or the trees by hashing them, and the memory guard can drop either tier and let the database fall back on these keys ([chapter 8](08-node.md)). `'t'` rather than `'c'` for the chunks because `'c'` is the counters, and a chunk key of type T's tree would otherwise have had T's counter key as a prefix.
+The three history prefixes are written and read by `HistoryLog` in `src/app/core/history.ts` (above); `'a'` and `'q'`, the layout before the log, are found only in a store that has not been opened since, and are moved into the log when it is. The three prefixes `'i'`, `'t'` and `'n'` are the database's own, defined in `src/db/indexstore.ts`, `src/db/merkle.ts` and `src/db/smt.ts` and explained in [chapter 09](09-database.md); the application only writes what the database's change list says and lends the database the store to read them back from. They are what makes the store hold every tier of the state, not only the objects: a restart no longer rebuilds the indices by decoding every object or the trees by hashing them, and the memory guard can drop either tier and let the database fall back on these keys ([chapter 8](08-node.md)). `'t'` rather than `'c'` for the chunks because `'c'` is the counters, and a chunk key of type T's tree would otherwise have had T's counter key as a prefix.
 
-**`OpenedDatabase`** is what reopening returns: the database, the stored height and app hash, `staleHistory` (history versions in the store that fell outside the window) and timing figures for the startup log. **`OpenOptions`** says how to open it:
+**`OpenedDatabase`** is what reopening returns: the database, the stored height and app hash, `staleHistory` (history versions in the store that fell outside the window), timing figures for the startup log (the object count, the milliseconds of the import, of the trees and root, and of the history, and `indexVersions`, how the sparse trees' past versions came back: `'records'`, `'replay'` or `'none'`), and `paged`, the names of what was left out because `heapRoom` had no room for it (`indexTrees`, `trees`, `history`; empty when everything was opened). **`OpenOptions`** says how to open it:
 
 ```ts
 /** How to open a store: the database's options, and how the trees come back. */
@@ -1134,6 +1346,10 @@ export interface OpenOptions {
   retainVersions?: number;
   indexTrees?: boolean;
   trees?: boolean;
+  /** As CoreAppOptions.arenaBytes: objects beyond it are left in the store instead of being loaded. */
+  arenaBytes?: number;
+  /** As CoreAppOptions.heapRoom: a tier that does not fit is opened dropped, and the history window with it. */
+  heapRoom?: number;
   /**
    * Take the Merkle trees from their chunks and nodes in the store (the default) instead of hashing every object and
    * inserting every index key again. Either way the root must equal the stored app hash; a store written before the
@@ -1141,18 +1357,41 @@ export interface OpenOptions {
    */
   fromTrees?: boolean;
   /**
-   * With the trees from the store, hash every object and compare it with its leaf (the default): the root then still
-   * proves that the objects are the ones the app hash commits to, as it did when the trees were computed from them.
-   * Off, a restart is about an eighth faster and a corrupt object goes unnoticed until something reads it.
+   * With the trees from the store, check them before use (the default): every stored node against its children,
+   * every object against its leaf, and every non-empty leaf against an object. The root then still proves that the
+   * objects are the ones the app hash commits to, as it did when the trees were computed from them. Off, a restart is
+   * faster and a corrupt object or tree node goes unnoticed until something reads it.
    */
   checkLeaves?: boolean;
+  /**
+   * With the index entries from the store, check them against the objects (the default): each object decoded for its
+   * keys, every key stored and naming it, and no entry over. The app hash does not cover an unauthenticated index, so
+   * this is the only thing that catches a damaged entry before a lookup goes to the wrong object. Off, a restart
+   * decodes no object at all.
+   */
+  checkIndexEntries?: boolean;
 }
 ```
 
 **`openObjectDatabase(kv, types, opts = {})`** loads a database from a store written by `CoreApp`, or returns null if the store is empty:
 
 ```ts
-  const db = new ObjectDatabase(types, { retainVersions, indexStore: kv, indexTrees: opts.indexTrees, trees: opts.trees });
+  // With a figure for the heap's room, a tier estimated not to fit is opened dropped rather than built and then
+  // dropped by the memory guard, which would be too late: the index trees first, then the Merkle trees with what is left.
+  let { indexTrees, trees } = opts;
+  const paged: string[] = [];
+  if (opts.heapRoom !== undefined) {
+    const counter = (type: number) => {
+      const c = kv.get(counterKey(type));
+      return c ? Number(decode(c, (r) => r.u64())) : 0;
+    };
+    const est = estimateTiers(types, counter);
+    let room = opts.heapRoom;
+    if (indexTrees === undefined && est.indexTrees > room) (indexTrees = false), paged.push('indexTrees');
+    else if (indexTrees !== false) room -= est.indexTrees;
+    if (trees === undefined && est.trees > room) (trees = false), paged.push('trees');
+  }
+  const db = new ObjectDatabase(types, { retainVersions, indexStore: kv, indexTrees, trees, objectStore: (id) => kv.get(objectKey(id)), arenaBytes: opts.arenaBytes, historyStore: (version) => kv.get(historyKey(version)) });
   // A store written before the index entries were (STATE-PAGING.md phase two) has none: the objects are decoded for
   // their keys as they always were, and the entries written once below. An empty prefix in a store that has objects
   // means exactly that, because every write of objects carries their entries in the same transaction. The same holds
@@ -1182,8 +1421,8 @@ export interface OpenOptions {
     if (opts.fromTrees ?? true) db.loadTrees(opts.checkLeaves ?? true);
     else db.assumeStoredTrees();
   }
-  // The indices come from their entries, so no object is decoded on the way in.
-  if (indexed && objects > 0) db.loadIndexEntries();
+  // The indices come from their entries rather than from inserting every key, and are checked against the objects.
+  if (indexed && objects > 0) db.loadIndexEntries(opts.checkIndexEntries ?? true);
   const appHash = db.root(Number(meta.height));
   if (!bytesEqual(appHash, meta.appHash)) throw new Error('stored objects do not hash to the stored app hash');
   const missing = [...(indexed ? [] : db.lastChanges!.indices), ...(treesStored ? [] : db.lastChanges!.trees)];
@@ -1192,39 +1431,70 @@ export interface OpenOptions {
   db.dropChanges();
 ```
 
-The database is given the store itself as `indexStore`, the read-only view it falls back on when its trees are dropped, and whichever tiers the options say to start dropped. Two probes then decide how the rest of the store is read, each one cursor positioned on a prefix and closed again: a store written by these phases has index entries under `'i'` and chunks under `'t'` (the sparse nodes always come with the chunks), and an empty prefix in a store that holds objects can only mean the store predates them, because every commit writes the objects and their entries in one transaction. With `indexed`, every `o` entry is imported as bytes with no decode at all (`importObject(id, bytes, true)`, [chapter 09](09-database.md)); without it each object is decoded once for its index keys, as a restart always did. The counters follow. Then the trees, three ways: by default `loadTrees(true)` takes every dense tree's chunks and every sparse tree's nodes from the store, so the first root hashes no object and inserts no key, and still hashes every imported object against its leaf (`checkLeaves`), which is what keeps the property the old path had, that a corrupt object store fails at startup and not when something reads the object; `checkLeaves: false` skips that and saves about an eighth of the restart; and `fromTrees: false` calls `assumeStoredTrees()` instead, which only tells the database that the trees it is about to compute from the objects are already in the store, so the first root reports no chunks, the old path kept for comparison and for a store without trees. With `indexed`, `loadIndexEntries()` fills the B+ trees, and the sparse trees unless their nodes were just loaded, from the `'i'` prefix in key order. Then the root at the stored height, which must equal the stored app hash, and the one-time upgrade: a store from before phase two or four has that root's change list holding every index entry or every chunk and node, which are written in one transaction, so the store is complete from then on. Finally the change list is dropped (review finding 36: otherwise a second copy of every object sat in memory). The history follows:
+The first lines decide what to open. The guard of [chapter 8](08-node.md) can drop a tier that is resident, but it samples once a second, and a tier too large for the heap has taken the process past its limit before the first sample; so when the caller says how much heap there is (`heapRoom`, which the node computes as 0.7 of the heap limit less the heap in use), the decision is made here, before anything is built. `estimateTiers` ([chapter 09](09-database.md)) turns the type counters in the store, an upper bound on the objects of each type, into the heap each tier would take resident, with the figures the guard's rebuild estimate uses. If the index trees do not fit the room they are opened dropped and named in `paged`; otherwise their estimate is taken off the room, unless the caller asked for them to be left out (`indexTrees: false`, which is what a node configured with `indexTrees: 'store'` passes, [chapter 8](08-node.md)): trees that will not be built take no room from the Merkle trees. Then the Merkle trees are opened dropped if they do not fit what is left. A tier the caller named, `indexTrees` or `trees` given as an option, is not decided here: it is opened as asked, whatever the room, which is how the test setup's `INDEX_TREES=0` and a test that wants a tier resident both keep their meaning.
+
+The database is given the store itself as `indexStore`, the read-only view it falls back on when its trees are dropped, whichever tiers were decided or asked to start dropped, two things for the arena, `objectStore`, a function that reads one object's bytes from the `'o'` keys, and `arenaBytes`, and `historyStore`, a function that reads one version's encoded history record from the `'h'` keys, from which the database answers for a past version its window in memory does not hold ([chapter 09](09-database.md), "Past versions from the store"). With a limit, `importObject` leaves the objects that do not fit it in the store instead of copying them into the arena, and the `dropChanges()` at the end shrinks the arena to the limit ([chapter 09](09-database.md)); without one every object is loaded as before. Two probes then decide how the rest of the store is read, each one cursor positioned on a prefix and closed again: a store written by these phases has index entries under `'i'` and chunks under `'t'` (the sparse nodes always come with the chunks), and an empty prefix in a store that holds objects can only mean the store predates them, because every commit writes the objects and their entries in one transaction. With `indexed`, every `o` entry is imported as bytes with no decode at all (`importObject(id, bytes, true)`, [chapter 09](09-database.md)); without it each object is decoded once for its index keys, as a restart always did. The counters follow. Then the trees, three ways: by default `loadTrees(true)` takes every dense tree's chunks and every sparse tree's nodes from the store, so the first root hashes no object and inserts no key, and still hashes every imported object against its leaf (`checkLeaves`), which is what keeps the property the old path had, that a corrupt object store fails at startup and not when something reads the object; `checkLeaves: false` skips that and saves about an eighth of the restart; and `fromTrees: false` calls `assumeStoredTrees()` instead, which only tells the database that the trees it is about to compute from the objects are already in the store, so the first root reports no chunks, the old path kept for comparison and for a store without trees. With `indexed`, `loadIndexEntries()` fills the B+ trees, and the sparse trees unless their nodes were just loaded, from the `'i'` prefix in key order, and by default checks the entries against the objects (`checkIndexEntries`): the app hash covers only the authenticated indices, so nothing else would catch a damaged entry before a lookup went to the wrong object. Then the root at the stored height, which must equal the stored app hash, and the one-time upgrade: a store from before phase two or four has that root's change list holding every index entry or every chunk and node, which are written in one transaction, so the store is complete from then on. Finally the change list is dropped (review finding 36: otherwise a second copy of every object sat in memory). The history follows:
 
 ```ts
   const t2 = performance.now();
   const staleHistory: number[] = [];
+  // Reading the window back puts every tree node and object the last hundred blocks overwrote into the heap, which
+  // under a scattered load is more than the trees themselves: a store opened with a tier left out for want of room
+  // starts with an empty window instead, which fills again as blocks are applied. The records stay in the store until
+  // they age out, and the database reads a past version from them there (ObjectDatabase.past), so the heights stay
+  // provable.
+  const withHistory = paged.length === 0;
+  if (!withHistory) paged.push('history');
+  const oldest = db.currentVersion - (retainVersions ?? 100);
+  const found = new Map<number, Uint8Array | null>();
   for (const [k, v] of kv.range(HISTORY_PREFIX, prefixEnd(HISTORY_PREFIX))) {
     const version = Number(decode(k, (r) => (r.u8(), r.u64())));
-    if (version > db.currentVersion - (retainVersions ?? 100) && version <= db.currentVersion) db.loadHistory(version, decode(v, decodeHistory));
+    if (version > oldest && version <= db.currentVersion) found.set(version, withHistory ? v : null);
     else staleHistory.push(version);
   }
-  db.rebuildIndexVersions();
+  // The records serve the heights from the lowest one that has every record up to the current height: one missing
+  // in between (a damaged store) would make every height below it read what the missing record overwrote as it is
+  // now, so the heights below it are not provable and their records go.
+  let from = db.currentVersion + 1;
+  while (found.has(from - 1)) from--;
+  for (const version of found.keys()) if (version < from) staleHistory.push(version);
+  for (let version = from; version <= db.currentVersion; version++) {
+    if (withHistory) db.loadHistory(version, decode(found.get(version)!, decodeHistory));
+    else db.noteStoredHistory(version);
+  }
+  found.clear();
+  const restored = withHistory ? db.restoreIndexVersions() : 'none';
+  const timing = { objects, importMs: Math.round(t1 - t0), rootMs: Math.round(t2 - t1), historyMs: Math.round(performance.now() - t2), indexVersions: restored };
 ```
 
-The history records inside the retention window are loaded (the rest are reported as stale for the next commit to delete), and the index versions are rebuilt so proofs at past heights work again. The store is never trusted blindly: a corrupted object makes the root differ, or fails the leaf check, and the node refuses to start; `test/app.test.ts` overwrites alice's object with bob's bytes and expects `does not hash to its leaf` from the default path and `do not hash to the stored app hash` from the recomputing one. What the three paths cost on the same store, 191,896 accounts under secp256k1 (STATE-PAGING.md 5.3): the trees from the store with the leaf check 5.18 s, without it 4.56 s, the trees computed from the objects 8.46 s; the restart as a whole went from 8.41 s before phase four to 5.2 s, and what is left is mostly the history, since rebuilding the sparse trees' past versions replays every account.
+The history keys are read in one pass. A record outside the retention window is reported as stale, for the next commit to delete; one inside it is noted in `found`, with its bytes if the window is to be read back. Then the records that will be used are chosen: `from` starts above the current version and moves down while the record below it is there, so it stops at the lowest version that has every record from itself up to the current height. Normally that is the whole window. In a store that has lost a record (a damaged store) it is the version above the gap, and the records found below the gap join `staleHistory`. They could not be used: a record says what its version overwrote, so a height below the gap, read without the missing record, would see whatever that record overwrote as it is now. The heights below the gap are therefore not provable (`lowestProvableHeight` rises to the gap, the version just below `from`), a proof there is refused as `not available` rather than answered wrongly, and the records go with the next commit. The database makes the same refusal on its own if a record goes missing while it runs ([chapter 09](09-database.md), `past()`).
 
-**`CoreApp`** implements `Application`. Its fields: `chainId`, the public `db`, the store, the verifier, the signing `context`, the logger, `height`, `appHash`, `lastTime`, the `pending` session, the `sigCache` (transaction id hex to address hex to the set of hashes of every signature by that signer over that body that verified), `toPersist` (what the next `commit` writes), `staleHistory`, the `recorder`, the three snapshot settings and `lastHistory` (what the last commit wrote, for the RPC's event streams).
+The records from `from` up are then loaded in ascending order with `loadHistory`, and `restoreIndexVersions()` gives the authenticated indices their past versions so that name proofs at past heights work again. It takes them from the sparse tree nodes the records carry, each older version built from what the commit after it overwrote, and returns `'records'`; if a record in the window was written before those nodes were kept, or does not hold a node a version needs, it replays every key from the object history as a restart always did and returns `'replay'`; with no past version to restore it returns `'none'` ([chapter 09](09-database.md), step 7). The answer goes into the timing object as `indexVersions`, beside `historyMs`, the time all of this took, and so into the line `loaded application state`.
+
+Unless a tier was left out: then the window is not read back either, and `history` joins the names in `paged`. Reading the window back puts every tree node and object the window's blocks overwrote into the heap, which under a scattered load is more than the trees that were just judged not to fit. The database then starts with an empty window in memory, which fills again one block at a time, and `indexVersions` is `'none'`. The earlier heights stay provable all the same. The pass over the keys still runs, because the records outside the window must still be found and reported as stale and a gap must still be found, and for each record from `from` up it calls `noteStoredHistory(version)` instead of `loadHistory`: the record is not decoded (its bytes are not even kept in `found`), the database only learns that the store holds it, and lowers the oldest version its history store can answer for to the one before it. `lowestVersion` is then what it would have been had the window been read, and a proof at a height before the one the store was opened at is read from the records where they lie, slower than from memory and at no cost in memory. The records stay in the store untouched and age out of it as they would have, so the same store opened later with room has its whole window back in memory. The store is never trusted blindly: a corrupted object makes the root differ, or fails the leaf check, and the node refuses to start; `test/app.test.ts` overwrites alice's object with bob's bytes and expects `does not hash to its leaf` from the default path and `do not hash to the stored app hash` from the recomputing one. What the three paths cost on the same store, 191,896 accounts under secp256k1 (STATE-PAGING.md 5.3): the trees from the store with the leaf check 5.18 s, without it 4.56 s, the trees computed from the objects 8.46 s; the restart as a whole went from 8.41 s before phase four to 5.2 s, and what was left was mostly the history, 3.5 s of it, since rebuilding the sparse trees' past versions replayed every account. That measurement predates `restoreIndexVersions`. With the past versions taken from the records the same restart is 2.91 s: 0.31 s reading the store, 2.59 s for the indices, the trees and the root with every check, and 2 ms for the history. Without the leaf check it is 1.46 s, with the trees computed from the objects 5.41 s, and the heap after the restart is 381 MiB where it was 572.
+
+**`CoreApp`** implements `Application`. Its fields: `chainId`, the public `db`, the store, the verifier, the signing `context`, the logger, `height`, `appHash`, `lastTime`, the `pending` session, the `sigCache` (transaction id hex to address hex to the set of hashes of every signature by that signer over that body that verified) with `sigCacheSignatures`, the number of hashes it holds, `toPersist` (what the next `commit` writes), `staleHistory`, the `recorder`, the three snapshot settings and `lastHistory` (what the last commit wrote, for the RPC's event streams).
 
 **The genesis and reopen paths** are the constructor:
 
 ```ts
-    const stored = openObjectDatabase(this.kv, CORE_TYPES, { retainVersions: opts.retainVersions, indexTrees: opts.indexTrees, trees: opts.trees });
+    const stored = openObjectDatabase(this.kv, CORE_TYPES, { retainVersions: opts.retainVersions, indexTrees: opts.indexTrees, trees: opts.trees, arenaBytes: opts.arenaBytes, heapRoom: opts.heapRoom });
     if (stored) {
       this.db = stored.db;
+      // The state holds the scheme genesis fixed, and the node derives its keys from the genesis it was given: the two
+      // must name the same one.
+      const scheme = getGlobal(this.db).scheme;
+      if (scheme !== schemeTag(opts.genesis.signatureScheme ?? 'ml-dsa-44')) throw new Error(`the application state is for a ${schemeName(scheme)} chain, genesis names ${opts.genesis.signatureScheme ?? 'ml-dsa-44'}`);
       this.height = stored.height;
       this.appHash = stored.appHash;
       this.staleHistory = stored.staleHistory;
-      this.log('info', 'loaded application state', { height: this.height, appHash: this.appHash, provableFrom: this.db.lowestVersion, ...stored.timing });
+      this.log('info', 'loaded application state', { height: this.height, appHash: this.appHash, provableFrom: this.db.lowestVersion, ...stored.timing, ...(stored.paged.length > 0 ? { paged: stored.paged.join(', ') } : {}) });
     } else {
       if (opts.genesis.appStateFile && !opts.appGenesis) throw new Error('the application genesis is in a file; parse it with loadAppGenesis first');
       const t0 = performance.now();
       const g = opts.appGenesis ?? parseAppGenesis(opts.genesis.appState);
       const t1 = performance.now();
-      this.db = new ObjectDatabase(CORE_TYPES, { retainVersions: opts.retainVersions, indexStore: this.kv, indexTrees: opts.indexTrees, trees: opts.trees });
+      this.db = new ObjectDatabase(CORE_TYPES, { retainVersions: opts.retainVersions, indexStore: this.kv, indexTrees: opts.indexTrees, trees: opts.trees, objectStore: (id) => this.kv.get(objectKey(id)), arenaBytes: opts.arenaBytes, historyStore: (version) => this.kv.get(historyKey(version)) });
       applyGenesis(this.db, g, opts.genesis.genesisTime, schemeTag(opts.genesis.signatureScheme ?? 'ml-dsa-44'));
       const t2 = performance.now();
       this.appHash = this.db.root(0);
@@ -1236,29 +1506,33 @@ The history records inside the retention window are loaded (the rest are reporte
     this.pending = this.db.startSession();
 ```
 
-A store with state wins over genesis, so genesis is parsed only once in a node's life; **`CoreApp.hasState(kv)`** lets the node skip parsing it at all. On both paths the database is given the store as its `indexStore` and the two tier options, so a database built from genesis can drop its trees as well as one reopened from the store. Genesis is applied, hashed as version 0 and persisted immediately; that first root's change list holds every index entry and every chunk and node besides every object (576,000 entries, about 600,000 sparse nodes and 25 MiB of chunks for 191,896 accounts, STATE-PAGING.md 4.4 and 5.3), so the genesis write is where the store grows from 34.6 to 213 MiB at that size. The scheme handed to `applyGenesis` is the engine genesis's `signatureScheme`, ML-DSA-44 when absent, turned into its tag by `schemeTag`; from then on the application reads it from the committed `global` object (`chainScheme`, below) and never from the genesis document again, so a reopened store carries its own scheme. Either way the constructor ends by opening the pending session. The README reports a one-gigabyte genesis (193,536 accounts with two keys each) parsing as a token stream in 6.4 s and building its objects, first root and LMDB write in 8.1 s, and a restart from LMDB at that size in 11.8 s, most of it decoding objects and rebuilding index history; those figures predate the index entries and the trees in the store, which took the restart of the 191,896-account secp256k1 state from 8.4 s to 5.2 s (STATE-PAGING.md 5.3, quoted under `openObjectDatabase` above).
+A store with state wins over genesis, so genesis is parsed only once in a node's life; **`CoreApp.hasState(kv)`** lets the node skip parsing it at all. On both paths the database is given the store as its `indexStore`, its `objectStore` and its `historyStore`, the two tier options and the arena's limit, so a database built from genesis can drop its trees, bound its arena and read a past version from the store's history records as well as one reopened from the store; `heapRoom` matters only to the reopen path, a genesis being built resident. A reopened state must be for the scheme genesis names, or the constructor throws. When something was left out for want of room, the `loaded application state` line says so: `paged` lists the names, for example `indexTrees, trees, history`, and is absent when the store was opened whole. Genesis is applied, hashed as version 0 and persisted immediately; that first root's change list holds every index entry and every chunk and node besides every object (576,000 entries, about 600,000 sparse nodes and 25 MiB of chunks for 191,896 accounts, STATE-PAGING.md 4.4 and 5.3), so the genesis write is where the store grows from 34.6 to 213 MiB at that size. The scheme handed to `applyGenesis` is the engine genesis's `signatureScheme`, ML-DSA-44 when absent, turned into its tag by `schemeTag`; from then on the application reads it from the committed `global` object (`chainScheme`, below) and never from the genesis document again, so a reopened store carries its own scheme. Either way the constructor ends by opening the pending session. The README reports a one-gigabyte genesis (193,536 accounts with two keys each) parsing as a token stream in 6.4 s and building its objects, first root and LMDB write in 8.1 s, and a restart from LMDB at that size in 11.8 s, most of it decoding objects and rebuilding index history; those figures predate the index entries and the trees in the store, which took the restart of the 191,896-account secp256k1 state from 8.4 s to 5.2 s (STATE-PAGING.md 5.3, quoted under `openObjectDatabase` above).
 
 **`initChain(_genesis)`** refuses to run on an application that already has blocks and returns the genesis app hash with the active set as validator updates; when the set is non-empty, the engine uses it in place of its own genesis list (`STAKING.md` section 2.3).
 
-**`checkTx(bytes)`**:
+**`checkTx(bytes, opts)`**:
 
 ```ts
-  async checkTx(bytes: Uint8Array): Promise<CheckTxResult> {
+  async checkTx(bytes: Uint8Array, opts: CheckTxOptions = {}): Promise<CheckTxResult> {
     const d = this.decode(bytes);
     if ('error' in d) return { ok: false, error: d.error };
     while (this.applying) await this.applying;
-    const sigError = await this.verifySignatures(d.tx, d.txId);
-    if (sigError) return { ok: false, error: sigError };
+    const signed = await this.verifySignatures(d.tx, d.txId);
+    if (typeof signed === 'string') return { ok: false, error: signed };
     // A block may have started while the pool verified; its state must be the one checked against.
     while (this.applying) await this.applying;
-    const r = this.applyChecked(d.tx, d.txId, this.lastTime, this.height + 1n, this.pending !== null, false);
+    // Nor is a transaction the mempool would now refuse applied: its writes would stay in the pending state, and
+    // the transactions checked after it would be checked against them.
+    const refused = opts.admit?.() ?? null;
+    if (refused !== null) return { ok: false, error: refused };
+    const r = this.applyChecked(d.tx, d.txId, signed, this.lastTime, this.height + 1n, this.pending !== null, false);
     return r.ok ? { ok: true } : { ok: false, error: r.error };
   }
 ```
 
-Decode (a failure is `malformed transaction: ...`), wait for any block in progress, verify the signatures, wait again in case a block began during the await, then evaluate against the pending session with the last block time and the next height, keeping the result in the pending session. `applying` is the promise that serialises checks behind a block; review finding 3 explains why a check must not resolve keys against a state that a block is about to change.
+Decode (a failure is `malformed transaction: ...`), wait for any block in progress, verify the signatures, wait again in case a block began during the await, ask the caller's `admit` whether it still takes the transaction (the mempool passes one, [chapter 05](05-mempool-executor.md); a refusal returns its reason and leaves nothing in the pending state), then evaluate against the pending session with the last block time and the next height, keeping the result in the pending session. What `verifySignatures` returns is either an error string or the set of addresses that validly signed, and that set is handed to `applyChecked`. `applying` is the promise that serialises checks behind a block; review finding 3 explains why a check must not resolve keys against a state that a block is about to change.
 
-The concurrency story in full. Node is single-threaded, so two `checkTx` calls and a `finalizeBlock` interleave only at `await` points, and the only awaits in this file are the two calls into the verifier. Everything between an await and the next one is one synchronous run that opens a session, evaluates and closes it, so sessions always close innermost first, which the database insists on. The one hazard is a check whose signature verification was in flight when a block began: its candidate keys were resolved against the pre-block state. The second `while (this.applying)` makes it wait, and `applyChecked` then re-reads the authorities and checks the thresholds against the state after the block, in the fresh pending session. The signature cache entry it produced stays valid, since a signature over a body is a fact about bytes. The README measures `checkTx` at 6,700 transfers per second through the worker pool, essentially the pool's verification rate.
+The concurrency story in full. Node is single-threaded, so two `checkTx` calls and a `finalizeBlock` interleave only at `await` points, and the only awaits in this file are the two calls into the verifier. Everything between an await and the next one is one synchronous run that opens a session, evaluates and closes it, so sessions always close innermost first, which the database insists on. The one hazard is a check whose signature verification was in flight when a block began: its candidate keys were resolved against the pre-block state. The second `while (this.applying)` makes it wait, and `applyChecked` then re-reads the authorities and checks the thresholds against the state after the block, in the fresh pending session. The set of signers it verified stays valid, and so does the cache entry it produced, since a signature over a body is a fact about bytes. The README measures `checkTx` at 6,700 transfers per second through the worker pool, essentially the pool's verification rate.
 
 **`finalizeBlock(req)`** is the block procedure of `DESIGN.md` section 7 and `STAKING.md` section 7, in this order:
 
@@ -1268,7 +1542,7 @@ The concurrency story in full. Node is single-threaded, so two `checkTx` calls a
 4. `recorder.reset(req.height)` and `beginBlock(...)` with the recorder: proposals, mint, rewards, downtime, evidence, then the queues (begin block).
 5. Decode every transaction.
 6. `prewarmSignatures(decoded)`: one batch to the worker pool for every signature that the cache does not already vouch for (batch signature pre-verification).
-7. For each transaction in order: a decode error is its result; otherwise `verifySignatures` resolves the signers' keys against the state as it stands after the transactions before it, `recorder.beginTx`, `applyChecked(..., keep: true, final: true)`, `recorder.endTx(r.ok)`, and the result is pushed (per-transaction key resolution and evaluation).
+7. For each transaction in order: a decode error is its result; otherwise `verifySignatures` resolves the signers' keys against the state as it stands after the transactions before it, `recorder.beginTx`, `applyChecked(..., signed, ..., keep: true, final: true)` with the signers that pass returned, `recorder.endTx(r.ok)`, and the result is pushed (per-transaction key resolution and evaluation).
 8. `endBlock(this.db, this.log)`: tally proposals, compute the set, the validator updates (end block).
 9. Write `height` and `time` into `dynamic`, then `blockSession.commit()`: the block's changes become the live state and no session is open.
 10. `this.db.root(Number(req.height))`: the app hash for this height (root). The root requires every session closed, which the commit in step 9 guaranteed.
@@ -1287,13 +1561,13 @@ The block session exists for the failure in step 12. `beginBlock` and `endBlock`
           continue;
         }
         // Keys are resolved against the state as it stands after the transactions before this one, on every node alike.
-        const sigError = await this.verifySignatures(d.tx, d.txId);
-        if (sigError) {
-          txResults.push({ ok: false, error: sigError });
+        const signed = await this.verifySignatures(d.tx, d.txId);
+        if (typeof signed === 'string') {
+          txResults.push({ ok: false, error: signed });
           continue;
         }
         this.recorder.beginTx(txHash(req.txs[i]!), i);
-        const r = this.applyChecked(d.tx, d.txId, req.time, req.height, true, true);
+        const r = this.applyChecked(d.tx, d.txId, signed, req.time, req.height, true, true);
         this.recorder.endTx(r.ok);
         txResults.push(r);
       }
@@ -1302,19 +1576,13 @@ The block session exists for the failure in step 12. `beginBlock` and `endBlock`
 
 Why two signature passes? Review finding 3 showed that resolving every key before any transaction executes lets a node that saw T1 (install a new key) and T2 (spend with it) in its mempool accept T2 while a cold node rejects it: different roots for the same block. So keys are resolved per transaction. Review finding 32 then showed that doing the crypto inside that loop fed the worker pool one job at a time, so a cold block ran at single-thread speed. The split is sound because a cache entry says only "this address signed this body", which no state change can invalidate; the per-transaction pass still decides whether that address is allowed to sign. The README puts the warm path (signatures verified at admission) at 26,000 transfers per second, a full block of 1,500 in 57 ms, and the cold path (block sync, or a node that missed the gossip) at 6,300 per second with 11 verification threads.
 
-**`commit()`** persists `toPersist` if there is one, publishes `lastHistory`, and takes a snapshot when the height is a multiple of `snapshotInterval`. The README measures a commit after a 500-transfer block at 2.6 ms to memory and 8.8 ms to LMDB.
+**`commit()`** persists `toPersist` if there is one, publishes `lastHistory`, and takes a snapshot when the height is a multiple of `snapshotInterval`. The README measures a commit after a 500-transfer block at 3.1 to 3.9 ms to memory and 9.6 ms to LMDB (2.6 and 8.8 before the index entries and tree chunks were written with the objects). The method is `async` because the interface says so, and it awaits nothing: `persist` and `takeSnapshot` are both synchronous writes to `this.kv`. That is what the comment on `Application.commit` asks of an application that keeps its state in the engine's store environment. The executor of a node that created this application calls `commit()` inside the environment transaction in which it has just saved the block ([chapter 5](05-mempool-executor.md)), and everything written before the first `await` joins that transaction, so the block, the chain state, the application's state and a snapshot taken at that height land together, with one flush to the device. A `CoreApp` constructed by a caller on a store of its own and handed to the node is called outside any such transaction, and its `kv.write` then commits by itself, after the chain store's.
 
-`persist(p)` (private) is the one store transaction per block:
+`persist(p)` (private) is the application's one store write per block:
 
 ```ts
     this.kv.write((w) => {
-      const next = new Map<ObjectId, bigint>();
-      for (const [account, entry] of p.history) {
-        const seq = next.get(account) ?? this.nextSequence(account);
-        w.put(accountHistoryKey(account, seq), historyEntryToBytes(entry));
-        next.set(account, seq + 1n);
-      }
-      for (const [account, seq] of next) w.put(sequenceKey(account), encode((wr) => wr.u64(seq)));
+      this.historyLog.append(w, p.history);
       for (const c of p.changes.objects) {
         if (c.bytes) w.put(objectKey(c.id), c.bytes);
         else w.del(objectKey(c.id));
@@ -1331,7 +1599,8 @@ Why two signature passes? Review finding 3 showed that resolving every key befor
       for (const [type, next] of p.changes.counters) w.put(counterKey(type), encode((wr) => wr.u64(BigInt(next))));
       if (p.changes.history) w.put(historyKey(p.changes.version), encode((wr) => encodeHistory(wr, p.changes.history!)));
       // History that no longer serves any provable height: the version that just left the window, and leftovers found at startup.
-      if (this.db.lowestVersion > 0) w.del(historyKey(this.db.lowestVersion));
+      // The store's window is the full one even while the memory guard has trimmed the one in memory, so a restart has it back.
+      if (this.db.lastStaleVersion > 0) w.del(historyKey(this.db.lastStaleVersion));
       for (const v of this.staleHistory) w.del(historyKey(v));
       this.staleHistory = [];
       w.put(META_KEY, encode((wr) => wr.u64(p.meta.height).fixed(p.meta.appHash)));
@@ -1339,7 +1608,7 @@ Why two signature passes? Review finding 3 showed that resolving every key befor
     this.db.dropChanges();
 ```
 
-History entries with their per-account sequence numbers, the changed objects (a null encoding is a removal), the index entries the block added and removed (`Changes.indices`, removals before additions, so a unique key that passed from one object to another inside the block ends with its new owner when the list is applied in order; a transfer, which changes amounts and no key, adds none), the dense tree chunks and sparse tree nodes the root changed (`Changes.trees`, a null value deleting a chunk that emptied or a node that collapsed), the moved counters, the version's history record, deletion of the record that just left the window, and the meta last, all in one write. Then the change list is dropped, which is also the word to the database that the store now holds what the root reported: until then it lays the list over the store for whatever index or tree is dropped, so a query between `finalizeBlock` and `commit` never sees an index older than the objects ([chapter 09](09-database.md)). The extra writes are not a mode; a node that never pages pays them anyway so that the fallback exists the moment it is needed, and they are measured (STATE-PAGING.md 4.4 and 5.3): a 500-transfer block writes about a thousand index entries, and `commit to LMDB` went from a mean of 8.95 to 9.63 ms, 7%; the chunks cost nothing measurable for a block whose writes are local, and a fifth more (45.7 to 55.1 ms) for a block of 2,400 transfers scattered over 192,000 accounts, which rewrites nearly every chunk of the trees it touches, about 12 MiB. A crash between `finalizeBlock` and `commit` leaves the store at the previous height and the engine replays the block on restart, which is why `info()` reports the stored height.
+The block's history entries appended to the log (`HistoryLog.append`, above, which also writes the log's length and the waiting heads of one slice of the account numbers), the changed objects (a null encoding is a removal), the index entries the block added and removed (`Changes.indices`, removals before additions, so a unique key that passed from one object to another inside the block ends with its new owner when the list is applied in order; a transfer, which changes amounts and no key, adds none), the dense tree chunks and sparse tree nodes the root changed (`Changes.trees`, a null value deleting a chunk that emptied or a node that collapsed), the moved counters, the version's history record, deletion of the record that just left the window, and the meta last, all in one write. The record deleted is the one for `db.lastStaleVersion`, the current version less the configured retention, and not for `db.lowestVersion`: `lowestVersion` says what the database can answer for, `lastStaleVersion` what the store may forget, and the second is counted from the retention alone. From the memory guard's `warn` level on the node trims the window in memory to two versions ([chapter 8](08-node.md)); in a database with no history store `lowestVersion` then jumps up to the trimmed edge, and deleting by it would leave the records between the two edges in the store forever while no longer keeping the window the store is supposed to hold. Counted from the retention, the store keeps the whole configured window whatever the memory guard does, each root's record still being written in full. That window of records is what a restart reads back, and what the database reads a past version from while its window in memory is trimmed: every record from the oldest provable version on must be there, since a missing one is taken to mean that no root was computed at that version ([chapter 09](09-database.md)). Then the change list is dropped, which is also the word to the database that the store now holds what the root reported: until then it lays the list over the store for whatever index or tree is dropped, so a query between `finalizeBlock` and `commit` never sees an index older than the objects ([chapter 09](09-database.md)). The extra writes are not a mode; a node that never pages pays them anyway so that the fallback exists the moment it is needed, and they are measured (STATE-PAGING.md 4.4 and 5.3): a 500-transfer block writes about a thousand index entries, and `commit to LMDB` went from a mean of 8.95 to 9.63 ms, 7%; the chunks cost nothing measurable for a block whose writes are local, and a fifth more (45.7 to 55.1 ms) for a block of 2,400 transfers scattered over 192,000 accounts, which rewrites nearly every chunk of the trees it touches, about 12 MiB. A crash between `finalizeBlock` and `commit` leaves the store at the previous height and the engine replays the block on restart, which is why `info()` reports the stored height.
 
 Snapshots: **`takeSnapshot()`** exports the committed state at the current height and writes it in one store transaction:
 
@@ -1366,25 +1635,13 @@ The `stale` expression keeps the newest `snapshotsKept − 1` earlier heights an
 History: **`accountHistory(account, from = 0n, limit = 100, reverse = false)`** returns `{ entries, total }`:
 
 ```ts
+  /** An account's history, oldest first from `from`, or newest first when reversed. */
   accountHistory(account: ObjectId, from = 0n, limit = 100, reverse = false): { entries: (HistoryEntry & { sequence: bigint })[]; total: bigint } {
-    const total = this.nextSequence(account);
-    const entries: (HistoryEntry & { sequence: bigint })[] = [];
-    if (reverse) {
-      for (let seq = total - 1n - from; seq >= 0n && entries.length < limit; seq--) {
-        const v = this.kv.get(accountHistoryKey(account, seq));
-        if (v) entries.push({ ...historyEntryFromBytes(v), sequence: seq });
-      }
-    } else {
-      for (const [k, v] of this.kv.range(accountHistoryKey(account, from), accountHistoryKey(account, total))) {
-        if (entries.length >= limit) break;
-        entries.push({ ...historyEntryFromBytes(v), sequence: decode(k, (r) => (r.u8(), r.u64(), r.u64())) });
-      }
-    }
-    return { entries, total };
+    return this.historyLog.read(account, from, limit, reverse);
   }
 ```
 
-Oldest first is a range read from `from`; newest first walks sequence numbers down from `total − 1 − from`, which is what a wallet showing recent activity wants. A reader decodes an `operation` entry's `data` with `decodeOperation` and a virtual entry's with `decodeVirtualData`, as the RPC and the network test do. The README measures the newest twenty entries of an account at 930,000 reads per second on the gigabyte state. `nextSequence` (private) reads the `q` entry.
+The application keeps one `HistoryLog` over its store (`historyLog`, made in the constructor before the database is opened, which is also when a store with the earlier layout is moved into the log) and the method is its `read`: oldest first from sequence `from`, or with `reverse` newest first, `from` then counting entries back from the newest, which is what a wallet showing recent activity wants. `total` is the account's count and every entry carries its `sequence`. A reader decodes an `operation` entry's `data` with `decodeOperation` and a virtual entry's with `decodeVirtualData`, as the RPC and the network test do. The newest twenty entries of an account are read at about a million a second on the gigabyte state (1,023,000, docs/benchmarks.md section 4.8; 930,000 to 991,000 with the earlier layout, the entries keyed by account), most accounts of that state having no entries.
 
 Queries: `lastHeight`, `lastAppHash`, `lowestProvableHeight` (the oldest height a proof can be made for), `coreAsset`, **`stakingParameters()`**, **`global()`**, **`feeSchedule()`**, **`chainParameters()`**, **`dynamic()`**, **`accountByName(name)`** (a name that cannot be an index key, one with a zero byte, returns null rather than throwing), **`account(id)`**, **`balance(owner, asset = core)`**. What "committed" means here needs stating precisely, because two views are in play. `global()`, `dynamic()`, `account(id)`, `accountByName` and `balance` return objects read through `db.getCommitted`, which looks through every open session back to the last `root()`, so a transfer sitting in the pending session is invisible and the test `checks pending transactions in sequence` asserts exactly that. The indices, though, are live: `accountByName` finds the id through the live `byName` index and `balance` through the live `byOwnerAsset` index, and only then reads the object behind that id committed. The difference shows for an object the pending session created: the live index finds it, `getCommitted` says it did not exist at the last root, and the query answers null, which is the right answer. `coreAsset` and `stakingParameters()` read the live `global` object, which only a block ever modifies, so outside `finalizeBlock` the live and committed values are one and the same. The RPC in [chapter 12](12-rpc.md) follows the same rule for everything it derives from these objects: a validator's self-bond and delegator count, a delegation's unbonding entries and an account's balances are assembled from committed objects, with the live indices used only to find which ids to read. Proofs: **`proof(id)`** against the current app hash, **`proofAt(id, height)`** for a past height inside the window ("Verify it against header height+1"), **`proveAccountName(name, height)`**, **`proveAssetSymbol(symbol, height)`**, **`proveValidatorAddress(address, height)`** and **`proveDelegation(delegator, validator, height)`** over the four authenticated indices; a key proof proves the 8-byte id the key maps to, or its absence.
 
@@ -1394,7 +1651,7 @@ The private internals:
 - `lookupAuthorities` is the `AuthorityLookup` over the live database.
 - `closePending()` undoes and clears the pending session.
 - `signingKeys(tx)` gathers the candidate keys of every required account's active and owner authorities with `collectKeys`, or returns the error `account X does not exist`.
-- `cacheVerified(txKey, address, sigHash)`, `isVerified(txKey, address, sigHash)` and `trimCache` maintain `sigCache`, a map from transaction id to a map from signer address to a **set** of signature hashes. `cacheVerified` adds to the set and never replaces it; `isVerified` asks whether a particular signature's hash is in the set; `trimCache` drops the oldest transaction once the cache holds more than `SIG_CACHE_MAX = 20,000`:
+- `cacheVerified(txKey, address, sigHash)`, `isVerified(txKey, address, sigHash)` and `trimCache` maintain `sigCache`, a map from transaction id to a map from signer address to a **set** of signature hashes. `cacheVerified` adds to the set, which holds at most `SIG_CACHE_VARIANTS = 4` hashes, the oldest making way for a fifth; `isVerified` asks whether a particular signature's hash is in the set; `trimCache` drops the oldest transactions while the cache holds more than `SIG_CACHE_MAX = 20,000` bodies or more than `SIG_CACHE_SIGNATURES = 40,000` signature hashes across them, so the bound is on memory and not only on bodies:
 
 ```ts
   private cacheVerified(txKey: string, address: string, sigHash: string): void {
@@ -1402,13 +1659,17 @@ The private internals:
     if (!verified) {
       verified = new Map();
       this.sigCache.set(txKey, verified);
-      this.trimCache();
     }
     // A set, never a replacement: two valid signatures by one key over one body can be in flight at once
-    // (signing is randomised), and a later verification must not make an earlier one look unverified.
+    // (signing is randomised), and a later one should not cost the earlier its cache entry. Past a few the oldest
+    // goes; a transaction in flight holds its own verified signers, so that costs at most a second verification.
     let hashes = verified.get(address);
     if (!hashes) verified.set(address, (hashes = new Set()));
+    if (hashes.has(sigHash)) return;
+    if (hashes.size >= SIG_CACHE_VARIANTS) hashes.delete(hashes.values().next().value!);
+    else this.sigCacheSignatures++;
     hashes.add(sigHash);
+    this.trimCache();
   }
 
   private isVerified(txKey: string, address: string, sigHash: string): boolean {
@@ -1416,7 +1677,7 @@ The private internals:
   }
 ```
 
-  Why a set per (body, key) rather than one hash: ML-DSA signing is randomised by default (the "hedged" variant), so one key produces a different valid signature over the same body every time it signs. Two copies of one transaction with different signature bytes can be in the system at once, one gossiped from a peer and one re-signed by a wallet that retried, and both are valid. With a single slot per signer, verifying the second copy overwrote the record of the first, and a `checkTx` for the first copy that was between its verification and its evaluation then found its own signature "unverified". A set keeps every signature that verified, so neither copy can make the other look bad, and the entry still says only "this key signed this body with these exact bytes".
+  Why a set per (body, key) rather than one hash: ML-DSA signing is randomised by default (the "hedged" variant), so one key produces a different valid signature over the same body every time it signs. Two copies of one transaction with different signature bytes can be in the system at once, one gossiped from a peer and one re-signed by a wallet that retried, and both are valid. With a single slot per signer, verifying the second copy overwrote the record of the first, and a `checkTx` for the first copy that was between its verification and its evaluation then found its own signature "unverified". A set keeps the signatures that verified, so one copy does not cost the other its entry, and the entry still says only "this key signed this body with these exact bytes". The set is capped because a key can make any number of valid signatures over one body, each of which verifies once and is then refused in execution without paying a fee; without a cap one body would hold them all. Losing an entry costs nothing but a second verification: a transaction between its verification and its evaluation carries its own set of verified signers and does not go back to the cache.
 - `chainScheme` (a getter) reads the scheme genesis fixed from the committed global properties:
 
 ```ts
@@ -1440,7 +1701,7 @@ The private internals:
       }
 ```
 
-- `verifySignatures(tx, txId)` returns an error string or null:
+- `verifySignatures(tx, txId)` returns an error string, or the set of addresses that validly signed, which is the caller's to apply the transaction with (what the cache says by then does not matter, since load shedding can clear it and trimming shrink it while this awaits the pool):
 
 ```ts
     for (const s of tx.signatures) {
@@ -1452,20 +1713,27 @@ The private internals:
       if (schemeOf(s.signature) !== this.chainScheme) return 'signature of another scheme than the chain uses';
       // A cache hit is only for the exact signature bytes seen before.
       const sigHash = toHex(sha256(s.signature));
-      if (this.isVerified(txKey, address, sigHash)) continue;
+      if (this.isVerified(txKey, address, sigHash)) {
+        signed.add(address);
+        continue;
+      }
       jobs.push({ sig: s.signature, msg: body, publicKey, context: this.context });
       jobKeys.push([address, sigHash]);
     }
     if (jobs.length > 0) {
       const results = await this.verifier.verify(jobs);
       if (results.some((ok) => !ok)) return 'invalid signature';
-      for (const [address, sigHash] of jobKeys) this.cacheVerified(txKey, address, sigHash);
+      for (const [address, sigHash] of jobKeys) {
+        signed.add(address);
+        this.cacheVerified(txKey, address, sigHash);
+      }
     }
+    return signed;
 ```
 
 A transaction with no signatures is `transaction has no signatures`. A signature tagged with another scheme than the chain's is refused as `signature of another scheme than the chain uses` before any job is built: chapter 2's `verify` would fail it anyway, since the key and the signature would disagree on their tags, but the refusal names the reason and costs no verification work. The cache binds the hash of the signature bytes (review finding 2): before that, a node that had verified a transaction once accepted the same body with a zeroed signature in a block, and nodes that had not split from it. The review test "accepts both valid signatures a key can make over one body, whichever was seen first" signs one body twice with one key, verifies both copies, and checks that each still evaluates after the other.
 
-- `applyChecked(tx, txId, time, height, keep, final)` is synchronous on purpose. It first requires every signature to be in the cache (`unverified signature` otherwise; `verifySignatures` has just run on every path, and because the cache keeps every verified signature of a signer rather than the latest one, a second copy of the transaction verified in between cannot make this one look unverified), then checks thresholds against current state: each owner-required account's owner authority, and each active-required account's active or owner authority (`missing owner authority of X`, `missing active authority of X`). Then:
+- `applyChecked(tx, txId, signed, time, height, keep, final)` is synchronous on purpose. `signed` is what `verifySignatures` returned for this transaction. It first requires that set to hold one address per signature (`unverified signature` otherwise; `verifySignatures` has just run on every path and returns only when every signature verified, and since the set travels with the call, nothing that happens to the cache in between, a second copy verified, a trim, a drop under load, can make this transaction look unverified), then checks thresholds against current state, with the same set as the signers: each owner-required account's owner authority, and each active-required account's active or owner authority (`missing owner authority of X`, `missing active authority of X`). Then:
 
 ```ts
     const session = this.db.startSession();
@@ -1494,7 +1762,7 @@ For completeness, every error `app.ts` produces on its own, before the evaluator
 | `signature by a key that no required authority contains` | `verifySignatures` | the address is not among the candidate keys of the required accounts, to depth 2 |
 | `signature of another scheme than the chain uses` | `verifySignatures` | the signature's tag is not the scheme genesis fixed (`global.scheme`) |
 | `invalid signature` | `verifySignatures` | the worker pool rejected at least one signature |
-| `unverified signature` | `applyChecked` | a signature is not in the cache; a guard rather than an expected outcome, since `verifySignatures` runs first on every path and the cache keeps every verified signature, so only an eviction of the entry (20,000 other transactions between verification and evaluation) could trigger it |
+| `unverified signature` | `applyChecked` | the set of verified signers does not cover every signature; a guard rather than an expected outcome, since `verifySignatures` runs first on every path and hands over the set only when every signature verified |
 | `missing owner authority of X` | `applyChecked` | the signers do not reach X's owner threshold |
 | `missing active authority of X` | `applyChecked` | the signers reach neither X's active nor its owner threshold |
 
@@ -1513,6 +1781,7 @@ A failed `checkTx` leaves nothing behind in the pending session, and a failed tr
 - `creates and issues user assets up to the max supply`: an asset `ALICE` is `4.1`, only its issuer can issue, issuing past the max supply fails while the issues around it succeed, and `byAsset` lists the holders.
 - `proves objects against the app hash`, `proves past heights inside the retention window`, `proves account names present and absent, now and at past heights`: object and key proofs verify against the right hash, fail against the wrong one, and a name is proven absent at height 0 and present later.
 - `restarts from the store with the same app hash and keeps producing the same hashes`: two applications on the same blocks agree; one reopened from the store reports the stored height and hash, has every past height provable with byte-identical proofs, continues to the same hash as the other, and the history window slides in both memory and store.
+- `keeps the whole history window in the store while the one in memory is trimmed, so a restart has it back`: two applications with a retention of four run the same six blocks, and one has `db.setHistoryWindow(1)` called after its third. At height 6 its window in memory holds one past version, yet it proves from height 2 like the other, its object proofs and name proofs at heights 2 to 6 byte for byte those of the application that was never trimmed: the heights below 5 are read from the history records in its store, which holds those of versions 3 to 6, the full window. A proof at height 1 throws `not available` on both. An application restarted from that store logs `indexVersions: 'records'` in its `loaded application state` line and proves from height 2 as well, with the same proofs, from the window it read back. Then the record of version 4 is deleted from the store: an application opened on it proves from height 4, gives the same proofs at heights 4 to 6, refuses height 3 as `not available`, and after its next block the store holds the records of versions 5, 6 and 7 only.
 
 A second group, `core application: index entries in the store`, is the application's side of STATE-PAGING.md phases two to four. Its `consistent(app, kv)` check is applied after every commit: the store's `'i'` entries equal `db.indexEntries()` and `checkIndexStore()` finds nothing to report, and the store's `'t'` and `'n'` entries equal `db.treeEntries()`.
 
@@ -1521,6 +1790,11 @@ A second group, `core application: index entries in the store`, is the applicati
 - `writes the entries of a state imported from a snapshot`: a snapshot exported in chunks of three objects, imported, and written with `writeImportedState` leaves a store whose entries and trees equal the original application's, and an application opened on it has the original's hash.
 - `writes the trees with every commit and restarts from them, with the proofs of the original`: after three blocks the reopened application has the same hash and, at every height in the window, the same object proofs and name proofs as the one that wrote the store; the three reopen paths (`fromTrees: false`, `checkLeaves: true`, `trees: false`) give the same hash and proofs; a store in which alice's object was overwritten with bob's bytes is refused by the leaf check with `does not hash to its leaf` and by the recomputing path with `do not hash to the stored app hash`; the reopened application keeps producing the twin's hashes; and a copy of the store without its `'t'` and `'n'` keys computes the trees on opening and writes them once.
 - `runs blocks with the Merkle trees dropped and rebuilt, with the hashes and proofs of an app that keeps them`: with both tiers dropped, blocks match a resident twin in hash, results and, at every height in the window, the faucet's object proof and the name proofs of alice and bob; `checkTx` refuses a taken name and admits a transfer while everything is dropped; the trees are rebuilt, a `checkTx` leaves pending writes in the mempool's session and the trees are dropped in the middle of them, another block matches, and after both tiers are rebuilt the store is consistent.
+
+A third group, `core application: a store opened without room for it`, is the open path's two limits. Each case runs two blocks on an application over a store and on a resident twin, reopens the store in its own way, and from then on applies every block to both and compares the app hash, the results and, at every height the reopened one can prove, alice's object proof and the name proofs of alice and carol.
+
+- `opens with the trees left in the store and no history window when the heap has no room, and runs on`: reopened with `heapRoom: 0`, the database reports both tiers `dropped`; the window in memory starts at height 2, where the store was opened, but `lowestProvableHeight` is 0 like the twin's, and alice's object proof and name proof at heights 0 to 2 are byte for byte the twin's, read from the history records left in the store. Two blocks (a signed transfer, a registration) match the twin, proofs at every provable height included, and the lowest provable height stays 0. The store still holds the history records 1 to 4 that were not read, and after one more block 2 to 5: they age out as they would have. The same store opened with a `heapRoom` of 2^30 proves from height 1 again, heights 1 to 5 matching the twin. And `openObjectDatabase` with `heapRoom: 0` but `indexTrees: true, trees: true` returns an empty `paged` and both tiers resident: a tier asked for by name is opened as asked.
+- `leaves the objects in the store when the arena has no room for them, and reads them from there`: reopened with `arenaBytes: 0`, the database counts more than five objects as stored and the arena holds no bytes, yet the whole history window was read (provable from height 0) and `accountByName('bob')` answers. After the two blocks the arena holds bytes again and fewer objects are stored, though some still are: what the blocks wrote went back into the arena. Alice's balance and the export of every object equal the twin's.
 
 `test/fees.test.ts` covers `FEES.md`:
 
@@ -1550,6 +1824,8 @@ A second group, `core application: index entries in the store`, is the applicati
 
 `test/chain.test.ts` runs the application on a live four-validator network with a full node: a registration gossips to every node, a forged transaction never enters a mempool, a payment reaches every node, a proof from one node verifies against the app hash in the next header on every node, state and name queries verify through `verifyStateQuery`, `verifyKeyQuery` and a light client, a transaction is proven included and successful, and account history on every node shows the faucet's two operations and alice's two receipts, newest first when reversed.
 
+`test/history.test.ts` tests `HistoryLog` on its own over a `MemoryKv`. `pages an account oldest first and newest first, whatever the other accounts wrote between its entries`: forty blocks of thirteen entries over five accounts, one of them in most entries, are appended, and every account is read from eight starting points with five limits in both directions and compared with a model kept in arrays, by the log that wrote them and by a second one opened on the same store; an account with no entries has a total of 0, and a log opened later goes on from where the first stopped. `reaches the old end of a long history in a few dozen reads, and appends a block with a few pages of writes`: 5,000 entries of one account in fifty blocks are written with fewer than three store reads an entry, two entries from any of seven starting sequences are read in fewer than a hundred, and the `'l'` keys are exactly 0 to 4,999 in order. `writes the heads a slice of the accounts at a time, and has the waiting ones back after a stop`: the store is wrapped so that every put of a `'p'` key is noted, and 200 blocks of 300 entries are appended over 6,400 accounts taken from all over the range in no order. The head writes of any one block span fewer than 128 account numbers, one slice once the width has doubled to 128. At every 37th block and at the last, a second log opened on the store reports every account's count as the test counted it, and reads account 0 in full. Over the run fewer than half as many heads are written as were changed, since a head changed several times while it waits is written once, and no block writes as many as 300. At the end `'L'` holds a length of 60,000 and a `covered` no more than 64 blocks of entries, 19,200, behind it. `moves a store written before the log into it the first time it is opened`: a store filled with `'a'` and `'q'` keys reads through the log with the same sequences, heights and positions, holds no `'a'` or `'q'` key afterwards, has its log in height order, and a second open moves nothing and appends after the moved entries.
+
 `test/schemes.test.ts` runs the application on the second scheme: a four-validator chain whose genesis names secp256k1 creates an account with a secp256k1 key and refuses an ML-DSA key in an authority (`must be a secp256k1 key`), an ML-DSA consensus key (`consensus key must be a secp256k1 key`) and an ML-DSA signature relabelled with a secp256k1 address (`another scheme`); the rest of the suite runs on whichever scheme `CHAIN_SCHEME` names (chapter 15).
 
 `test/staking-net.test.ts` runs an application-owned validator set on a live network: the engine starts on the set `initChain` built, a delegation raises a validator's power two heights later on every node, a stopped validator is jailed within the window and the chain continues on three, it restarts, catches up, is unjailed by its operator and the set is four again, and a light client that trusted height 2 follows the whole sequence and proves which account stands behind an operator name.
@@ -1565,6 +1841,8 @@ Known simplifications, from `DESIGN.md` section 10 and the code:
 - Commission is one rate for every validator; there is no per-validator commission.
 - Rewards are recorded in history per validator per block, not per delegator; a delegator's share is implicit in the exchange rate.
 - A state-synced node has account history only from its snapshot height.
+- The account history log is never pruned, and a store written with the earlier layout is moved into it in one write with every entry held in memory. After a stop the log's last entries, from the oldest change whose head was still waiting, up to about 64 blocks of them, are read again when the store is opened, to have the heads back that were not yet written.
+- The decision to open a store paged rests on an estimate from the type counters and fixed per-entry figures; it is not checked against what the tiers then take. A store opened without its history window proves the heights before the one it opened at from the records in the store, slower than from memory, until the window has filled again or the store is opened with room. A record written by a build from before the records carried the sparse tree nodes cannot serve an object proof or a name proof that way, and such a height is refused as `not available` until those records have aged out.
 - Signatures are not priced, so a transaction with sixteen signatures costs the same as one with one.
 - The streaming genesis parser handles a large `accounts` array; a large `validators` array would still be assembled in memory.
 

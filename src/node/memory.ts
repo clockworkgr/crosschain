@@ -6,8 +6,9 @@
  * samples the heap and, by how full it is, moves through four levels:
  *
  *   ok         nothing
- *   warn       logged, a major collection started
- *   pressure   load is shed: the mempool stops admitting, costly RPC methods
+ *   warn       logged, a major collection started; the node pages what its
+ *              blocks do not need (the index trees, most of the history window)
+ *   pressure   load is shed: the mempool's limit is lowered, costly RPC methods
  *              and new event streams are refused, the signature cache is
  *              dropped; consensus keeps running on whatever is pooled
  *   critical   a clean stop with a reason, so a supervisor restarts the node
@@ -26,7 +27,7 @@
  * counted, so an operator can see the pauses.
  */
 import { PerformanceObserver, constants as perf } from 'node:perf_hooks';
-import { getHeapStatistics } from 'node:v8';
+import { getHeapSpaceStatistics, getHeapStatistics } from 'node:v8';
 import type { Logger } from '../util/log.ts';
 
 export interface MemoryStats {
@@ -34,6 +35,11 @@ export interface MemoryStats {
   heapUsed: number;
   heapLimit: number;
   heapTotal: number;
+  /**
+   * Bytes of the old generation in use, given when the limit is the old generation's (--max-old-space-size): the
+   * heap without the young generation, whose garbage the limit does not bound. The levels are taken from it.
+   */
+  heapOld?: number;
   /** Bytes outside the heap: ArrayBuffers (keys, hashes, stored bytes) and other external memory. */
   arrayBuffers: number;
   external: number;
@@ -98,11 +104,30 @@ function oldGenerationLimit(): number | null {
 
 const OLD_LIMIT = oldGenerationLimit();
 
+/**
+ * Bytes in use in every space but the young generation's two. Between two minor collections the young generation
+ * holds up to a semi-space of garbage (64 MiB as `start` runs the node) that never reaches the old generation: counted
+ * against an old-generation limit, it read as a full heap on a node with a small one, 162 MiB "of 153" a moment
+ * before a collection left 42.
+ */
+function oldGenerationUsed(): number {
+  let used = 0;
+  for (const s of getHeapSpaceStatistics()) if (s.space_name !== 'new_space' && s.space_name !== 'new_large_object_space') used += s.space_used_size;
+  return used;
+}
+
 export function memoryStats(): MemoryStats {
   const h = getHeapStatistics();
   const m = process.memoryUsage();
   const heapLimit = OLD_LIMIT !== null ? Math.min(OLD_LIMIT, h.heap_size_limit) : h.heap_size_limit;
-  return { heapUsed: h.used_heap_size, heapLimit, heapTotal: h.total_heap_size, arrayBuffers: m.arrayBuffers, external: m.external, rss: m.rss };
+  const stats: MemoryStats = { heapUsed: h.used_heap_size, heapLimit, heapTotal: h.total_heap_size, arrayBuffers: m.arrayBuffers, external: m.external, rss: m.rss };
+  if (OLD_LIMIT !== null) stats.heapOld = oldGenerationUsed();
+  return stats;
+}
+
+/** The bytes a sample's level is taken from, against its heapLimit: the old generation's when the limit is its, else the whole heap's. */
+export function heapInUse(s: MemoryStats): number {
+  return s.heapOld ?? s.heapUsed;
 }
 
 export type MemoryLevel = 'ok' | 'warn' | 'pressure' | 'critical';
@@ -164,7 +189,7 @@ export class MemoryGuard {
   /** Take a sample and move the level; returns the level afterwards. */
   check(): MemoryLevel {
     const s = (this.last = this.o.stats());
-    const fraction = s.heapUsed / s.heapLimit;
+    const fraction = heapInUse(s) / s.heapLimit;
     const thresholds = [this.o.warnAt, this.o.pressureAt, this.o.criticalAt];
     let idx = this.levelIndex;
     while (idx < thresholds.length && fraction >= thresholds[idx]!) idx++;
@@ -173,7 +198,7 @@ export class MemoryGuard {
       const rising = idx > this.levelIndex;
       this.levelIndex = idx;
       const level = this.level;
-      const fields = { level, heap: `${MiB(s.heapUsed)}/${MiB(s.heapLimit)} MiB`, arrayBuffers: `${MiB(s.arrayBuffers)} MiB`, rss: `${MiB(s.rss)} MiB` };
+      const fields = { level, heap: `${MiB(heapInUse(s))}/${MiB(s.heapLimit)} MiB`, arrayBuffers: `${MiB(s.arrayBuffers)} MiB`, rss: `${MiB(s.rss)} MiB` };
       if (level === 'critical') this.o.log('error', 'memory: heap at the limit; stopping before the process aborts (raise --max-old-space-size or --heap)', fields);
       else if (rising) this.o.log('warn', level === 'pressure' ? 'memory: shedding load' : 'memory: heap filling', fields);
       else this.o.log('info', 'memory: easing', fields);
@@ -235,7 +260,7 @@ export class GcScheduler {
     this.growthFraction = opts.majorGrowthFraction ?? 0.1;
     this.observe = opts.observe ?? true;
     this.log = opts.log;
-    this.heapAtLastMajor = this.stats_().heapUsed;
+    this.heapAtLastMajor = heapInUse(this.stats_());
     this.counts = { available: this.gc !== null, collections: 0, minor: 0, major: 0, incremental: 0, totalMs: 0, maxMs: 0, lastMs: 0, scheduledMinor: 0, scheduledMajor: 0 };
   }
 
@@ -284,7 +309,7 @@ export class GcScheduler {
     }
     const s = this.stats_();
     const due = Math.min(this.growthBytes, this.growthFraction * s.heapLimit);
-    if (s.heapUsed - this.heapAtLastMajor >= due) void this.major();
+    if (heapInUse(s) - this.heapAtLastMajor >= due) void this.major();
   }
 
   /** Start a major collection now, without blocking the caller on it; one at a time. */
@@ -298,7 +323,7 @@ export class GcScheduler {
       this.log('warn', 'gc: major collection failed', { err: (e as Error).message });
     } finally {
       this.majorRunning = false;
-      this.heapAtLastMajor = this.stats_().heapUsed;
+      this.heapAtLastMajor = heapInUse(this.stats_());
     }
   }
 }

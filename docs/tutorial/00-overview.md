@@ -14,7 +14,7 @@ made, with [STAKING.md](../../STAKING.md), [FEES.md](../../FEES.md),
 [RPC-SYNC-PROOFS.md](../../RPC-SYNC-PROOFS.md) and [STATE-PAGING.md](../../STATE-PAGING.md) as
 the detailed specifications it points to.
 [REVIEW-2026-10-28.md](../../REVIEW-2026-10-28.md) records an external review and what each
-finding changed; the tutorial refers to findings by number. The test suite is 22 files and 160
+finding changed; the tutorial refers to findings by number. The test suite is 24 files and 203
 tests; `npm test` runs it under ML-DSA-44 and `CHAIN_SCHEME=secp256k1 npm test` runs it again
 under secp256k1, the other signature scheme a genesis may choose; `INDEX_TREES=0` and `TREES=0`
 run it with the object database's index trees or Merkle trees dropped from the start, the
@@ -171,7 +171,7 @@ the concepts of the ones before it.
 12. [RPC](12-rpc.md): JSON-RPC methods, event streams, limits, the client.
 13. [Light client](13-light-client.md): verifying headers and queries with proofs.
 14. [Wallet and CLI](14-wallet-cli.md): the keystore and the command line.
-15. [Tests](15-tests.md): the harness, every suite (22 files, 160 tests, run under either
+15. [Tests](15-tests.md): the harness, every suite (24 files, 203 tests, run under either
     signature scheme and with the database's trees resident or dropped), and how to write a new
     test.
 

@@ -224,7 +224,7 @@ export class RpcServer {
     const m = this.methods[method];
     if (!m) return answer({ code: -32601, message: `unknown method ${method}` });
     if (params !== undefined && (typeof params !== 'object' || params === null || Array.isArray(params))) return answer({ code: INVALID_PARAMS, message: 'params must be an object' });
-    if (m.costly && this.node.isShedding) return answer({ code: RATE_LIMITED, message: 'node under memory pressure' });
+    if (m.costly && !m.whileShedding && this.node.isShedding) return answer({ code: RATE_LIMITED, message: 'node under memory pressure' });
     if (m.costly && !this.allow(remote, this.limits.costlyCost - 1)) return answer({ code: RATE_LIMITED, message: 'rate limited' });
     try {
       return answer(null, await m.fn((params as Record<string, unknown>) ?? {}));

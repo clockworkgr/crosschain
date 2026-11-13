@@ -38,13 +38,46 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
   /** Insertion order is FIFO order. */
   private readonly txs = new Map<string, Uint8Array>();
   private readonly cache = new Set<string>();
+  /** The hashes in the cache in the order they came, as a ring once it is full: the oldest is at cacheHead. */
   private readonly cacheOrder: string[] = [];
+  private cacheHead = 0;
   private pausedReason: string | null = null;
+  /** How many transactions the pool admits up to just now: maxTxs, or less while the node is short of memory. */
+  private limit: number;
 
   constructor(app: Application, opts: Partial<MempoolOptions> = {}) {
     super();
     this.app = app;
     this.opts = { ...DEFAULTS, ...opts };
+    this.limit = this.opts.maxTxs;
+  }
+
+  /** The most the pool may hold, whatever it admits up to just now. */
+  get maxTxs(): number {
+    return this.opts.maxTxs;
+  }
+
+  /** How many transactions the pool admits up to just now. */
+  get currentLimit(): number {
+    return this.limit;
+  }
+
+  /**
+   * Admit up to this many transactions from now on (never more than maxTxs). The memory guard lowers it as the heap
+   * fills, since every pooled transaction holds its bytes and its writes in the pending state. Lowering it evicts
+   * nothing: what is pooled stays and is reaped, and admission begins again once blocks have taken the pool below it.
+   */
+  setLimit(limit: number): void {
+    this.limit = Math.max(0, Math.min(this.opts.maxTxs, Math.floor(limit)));
+  }
+
+  /** Whether a transaction arriving now could be admitted: not paused, and room under the limit. */
+  get accepting(): boolean {
+    return this.pausedReason === null && this.txs.size < this.limit;
+  }
+
+  private get fullReason(): string {
+    return this.limit < this.opts.maxTxs ? 'mempool full: its limit is lowered while the node is short of memory' : 'mempool full';
   }
 
   get size(): number {
@@ -80,8 +113,19 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
   private remember(key: string): void {
     if (this.cache.has(key)) return;
     this.cache.add(key);
-    this.cacheOrder.push(key);
-    while (this.cacheOrder.length > this.opts.cacheSize) this.cache.delete(this.cacheOrder.shift()!);
+    if (this.cacheOrder.length < this.opts.cacheSize) {
+      this.cacheOrder.push(key);
+      return;
+    }
+    // Full: the newest takes the oldest's place. Shifting an array of this size for every transaction instead cost
+    // a node under load a twelfth of its time (docs/benchmarks.md section 4.13).
+    if (this.opts.cacheSize === 0) {
+      this.cache.delete(key);
+      return;
+    }
+    this.cache.delete(this.cacheOrder[this.cacheHead]!);
+    this.cacheOrder[this.cacheHead] = key;
+    this.cacheHead = (this.cacheHead + 1) % this.opts.cacheSize;
   }
 
   async addTx(tx: Uint8Array, source: string | null = null): Promise<AddTxResult> {
@@ -90,12 +134,12 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
     if (this.pausedReason !== null) return { status: 'paused', hash, error: this.pausedReason };
     if (tx.length > this.opts.maxTxBytes) return { status: 'too-large', hash };
     if (this.cache.has(key)) return { status: 'seen', hash };
-    if (this.txs.size >= this.opts.maxTxs) return { status: 'full', hash };
+    if (this.txs.size >= this.limit) return { status: 'full', hash, error: this.fullReason };
     // Mark before the await so a concurrent duplicate is not checked twice.
     this.remember(key);
     // The application asks this again after its last wait, so a transaction refused here is not applied to its
     // pending state either.
-    const admit = () => this.pausedReason ?? (this.txs.size >= this.opts.maxTxs ? 'mempool full' : null);
+    const admit = () => this.pausedReason ?? (this.txs.size >= this.limit ? this.fullReason : null);
     let res: Awaited<ReturnType<Application['checkTx']>>;
     try {
       res = await this.app.checkTx(tx, { admit });
@@ -109,9 +153,9 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
       this.cache.delete(key);
       return { status: 'paused', hash, error: this.pausedReason };
     }
-    if (this.txs.size >= this.opts.maxTxs) {
+    if (this.txs.size >= this.limit) {
       this.cache.delete(key); // the pool filled while we checked; let the sender try again rather than hear "seen"
-      return { status: 'full', hash };
+      return { status: 'full', hash, error: this.fullReason };
     }
     if (!res.ok) return { status: 'invalid', hash, error: res.error };
     this.txs.set(key, tx);

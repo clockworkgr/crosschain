@@ -9,17 +9,18 @@
  * summary at the end.
  */
 import './scheme.ts';
+import { writeFileSync } from 'node:fs';
+import { Session } from 'node:inspector/promises';
 import { join } from 'node:path';
-import { CoreApp } from '../src/app/core/app.ts';
+import type { CoreApp } from '../src/app/core/app.ts';
 import { signedTxBytes, withFees } from '../src/app/core/client.ts';
 import { TYPE } from '../src/app/core/types.ts';
 import { keyPairFromSeed } from '../src/crypto/keys.ts';
 import { WorkerVerifier } from '../src/crypto/verifier.ts';
 import { objectId } from '../src/db/id.ts';
 import { Node } from '../src/node/node.ts';
-import { memoryStats } from '../src/node/memory.ts';
+import { heapInUse, memoryStats } from '../src/node/memory.ts';
 import { MemoryHub } from '../src/p2p/memory.ts';
-import { LmdbEnv } from '../src/store/lmdb.ts';
 import { loadGenesisFile, type Genesis } from '../src/types/genesis.ts';
 import { seed } from './fixtures.ts';
 import { CHAIN_ID, POOL, poolKeys } from './bigstate.ts';
@@ -36,23 +37,29 @@ const seconds = Number(secondsArg ?? 40);
 /** How many transfers the feeder keeps ahead of the chain (about two blocks by default), and how often a window is reported. */
 const AHEAD = Number(process.env.BENCH_PAGING_AHEAD ?? 1000);
 const WINDOW_S = Number(process.env.BENCH_PAGING_WINDOW ?? 2);
+/** BENCH_PAGING_ARENA bounds the arena in MiB, as `start --arena` does. */
+const ARENA = process.env.BENCH_PAGING_ARENA ? Number(process.env.BENCH_PAGING_ARENA) * 1048576 : undefined;
+/** BENCH_PAGING_MEMORY_VERSIONS keeps that many past versions in memory, as `retain.memoryVersions` does. */
+const MEMORY_VERSIONS = process.env.BENCH_PAGING_MEMORY_VERSIONS ? Number(process.env.BENCH_PAGING_MEMORY_VERSIONS) : undefined;
+/** BENCH_PAGING_PROFILE names a directory: a CPU profile of the run's first 30 seconds and one of its last 30 are written there. */
+const PROFILE = process.env.BENCH_PAGING_PROFILE;
 const t0 = performance.now();
 const verifier = new WorkerVerifier();
-const env = new LmdbEnv(join(dir!, 'lmdb'));
 const genesis = loadGenesisFile(join(dir!, 'genesis.json'));
-const app = new CoreApp({ genesis, verifier, kv: env.store('app'), snapshotInterval: 0 });
-emit({ event: 'opened', ms: Math.round(performance.now() - t0), heap: MiB(memoryStats().heapUsed), limit: MiB(memoryStats().heapLimit) });
-
 const keys = poolKeys();
 const start = performance.now();
 const valSeed = seed('paging/val');
 const nodeGenesis: Genesis = { ...genesis, validators: [{ publicKey: keyPairFromSeed(valSeed).publicKey, power: 10n, name: 'v0' }] };
+// The node opens the state the parent built as its own application, in its own environment, as `start` does: under
+// the heap limit a state whose trees would not fit below the warn line is opened paged, and a block's writes and
+// the application's are one store transaction.
 const node = await Node.create({
   name: 'paged',
   genesis: nodeGenesis,
-  // Blocks in LMDB as a node keeps them, not in the heap the guard watches.
-  dataDir: join(dir!, 'node'),
-  app,
+  dataDir: dir!,
+  arenaBytes: ARENA,
+  indexTrees: process.env.BENCH_PAGING_INDEX_TREES === 'store' ? 'store' : undefined,
+  retain: MEMORY_VERSIONS === undefined ? undefined : { memoryVersions: MEMORY_VERSIONS },
   nodeKeySeed: seed('paging/node'),
   validatorSeed: valSeed,
   transport: new MemoryHub().transport('paged:1'),
@@ -63,11 +70,14 @@ const node = await Node.create({
   network: NETWORK,
   snapshotInterval: 0,
   memory: { intervalMs: 250 },
-  // The guard's own messages, with the second they came at.
+  // The guard's own messages, with the second they came at, and how the store was opened.
   log: (_level, msg, fields) => {
-    if (msg.startsWith('memory') || msg.startsWith('shedding') || msg.startsWith('load shedding')) emit({ event: 'log', s: Math.round((performance.now() - start) / 100) / 10, msg, ...fields });
+    if (msg === 'loaded application state') emit({ event: 'log', s: 0, msg: `${msg}${fields?.paged ? `, left in the store: ${fields.paged}` : ', every tier resident'}` });
+    else if (msg.startsWith('memory') || msg.startsWith('shedding') || msg.startsWith('load shedding')) emit({ event: 'log', s: Math.round((performance.now() - start) / 100) / 10, msg, ...fields });
   },
 });
+const app = node.app as CoreApp;
+emit({ event: 'opened', ms: Math.round(performance.now() - t0), heap: MiB(heapInUse(memoryStats())), limit: MiB(memoryStats().heapLimit) });
 await node.start();
 let blocks = 0;
 let committed = 0;
@@ -85,7 +95,7 @@ let submitted = 0;
 let refused = 0;
 const expiration = BigInt(Date.now()) + 3_600_000n;
 const rnd = () => Math.floor(Math.random() * N);
-// Keep about two blocks' worth ahead of the chain; a transfer refused while the mempool is paused is not retried.
+// Keep about two blocks' worth ahead of the chain; a transfer refused while the mempool is at its lowered limit is not retried.
 const feeder = setInterval(() => {
   if (submitted - committed - refused >= AHEAD) return;
   for (let i = 0; i < 200; i++) {
@@ -111,6 +121,22 @@ node.onMemory((level) => levels.push(level));
 const runStart = performance.now();
 let lastAt = runStart;
 const seconds1 = (ms: number) => Math.round(ms / 100) / 10;
+if (PROFILE) {
+  const session = new Session();
+  session.connect();
+  await session.post('Profiler.enable');
+  const take = (name: string, fromS: number) =>
+    setTimeout(() => {
+      void (async () => {
+        await session.post('Profiler.start');
+        await sleep(30_000);
+        const { profile } = await session.post('Profiler.stop');
+        writeFileSync(join(PROFILE, `${name}.cpuprofile`), JSON.stringify(profile));
+      })();
+    }, fromS * 1000);
+  take('early', 5);
+  take('late', seconds - 40);
+}
 for (let s = WINDOW_S; s <= seconds; s += WINDOW_S) {
   await sleep(Math.max(0, runStart + s * 1000 - performance.now()));
   const now = performance.now();
@@ -129,8 +155,13 @@ for (let s = WINDOW_S; s <= seconds; s += WINDOW_S) {
     objects: d.objects,
     indexTrees: d.indexTrees,
     trees: d.trees,
-    heap: MiB(m.heapUsed),
+    heap: MiB(heapInUse(m)),
+    young: MiB(m.heapUsed - heapInUse(m)),
     limit: MiB(m.heapLimit),
+    arrayBuffers: MiB(process.memoryUsage().arrayBuffers),
+    rss: MiB(process.memoryUsage().rss),
+    arena: MiB(d.arena.capacity),
+    stored: d.storedObjects,
     gcPauses: gc.collections - lastGc.collections,
     gcMs: Math.round(gc.totalMs - lastGc.totalMs),
     gcMax: Math.round(gc.maxMs * 10) / 10,
@@ -142,8 +173,18 @@ for (let s = WINDOW_S; s <= seconds; s += WINDOW_S) {
   lastAt = now;
 }
 clearInterval(feeder);
+// Proofs of random accounts at the newest height and at the oldest provable one, which a trimmed window reads from the store's records.
+{
+  const time = (height: bigint) => {
+    const t = performance.now();
+    for (let i = 0; i < 20; i++) app.proofAt(objectId(TYPE.account, rnd()), height);
+    return Math.round((performance.now() - t) * 5) / 100;
+  };
+  const d = app.db.memory();
+  const oldest = app.lowestProvableHeight;
+  emit({ event: 'proofs', height: Number(app.lastHeight), oldest: Number(oldest), window: d.historyWindow, history: d.history, inMemoryFrom: Number(app.lastHeight) - d.historyWindow, newestMs: time(app.lastHeight), oldestMs: time(oldest), middleMs: time((oldest + app.lastHeight) / 2n) });
+}
 emit({ event: 'summary', seconds: seconds1(performance.now() - runStart), blocks, txs: committed, pagedBlocks: paged.blocks, pagedTxs: paged.txs, submitted, refused, levels: levels.join(' ') });
 await node.stop();
-await env.close();
 // The verifier is not closed: checks of transfers still in flight would fail with it, and exiting ends its workers.
 process.exit(0);

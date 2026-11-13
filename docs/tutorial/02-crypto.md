@@ -134,7 +134,7 @@ export const SCHEME_NAMES: readonly SchemeName[] = ['ml-dsa-44', 'secp256k1'];
 
 **`schemeTag(name)`** and **`schemeName(tag)`** convert between the two. An unknown name throws `unknown signature scheme "x"; one of ml-dsa-44, secp256k1`, which is the error a genesis file with a misspelt scheme produces when it is loaded.
 
-**`interface SchemeImpl`** (private) is what a scheme has to provide: its tag and name, its three raw sizes, a seed check, key generation, and sign and verify taking a context:
+**`interface SchemeImpl`** (private) is what a scheme has to provide: its tag and name, its three raw sizes, a seed check, a public key check, key generation, and sign and verify taking a context:
 
 ```ts
 interface SchemeImpl {
@@ -145,6 +145,8 @@ interface SchemeImpl {
   readonly secretKeySize: number;
   readonly signatureSize: number;
   validSeed(seed: Uint8Array): boolean;
+  /** Whether raw bytes of the right size are a key the scheme can verify with. */
+  validPublicKey(raw: Uint8Array): boolean;
   keygen(seed: Uint8Array): { publicKey: Uint8Array; secretKey: Uint8Array };
   sign(msg: Uint8Array, secretKey: Uint8Array, context: Uint8Array): Uint8Array;
   verify(sig: Uint8Array, msg: Uint8Array, publicKey: Uint8Array, context: Uint8Array): boolean;
@@ -161,6 +163,8 @@ const mlDsa44: SchemeImpl = {
   secretKeySize: 2560,
   signatureSize: 2420,
   validSeed: () => true,
+  // Every byte string of the size decodes to a key (a seed and packed coefficients); none is refused.
+  validPublicKey: () => true,
   keygen: (seed) => ml_dsa44.keygen(seed),
   // Deterministic signing (no extra entropy): the same message signed twice yields identical bytes.
   sign: (msg, secretKey, context) => ml_dsa44.sign(msg, secretKey, { context, extraEntropy: false }),
@@ -168,7 +172,7 @@ const mlDsa44: SchemeImpl = {
 };
 ```
 
-Every seed is valid, because ML-DSA key generation is a deterministic expansion of any 32 bytes. The secp256k1 entry has more to say:
+Every seed is valid, because ML-DSA key generation is a deterministic expansion of any 32 bytes, and so is every public key of the right size. The secp256k1 entry has more to say:
 
 ```ts
 /** ECDSA signs a digest; the context is bound in by hashing it, length first, ahead of the message. */
@@ -184,6 +188,9 @@ const secp: SchemeImpl = {
   signatureSize: 64,
   // A 32-byte seed is the secret key itself; the few values at or beyond the curve order are not keys.
   validSeed: (seed) => secp256k1.utils.isValidSecretKey(seed),
+  // A compressed point: x below the field prime, and on the curve. Without this an account authority or a validator
+  // could be given a key nothing can ever sign for.
+  validPublicKey: (raw) => secp256k1.utils.isValidPublicKey(raw, true),
   keygen: (seed) => {
     if (!secp256k1.utils.isValidSecretKey(seed)) throw new Error('seed is not a valid secp256k1 secret key');
     return { publicKey: secp256k1.getPublicKey(seed, true), secretKey: seed.slice() };
@@ -193,7 +200,7 @@ const secp: SchemeImpl = {
 };
 ```
 
-Four things to notice. ECDSA signs a 32-byte digest, not a message, so the context has to be folded into the digest: `secpDigest` hashes the context's length, the context and the message, in that order. The length byte keeps the boundary unambiguous (recall from `sha256` above that parts are concatenated as far as the hash is concerned, so without it a context ending in some byte followed by a message, and the shorter context followed by that byte and the message, would collide); a context is at most 255 bytes, so one byte holds it, and `prehash: false` tells noble the digest is already made. `lowS: true` on both calls is the malleability rule from the Concepts section: the signer canonicalises, the verifier refuses the twin. Third, the seed: there is no derivation step, the 32-byte seed *is* the secret key, and the handful of 32-byte values at or beyond the curve order are not keys, so `validSeed` reports them and `keygen` refuses them. Last, the formats: the public key is the 33-byte compressed point and the signature the 64-byte compact `r` and `s`, the smallest encodings the curve has.
+Five things to notice. ECDSA signs a 32-byte digest, not a message, so the context has to be folded into the digest: `secpDigest` hashes the context's length, the context and the message, in that order. The length byte keeps the boundary unambiguous (recall from `sha256` above that parts are concatenated as far as the hash is concerned, so without it a context ending in some byte followed by a message, and the shorter context followed by that byte and the message, would collide); a context is at most 255 bytes, so one byte holds it, and `prehash: false` tells noble the digest is already made. `lowS: true` on both calls is the malleability rule from the Concepts section: the signer canonicalises, the verifier refuses the twin. Third, the seed: there is no derivation step, the 32-byte seed *is* the secret key, and the handful of 32-byte values at or beyond the curve order are not keys, so `validSeed` reports them and `keygen` refuses them. Fourth, the public key: not every 33 bytes are a compressed point on the curve, so `validPublicKey` asks noble, and a key that nothing could ever sign for is refused where it enters the chain. Last, the formats: the public key is the 33-byte compressed point and the signature the 64-byte compact `r` and `s`, the smallest encodings the curve has.
 
 **`SCHEMES`** maps tag to implementation, and the private `impl(tag)` looks one up or throws `unknown signature scheme N`:
 
@@ -205,14 +212,26 @@ const SCHEMES: Record<SchemeTag, SchemeImpl> = { [Scheme.mlDsa44]: mlDsa44, [Sch
 
 ```ts
 /**
- * The scheme keyPairFromSeed and generateSeed use when none is given: ML-DSA-44,
- * or CHAIN_SCHEME from the environment, so the whole test suite and the local
- * network can run under either scheme. A node always passes its genesis scheme.
+ * The scheme keyPairFromSeed and generateSeed use when none is given: ML-DSA-44, unless an entry point that wants
+ * another set it (useSchemeFromEnvironment). A node always passes its genesis scheme.
  */
-export const DEFAULT_SCHEME: SchemeTag = process.env.CHAIN_SCHEME ? schemeTag(process.env.CHAIN_SCHEME) : Scheme.mlDsa44;
+export let DEFAULT_SCHEME: SchemeTag = Scheme.mlDsa44;
+
+export function setDefaultScheme(tag: SchemeTag): void {
+  DEFAULT_SCHEME = impl(tag).tag;
+}
+
+/**
+ * Take the default scheme from CHAIN_SCHEME, so the test suite, the benchmarks and the local network can run under
+ * either scheme. Only those entry points call it: a node follows its genesis, and a stray or mistyped CHAIN_SCHEME in
+ * its environment must not stop it from starting.
+ */
+export function useSchemeFromEnvironment(): void {
+  if (process.env.CHAIN_SCHEME) setDefaultScheme(schemeTag(process.env.CHAIN_SCHEME));
+}
 ```
 
-The environment variable exists for the tests, the benchmarks and `scripts/localnet.ts`, which build their genesis with `signatureScheme: schemeName(DEFAULT_SCHEME)` and so run wholly on secp256k1 under `CHAIN_SCHEME=secp256k1`. Nothing in the node relies on the default: `Node` reads `genesis.signatureScheme` and passes the tag when it derives its node key and its validator key ([chapter 8](08-node.md)), and the keystore records each key's scheme ([chapter 14](14-wallet-cli.md)).
+The environment variable exists for the tests (`test/setup.ts`), the benchmarks (`bench/scheme.ts`) and `scripts/localnet.ts`, which call `useSchemeFromEnvironment()` before anything else, build their genesis with `signatureScheme: schemeName(DEFAULT_SCHEME)` and so run wholly on secp256k1 under `CHAIN_SCHEME=secp256k1`. The node code never reads the variable, and nothing in the node relies on the default: `Node` reads `genesis.signatureScheme` and passes the tag when it derives its node key and its validator key ([chapter 8](08-node.md)), and the keystore records each key's scheme ([chapter 14](14-wallet-cli.md)).
 
 **The size helpers.** `publicKeySize(tag)` and `signatureSize(tag)` give the tagged sizes; `MAX_PUBLIC_KEY_SIZE` and `MAX_SIGNATURE_SIZE` are the ML-DSA-44 ones, for anything that must budget for the largest case:
 
@@ -230,7 +249,7 @@ export const MAX_PUBLIC_KEY_SIZE = 1 + mlDsa44.publicKeySize;
 export const MAX_SIGNATURE_SIZE = 1 + mlDsa44.signatureSize;
 ```
 
-**The tag readers.** `isSchemeTag(n)` says whether a number is a known tag; `schemeOf(bytes)` returns the tag a key or signature starts with, or `null`; `isPublicKey(bytes)` and `isSignature(bytes)` require a known tag *and* exactly that scheme's size:
+**The tag readers.** `isSchemeTag(n)` says whether a number is a known tag; `schemeOf(bytes)` returns the tag a key or signature starts with, or `null`; `isPublicKey(bytes)` and `isSignature(bytes)` require a known tag *and* exactly that scheme's size, and `isPublicKey` also asks the scheme's `validPublicKey`, remembering the secp256k1 keys it has found valid so that a key seen again costs a lookup:
 
 ```ts
 export function isSchemeTag(tag: number): tag is SchemeTag {
@@ -243,10 +262,25 @@ export function schemeOf(bytes: Uint8Array): SchemeTag | null {
   return s ? s.tag : null;
 }
 
-/** A known tag followed by exactly that scheme's key. */
+/** Keys found valid lately, so a key seen again (a validator set read back, one genesis key on many accounts) costs a lookup. */
+const validKeys = new Set<string>();
+const VALID_KEYS_MAX = 8192;
+
+/**
+ * A known tag followed by exactly that scheme's key, and a key the scheme accepts (a point on the curve, for
+ * secp256k1): what every place a key enters the chain checks, genesis, account authorities, validator sets and their
+ * updates, and the p2p handshake.
+ */
 export function isPublicKey(bytes: Uint8Array): boolean {
   const s = schemeOf(bytes);
-  return s !== null && bytes.length === publicKeySize(s);
+  if (s === null || bytes.length !== publicKeySize(s)) return false;
+  if (s === Scheme.mlDsa44) return true; // nothing to check, and a key too large to be worth remembering
+  const hex = toHex(bytes);
+  if (validKeys.has(hex)) return true;
+  if (!impl(s).validPublicKey(bytes.subarray(1))) return false;
+  if (validKeys.size >= VALID_KEYS_MAX) validKeys.delete(validKeys.values().next().value!);
+  validKeys.add(hex);
+  return true;
 }
 
 export function isSignature(bytes: Uint8Array): boolean {

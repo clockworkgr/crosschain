@@ -13,6 +13,14 @@
  * If the process dies between 2 and 3 the app is one block behind the chain
  * state on restart. `open` detects this through app.info() and replays the
  * missing blocks, checking that the app hash comes out the same.
+ *
+ * When the application keeps its state in the same store environment as the
+ * chain (a node with its own CoreApp), steps 2 and 3 run inside one store
+ * transaction (ExecutorDeps.transaction): both land or neither does, and the
+ * device is flushed once per block instead of twice, which is most of what a
+ * commit costs. The order inside it is the same, and so is the recovery: an
+ * application that writes later than that, or elsewhere, is still never
+ * ahead of the chain state.
  */
 import { toHex } from '../crypto/hash.ts';
 import { schemeName, schemeTag } from '../crypto/keys.ts';
@@ -41,6 +49,11 @@ export interface ExecutorDeps {
   protectedHeight?: () => bigint;
   /** How far back evidence may reach; blocks within it stay so their validator sets and times can be checked. */
   evidenceAgeMs?: () => bigint;
+  /**
+   * Runs writes to the chain store and to the application's store as one transaction (KvEnv.transaction), for an
+   * application whose store is in the chain store's environment. Without it each commits, and flushes, on its own.
+   */
+  transaction?: (fn: () => void) => void;
 }
 
 export class BlockExecutor {
@@ -163,13 +176,30 @@ export class BlockExecutor {
     const newState = nextState(this.state, block, res.validatorUpdates, res.appHash, resultsRoot(res.txResults));
 
     // Block, commit, results, the next set and the new state land together or not at all.
-    this.d.store.batch(() => {
-      this.d.store.saveBlock(block, commit, res.txResults);
-      this.d.store.saveValidatorSet(newState.nextValidators);
-      this.d.store.saveValidatorsAt(h + 2n, newState.nextValidators);
-      this.d.store.saveState(newState);
-    });
-    await this.d.app.commit();
+    const save = () =>
+      this.d.store.batch(() => {
+        this.d.store.saveBlock(block, commit, res.txResults);
+        this.d.store.saveValidatorSet(newState.nextValidators);
+        this.d.store.saveValidatorsAt(h + 2n, newState.nextValidators);
+        this.d.store.saveState(newState);
+      });
+    let persisted: Promise<void>;
+    if (this.d.transaction) {
+      // One transaction and one flush for the chain's writes and the application's. commit() is called inside it:
+      // what the application writes before its first await joins the transaction (CoreApp writes everything there),
+      // and what it writes after lands on its own afterwards, as without a shared transaction. A commit that fails
+      // rejects the promise, not the transaction: the chain's writes stay, and the restart replays the block.
+      let inside!: Promise<void>;
+      this.d.transaction(() => {
+        save();
+        inside = this.d.app.commit();
+      });
+      persisted = inside;
+    } else {
+      save();
+      persisted = this.d.app.commit();
+    }
+    await persisted;
 
     this.state = newState;
     this.prune();

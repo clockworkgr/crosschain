@@ -35,8 +35,10 @@ export const RATE_LIMITED = -32004;
 export const INVALID_PARAMS = -32602;
 
 export interface RpcMethod {
-  /** Costly calls spend more of the rate budget. */
+  /** Costly calls spend more of the rate budget, and are refused while the node sheds load. */
   costly?: boolean;
+  /** A costly call that is still served while the node sheds load, because something else throttles it then. */
+  whileShedding?: boolean;
   fn(params: Record<string, unknown>): Promise<unknown>;
 }
 
@@ -327,6 +329,8 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
     },
     broadcastTx: {
       costly: true,
+      // Under memory pressure the mempool's lowered limit is the throttle: a transaction gets in when there is room.
+      whileShedding: true,
       async fn(p) {
         const raw = parseHex(p.tx, 'tx');
         const mode = p.mode ?? 'sync';
@@ -337,6 +341,8 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
         try {
           const r = await node.submitTx(raw);
           if (r.status === 'paused') throw new RpcError(RATE_LIMITED, r.error ?? 'node under memory pressure');
+          // A pool full because its limit is lowered is the node's doing, not the transaction's: try again later.
+          if (r.status === 'full' && node.memoryLevel !== 'ok') throw new RpcError(RATE_LIMITED, r.error ?? 'mempool full');
           if (r.status === 'invalid' || r.status === 'too-large' || r.status === 'full') throw new RpcError(CHECK_FAILED, `${r.status}${r.error ? `: ${r.error}` : ''}`);
           if (!waiter) return { hash: toHex(hash), status: r.status };
           const seen = node.store.txLocation(hash);

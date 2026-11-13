@@ -31,7 +31,7 @@ A node is the consensus engine, the mempool, the network, block sync, state sync
  *
  *   ok         nothing
  *   warn       logged, a major collection started
- *   pressure   load is shed: the mempool stops admitting, costly RPC methods
+ *   pressure   load is shed: the mempool's limit is lowered, costly RPC methods
  *              and new event streams are refused, the signature cache is
  *              dropped; consensus keeps running on whatever is pooled
  *   critical   a clean stop with a reason, so a supervisor restarts the node
@@ -50,7 +50,7 @@ A node is the consensus engine, the mempool, the network, block sync, state sync
  * counted, so an operator can see the pauses.
 ```
 
-What is shed and what is not follows from what the node is for. The mempool, the costly RPC methods, new event streams and the signature cache are all memory held on behalf of clients and peers, and all of it can be refused or dropped without the chain noticing. Consensus and block sync are never shed: a validator that stopped voting under pressure would be counted absent and jailed, and a node that stopped following would only fall further behind, so both go on with whatever is pooled. Besides shedding, each level turns the object database's dials ([chapter 9](09-database.md)), the ones STATE-PAGING.md section 7 gives the guard: at `warn` the cache of decoded objects is capped at 100,000 and at `pressure` at 10,000; at `pressure` the secondary indices' B+ trees are dropped and then the Merkle trees, so that every index read, every root and every proof goes to LMDB from then on; and at `ok` the cache is unbounded again and a dropped tier is rebuilt from the store, but only once the heap has room for it. Each dial trades speed for room without refusing anything: with everything dropped the database runs on 40 to 50% of its resident heap, and a block of transfers among random accounts takes 5 to 20% longer, all of it in the commit (STATE-PAGING.md 7.1). What the guard does not buy is a home for a state larger than the heap: a node opening its store builds every tier resident before the guard takes its first sample, so a heap below the resident state still aborts at startup, and the fix for that is a larger heap, which the CLI's `start` sets ([chapter 14](14-wallet-cli.md)).
+What is shed and what is not follows from what the node is for. The mempool, the costly RPC methods, new event streams and the signature cache are all memory held on behalf of clients and peers, and all of it can be refused or dropped without the chain noticing. Consensus and block sync are never shed: a validator that stopped voting under pressure would be counted absent and jailed, and a node that stopped following would only fall further behind, so both go on with whatever is pooled. Besides shedding, each level turns the object database's dials ([chapter 9](09-database.md)), the ones STATE-PAGING.md section 7 gives the guard: at `warn` the cache of decoded objects is capped at 100,000 and at `pressure` at 10,000; from `warn` on the secondary indices' B+ trees are dropped and the window of past versions kept in memory is cut to the last two, so that every index read and every proof at an older height goes to LMDB from then on; from `pressure` on the Merkle trees are dropped as well, and every root and every proof goes there with them; and at `ok` the cache is unbounded again and a dropped tier is rebuilt from the store, but only once the heap has room for it. Each dial trades speed for room without refusing anything: with everything dropped the database runs on 40 to 50% of its resident heap and commits blocks of transfers among random accounts at the rate it has resident, within a tenth (STATE-PAGING.md 7.1); what goes slower is what reads through the store, scans, name proofs and proofs at past heights. What the guard itself does not do is open a store, which happens before its first sample. Under a heap limit the node tells the application how much room is left under the warn line, and a stored state whose trees would not fit in it is opened with them left in the store and without its history window in memory (STATE-PAGING.md section 9.1; [chapter 11](11-application.md)). A heap too small even for a state opened that way still aborts at startup, and the fix for that is a larger heap, which the CLI's `start` sets ([chapter 14](14-wallet-cli.md)).
 
 ## The code, file by file
 
@@ -67,8 +67,10 @@ What is shed and what is not follows from what the node is for. The mempool, the
 - `app?`: an `Application`. Default is `CoreApp` on the node's own store. Must be left out when state syncing, because state sync writes the application store before the application is built.
 - `env?`: a `KvEnv`. Default is LMDB under `dataDir`, or `MemoryEnv`.
 - `stateSync?`: `{ trustHeight, trustHash, backfill? }`.
-- `retain?`: `{ blocks?, versions?, snapshots? }`: blocks kept behind the latest (all when unset), the provable version window of the database, snapshots kept.
+- `retain?`: `{ blocks?, versions?, snapshots?, memoryVersions? }`: blocks kept behind the latest (all when unset), the provable version window of the database, snapshots kept, and how many of the provable versions are kept in memory (all of them when unset), the store answering for the rest ("Shedding load under memory pressure" below).
 - `snapshotInterval?`: export a snapshot every this many blocks; 0 disables.
+- `indexTrees?`: `'memory'` or `'store'`, where the application's secondary indices are read from. `'memory'`, the default, keeps their B+ trees in the heap while they fit, dropped under memory pressure and rebuilt after it. `'store'` never builds them and reads LMDB ("Shedding load under memory pressure" below).
+- `arenaBytes?`: the most bytes the application's arena of encoded objects may take, the rest being read from the store ([chapter 9](09-database.md)); unbounded by default.
 - `verifier?`: a `Verifier`; default `InlineVerifier`. Tests share one inline verifier; the localnet and benchmarks share one `WorkerVerifier` across all nodes in the process.
 - `timeouts?`, `limits?`: consensus timeouts and validation limits, partial overrides.
 - `network?`: the subset `desiredOutbound`, `maxInbound`, `connectIntervalMs`, `pingIntervalMs`, `idleTimeoutMs` of `NetworkConfig`.
@@ -225,7 +227,7 @@ The headers handler walks downward from the height asked, taking a stored block'
 
 The network is started early so peers can be found; `networkStarted` prevents `start()` from starting it twice. `evidenceAgeMs` tells state sync how far below the snapshot to fetch headers ([chapter 7](07-sync.md)): the operator's `limits.maxEvidenceAgeMs` if one was pinned, else the unbonding period held by the imported state, read through `getGlobal(db)` once the database exists, which is the figure the executor will prune by once the application is open (step 7). `scheme` is the node key's, which is genesis's: the validator sets state sync fetches must hold keys of it ([chapter 7](07-sync.md)), or the snapshot is not of the chain this genesis describes, and the chain state it writes records it. `transaction` is `env.transaction`, so the install's writes to the application store and the chain store land as one. A `null` result (no peers, no snapshots) falls through to a normal start from genesis. A thrown error propagates out of `Node.create`.
 
-**5. The application.** `cfg.app` if given; otherwise a `CoreApp` on the env's `app` store. The genesis application state is parsed only if the store is empty (`CoreApp.hasState(kv)`), because a large genesis is streamed from its file once, at first start (DESIGN.md section 7). After state sync the store is not empty, so genesis is not parsed and the app opens at the snapshot height.
+**5. The application.** `cfg.app` if given; otherwise a `CoreApp` on the env's `app` store. The genesis application state is parsed only if the store is empty (`CoreApp.hasState(kv)`), because a large genesis is streamed from its file once, at first start (DESIGN.md section 7). After state sync the store is not empty, so genesis is not parsed and the app opens at the snapshot height. Three options go to the application beside the retention and snapshot settings. `arenaBytes` is the config's, passed through. `indexTrees` is `false` when the config says `'store'` and unset otherwise: `false` opens the database with its index trees left in the store, unset lets the application decide by the room. `heapRoom` is computed here, and only when the process runs under a heap limit (`heapLimitFlag()` of `src/node/memory.ts` finds a `--max-old-space-size`, which the CLI's `start` always sets): `Node.OPEN_FILL` (0.7, the guard's warn line) times the heap limit, less the heap in use now (`heapInUse(memoryStats())`, the old generation's use, as the guard measures it; `src/node/memory.ts` below), never below zero. It tells the application how much heap the trees of a stored state may take when it is opened; a tier estimated to need more is left in the store, and the node starts paged rather than running out of heap before the guard has taken its first sample ([chapter 11](11-application.md)). Without a heap limit the option is left unset and the store is opened whole. Two lines follow the application, whichever way it was made. With `indexTrees: 'store'` the node calls `dropIndexTrees()` on the database, which does nothing to the `CoreApp` it has just opened without them and drops the trees of an application handed in through `cfg.app`. And if `retain.memoryVersions` is set and is less than the database's window in memory, the node calls `setHistoryWindow` with it, so the window in memory is shorter than the provable one from the start and never longer than what the store was opened with.
 
 **6. The mempool.** `new Mempool(this.app)`: admission by `checkTx`, re-check after every commit.
 
@@ -240,6 +242,8 @@ The network is started early so peers can be found; `networkStarted` prevents `s
         evidencePool: this.evidencePool,
         log: this.log,
         retainBlocks: this.cfg.retain?.blocks,
+        // The node's own application keeps its state in the node's environment: a block's writes and its are one transaction.
+        transaction: this.cfg.app ? undefined : (fn) => this.env.transaction(fn),
         protectedHeight: () => (this.app instanceof CoreApp ? (this.app.snapshotHeights().at(-1) ?? 0n) : 0n),
         evidenceAgeMs: () => limits.maxEvidenceAgeMs,
       },
@@ -249,7 +253,7 @@ The network is started early so peers can be found; `networkStarted` prevents `s
     if (this.app instanceof CoreApp && this.cfg.limits?.maxEvidenceAgeMs === undefined) limits.maxEvidenceAgeMs = this.app.stakingParameters().unbondingPeriodMs;
 ```
 
-`open` loads the chain state or initialises it from genesis through `app.initChain`, refuses a data directory from another chain, and replays to the application any blocks it has not committed (crash recovery, [executor](05-mempool-executor.md)). `protectedHeight` keeps pruning from deleting the newest snapshot's block, so a snapshot can always be joined and then block-synced from (RPC-SYNC-PROOFS.md section 4.7, "never below the newest snapshot height"). `evidenceAgeMs` is a function that reads the shared `limits` object, so pruning keeps the blocks of exactly the evidence window consensus is enforcing, however that window changes. The line after `open` is the first of the two evidence-age refreshes: with the application open, its staking parameters say what the unbonding period is *now*, which after a governance change is not what genesis said, and a node that only refreshed on commit would check evidence and prune against the genesis value from restart until its first commit.
+`open` loads the chain state or initialises it from genesis through `app.initChain`, refuses a data directory from another chain, and replays to the application any blocks it has not committed (crash recovery, [executor](05-mempool-executor.md)). `transaction` is the environment's, and it is given only when `cfg.app` is absent: the `CoreApp` the node created in step 5 keeps its state in the `app` store of the node's own environment, so the executor can save a block to the `chain` store and have the application commit to the `app` store inside one transaction, with one flush to the device where there were two ([chapter 5](05-mempool-executor.md)). An application handed in through `cfg.app` keeps its state wherever its maker put it, which the node cannot see, so the executor is given no transaction and the two commit one after the other, as they always did. `protectedHeight` keeps pruning from deleting the newest snapshot's block, so a snapshot can always be joined and then block-synced from (RPC-SYNC-PROOFS.md section 4.7, "never below the newest snapshot height"). `evidenceAgeMs` is a function that reads the shared `limits` object, so pruning keeps the blocks of exactly the evidence window consensus is enforcing, however that window changes. The line after `open` is the first of the two evidence-age refreshes: with the application open, its staking parameters say what the unbonding period is *now*, which after a governance change is not what genesis said, and a node that only refreshed on commit would check evidence and prune against the genesis value from restart until its first commit.
 
 **8. The memory guard and the collection scheduler.**
 
@@ -261,18 +265,20 @@ The network is started early so peers can be found; `networkStarted` prevents `s
       onLevel: (level, stats) => this.onMemoryLevel(level, stats),
       onSample: (level, stats) => {
         if (!(this.app instanceof CoreApp)) return;
-        const est = this.app.db.rebuildEstimate();
-        if (est.indexTrees === 0 && est.trees === 0) return;
-        // While something is dropped, the heap of the last few samples: garbage between collections included, since
-        // that is what the levels are taken from.
-        this.recentHeap.push(stats.heapUsed);
+        const est = this.rebuildEstimate(this.app.db);
+        this.sinceRebuild++;
+        if (est.indexTrees === 0 && est.trees === 0 && this.historyHeld === 0) return;
+        // While something is dropped or trimmed, the heap of the last few samples, as the levels are taken from it: the
+        // old generation's garbage between major collections included.
+        this.sinceDrop = level === 'ok' ? this.sinceDrop + 1 : 0;
+        this.recentHeap.push(heapInUse(stats));
         if (this.recentHeap.length > Node.REBUILD_WINDOW) this.recentHeap.shift();
         if (level === 'ok') this.rebuildWhatFits(stats);
       },
     });
 ```
 
-Both take the node's logger and whatever `cfg.gc` and `cfg.memory` override. The guard's level callback is the node's own `onMemoryLevel`, which turns the database's dials and sheds load; its sample callback runs after every sample whatever the level, and while a tier of the database is dropped (`rebuildEstimate` says what rebuilding each would cost, zero for a resident one) it keeps the last `REBUILD_WINDOW` heap figures and, at `ok`, asks `rebuildWhatFits` whether anything fits yet. Both are described below with the rest of the shedding. Neither runs yet: the guard's timer and the scheduler's observer start in `start()`. The guard takes one sample in its constructor, so `memoryGuard.stats` reads before `start()`, and the scheduler records the heap in use now as the baseline its first major collection is measured from. The two classes themselves are described after this file.
+Both take the node's logger and whatever `cfg.gc` and `cfg.memory` override. The guard's level callback is the node's own `onMemoryLevel`, which turns the database's dials and sheds load; its sample callback runs after every sample whatever the level. It counts the sample in `sinceRebuild`, the number of samples since something was last rebuilt or since the node started, which is what the wait before a rebuild is taken from. Then, while a tier of the database is dropped (the node's `rebuildEstimate`, below, says what rebuilding each would cost, zero for a resident one and for index trees the config keeps in the store) or its history window is trimmed (`historyHeld`, below), it counts in `sinceDrop` the samples in a row at `ok` (any other level sets it back to zero), keeps the last `REBUILD_WINDOW` heap figures (`heapInUse` of each sample, the figure the levels are taken from: under an old-generation limit that is the old generation, with whatever garbage it holds between two major collections and without the young generation's) and, at `ok`, asks `rebuildWhatFits` whether anything fits yet. Both are described below with the rest of the shedding. Neither runs yet: the guard's timer and the scheduler's observer start in `start()`. The guard takes one sample in its constructor, so `memoryGuard.stats` reads before `start()`, and the scheduler records the heap in use now as the baseline its first major collection is measured from. The two classes themselves are described after this file.
 
 **9. Consensus.**
 
@@ -376,15 +382,15 @@ Inventory gossip for transactions and evidence:
       return out;
     };
     this.network.on('inv', (peer, m) => {
-      // Under memory pressure the mempool admits nothing, so there is no point fetching what peers announce.
-      const want = m.kind === InvKind.Tx ? (this.mempool.paused ? [] : wanted(m.hashes, (h) => this.mempool.seen(h))) : m.kind === InvKind.Evidence ? wanted(m.hashes, (h) => this.evidencePool.hasHash(h)) : [];
+      // A mempool that would refuse them (full, or its limit lowered under memory pressure) fetches nothing peers announce.
+      const want = m.kind === InvKind.Tx ? (!this.mempool.accepting ? [] : wanted(m.hashes, (h) => this.mempool.seen(h))) : m.kind === InvKind.Evidence ? wanted(m.hashes, (h) => this.evidencePool.hasHash(h)) : [];
       for (let i = 0; i < want.length; i += 256) peer.send({ type: 'fetch', kind: m.kind, hashes: want.slice(i, i + 256) });
     });
 ```
 
 A transaction admitted to the mempool is announced to every peer but the one it came from (`source` is `null` for a local submission, so then it goes to all). Evidence is announced to everyone, including the peer that sent it, which costs one `inv` that the sender ignores (it has the hash).
 
-On the receiving side, `wanted` decides what to fetch. The mempool's `seen` cache and the evidence pool's `hasHash` cover what the node already holds or has already rejected, but a hash is only in them once the item has arrived and been checked; between the `fetch` and the `item` the node has nothing, and every peer that announces the same hash in that gap (several do, within milliseconds, for a transaction flooding through the network) would trigger another fetch. The `outstanding` map closes that gap: a hash is fetched at most once while a fetch for it is outstanding. The entry is removed when the `item` arrives (keyed by `txHash` of the data for a transaction and `sha256` of the data for evidence, which is `evidenceId`) or when the peer answers `itemNotFound`, and expires after 10 s regardless, so a peer that never answers only delays the fetch rather than blocking it for good: the next `inv` after the expiry fetches again. Expired entries are swept on every `inv`, so the map never grows past what was announced in the last ten seconds. Fetches go out in slices of 256 hashes because that is what the serving side accepts (below); an `inv` of a thousand hashes would otherwise produce one `fetch` that the server trims and charges for. While the mempool is paused (the node is shedding load, below), announced transactions are not fetched at all: `addTx` would refuse them on arrival, so the fetch, the item and the check would be work for nothing; and since `wanted` is not called, nothing is marked outstanding, so the same hashes are fetched as usual once the pool resumes and a peer announces them again. Evidence is fetched regardless: it is small, and a validator under pressure should still see a double sign.
+On the receiving side, `wanted` decides what to fetch. The mempool's `seen` cache and the evidence pool's `hasHash` cover what the node already holds or has already rejected, but a hash is only in them once the item has arrived and been checked; between the `fetch` and the `item` the node has nothing, and every peer that announces the same hash in that gap (several do, within milliseconds, for a transaction flooding through the network) would trigger another fetch. The `outstanding` map closes that gap: a hash is fetched at most once while a fetch for it is outstanding. The entry is removed when the `item` arrives (keyed by `txHash` of the data for a transaction and `sha256` of the data for evidence, which is `evidenceId`) or when the peer answers `itemNotFound`, and expires after 10 s regardless, so a peer that never answers only delays the fetch rather than blocking it for good: the next `inv` after the expiry fetches again. Expired entries are swept on every `inv`, so the map never grows past what was announced in the last ten seconds. Fetches go out in slices of 256 hashes because that is what the serving side accepts (below); an `inv` of a thousand hashes would otherwise produce one `fetch` that the server trims and charges for. While the mempool is not `accepting` (it holds as many transactions as it admits just now, which under memory pressure is a lowered limit, or it is paused; below), announced transactions are not fetched at all: `addTx` would refuse them on arrival, so the fetch, the item and the check would be work for nothing; and since `wanted` is not called, nothing is marked outstanding, so the same hashes are fetched as usual once the pool has room and a peer announces them again. Evidence is fetched regardless: it is small, and a validator under pressure should still see a double sign.
 
 Serving fetches, with the fix for finding 14:
 
@@ -434,7 +440,7 @@ Handlers registered by the node and by the two objects it constructs. The networ
 | `blockResponse`, `blocksResponse`, `headerResponse`, `headersResponse`, `validatorSetResponse`, `validatorsResponse`, `snapshotsResponse`, `manifestResponse`, `chunkResponse`, `addrResponse` | `Requester` | settle the first matching pending request |
 | `proposal` | `Node.init` | `consensus.handleProposal(proposal, peer.id)` |
 | `vote` | `Node.init` | `consensus.handleVote(vote, peer.id)` |
-| `inv` | `Node.init` | `fetch` the hashes the mempool or evidence pool lacks and no fetch is outstanding for, 256 per message; no transaction fetches while the mempool is paused |
+| `inv` | `Node.init` | `fetch` the hashes the mempool or evidence pool lacks and no fetch is outstanding for, 256 per message; no transaction fetches while the mempool would refuse them (full, at a lowered limit, or paused) |
 | `fetch` | `Node.init` | `item` or `itemNotFound` per hash, at most 256, 5 points if trimmed |
 | `item` | `Node.init` | clear `outstanding`; `mempool.addTx(data, peer.id)` or `acceptEvidence` |
 | `itemNotFound` | `Node.init` | clear `outstanding` |
@@ -446,7 +452,7 @@ Handlers registered by the node and by the two objects it constructs. The networ
 
 #### The life of a transaction
 
-1. A client calls `submitTx` (or the RPC does). `mempool.addTx(tx, null)` runs `app.checkTx`; on success the mempool stores it and emits `tx` with `source = null`. While the node sheds load the call answers `paused` instead and nothing else happens.
+1. A client calls `submitTx` (or the RPC does). `mempool.addTx(tx, null)` runs `app.checkTx`; on success the mempool stores it and emits `tx` with `source = null`. While the pool holds as many transactions as it admits (fewer than `maxTxs` when the node is short of memory) the call answers `full` instead and nothing else happens.
 2. The node broadcasts `inv { Tx, [hash] }` to every peer.
 3. A peer's `inv` handler sees a hash its mempool has not seen and it is not already fetching, and sends `fetch`; the node's `fetch` handler answers with `item`; the peer's `item` handler calls `mempool.addTx(data, peerId)`, which checks it again and emits `tx` with the sender as source, so the peer announces it to everyone but the sender. Within a few hops every node holds it.
 4. The proposer of the next height calls `reapTxs`, which takes transactions in FIFO order up to the block's byte budget, and pushes the proposal to all peers.
@@ -490,16 +496,21 @@ Evidence for a height whose validator set is unknown (pruned, or below the heade
 The guard reports every level change to `onMemoryLevel`, and the node decides what each level means:
 
 ```ts
-  /** Called on every change of the memory guard's level; the CLI stops the node on `critical`. */
+  /**
+   * Called on every change of the memory guard's level; the CLI stops the node on `critical`. A listener added once
+   * the guard is sampling is told the level it is at, unless that is `ok`: a node already critical at its first
+   * sample would otherwise never be reported, since a level that stays the same fires nothing.
+   */
   onMemory(fn: (level: MemoryLevel, stats: MemoryStats) => void): void {
     this.memoryListeners.push(fn);
+    if (this.started && this.memoryGuard.level !== 'ok') fn(this.memoryGuard.level, this.memoryGuard.stats);
   }
 
   get memoryLevel(): MemoryLevel {
     return this.memoryGuard.level;
   }
 
-  /** True while load is shed: the mempool admits nothing, costly RPC methods and new streams are refused. */
+  /** True while load is shed: the mempool's limit is lowered, costly RPC methods and new streams are refused. */
   get isShedding(): boolean {
     return this.shedding;
   }
@@ -507,19 +518,42 @@ The guard reports every level change to `onMemoryLevel`, and the node decides wh
   /** The database's hot cache of decoded objects: unbounded while memory is fine, capped as it fills (STATE-PAGING.md section 7). */
   static readonly HOT_OBJECTS = { ok: Infinity, warn: 100_000, pressure: 10_000, critical: 10_000 } as const;
 
+  /**
+   * The share of its limit the mempool admits up to at each level. Every pooled transaction holds its bytes, its
+   * writes in the pending state and its overlay entries, so the pool's size is a dial like the others; lowered in
+   * steps, the node goes on admitting at the rate its blocks take transactions out instead of refusing everything
+   * and then everything at once. At `critical` nothing is admitted: the node is about to stop.
+   */
+  static readonly MEMPOOL_SHARE = { ok: 1, warn: 0.5, pressure: 0.1, critical: 0 } as const;
+
   private onMemoryLevel(level: MemoryLevel, stats: MemoryStats): void {
     if (level === 'warn' || level === 'pressure') void this.gcScheduler.major();
+    this.mempool.setLimit(this.mempool.maxTxs * Node.MEMPOOL_SHARE[level]);
+    if (level === 'critical') this.mempool.pause('node out of memory');
+    else this.mempool.resume();
     if (this.app instanceof CoreApp) {
       const db = this.app.db;
       db.setHotLimit(Node.HOT_OBJECTS[level]);
-      // The second and third dials: from `pressure` on the index trees are dropped, every index read going to LMDB
-      // through the overlay of the block in progress, and then the Merkle trees, every root and proof reading its
-      // paths from LMDB (STATE-PAGING.md section 7); back at `ok` both are rebuilt from LMDB. `warn` leaves them.
-      if (level === 'pressure' || level === 'critical') {
+      // The second dial, from `warn` on: the index trees are dropped, every index read going to LMDB through the
+      // overlay of the block in progress, and the window of past versions is cut to the last few, the store answering
+      // for the rest. A loaded node commits more that way than with both in its heap (docs/benchmarks.md section
+      // 4.13), so it does not wait for `pressure` to get there. The third, from `pressure` on: the Merkle trees are
+      // dropped, every root and proof reading its paths from LMDB (STATE-PAGING.md section 7). Back at `ok` each is
+      // rebuilt from LMDB when it fits.
+      if (level !== 'ok') {
         db.dropIndexTrees();
-        db.dropTrees();
+        if (level !== 'warn') db.dropTrees();
+        // What the window held, for letting it grow back.
+        if (db.historyWindow > Node.HISTORY_WHEN_PAGED) {
+          this.historyHeld = Math.max(1, this.historyHeld, db.historyEstimate());
+          db.setHistoryWindow(Node.HISTORY_WHEN_PAGED);
+        }
         this.deferredRebuild = null;
         this.recentHeap = [];
+        // How long the node ran since it last had something rebuilt (or since it started) is how long the heap took
+        // to fill: nothing is rebuilt until it has stayed at `ok` for as long again.
+        this.rebuildAfter = Math.min(Node.REBUILD_WAIT_MAX, Math.max(Node.REBUILD_WINDOW, this.sinceRebuild));
+        this.sinceDrop = 0;
       }
     }
     this.shed(level === 'pressure' || level === 'critical');
@@ -527,47 +561,87 @@ The guard reports every level change to `onMemoryLevel`, and the node decides wh
   }
 ```
 
-`warn` and `pressure` each start a major collection (the scheduler runs one at a time, so a request while one is running is dropped); every level sets the object database's cache of decoded objects from `Node.HOT_OBJECTS`, through `setHotLimit` ([chapter 9](09-database.md)), on a core application (the key-value test app has no such database); `pressure` and `critical` drop the index trees and then the Merkle trees, and forget what an earlier rebuild was waiting for; `pressure` and `critical` shed, `warn` and `ok` stop shedding; and every listener hears the change with the sample that caused it. The whole table of dials, as built:
+`warn` and `pressure` each start a major collection (the scheduler runs one at a time, so a request while one is running is dropped); every level sets the mempool's limit to its share of `maxTxs` from `Node.MEMPOOL_SHARE`, and pauses the pool at `critical` and at no other level; every level sets the object database's cache of decoded objects from `Node.HOT_OBJECTS`, through `setHotLimit` ([chapter 9](09-database.md)), on a core application (the key-value test app has no such database); every level but `ok` drops the index trees, `pressure` and `critical` the Merkle trees as well, and then, if the window in memory is still wider than `HISTORY_WHEN_PAGED` versions, the level cuts it to that after noting what it held; each of them also forgets what an earlier rebuild was waiting for, empties the remembered samples, and sets how long the node will wait at `ok` before it rebuilds anything (`rebuildAfter`, below); `pressure` and `critical` shed, `warn` and `ok` stop shedding; and every listener hears the change with the sample that caused it. `onMemory` also tells a listener added after the guard began sampling the level the node is already at, unless that is `ok`, so a node critical at its first sample is still reported. The whole table of dials, as built:
 
-| level | heap used of limit | cache of decoded objects | index trees | Merkle trees | load |
-|---|---|---|---|---|---|
-| `ok` | under 70% | unbounded | rebuilt once the estimate fits under the warn line | rebuilt once the estimate fits, after the index trees | admitted |
-| `warn` | 70% | capped at 100,000 | left as they are | left as they are | admitted; a major collection started |
-| `pressure` | 85% | capped at 10,000 | dropped | dropped | shed: mempool paused, costly RPC refused, signature cache dropped |
-| `critical` | 95% | capped at 10,000 | dropped | dropped | shed; the CLI stops the node |
+| level | heap in use of limit | cache of decoded objects | index trees | Merkle trees | history window in memory | mempool admits up to | load |
+|---|---|---|---|---|---|---|---|
+| `ok` | under 70% | unbounded | rebuilt once the node has waited and the estimate fits within half the limit | rebuilt once the estimate fits, after the index trees | let grow back once both tiers are resident and what it held fits | its limit (10,000) | admitted |
+| `warn` | 70% | capped at 100,000 | dropped | left as they are | cut to the last 2 versions | half its limit (5,000) | admitted; a major collection started |
+| `pressure` | 85% | capped at 10,000 | dropped | dropped | cut to the last 2 versions | a tenth of its limit (1,000) | shed: costly RPC refused, signature cache dropped |
+| `critical` | 95% | capped at 10,000 | dropped | dropped | cut to the last 2 versions | nothing: paused | shed; the CLI stops the node |
 
-The cache limit is the first dial: unbounded at `ok`, so a node with memory to spare keeps every object it has decoded and runs at full speed; 100,000 objects at `warn`; 10,000 at `pressure`, and `critical` keeps that. `setHotLimit` evicts the excess at once, and nothing else changes: an evicted object is decoded again from the database's arena of encoded bytes the next time it is read, about a microsecond for an account, so a capped node computes the same roots, only slower (a block of transfers among random accounts takes about twice as long, [benchmarks.md](../benchmarks.md) section 4.10). The second and third dials are the trees. `dropIndexTrees()` lets every type's B+ trees go; lookups and scans then read the index entries the application's commits have been writing to LMDB all along, with the writes of the block in progress laid over them. `dropTrees()` lets the dense trees' chunks and the sparse trees' nodes go; a root then reads the paths it changes from LMDB through a small cache of chunks and writes the changed ones back through the change list, and proofs walk the store. Both are cheap to turn (0.3 ms for the trees at 100,000 balances) and both may be turned with the mempool's pending session open, because the database builds the overlays from what is dirty ([chapter 9](09-database.md)). The order follows what each gives back and costs: at 192,000 accounts the index trees were 130 to 175 MiB of heap and cost a block nothing it notices (a block of transfers looks up no index, and its finalize gets faster without the B+ tree updates), while the Merkle trees were 190 to 220 MiB and cost 5 to 20% of throughput once dropped (STATE-PAGING.md 7.1).
+The cache limit is the first dial: unbounded at `ok`, so a node with memory to spare keeps every object it has decoded and runs at full speed; 100,000 objects at `warn`; 10,000 at `pressure`, and `critical` keeps that. `setHotLimit` evicts the excess at once, and nothing else changes: an evicted object is decoded again from the database's arena of encoded bytes the next time it is read, about a microsecond for an account, so a capped node computes the same roots, only slower (a block of transfers among random accounts takes about twice as long, [benchmarks.md](../benchmarks.md) section 4.10). The second dial, turned from `warn` on, is the index trees together with the history window (below), and the third, from `pressure` on, the Merkle trees. `dropIndexTrees()` lets every type's B+ trees go; lookups and scans then read the index entries the application's commits have been writing to LMDB all along, with the writes of the block in progress laid over them. `dropTrees()` lets the dense trees' chunks and the sparse trees' nodes go; a root then reads the paths it changes from LMDB through a cache of chunks (4,096 of them, enough to hold the dense trees of about two million objects whole) and writes the changed ones back through the change list, and proofs walk the store. Both are cheap to turn (0.3 ms for the trees at 100,000 balances) and both may be turned with the mempool's pending session open, because the database builds the overlays from what is dirty ([chapter 9](09-database.md)). The order follows what each gives back and costs: at 192,000 accounts the index trees were 130 to 175 MiB of heap and cost a block nothing it notices (a block of transfers looks up no index, and its finalize gets faster without the B+ tree updates), while the Merkle trees were 190 to 220 MiB and cost less than a tenth of throughput once dropped, 10.3 against 10.9 blocks a second; they cost more, 7.7 against 9.4, while the chunk cache held 256 chunks, fewer than the trees of this state have (STATE-PAGING.md 7.1). That is also why the index trees go a level before the Merkle trees. As first built both went at `pressure`, and `warn` only capped the cache. But a loaded node commits more with its index trees in the store than with them in its heap, about a tenth more: a block of transfers looks up no index. The history window goes with them for the heap it holds; how much of it is in memory does not change the rate (below). Under the first rule the node reached that state only when the heap arrived at the pressure line, minutes into a full load. So `warn` pages what a block does not need, without refusing anything, and `pressure` drops what costs a block something and sheds load.
 
-Back at `ok` the trees are not simply rebuilt. The rule was first written that way and measured: dropping both tiers takes a large state from above the pressure line to well below the ok line in one go, rebuilding them takes the heap straight back over the pressure line, and a node under load dropped, read `ok`, rebuilt and read `pressure` again within a second or two, over and over, a second of rebuilding each time; the paging benchmark's node changed level 30 times in 40 seconds that way and committed 622 transfers a second, against 1,478 with the rule below (STATE-PAGING.md section 7). So a dropped tier is rebuilt only when it fits:
+The history window is turned with the index trees, from `warn` on. The database keeps, for `retain.versions` past versions (100 by default), every object value a version overwrote and a record of every tree node it overwrote, which is what proofs and queries at past heights are answered from. Under load that is what still grew with the cache capped and both tiers dropped: a block of scattered transfers adds tens of thousands of records. `setHistoryWindow(HISTORY_WHEN_PAGED)` cuts the window in memory to the last two versions, forgetting the older ones at once ([chapter 9](09-database.md)); two in memory is enough for a proof at the height a client has just read to be made at full speed. Nothing a block does reads a past version, so consensus, execution and admission do not notice. The store is not touched: the application goes on writing each version's history record and deleting only the one that left the configured window ([chapter 11](11-application.md)), so a restart has the whole window back. A proof or a query at a height older than the last two is not refused either. The database was given the application's store of history records (`historyStore`) and reads such a version from them: it scans the record of every version after the one asked about and takes the first it finds for each entry it needs ([chapter 9](09-database.md), "Past versions from the store"). The answer is the same as from memory; it takes longer, the more so the further back the height, and it keeps nothing, so the cut costs a past read time and the node no memory. `lowestVersion`, and with it the application's `lowestProvableHeight`, does not move when the window is cut. Measured at 192,000 accounts under full blocks, such a proof takes about 0.2 ms per height back, 19 ms at the oldest of a hundred, against a tenth of a millisecond from memory (docs/benchmarks.md section 4.13). The cut is made once: a level that finds the window already no wider than two versions, as `pressure` does after `warn`, leaves it and the note alone. Before the cut the node notes `historyEstimate()`, about the heap the window holds, in `historyHeld` (keeping the larger figure if an earlier one is still held, and at least 1 so that the field also says "trimmed"). The estimate counts the sparse trees' past versions whether those trees are resident or dropped: a dropped tree keeps records of them, and a resident one counts the nodes its retained commits replaced ([chapter 9](09-database.md)), so the note taken at `warn`, with the Merkle trees resident, is of the whole window.
+
+The window in memory is also a setting. `retain.memoryVersions` says how many of the `retain.versions` provable versions the node keeps in memory; unset, it keeps all of them until memory fills. The node applies it when it has made the application (step 5 of the constructor), and reads it through the getter `historyInMemory`, `Infinity` when unset, which is also what the window is widened to after the guard has trimmed it (below). The store keeps the whole window either way, and an older height is answered from the history records exactly as it is while the window is cut: of the order of 0.2 ms per version back, against under 0.1 ms from memory. The setting is for a node with a large heap. Such a node never reaches `warn`, so nothing trims its window, and it keeps the whole of it in its heap. What a short window gives such a node was measured with `bench/paging-node.ts`, which takes `BENCH_PAGING_MEMORY_VERSIONS` for it: 514,008 accounts under a heap of 3,126 MiB, twice the resident heap, 120 seconds, two runs each way. With the whole window the node committed 1,355 and 1,255 transfers a second, its heap peaked at about 2,140 MiB and its longest collection pause was 290 to 300 ms; with two versions it committed 1,369 and 1,241, on a peak of about 1,630 MiB with a longest pause of 190 to 200 ms. So the setting does not change throughput. It buys about 500 MiB of heap at that size and shorter pauses, and it costs the proofs at past heights, 12 to 28 ms fifty and a hundred versions back instead of under 0.2 ms.
+
+Whether the index trees are in memory at all is a setting too. `indexTrees: 'store'` makes a node that never builds them: the application is opened without them (step 5 of the constructor), every index read goes to LMDB through the overlay of the block in progress, as it does after a drop, and the guard has no index trees to drop or to rebuild. It is for a validator or a node that mostly applies blocks and serves few index lookups, or for a small heap. Measured with `bench/paging-node.ts`, which takes `BENCH_PAGING_INDEX_TREES=store` for it, at 191,896 accounts under a heap of 1,488 MiB, 2.5 times the resident heap, for ten minutes: the node opened with 258 MiB of heap in use against 398 MiB by default, a third less, and committed 1,552 transfers a second against 1,485, which is within what two runs differ by (4.5%); the default run's own stretches show the cost of the trees more clearly, 1,310 to 1,440 a second while they were resident and 1,420 to 1,600 while they were dropped. It reached `warn` once, at 40 s, from the history window and the cache, where the default run reached it twice, and had nothing to rebuild but the window (docs/benchmarks.md section 4.13). What the setting gives up is index reads from memory, an account by name or a scan; those were not measured under it. Proofs and the Merkle trees are unaffected.
+
+The last dial is the mempool's limit, which is not the database's but is turned by the same level. Every pooled transaction holds its bytes, its signature-cache entry, the objects it touched pinned decoded in the pending session (where the cache cannot evict them) and its overlay entries; the paging benchmark's node held about 330 MiB more live heap with a full mempool than idle (STATE-PAGING.md section 7). So the pool admits up to its whole limit at `ok`, half at `warn`, a tenth at `pressure` and nothing at `critical`. `setLimit` evicts nothing ([chapter 5](05-mempool-executor.md)): what is pooled is still reaped, and transactions are admitted again as soon as blocks have taken the pool below the limit, so a node under pressure admits at the rate its blocks take transactions out. The node first paused the pool at `pressure` instead, which refused everything until `ok` and then admitted everything at once; admission through the fallbacks was always correct (`test/app.test.ts` checks transactions against dropped index trees and dropped Merkle trees), so there was no reason to refuse it entirely. Only at `critical`, when the node is about to stop, is the pool paused, with the reason `node out of memory`, and any level below resumes it.
+
+Back at `ok` the trees are not simply rebuilt. The rule was first written that way and measured: dropping both tiers takes a large state from above the pressure line to well below the ok line in one go, rebuilding them takes the heap straight back over the pressure line, and a node under load dropped, read `ok`, rebuilt and read `pressure` again within a second or two, over and over, a second of rebuilding each time; the paging benchmark's node changed level 30 times in 40 seconds that way and committed 622 transfers a second, against 1,508 with the rule below and 1,712 as the node now stands (STATE-PAGING.md section 7). So a dropped tier is rebuilt only after a wait and only when it fits, and the history window is let grow back last:
 
 ```ts
+  /** The share of the heap limit a stored state's trees may fill when it is opened: the guard's warn line. */
+  static readonly OPEN_FILL = 0.7;
+  /** How many past versions stay in memory from `warn` on: enough for a proof at the height a client just read. */
+  static readonly HISTORY_WHEN_PAGED = 2;
+  /** About the heap the window of past versions held when it was trimmed, 0 while it is whole: what letting it grow back will take. */
+  private historyHeld = 0;
   /** What the last deferred rebuild was waiting for, so the log says it once rather than at every sample. */
   private deferredRebuild: string | null = null;
+  /** Guard samples since something was last rebuilt (or the node started), and samples in a row at `ok` with something dropped. */
+  private sinceRebuild = 0;
+  private sinceDrop = 0;
+  /** How many samples after the last drop the node waits before it rebuilds anything; set at each drop, REBUILD_WINDOW at least. */
+  private rebuildAfter = 0;
+  /** The longest that wait gets: ten minutes at the default interval. */
+  static readonly REBUILD_WAIT_MAX = 600;
+  /** How many past versions the operator wants in memory (`retain.memoryVersions`); all of the window when unset. */
+  private get historyInMemory(): number {
+    return this.cfg.retain?.memoryVersions ?? Infinity;
+  }
   /** Heap used at each guard sample since the last drop, the latest REBUILD_WINDOW of them. */
   private recentHeap: number[] = [];
   /** How many samples after a drop the heap is watched before anything is rebuilt: ten seconds at the default interval. */
   static readonly REBUILD_WINDOW = 10;
+  /**
+   * The share of the heap limit a rebuild may fill. Well below the warn line: what is rebuilt up to that line leaves
+   * the load no room, and a node whose index trees just fitted spent minutes between `warn` and `pressure`, the
+   * collector working on a nearly full old generation, committing a fifth less than it did with them dropped.
+   */
+  static readonly REBUILD_FILL = 0.5;
+
+  /** What rebuilding the dropped tiers would take; index trees kept in the store by choice are not waiting to be rebuilt. */
+  private rebuildEstimate(db: CoreApp['db']): { indexTrees: number; trees: number } {
+    const est = db.rebuildEstimate();
+    return this.cfg.indexTrees === 'store' ? { ...est, indexTrees: 0 } : est;
+  }
 
   /**
    * At `ok`, rebuild what was dropped, but only what fits: dropping can take the heap from above the pressure line to
    * below the ok line in one go, and rebuilding all of it then would take it straight back, and the node would drop
-   * and rebuild at every sample. One sample is not enough to judge by either: right after a major collection the heap
-   * reads a few hundred MiB lower than it will a second later. So nothing is rebuilt until REBUILD_WINDOW samples
-   * have been seen since the drop, and then a tier is rebuilt when its estimated heap
-   * (ObjectDatabase.rebuildEstimate) fits under the warn line beside the highest of those samples, the index trees
-   * first; otherwise it stays dropped, which the node runs fine on, and the guard asks again at every sample while
-   * the level is `ok`.
+   * and rebuild at every sample. One sample is not enough to judge by either: right after a major collection the old
+   * generation reads lower than it will once the load has refilled it. And a load that filled the heap once fills
+   * it again: trees rebuilt ten seconds after a drop were dropped again a few minutes later, the node committing less
+   * while it had them. So nothing is rebuilt until the heap has stayed at `ok` for as long as the node had run before
+   * the drop (`rebuildAfter`: REBUILD_WINDOW samples at least, REBUILD_WAIT_MAX at most), and then a tier is rebuilt when its estimated heap
+   * (ObjectDatabase.rebuildEstimate) fits within REBUILD_FILL of the limit beside the highest of those samples, the
+   * index trees first; otherwise it stays dropped, which the node runs fine on, and the guard asks again at every
+   * sample while the level is `ok`.
    */
   private rebuildWhatFits(stats: MemoryStats): void {
     if (!(this.app instanceof CoreApp)) return;
     const db = this.app.db;
-    const est = db.rebuildEstimate();
-    if (est.indexTrees === 0 && est.trees === 0) return;
-    if (this.recentHeap.length < Node.REBUILD_WINDOW) return;
+    const est = this.rebuildEstimate(db);
+    if (est.indexTrees === 0 && est.trees === 0 && this.historyHeld === 0) return;
+    if (this.recentHeap.length < Node.REBUILD_WINDOW || this.sinceDrop < this.rebuildAfter) return;
     const peak = Math.max(...this.recentHeap);
-    let room = this.memoryGuard.o.warnAt * stats.heapLimit - peak;
+    let room = Math.min(Node.REBUILD_FILL, this.memoryGuard.o.warnAt) * stats.heapLimit - peak;
     if (est.indexTrees > 0 && est.indexTrees <= room) {
       db.rebuildIndexTrees();
+      this.sinceRebuild = 0;
       room -= est.indexTrees;
       // The samples from before it do not count for the next tier: the heap is larger by that much now.
       this.recentHeap = this.recentHeap.map((h) => h + est.indexTrees);
@@ -575,16 +649,30 @@ Back at `ok` the trees are not simply rebuilt. The rule was first written that w
     }
     if (est.trees > 0 && est.trees <= room) {
       db.rebuildTrees();
+      this.sinceRebuild = 0;
+      room -= est.trees;
+      this.recentHeap = this.recentHeap.map((h) => h + est.trees);
       this.log('info', 'memory: Merkle trees rebuilt', { estimate: `${Math.round(est.trees / 1048576)} MiB` });
     }
-    const left = db.rebuildEstimate();
-    const waiting = left.indexTrees + left.trees > 0 ? `${Math.round((left.indexTrees + left.trees) / 1048576)} MiB` : null;
-    if (waiting && waiting !== this.deferredRebuild) this.log('info', 'memory: staying paged until the heap has room to rebuild', { needs: waiting, room: `${Math.round(Math.max(0, room) / 1048576)} MiB` });
+    const left = this.rebuildEstimate(db);
+    // Last, with both tiers back: the window of past versions is let grow again, a root at a time, if what it held fits.
+    if (this.historyHeld > 0 && left.indexTrees + left.trees === 0 && this.historyHeld <= room) {
+      db.setHistoryWindow(this.historyInMemory);
+      this.sinceRebuild = 0;
+      this.log('info', 'memory: history window restored', { estimate: `${Math.round(this.historyHeld / 1048576)} MiB`, provableFrom: db.lowestVersion });
+      this.historyHeld = 0;
+    }
+    const needs = left.indexTrees + left.trees + this.historyHeld;
+    const waiting = needs > 0 ? `${Math.round(needs / 1048576)} MiB` : null;
+    // Said once per drop: what is needed grows with the state, and a line at every MiB of it filled the log.
+    if (waiting && this.deferredRebuild === null) this.log('info', 'memory: staying paged until the heap has room to rebuild', { needs: waiting, room: `${Math.round(Math.max(0, room) / 1048576)} MiB` });
     this.deferredRebuild = waiting;
   }
 ```
 
-Three things make the decision. The estimate comes from the database: every committed object has one entry in each index of its type and one leaf in each authenticated index's sparse tree, at 210 and 1,000 bytes of heap, which is what dropping them gave back at 192,000 accounts, within a few percent (STATE-PAGING.md section 10 lists the two constants among the defaults). What it is compared with is not one sample: right after a major collection the heap reads a few hundred MiB lower than it will a second later, and a rebuild judged on such a sample flapped just the same, so the node waits until ten samples have been seen since the drop (ten seconds at the default interval; `onMemoryLevel` empties the window at every drop) and takes the highest of them as the heap it has to live beside. And the room is what is left under the warn line, `warnAt * heapLimit`, not the pressure line, so a rebuilt tier does not land the node at `warn` by construction. The index trees go first, being cheaper and given back sooner; a tier that does not fit stays dropped, the node running on the fallbacks at `ok`, and the guard asks again at every sample while the level is `ok`, logging once what it is waiting for (`deferredRebuild` remembers the figure so the line is not repeated). In the paging benchmark's node (`bench/paging.bench.ts` with `bench/paging-node.ts`: a single validator in a child process, so that its `--max-old-space-size` of 744 MiB over a 595 MiB resident state is V8's own limit, with its mempool kept two blocks ahead for 40 seconds; STATE-PAGING.md 7.1) this is what happened: `pressure` at 9.2 s dropped both tiers and the next sample read 225 MiB; at 13.3 s, after ten samples, the index trees were rebuilt and the Merkle trees stayed dropped, 183 MiB needed against 96 MiB of room; `pressure` again at 21.5 s dropped the index trees, and from then on nothing fitted (313 MiB needed) and the node ran on the fallbacks, 107 blocks and 59,128 transfers in 40 seconds, 79 of the blocks with the Merkle trees dropped, and no abort.
+`rebuildEstimate` is the node's reading of the database's estimate, and the only place the setting enters the rebuild: with `indexTrees: 'store'` it reports the index trees as needing nothing, so `onSample` does not count them as dropped, `rebuildWhatFits` neither rebuilds them nor counts them in what it is waiting for, and the Merkle trees and the history window are judged as if the index trees were resident. In the source it stands between `rebuildWhatFits` and that method's comment, as the excerpt shows.
+
+Three things make the decision. The estimate comes from the database: every committed object has one entry in each index of its type and one leaf in each authenticated index's sparse tree, at 210 and 1,000 bytes of heap, which is what dropping them gave back at 192,000 accounts, within a few percent (STATE-PAGING.md section 10 lists the two constants among the defaults); for the sparse trees it also counts what a rebuild allocates and throws away, another 1,000 bytes a leaf, and 500 bytes for each record of a retained version ([chapter 9](09-database.md)). What it is compared with is not one sample. When the rule was written the guard read the whole heap, which right after a major collection was a few hundred MiB lower than a second later, and a rebuild judged on such a sample flapped just the same. The guard now reads the old generation under an old-generation limit, so the young generation's garbage is no longer in the figure, but the old generation's is: what was promoted and has died since the last major collection is counted until the next one, and a sample taken right after a major collection is still the lowest the node will show. So the node keeps the last ten samples (`REBUILD_WINDOW`; `onMemoryLevel` empties them at every drop) and takes the highest of them as the heap it has to live beside. Ten samples, ten seconds at the default interval, were at first also the whole wait before a rebuild, and that was too short. A load that filled the heap once fills it again: in a ten-minute run under a heap 2.5 times the state the index trees were rebuilt four seconds after each drop and dropped again a few minutes later, and the node committed less while it had them. With the wait described next, the same run made one rebuild instead of two: the index trees were dropped at `warn` at 34 s and rebuilt at 64.6 s, the node having run 34 s and so waited 30 s at `ok`; they were dropped again at 210.6 s, and this time the node had run 146 s since the rebuild, waited as long, to 360 s, found no room (565 MiB needed) and stayed paged to the end. It committed 1,310 to 1,440 transfers a second while the index trees were resident and 1,420 to 1,600 after the second drop, 1,485 over the ten minutes. So the wait follows how long the heap took to fill. At each level other than `ok`, `onMemoryLevel` sets `rebuildAfter` to `sinceRebuild`, the samples since something was last rebuilt or since the node started, at least `REBUILD_WINDOW` and at most `REBUILD_WAIT_MAX` (600, ten minutes at the default interval), and sets `sinceDrop` to zero. `rebuildWhatFits` returns without deciding anything until `sinceDrop` has reached `rebuildAfter`, that is until the level has been `ok` for that many samples in a row; a sample at any other level starts the count again. Every rebuild, the window's restoring included, sets `sinceRebuild` to zero, so a node that fills its heap two minutes after a rebuild waits two minutes at `ok` after the drop that follows, and one that took an hour waits ten minutes. And the room is what is left within `REBUILD_FILL` of the limit, half of it (or within the warn line, should a configuration put that lower): `Math.min(Node.REBUILD_FILL, warnAt) * heapLimit - peak`. The room was first taken to the warn line, 0.7, so that a rebuilt tier did not land the node at `warn` by construction, and that was measured too once the guard read the old generation: a node rebuilt its index trees whenever they just fitted under the warn line and then spent minutes between `warn` and `pressure`, the collector working on a nearly full old generation, collections taking 7 to 12% of its time against 4 to 5% with the trees dropped, and it committed about a fifth less, 1,050 to 1,280 transfers a second against 1,330 to 1,560. What is rebuilt up to the warn line leaves the load no room; half the limit leaves it a fifth of the heap before `warn`. Opening a stored state is judged against the warn line still (`OPEN_FILL`, 0.7): nothing is running yet, and what is opened resident can be dropped later. The index trees go first, being cheaper and given back sooner; a tier that does not fit stays dropped, the node running on the fallbacks at `ok`, and the guard asks again at every sample while the level is `ok`, logging what it is waiting for once per drop (`deferredRebuild` is set by the first line and emptied by `onMemoryLevel` at the next drop, so the line is not repeated while the figure grows with the state; it was first compared with the figure, and a loaded node wrote the line at every MiB). Each tier rebuilt is taken off `room` and added to the remembered samples, so whatever is decided next in the same call counts it. The history window comes last: only when the estimate says nothing is left dropped, and `historyHeld` fits in the room that remains, is `setHistoryWindow(this.historyInMemory)` called (`retain.memoryVersions`, or `Infinity` when it is unset, which the database clamps to its configured retention) and `historyHeld` reset. The window does not come back at once, since what was forgotten is gone: it grows by one version at every root, which is why the log line `memory: history window restored` carries `provableFrom`, the oldest version that can be proven at that moment. Until then `historyHeld` is part of `needs` in the `staying paged` line. In the paging benchmark's node (`bench/paging.bench.ts` with `bench/paging-node.ts`: a single validator in a child process, so that its `--max-old-space-size` of 744 MiB over a 595 MiB resident state is V8's own limit, with its mempool kept two blocks ahead for 40 seconds; STATE-PAGING.md 7.1) this is what happened: `warn` at about five seconds, at 539 of 744 MiB, dropped the index trees and cut the history window, and the next sample read 308 MiB, `ok`; after ten samples the index trees were asked for and stayed dropped, 161 MiB needed for them and no room within half the limit (372 MiB), the heap running between 311 and 501 MiB; the node then ran at `ok` to the end with the Merkle trees resident and the index trees in the store, 124 blocks and 69,492 transfers in 40.6 seconds, no visit to `pressure`, and no abort. In a run taken while the index trees and the window still went at `pressure`, that level came at 14.0 s, dropped both tiers and cut the window, and the next sample read 45 MiB; at 17.6 s the index trees were rebuilt and the Merkle trees stayed dropped, 451 MiB needed for them and the window against 185 MiB of room; that run committed 112 blocks and 61,364 transfers, 80 of the blocks with the Merkle trees dropped.
 
 Shedding itself is the last method:
 
@@ -592,15 +680,12 @@ Shedding itself is the last method:
   private shed(on: boolean): void {
     if (on === this.shedding) return;
     this.shedding = on;
-    if (on) {
-      this.mempool.pause('node under memory pressure');
-      if (this.app instanceof CoreApp) this.app.dropSignatureCache();
-    } else this.mempool.resume();
-    this.log(on ? 'warn' : 'info', on ? 'shedding load: mempool paused, costly requests refused' : 'load shedding over', { mempool: this.mempool.size });
+    if (on && this.app instanceof CoreApp) this.app.dropSignatureCache();
+    this.log(on ? 'warn' : 'info', on ? 'shedding load: mempool limit lowered, costly requests refused' : 'load shedding over', { mempool: this.mempool.size, limit: this.mempool.currentLimit });
   }
 ```
 
-`shed` is idempotent, so a guard that moves from `pressure` to `critical` does not pause the pool twice, and one that eases from `critical` to `pressure` does not resume it. Shedding is three things. The mempool is paused with the reason the RPC will quote ([chapter 5](05-mempool-executor.md)), and the inventory handler above stops fetching what peers announce. The core application's signature cache is dropped: `dropSignatureCache` clears the verify cache of [chapter 11](11-application.md), 20,000 bodies at most, and the signatures of the transactions still pooled are then verified again when they reach a block, CPU spent to free heap. And `isShedding` turns true, which the RPC server reads to refuse costly methods and new event streams ([chapter 12](12-rpc.md)). The mempool stays paused at `pressure` although admission through the fallbacks is correct (`test/app.test.ts` checks transactions against dropped index trees and dropped Merkle trees), because admission is also what grows the heap under load: every pooled transaction pins the objects it touches decoded in the pending session, where the cache cannot evict them, adds overlay entries, and keeps its bytes and its signature-cache entry; the paging benchmark's node held about 330 MiB more live heap with a full mempool than idle (STATE-PAGING.md section 7). Shedding that is what lets the level come down, and with the rebuild conditional, `ok` is reached with the trees still dropped, so the node admits and commits through the fallbacks without flapping. The `critical` level is reported and nothing more: what to do then is the owner's decision. The CLI's `start` registers an `onMemory` listener that stops the node and exits with code 3 ([chapter 14](14-wallet-cli.md)); a test registers one that records the sequence.
+`shed` is idempotent, so a guard that moves from `pressure` to `critical` does not drop the signature cache or log twice. Shedding is two things, the mempool's limit having been set by `onMemoryLevel` before `shed` is called (the log line reports it as `limit` beside the pool's size). The core application's signature cache is dropped: `dropSignatureCache` clears the verify cache of [chapter 11](11-application.md), 20,000 bodies at most, and the signatures of the transactions still pooled are then verified again when they reach a block, CPU spent to free heap. And `isShedding` turns true, which the RPC server reads to refuse costly methods and new event streams ([chapter 12](12-rpc.md)). `broadcastTx` is a costly method the server still serves then, since the mempool's lowered limit is what throttles it: at `pressure` a broadcast is admitted when the pool has room under a tenth of its limit and answered with `-32004` when it has not. The `critical` level is reported and nothing more: what to do then is the owner's decision. The CLI's `start` registers an `onMemory` listener that stops the node and exits with code 3 ([chapter 14](14-wallet-cli.md)); a test registers one that records the sequence.
 
 #### `start`, `stop` and the accessors
 
@@ -627,9 +712,25 @@ The default height is `lastHeight - 1`, the latest height whose next header exis
 
 ### src/node/memory.ts
 
-Purpose: the two objects the node wires in step 8, with no dependency on the node. **`MemoryStats`** is one sample: `heapUsed`, `heapLimit` and `heapTotal`, the first and last from `v8.getHeapStatistics`, and `arrayBuffers`, `external` and `rss` from `process.memoryUsage`, the memory outside the heap, where ML-DSA keys, the database's arena and stored bytes live. **`memoryStats()`** takes one, and the limit it reports needs a word:
+Purpose: the two objects the node wires in step 8, with no dependency on the node. **`MemoryStats`** is one sample: `heapUsed`, `heapLimit` and `heapTotal`, the first and last from `v8.getHeapStatistics`, an optional `heapOld`, the old generation's use, present only when the limit is the old generation's, and `arrayBuffers`, `external` and `rss` from `process.memoryUsage`, the memory outside the heap, where ML-DSA keys, the database's arena and stored bytes live. **`memoryStats()`** takes one, and both the limit it reports and the use that is compared with it need a word:
 
 ```ts
+/**
+ * The --max-old-space-size the process runs under, in MiB, or null when none was given. Node reads NODE_OPTIONS
+ * first and its command line after, so a flag on the command line wins, and the last of several wins; V8 takes the
+ * flag with dashes or underscores alike. Shared with the CLI's `start`, which must not put a limit of its own over
+ * one the operator set.
+ */
+export function heapLimitFlag(execArgv: readonly string[] = process.execArgv, nodeOptions: string = process.env.NODE_OPTIONS ?? ''): number | null {
+  const flags = [...splitNodeOptions(nodeOptions), ...execArgv];
+  let mib: number | null = null;
+  for (const f of flags) {
+    const m = /^--max[-_]old[-_]space[-_]size=(\d+)$/.exec(f);
+    if (m) mib = Number(m[1]);
+  }
+  return mib;
+}
+
 /**
  * The old generation's limit in bytes, when the process was started with one (--max-old-space-size, as the CLI does).
  * V8's heap_size_limit adds the young generation's reserve to it (three semi-spaces, 192 MiB with 64 MiB ones), which
@@ -637,26 +738,42 @@ Purpose: the two objects the node wires in step 8, with no dependency on the nod
  * levels' lines, taken from 936 MiB, would sit past the point of the abort and `pressure` would never come.
  */
 function oldGenerationLimit(): number | null {
-  const flags = [...process.execArgv, ...(process.env.NODE_OPTIONS ?? '').split(/\s+/)];
-  let mib: number | null = null;
-  for (const f of flags) {
-    const m = /^--max[-_]old[-_]space[-_]size=(\d+)$/.exec(f);
-    if (m) mib = Number(m[1]);
-  }
+  const mib = heapLimitFlag();
   return mib === null ? null : mib * 1048576;
 }
 
 const OLD_LIMIT = oldGenerationLimit();
 
+/**
+ * Bytes in use in every space but the young generation's two. Between two minor collections the young generation
+ * holds up to a semi-space of garbage (64 MiB as `start` runs the node) that never reaches the old generation: counted
+ * against an old-generation limit, it read as a full heap on a node with a small one, 162 MiB "of 153" a moment
+ * before a collection left 42.
+ */
+function oldGenerationUsed(): number {
+  let used = 0;
+  for (const s of getHeapSpaceStatistics()) if (s.space_name !== 'new_space' && s.space_name !== 'new_large_object_space') used += s.space_used_size;
+  return used;
+}
+
 export function memoryStats(): MemoryStats {
   const h = getHeapStatistics();
   const m = process.memoryUsage();
   const heapLimit = OLD_LIMIT !== null ? Math.min(OLD_LIMIT, h.heap_size_limit) : h.heap_size_limit;
-  return { heapUsed: h.used_heap_size, heapLimit, heapTotal: h.total_heap_size, arrayBuffers: m.arrayBuffers, external: m.external, rss: m.rss };
+  const stats: MemoryStats = { heapUsed: h.used_heap_size, heapLimit, heapTotal: h.total_heap_size, arrayBuffers: m.arrayBuffers, external: m.external, rss: m.rss };
+  if (OLD_LIMIT !== null) stats.heapOld = oldGenerationUsed();
+  return stats;
+}
+
+/** The bytes a sample's level is taken from, against its heapLimit: the old generation's when the limit is its, else the whole heap's. */
+export function heapInUse(s: MemoryStats): number {
+  return s.heapOld ?? s.heapUsed;
 }
 ```
 
-The figure that matters is the old generation's, because that is where the state lives and where the process aborts. V8's `heap_size_limit` is `--max-old-space-size` plus the young generation's reserve, 192 MiB on the machine measured, which long-lived objects never fill. The guard first took its lines from `heap_size_limit`, and the paging benchmark showed what that meant (STATE-PAGING.md section 7): with the CLI's `--heap 744` the lines were taken from 936 MiB, `pressure` at 85% of that sat past the point of the abort, and a node under load reached `warn` and then died of an out-of-memory error at 19.5 s without ever shedding. So when the process was started with `--max-old-space-size`, on the command line or in `NODE_OPTIONS`, `memoryStats` measures against that, and `heapLimit` is then the old generation's limit (a node started with `--heap 512` reports 512 MiB, not the 704 `heap_size_limit` would say); without the flag it falls back to `heap_size_limit`, which is all there is. **`MemoryLevel`** is `'ok' | 'warn' | 'pressure' | 'critical'`.
+The figure that matters is the old generation's, because that is where the state lives and where the process aborts. V8's `heap_size_limit` is `--max-old-space-size` plus the young generation's reserve, 192 MiB on the machine measured, which long-lived objects never fill. The guard first took its lines from `heap_size_limit`, and the paging benchmark showed what that meant (STATE-PAGING.md section 7): with the CLI's `--heap 744` the lines were taken from 936 MiB, `pressure` at 85% of that sat past the point of the abort, and a node under load reached `warn` and then died of an out-of-memory error at 19.5 s without ever shedding. So when the process was started with `--max-old-space-size`, on the command line or in `NODE_OPTIONS`, `memoryStats` measures against that (`heapLimitFlag` finds the flag, with `splitNodeOptions` splitting `NODE_OPTIONS` at spaces the way Node does, double quotes grouping; the command line is read after `NODE_OPTIONS`, so it wins, and the CLI's `start` in [chapter 14](14-wallet-cli.md) uses the same function), and `heapLimit` is then the old generation's limit (a node started with `--heap 512` reports 512 MiB, not the 704 `heap_size_limit` would say); without the flag it falls back to `heap_size_limit`, which is all there is.
+
+The use has the same problem from the other side. `used_heap_size` counts every space of the heap, the young generation's among them, and between two minor collections the young generation holds up to a semi-space of garbage, 64 MiB as `start` runs the node (`--max-semi-space-size=64`), that will be collected where it lies and never reach the old generation. Set against an old-generation limit that garbage reads as a full heap on a node with a small one: a benchmark node under a 153 MiB limit logged `critical` at "162/153 MiB", and the next sample, after a collection, read 42 MiB. So under `--max-old-space-size` the sample also carries `heapOld`, the bytes in use in every space `v8.getHeapSpaceStatistics()` lists except `new_space` and `new_large_object_space` (`oldGenerationUsed`), and **`heapInUse(stats)`** is the one place that chooses: `heapOld` when the sample has it, `heapUsed` when it does not, which is a process without the flag or a test's invented sample. The guard's levels and log fields, the scheduler's growth test, the node's `recentHeap` and `heapRoom` (above) and the CLI's status line ([chapter 14](14-wallet-cli.md)) all go through it. `heapUsed` itself is unchanged and still reported: `status` spreads the whole sample ([chapter 12](12-rpc.md)), so under a heap limit it shows both. **`MemoryLevel`** is `'ok' | 'warn' | 'pressure' | 'critical'`.
 
 **`MemoryGuard`** takes `MemoryGuardOptions`: `intervalMs` (1000), the three thresholds as fractions of the limit (`warnAt` 0.7, `pressureAt` 0.85, `criticalAt` 0.95), `hysteresis` (0.05), a `stats` source (`memoryStats` unless a test injects a function), the logger, an `onLevel` callback for every change of level and an `onSample` callback for every sample, with the level it left the guard at. The constructor refuses thresholds that do not rise or exceed 1 and takes a first sample; `start()` takes another at once and then one per interval on an unreferenced timer; `level` and `stats` read the current level and the last sample. `check()` is the whole mechanism:
 
@@ -664,7 +781,7 @@ The figure that matters is the old generation's, because that is where the state
   /** Take a sample and move the level; returns the level afterwards. */
   check(): MemoryLevel {
     const s = (this.last = this.o.stats());
-    const fraction = s.heapUsed / s.heapLimit;
+    const fraction = heapInUse(s) / s.heapLimit;
     const thresholds = [this.o.warnAt, this.o.pressureAt, this.o.criticalAt];
     let idx = this.levelIndex;
     while (idx < thresholds.length && fraction >= thresholds[idx]!) idx++;
@@ -673,7 +790,7 @@ The figure that matters is the old generation's, because that is where the state
       const rising = idx > this.levelIndex;
       this.levelIndex = idx;
       const level = this.level;
-      const fields = { level, heap: `${MiB(s.heapUsed)}/${MiB(s.heapLimit)} MiB`, arrayBuffers: `${MiB(s.arrayBuffers)} MiB`, rss: `${MiB(s.rss)} MiB` };
+      const fields = { level, heap: `${MiB(heapInUse(s))}/${MiB(s.heapLimit)} MiB`, arrayBuffers: `${MiB(s.arrayBuffers)} MiB`, rss: `${MiB(s.rss)} MiB` };
       if (level === 'critical') this.o.log('error', 'memory: heap at the limit; stopping before the process aborts (raise --max-old-space-size or --heap)', fields);
       else if (rising) this.o.log('warn', level === 'pressure' ? 'memory: shedding load' : 'memory: heap filling', fields);
       else this.o.log('info', 'memory: easing', fields);
@@ -684,7 +801,7 @@ The figure that matters is the old generation's, because that is where the state
   }
 ```
 
-The two `while` loops are the hysteresis. Rising, the level climbs while the fraction is at or above the next threshold, so one sample can cross several levels (10% to 90% is straight to `pressure`); falling, it drops while the fraction is below the threshold of the level it is in, less the hysteresis, so a level entered at 85% is left at 80%, and a heap that hovers at 85% does not log, shed and resume on every sample. A change is logged once, with the heap used and limit, the array buffers and the resident set in MiB, at `error` for `critical` (with the remedy in the message), `warn` on the way up and `info` on the way down, and then reported to `onLevel` with the sample; `onSample` hears every sample afterwards, change or not, which is how the node's conditional rebuild keeps asking at `ok`. Nothing else happens here: what a level means is the node's business.
+The two `while` loops are the hysteresis. Rising, the level climbs while the fraction is at or above the next threshold, so one sample can cross several levels (10% to 90% is straight to `pressure`); falling, it drops while the fraction is below the threshold of the level it is in, less the hysteresis, so a level entered at 85% is left at 80%, and a heap that hovers at 85% does not log, shed and resume on every sample. A change is logged once, with the heap in use (`heapInUse`, the figure the fraction was taken from) and the limit, the array buffers and the resident set in MiB, at `error` for `critical` (with the remedy in the message), `warn` on the way up and `info` on the way down, and then reported to `onLevel` with the sample; `onSample` hears every sample afterwards, change or not, which is how the node's conditional rebuild keeps asking at `ok`. Nothing else happens here: what a level means is the node's business.
 
 **`GcScheduler`** takes `GcSchedulerOptions`: a `gc` function (the global one `--expose-gc` provides when the option is absent; `null` disables scheduling), a `stats` source, `majorGrowthBytes` (256 MiB) and `majorGrowthFraction` (0.1), `observe` (true) and the logger. `available` says whether anything can be scheduled. `start()` installs a `PerformanceObserver` on `gc` entries that counts every collection V8 runs by kind (minor, major or incremental, from the entry's `detail.kind` flags) with the total, longest and last pause, and logs once, without `--expose-gc`, that collections will run when V8 decides; `stop()` disconnects it; `stats()` returns a copy of the counts as `GcStats`, the object `status` serves ([chapter 12](12-rpc.md)). The two scheduling calls:
 
@@ -699,7 +816,7 @@ The two `while` loops are the hysteresis. Rising, the level climbs while the fra
     }
     const s = this.stats_();
     const due = Math.min(this.growthBytes, this.growthFraction * s.heapLimit);
-    if (s.heapUsed - this.heapAtLastMajor >= due) void this.major();
+    if (heapInUse(s) - this.heapAtLastMajor >= due) void this.major();
   }
 
   /** Start a major collection now, without blocking the caller on it; one at a time. */
@@ -713,12 +830,12 @@ The two `while` loops are the hysteresis. Rising, the level climbs while the fra
       this.log('warn', 'gc: major collection failed', { err: (e as Error).message });
     } finally {
       this.majorRunning = false;
-      this.heapAtLastMajor = this.stats_().heapUsed;
+      this.heapAtLastMajor = heapInUse(this.stats_());
     }
   }
 ```
 
-`afterCommit` runs a minor collection synchronously (the young generation: a few milliseconds, and the block just committed left plenty of short-lived garbage behind) and then, if the heap has grown since the last major collection by the growth step, starts a major one. The step is the smaller of 256 MiB and a tenth of the limit, so a node with a small heap collects proportionally sooner. `major` asks for an asynchronous collection (`execution: 'async'`, so the caller is not blocked on it), runs one at a time, and measures the next growth from the heap as it stands after the collection finished, not from before it, so a collection that freed little does not postpone the next one by what it failed to free. Both count what they scheduled; the observer counts what V8 ran, which includes these and everything V8 decided on its own.
+`afterCommit` runs a minor collection synchronously (the young generation: a few milliseconds, and the block just committed left plenty of short-lived garbage behind) and then, if the heap in use (`heapInUse` again: the old generation under a heap limit, which is what a major collection is for) has grown since the last major collection by the growth step, starts a major one. The step is the smaller of 256 MiB and a tenth of the limit, so a node with a small heap collects proportionally sooner. `major` asks for an asynchronous collection (`execution: 'async'`, so the caller is not blocked on it), runs one at a time, and measures the next growth from the heap as it stands after the collection finished, not from before it, so a collection that freed little does not postpone the next one by what it failed to free. Both count what they scheduled; the observer counts what V8 ran, which includes these and everything V8 decided on its own.
 
 ### scripts/localnet.ts
 
@@ -794,10 +911,11 @@ For comparison, the same constructor on disk and over TCP is in `src/cli.ts` (`s
     stateSync: cfg.stateSync ? { trustHeight: BigInt(cfg.stateSync.trustHeight), trustHash: fromHex(cfg.stateSync.trustHash), backfill: cfg.stateSync.backfill } : undefined,
     retain: cfg.retain,
     snapshotInterval: cfg.snapshotInterval,
+    arenaBytes: arenaMb === null ? undefined : arenaMb * 1048576,
   });
 ```
 
-The only differences from the localnet are the transport, the storage (an `LmdbEnv` passed in, so the CLI owns it), the state sync and retention options read from `config.json`, and what surrounds the constructor: the CLI runs it in a child process under a heap limit of its choosing, reports the guard's level and the collection pauses in its status line, and stops the node with exit code 3 when the guard reports `critical`. The [wallet and CLI](14-wallet-cli.md) chapter covers the rest of that file.
+The only differences from the localnet are the transport, the storage (an `LmdbEnv` passed in, so the CLI owns it), the state sync and retention options read from `config.json`, the arena's byte limit from the `--arena` flag, and what surrounds the constructor: the CLI runs it in a child process under a heap limit of its choosing, reports the guard's level and the collection pauses in its status line, and stops the node with exit code 3 when the guard reports `critical`. The [wallet and CLI](14-wallet-cli.md) chapter covers the rest of that file.
 
 ### bench/network.bench.ts
 
@@ -846,7 +964,8 @@ The cases that exercise the node's own wiring:
 - `test/review.test.ts`, `resumes after a restart that left a signature at the current height`: a one-validator node on a temporary data directory is stopped, its `priv_validator_state.bin` is overwritten to claim a signed proposal at the next height, and a new `Node` on the same directory must make progress in a later round, proving the on-disk pieces (LMDB chain store, application store, signing guard) are reopened consistently.
 - `test/review.test.ts`, `survives an aborted request body on the RPC`: an `RpcServer` on a node stays up after a client disconnects mid-body.
 - `test/review.test.ts`, `refuses a second node on a data directory that is in use`: described under the constructor; the lock is released by `stop()` and the directory can be reopened.
-- `test/memory.test.ts`, `sheds load, keeps following the chain, and resumes when the heap eases`: on a testnet of the core application, a full node made with `makeNode(2, { memory: { stats, intervalMs: 20 } })` has its guard fed invented samples. At first the database's `hotLimit` is `Infinity`. At 90% of the limit `isShedding` is true, the `hotLimit` is 10,000 with no more than that cached, `memory().indexTrees` and `memory().trees` are both `dropped`, `mempool.paused` is true, `submitTx` answers `paused`, the RPC refuses `broadcastTx`, `block` and `/events` and reports every tier's mode under `status.memory.database`, the node still advances two heights behind the validators with its trees dropped (a hash that differed from theirs would stop it there), and an object proof at its height is byte for byte the proof a validator with resident trees makes. Then the limit is raised to four times what `rebuildEstimate()` says both tiers would take and the heap set to 64% of it: shedding ends, the `hotLimit` is `Infinity` again and `submitTx` is no longer `paused` (the transaction is refused by the application, not by the pause), but 100 ms later both tiers are still `dropped`, the room under the warn line being a quarter of what rebuilding needs. At 20% the next samples rebuild them, `accountByName` answers on the resident trees, and `block` answers. At 99% the `critical` level is reported through `onMemory`, and the sequence seen is `pressure`, `ok`, `critical`, one sample crossing several thresholds each time. The guard and the scheduler have their own unit cases in the same file ([chapter 15](15-tests.md)).
+- `test/memory.test.ts`, `sheds load, keeps following the chain, and resumes when the heap eases`: on a testnet of the core application, a full node made with `makeNode(2, { memory: { stats, intervalMs: 20 } })` has its guard fed invented samples. At first the database's `hotLimit` is `Infinity`. At 75% of the limit the level is `warn` and nothing is shed: `memory()` reports `indexTrees: 'dropped'`, `trees: 'resident'` and `history: 'trimmed'` with a `historyWindow` of 2, the `hotLimit` is 100,000, `mempool.currentLimit` is half of `maxTxs`, and `block` still answers. At 90% of the limit `isShedding` is true, the `hotLimit` is 10,000 with no more than that cached, `memory().indexTrees` and `memory().trees` are both `dropped`, the database reports `history: 'trimmed'` with a `historyWindow` of 2, `mempool.paused` is false and `mempool.currentLimit` is a tenth of `maxTxs`, `submitTx` answers `full` once the test has set the limit to zero, the RPC answers `broadcastTx` with `-32004` at that limit and with `-32002` once there is room again, refuses `block` and `/events` and reports every tier's mode under `status.memory.database`, the node still advances two heights behind the validators with its trees dropped (a hash that differed from theirs would stop it there), and an object proof at its height is byte for byte the proof a validator with resident trees makes. Then the limit is raised to four times what `rebuildEstimate()` says the cheaper tier would take and the heap set to 40% of it: shedding ends, the `hotLimit` is `Infinity` again and the mempool's limit is `maxTxs` again, but 100 ms later both tiers are still `dropped` and the test's logger has not seen the line `memory: staying paged`: the node is waiting at `ok` for as long as it had run before the drop, a few seconds of 20 ms samples here, and considers nothing yet. Within 30 seconds the line is logged, once, and 200 ms of further samples do not repeat it; both tiers are still `dropped`. The cheaper tier takes 25% of that limit: the room to the warn line is 30% of it, which would hold the tier, and the room to half the limit is 10%, which holds neither, so the test tells the two rules apart. At 20% the next samples rebuild them and then restore the history window (`memory().history` is `resident` again), `accountByName` answers on the resident trees, `submitTx` is not refused as `full` (the transaction is refused by the application, not by the limit), and `block` answers. At 99% the `critical` level is reported through `onMemory`, and the sequence seen is `warn`, `pressure`, `ok`, `critical`, the last two each reached by one sample crossing several thresholds. The guard and the scheduler have their own unit cases in the same file ([chapter 15](15-tests.md)).
+- `test/memory.test.ts`, `keeps as many past versions in memory as retain.memoryVersions says, proves the older ones from the store, and leaves the index trees there when told to`: a single validator made with `makeNode(0, { retain: { memoryVersions: 3 }, indexTrees: 'store' })` runs to height 8. Its database reports `indexTrees: 'dropped'`, an account is found by name, and the trees are still dropped 300 ms later. Its database reports `history: 'trimmed'` with a `historyWindow` of 3, the application's `lowestProvableHeight` is at least six heights back, and `proofAt` and `rootAt` answer at the height six back, from the store's history records.
 
 ## Limitations and ideas
 
@@ -857,10 +976,10 @@ The cases that exercise the node's own wiring:
 - The RPC has no authentication (DESIGN.md section 10).
 - Evidence items are re-encoded on every fetch.
 - The data directory lock trusts the PID in the `LOCK` file: a PID recycled by an unrelated process makes a stale claim look live until that process exits.
-- The version history window is not trimmed under memory pressure: shedding touches the mempool, the RPC and the signature cache, and the dials the database's cache of decoded objects, its index trees and its Merkle trees, while the history keeps its own retention (`retain.versions`). The paging benchmark found the history window and the recent transaction ids to be the growth no dial can shed, the reason its node alternated between `warn` and `pressure` in its last ten seconds with every tier dropped (STATE-PAGING.md 7.1); a node whose history is what fills the heap needs a smaller window or a larger heap.
-- A store cannot yet be opened with its tiers dropped: a node opening its store builds every tier resident before the guard samples, so a `--heap` below what opening takes, about two thirds of the resident heap, aborts at startup rather than starting on the fallbacks; from 0.8 times the resident heap upward the node opens and pages from its first samples (STATE-PAGING.md section 9, docs/benchmarks.md 4.13).
-- The mempool stays paused for as long as the level is `pressure`, although admission through the dropped trees is correct; lifting the pause would want a mempool limit that follows the level, which is not built.
-- ArrayBuffers (ML-DSA keys, stored bytes, the database's arena) sit outside the V8 heap and outside the guard's fraction; a machine that runs out of physical memory for them meets the operating system's killer, not V8's limit. The guard reports `arrayBuffers` and `rss` beside the heap figures, but acts on the heap alone.
+- From `warn` until the history window has grown back, proofs and queries at heights older than the last two (and at any time those older than `retain.memoryVersions`, when it is set) are read from the history records in the store, which is slower than from memory: every record after the height asked about is scanned and nothing is cached between reads. Only a restart reads the whole window back into memory at once. The recent transaction ids are still growth no dial sheds.
+- The room a stored state is opened into is an estimate made from object counts before anything is built (STATE-PAGING.md section 9.1); a heap too small even for a state opened with both tiers left in the store still aborts at startup. `start()` runs one major collection before the guard's first sample, because opening leaves garbage several times what it keeps and the sample would otherwise read a node that fits as `critical` (measured at a third of the resident heap, docs/benchmarks.md section 4.13).
+- The mempool's limit counts transactions, not bytes, and lowering it evicts nothing: a pool already above the lowered limit stays as large as it is until blocks reap it.
+- ArrayBuffers (ML-DSA keys, stored bytes, the database's arena) sit outside the V8 heap and outside the guard's fraction; a machine that runs out of physical memory for them meets the operating system's killer, not V8's limit. The guard reports `arrayBuffers` and `rss` beside the heap figures, but acts on the heap alone. The arena can be bounded by hand with `arenaBytes` (the CLI's `--arena`), which no level turns.
 
 Exercises:
 
@@ -870,7 +989,7 @@ Exercises:
 4. Run the localnet over TCP: replace `hub.transport(...)` with a `TcpTransport` per node and `127.0.0.1:<port>` addresses, and compare the status lines.
 5. Add a per-peer transaction rate limit in the `item` handler, charging points above it.
 6. Replace the PID in the `LOCK` file with an advisory file lock that the operating system releases when the process dies, and write a test that kills a node without `stop()` and restarts it on the same directory.
-7. Trim the version history on `pressure`: have `shed` ask the application to drop the oldest provable versions down to a floor, and show with injected samples that the heap the guard reports falls and that `lowestProvableHeight` moves up.
+7. Serve past versions from the store while the window in memory is trimmed: the history records are still there (`'h'` keys, [chapter 11](11-application.md)). Have a proof at a height below `lowestVersion` read the record it needs instead of being refused, and compare its bytes with the proof an untrimmed node makes.
 
 ## Where to next
 

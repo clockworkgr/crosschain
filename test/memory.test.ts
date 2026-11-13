@@ -5,7 +5,7 @@ import { TYPE } from '../src/app/core/types.ts';
 import { keyPairFromSeed } from '../src/crypto/keys.ts';
 import { objectId } from '../src/db/id.ts';
 import { proofToBytes } from '../src/db/proof.ts';
-import { GcScheduler, MemoryGuard, memoryStats, type MemoryLevel, type MemoryStats } from '../src/node/memory.ts';
+import { GcScheduler, heapInUse, heapLimitFlag, MemoryGuard, memoryStats, type MemoryLevel, type MemoryStats } from '../src/node/memory.ts';
 import { RpcClient } from '../src/rpc/client.ts';
 import { RpcServer } from '../src/rpc/server.ts';
 import { silentLogger } from '../src/util/log.ts';
@@ -43,6 +43,26 @@ describe('memory guard', () => {
     expect(() => new MemoryGuard({ log: silentLogger, warnAt: 0.9, pressureAt: 0.8 })).toThrow(/thresholds/);
     const real = memoryStats();
     expect(real.heapLimit).toBeGreaterThan(real.heapUsed);
+  });
+
+  it('takes its levels from the old generation when the sample gives it, whatever the young generation holds', () => {
+    // A heap limit that is the old generation's: garbage in the young generation is not on its way to it.
+    let sample: MemoryStats = { ...stats(990), heapOld: 100 };
+    const logged: Record<string, unknown>[] = [];
+    const guard = new MemoryGuard({ log: (_level, _msg, fields) => void logged.push(fields!), stats: () => sample });
+    expect(guard.check()).toBe('ok');
+    sample = { ...stats(990), heapOld: 860 };
+    expect(guard.check()).toBe('pressure');
+    expect(logged[0]).toMatchObject({ level: 'pressure', heap: '0/0 MiB' });
+    sample = { ...stats(400 * 1048576, 1000 * 1048576), heapOld: 300 * 1048576 };
+    expect(guard.check()).toBe('ok');
+    expect(logged[1]).toMatchObject({ level: 'ok', heap: '300/1000 MiB' });
+    expect(heapInUse(sample)).toBe(300 * 1048576);
+    expect(heapInUse(stats(7))).toBe(7);
+    // The process's own sample has the figure only under a limit set for the old generation.
+    const real = memoryStats();
+    expect(real.heapOld === undefined).toBe(heapLimitFlag() === null);
+    if (real.heapOld !== undefined) expect(real.heapOld).toBeLessThanOrEqual(real.heapUsed);
   });
 
   it('schedules a minor collection after every commit and a major one once the heap has grown enough', async () => {
@@ -124,7 +144,8 @@ describe('a node under memory pressure', () => {
     });
     let heap = 100;
     let limit = 1000;
-    const watched = await net.makeNode(2, { memory: { stats: () => stats(heap, limit), intervalMs: 20 } });
+    const logged: string[] = [];
+    const watched = await net.makeNode(2, { memory: { stats: () => stats(heap, limit), intervalMs: 20 }, log: (_level, msg) => void logged.push(msg) });
     net.nodes.push(watched);
     const levels: MemoryLevel[] = [];
     watched.onMemory((level) => levels.push(level));
@@ -138,19 +159,38 @@ describe('a node under memory pressure', () => {
     expect(app.db.memory().hotLimit).toBe(Infinity);
     expect(((await rpc.call('status', {})) as { memory: { level: string; shedding: boolean; database: { hotObjects: number } }; gc: { available: boolean } }).memory).toMatchObject({ level: 'ok', shedding: false });
 
+    // At `warn` the node pages what its blocks do not need, and sheds nothing: the index trees are dropped and the
+    // window of past versions is cut to the last two, the Merkle trees stay, the mempool admits up to half its limit.
+    heap = 750; // 75% of the limit
+    await waitFor(() => watched.memoryLevel === 'warn', 5_000, 'the warn level');
+    expect(watched.isShedding).toBe(false);
+    // (TREES=0 runs the suite with the Merkle trees dropped from the start.)
+    expect(app.db.memory()).toMatchObject({ indexTrees: 'dropped', trees: process.env.TREES === '0' ? 'dropped' : 'resident', history: 'trimmed', historyWindow: 2 });
+    expect(app.db.memory().hotLimit).toBe(100_000);
+    expect(watched.mempool.currentLimit).toBe(watched.mempool.maxTxs / 2);
+    expect(await rpc.call('block', {})).toBeTruthy();
+
     heap = 900; // 90% of the limit
     await waitFor(() => watched.isShedding, 5_000, 'the node to shed load');
     expect(watched.memoryLevel).toBe('pressure');
     // The first dial: the database's cache of decoded objects is capped, and the excess evicted at once.
     expect(app.db.memory().hotLimit).toBe(10_000);
     expect(app.db.memory().hotObjects).toBeLessThanOrEqual(10_000);
-    // The second: the index trees are dropped, and every index read goes to the store through the overlay. The
-    // third: the Merkle trees are dropped, and every root and proof reads its paths from the store.
+    // The index trees stay dropped and the window trimmed, as from `warn`, and now the Merkle trees are dropped too:
+    // every root and proof reads its paths from the store.
     expect(app.db.memory().indexTrees).toBe('dropped');
     expect(app.db.memory().trees).toBe('dropped');
-    expect(watched.mempool.paused).toBe(true);
-    expect((await watched.submitTx(tx('set a=1'))).status).toBe('paused');
+    expect(app.db.memory()).toMatchObject({ history: 'trimmed', historyWindow: 2 });
+    // The mempool is not paused but admits up to a tenth of its limit; filled to that, it refuses as full, and the
+    // RPC says to try again rather than that the transaction is bad.
+    expect(watched.mempool.paused).toBe(false);
+    expect(watched.mempool.currentLimit).toBe(watched.mempool.maxTxs / 10);
+    watched.mempool.setLimit(0);
+    expect((await watched.submitTx(tx('set a=1'))).status).toBe('full');
     await expect(rpc.call('broadcastTx', { tx: '0102', mode: 'sync' })).rejects.toMatchObject({ code: -32004 });
+    watched.mempool.setLimit(watched.mempool.maxTxs / 10);
+    // With room under the lowered limit a broadcast is taken to the application, which is what refuses this one.
+    await expect(rpc.call('broadcastTx', { tx: '0102', mode: 'sync' })).rejects.toMatchObject({ code: -32002 });
     await expect(rpc.call('block', {})).rejects.toMatchObject({ code: -32004 });
     expect((await fetch(`${server.url}/events`)).status).toBe(503);
     expect(((await fetch(`${server.url}/health`).then((r) => r.json())) as { memory: string }).memory).toBe('pressure');
@@ -165,31 +205,71 @@ describe('a node under memory pressure', () => {
     await waitFor(() => other.lastHeight >= at, 10_000, 'a validator at the same height');
     expect(Buffer.from(proofToBytes(app.proofAt(objectId(TYPE.account, 0), at))).toString('hex')).toBe(Buffer.from(proofToBytes(other.proofAt(objectId(TYPE.account, 0), at))).toString('hex'));
 
-    // Back under the ok line, but with less room below the warn line than rebuilding is estimated to take: load
-    // shedding ends and the cache is unbounded again, while the trees stay dropped rather than take the heap back up.
+    // Back under the ok line, but with less room than rebuilding is estimated to take: load shedding ends and the
+    // cache is unbounded again, while the trees stay dropped rather than take the heap back up. The room is what is
+    // left to half the limit, not to the warn line: either tier would fit under that line here, and would leave the
+    // load nothing.
     const estimate = app.db.rebuildEstimate();
     expect(estimate.indexTrees).toBeGreaterThan(0);
     expect(estimate.trees).toBeGreaterThan(0);
     limit = 4 * Math.min(estimate.indexTrees, estimate.trees);
-    heap = Math.floor(0.64 * limit); // 6% of the limit to the warn line: a quarter of what rebuilding either tier would take
+    heap = Math.floor(0.4 * limit); // 30% of the limit to the warn line, more than either tier takes; 10% to half the limit, less than either
     await waitFor(() => !watched.isShedding, 5_000, 'shedding to end');
     expect(watched.memoryLevel).toBe('ok');
-    expect(watched.mempool.paused).toBe(false);
+    expect(watched.mempool.currentLimit).toBe(watched.mempool.maxTxs);
     expect(app.db.memory().hotLimit).toBe(Infinity);
+    // Nothing is even considered at once: the node waits at `ok` for as long as it had run before the drop (a few
+    // seconds of samples here), since a load that filled the heap once fills it again.
+    const staying = () => logged.filter((m) => m.startsWith('memory: staying paged')).length;
     await sleep(100);
+    expect(staying()).toBe(0);
+    expect(app.db.memory()).toMatchObject({ indexTrees: 'dropped', trees: 'dropped' });
+    // Then it finds no room, says so once however many samples follow, and stays as it is.
+    await waitFor(() => staying() === 1, 30_000, 'the node to say it stays paged');
+    await sleep(200);
+    expect(staying()).toBe(1);
     expect(app.db.memory()).toMatchObject({ indexTrees: 'dropped', trees: 'dropped' });
     // With room, the next sample rebuilds them.
     limit = 4 * (estimate.indexTrees + estimate.trees);
     heap = Math.floor(0.2 * limit);
     await waitFor(() => app.db.memory().trees === 'resident', 5_000, 'the trees to be rebuilt');
     expect(app.db.memory().indexTrees).toBe('resident');
+    // And with both back and room left, the window of past versions is let grow again.
+    await waitFor(() => app.db.memory().history === 'resident', 5_000, 'the history window to be restored');
     expect(app.accountByName('faucet')?.name).toBe('faucet');
-    expect((await watched.submitTx(tx('set a=1'))).status).not.toBe('paused'); // refused by the application, not by the pause
+    expect((await watched.submitTx(tx('set a=1'))).status).not.toBe('full'); // refused by the application, not by the limit
     expect(await rpc.call('block', {})).toBeTruthy();
     // Past the critical level the node reports it; what to do then (the CLI stops) is the caller's.
     heap = Math.floor(0.99 * limit);
     await waitFor(() => levels.includes('critical'), 5_000, 'the critical level to be reported');
-    // A sample can cross several thresholds at once: 10% to 90% is straight to pressure, 90% to 64% straight to ok.
-    expect(levels).toEqual(['pressure', 'ok', 'critical']);
+    // A sample can cross several thresholds at once: 90% to 40% is straight to ok, 20% to 99% straight to critical.
+    expect(levels).toEqual(['warn', 'pressure', 'ok', 'critical']);
+  });
+
+  it('keeps as many past versions in memory as retain.memoryVersions says, proves the older ones from the store, and leaves the index trees there when told to', async () => {
+    const faucet = keyPairFromSeed(seedFor('memory/faucet'));
+    net = await makeTestnet({
+      validators: 1,
+      skipStart: [0],
+      appFor: (_i, _d, genesis) => new CoreApp({ genesis, verifier }),
+      appState: new TextDecoder().decode(appGenesisBytes({ accounts: [{ name: 'faucet', owner: authorityJson([faucet.publicKey]), active: authorityJson([faucet.publicKey]), balance: '1000000000' }], staking: { inflationMinBps: 0, inflationMaxBps: 0 } })),
+    });
+    const node = await net.makeNode(0, { retain: { memoryVersions: 3 }, indexTrees: 'store' });
+    net.nodes.push(node);
+    await node.start();
+    await waitForHeight([node], 8n);
+    const app = node.app as CoreApp;
+    expect(app.db.memory()).toMatchObject({ history: 'trimmed', historyWindow: 3 });
+    // And with indexTrees 'store' the secondary indices are read from the store from the start: a lookup by name works,
+    // and nothing waits to be rebuilt.
+    expect(app.db.memory().indexTrees).toBe('dropped');
+    expect(app.accountByName('faucet')?.name).toBe('faucet');
+    await sleep(300);
+    expect(app.db.memory().indexTrees).toBe('dropped');
+    // The provable window is the store's, not the memory's: a height six back is answered from the history records.
+    const at = app.lastHeight;
+    expect(app.lowestProvableHeight).toBeLessThanOrEqual(at - 6n);
+    expect(app.proofAt(objectId(TYPE.account, 0), at - 6n)).toBeTruthy();
+    expect(app.db.rootAt(Number(at - 6n)).length).toBe(32);
   });
 });

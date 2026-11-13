@@ -298,7 +298,7 @@ describe('core application', () => {
     // History came back from the store: heights 0..2 are provable against the hashes the first instance produced.
     expect(restarted.lowestProvableHeight).toBe(0n);
     expect(verifyObjectProof(a.lastAppHash, restarted.proofAt(aliceId, 2n))).toBe(true);
-    // Name proofs at past heights are rebuilt from the object history and match the originals.
+    // Name proofs at past heights come back from the history records and match the originals.
     for (const h of [0n, 1n, 2n]) {
       expect(toHex(keyProofToBytes(restarted.proveAccountName('alice', h)))).toBe(toHex(keyProofToBytes(a.proveAccountName('alice', h))));
       expect(toHex(keyProofToBytes(restarted.proveAccountName('bob', h)))).toBe(toHex(keyProofToBytes(a.proveAccountName('bob', h))));
@@ -319,6 +319,48 @@ describe('core application', () => {
     expect(() => restarted.proofAt(aliceId, 2n)).toThrow(/not available/);
     const historyKeys = [...store.range(new Uint8Array([0x68]), prefixEnd(new Uint8Array([0x68])))].map(([k]) => Number(k[8]));
     expect(historyKeys).toEqual([4, 5, 6, 7]);
+  });
+
+  it('keeps the whole history window in the store while the one in memory is trimmed, so a restart has it back', async () => {
+    const store = new MemoryKv();
+    const a = makeApp(store);
+    const whole = makeApp();
+    for (let i = 0; i < 6; i++) {
+      const txs = i === 0 ? [tx([createOp('alice', makeAuthority([alice.publicKey]))])] : [tx([transferOp(FAUCET_ID, a.accountByName('alice')!.id, BigInt(i))])];
+      await block(a, txs);
+      await block(whole, txs);
+      if (i === 2) a.db.setHistoryWindow(1);
+    }
+    const aliceId = a.accountByName('alice')!.id;
+    // The window in memory holds one past version; the heights before it are proven from the store's records.
+    expect(a.db.memory()).toMatchObject({ history: 'trimmed', historyWindow: 1 });
+    expect(a.lowestProvableHeight).toBe(2n);
+    expect(whole.lowestProvableHeight).toBe(2n);
+    for (let h = 2n; h <= 6n; h++) {
+      expect(toHex(proofBytesAt(a, aliceId, h))).toBe(toHex(proofBytesAt(whole, aliceId, h)));
+      expect(toHex(keyProofToBytes(a.proveAccountName('alice', h)))).toBe(toHex(keyProofToBytes(whole.proveAccountName('alice', h))));
+    }
+    expect(() => a.proofAt(aliceId, 1n)).toThrow(/not available/);
+    const historyKeys = () => [...store.range(new Uint8Array([0x68]), prefixEnd(new Uint8Array([0x68])))].map(([k]) => Number(k[8]));
+    expect(historyKeys()).toEqual([3, 4, 5, 6]);
+    // A restart takes the sparse trees' past versions from the records, without replaying an account.
+    const opened: Record<string, unknown>[] = [];
+    const restarted = new CoreApp({ genesis, verifier: new InlineVerifier(), kv: store, retainVersions: 4, log: (_level, msg, fields) => void (msg === 'loaded application state' && opened.push(fields!)) });
+    expect(opened[0]).toMatchObject({ indexVersions: 'records', provableFrom: 2 });
+    expect(restarted.lowestProvableHeight).toBe(2n);
+    for (let h = 2n; h <= 6n; h++) {
+      expect(toHex(proofBytesAt(restarted, aliceId, h))).toBe(toHex(proofBytesAt(whole, aliceId, h)));
+      expect(toHex(keyProofToBytes(restarted.proveAccountName('alice', h)))).toBe(toHex(keyProofToBytes(whole.proveAccountName('alice', h))));
+    }
+    // A store that has lost a record: the heights it stood between and the present are provable, the ones below it are
+    // refused rather than answered from what is left, and their records go with the next commit.
+    store.write((w) => w.del(Uint8Array.of(0x68, 0, 0, 0, 0, 0, 0, 0, 4)));
+    const damaged = makeApp(store);
+    expect(damaged.lowestProvableHeight).toBe(4n);
+    for (let h = 4n; h <= 6n; h++) expect(toHex(proofBytesAt(damaged, aliceId, h))).toBe(toHex(proofBytesAt(whole, aliceId, h)));
+    expect(() => damaged.proofAt(aliceId, 3n)).toThrow(/not available/);
+    await block(damaged, []);
+    expect(historyKeys()).toEqual([5, 6, 7]);
   });
 });
 
@@ -507,6 +549,82 @@ describe('core application: index entries in the store', () => {
     paged.db.rebuildTrees();
     paged.db.rebuildIndexTrees();
     consistent(paged, kv);
+  });
+});
+
+describe('core application: a store opened without room for it', () => {
+  async function run(reopen: (kv: MemoryKv) => CoreApp) {
+    const kv = new MemoryKv();
+    const first = makeApp(kv);
+    const resident = makeApp();
+    const txs1 = [tx([createOp('alice', makeAuthority([alice.publicKey]))]), tx([createOp('bob', makeAuthority([bob.publicKey]))])];
+    await block(first, txs1);
+    await block(resident, txs1);
+    const aliceId = first.accountByName('alice')!.id;
+    const txs2 = [tx([transferOp(FAUCET_ID, aliceId, 5000n)])];
+    await block(first, txs2);
+    await block(resident, txs2);
+    const paged = reopen(kv);
+    expect(toHex(paged.lastAppHash)).toBe(toHex(resident.lastAppHash));
+    const both = async (txs: Uint8Array[]) => {
+      const [a, b] = [await block(paged, txs), await block(resident, txs)];
+      expect(toHex(a.appHash)).toBe(toHex(b.appHash));
+      expect(a.txResults).toEqual(b.txResults);
+      for (let h = paged.lowestProvableHeight; h <= paged.lastHeight; h++) {
+        expect(toHex(proofBytesAt(paged, aliceId, h))).toBe(toHex(proofBytesAt(resident, aliceId, h)));
+        for (const name of ['alice', 'carol']) expect(toHex(keyProofToBytes(paged.proveAccountName(name, h)))).toBe(toHex(keyProofToBytes(resident.proveAccountName(name, h))));
+      }
+    };
+    return { kv, paged, resident, aliceId, both };
+  }
+
+  it('opens with the trees left in the store and no history window when the heap has no room, and runs on', async () => {
+    const { kv, paged, resident, aliceId, both } = await run((kv) => new CoreApp({ genesis, verifier: new InlineVerifier(), kv, retainVersions: 4, heapRoom: 0 }));
+    // What the test setup dropped stays dropped; what it left to the default was decided by the room, which is none.
+    expect(paged.db.memory()).toMatchObject({ trees: 'dropped', indexTrees: 'dropped' });
+    // No window was read back, so the one in memory starts at the height it opened at; the heights before it are
+    // proven from the records left in the store, as they are from the window of the node that read them.
+    expect(paged.db.memory()).toMatchObject({ history: 'resident', historyWindow: 4 });
+    expect(paged.lowestProvableHeight).toBe(0n);
+    expect(resident.lowestProvableHeight).toBe(0n);
+    for (let h = 0n; h <= 2n; h++) {
+      expect(toHex(proofBytesAt(paged, aliceId, h))).toBe(toHex(proofBytesAt(resident, aliceId, h)));
+      expect(toHex(keyProofToBytes(paged.proveAccountName('alice', h)))).toBe(toHex(keyProofToBytes(resident.proveAccountName('alice', h))));
+    }
+    await both([tx([transferOp(aliceId, FAUCET_ID, 7n)], [alice])]);
+    await both([tx([createOp('carol', makeAuthority([carol.publicKey]))])]);
+    expect(paged.lowestProvableHeight).toBe(0n);
+    expect(paged.balance(aliceId)).toBe(resident.balance(aliceId));
+    // The records it did not read are still the store's, and age out of it as they would have.
+    const historyKeys = () => [...kv.range(new Uint8Array([0x68]), prefixEnd(new Uint8Array([0x68])))].map(([k]) => Number(k[8]));
+    expect(historyKeys()).toEqual([1, 2, 3, 4]);
+    await both([]);
+    expect(historyKeys()).toEqual([2, 3, 4, 5]);
+    // With room, the same store opens whole again, window and all.
+    const whole = new CoreApp({ genesis, verifier: new InlineVerifier(), kv, retainVersions: 4, heapRoom: 2 ** 30 });
+    expect(whole.lowestProvableHeight).toBe(1n);
+    for (let h = 1n; h <= 5n; h++) expect(toHex(proofBytesAt(whole, aliceId, h))).toBe(toHex(proofBytesAt(resident, aliceId, h)));
+    // A tier asked for by name is opened as asked, whatever the room.
+    const asked = openObjectDatabase(kv, CORE_TYPES, { retainVersions: 4, heapRoom: 0, indexTrees: true, trees: true })!;
+    expect(asked.paged).toEqual([]);
+    expect(asked.db.memory()).toMatchObject({ trees: 'resident', indexTrees: 'resident' });
+  });
+
+  it('leaves the objects in the store when the arena has no room for them, and reads them from there', async () => {
+    const { paged, resident, aliceId, both } = await run((kv) => new CoreApp({ genesis, verifier: new InlineVerifier(), kv, retainVersions: 4, arenaBytes: 0 }));
+    const stored = paged.db.memory().storedObjects;
+    expect(stored).toBeGreaterThan(5);
+    expect(paged.db.memory().arena.used).toBe(0);
+    expect(paged.lowestProvableHeight).toBe(0n);
+    expect(paged.accountByName('bob')?.name).toBe('bob');
+    await both([tx([transferOp(aliceId, FAUCET_ID, 7n)], [alice])]);
+    await both([tx([createOp('carol', makeAuthority([carol.publicKey]))])]);
+    // What the blocks wrote is in the arena again; the rest is still only in the store.
+    expect(paged.db.memory().arena.used).toBeGreaterThan(0);
+    expect(paged.db.memory().storedObjects).toBeLessThan(stored);
+    expect(paged.db.memory().storedObjects).toBeGreaterThan(0);
+    expect(paged.balance(aliceId)).toBe(resident.balance(aliceId));
+    expect([...paged.db.exportObjects()].map(([id, b]) => `${id}=${toHex(b)}`)).toEqual([...resident.db.exportObjects()].map(([id, b]) => `${id}=${toHex(b)}`));
   });
 });
 

@@ -64,6 +64,10 @@ export interface Application {
   initChain(genesis: Genesis): Promise<InitChainResult>;
   checkTx(tx: Uint8Array, opts?: CheckTxOptions): Promise<CheckTxResult>;
   finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult>;
+  /**
+   * Persist the block just finalized. An application that keeps its state in the engine's store environment does
+   * its writes before its first await, so that they join the transaction the engine saves the block in (executor.ts).
+   */
   commit(): Promise<void>;
   info(): Promise<{ lastHeight: bigint; lastAppHash: Uint8Array }>;
 }

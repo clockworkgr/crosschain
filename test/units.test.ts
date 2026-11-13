@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { txHash } from '../src/types/block.ts';
 import { decode, CodecError } from '../src/codec/reader.ts';
 import { encode } from '../src/codec/writer.ts';
 import { bytesEqual, sha256, toHex } from '../src/crypto/hash.ts';
@@ -155,5 +156,21 @@ describe('mempool', () => {
     expect(mp.reap(8).length).toBe(1);
     await mp.update([tx('a=1')]);
     expect(mp.size).toBe(1);
+  });
+
+  it('remembers the last transactions it saw, the newest taking the oldest one\'s place', async () => {
+    const mp = new Mempool(new KvStoreApp(), { cacheSize: 3 });
+    const seen = async (t: string) => (await mp.addTx(tx(t))).status === 'seen';
+    for (const t of ['a=1', 'b=1', 'c=1']) expect((await mp.addTx(tx(t))).status).toBe('added');
+    await mp.update(['a=1', 'b=1', 'c=1'].map(tx));
+    // Committed and gone from the pool, yet still remembered: gossip need not bring them again.
+    for (const t of ['a=1', 'b=1', 'c=1']) expect(await seen(t)).toBe(true);
+    // Seven more go round the ring more than twice; the three newest are what is left.
+    for (let i = 0; i < 7; i++) expect((await mp.addTx(tx(`d=${i}`))).status).toBe('added');
+    expect(await seen('d=6')).toBe(true);
+    expect(await seen('d=5')).toBe(true);
+    expect(await seen('d=4')).toBe(true);
+    expect(mp.seen(txHash(tx('d=3')))).toBe(false);
+    expect(mp.seen(txHash(tx('a=1')))).toBe(false);
   });
 });

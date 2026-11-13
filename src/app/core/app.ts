@@ -39,7 +39,7 @@ import { encode } from '../../codec/writer.ts';
 import { bytesEqual, HASH_SIZE, sha256, toHex } from '../../crypto/hash.ts';
 import { schemeName, schemeOf, schemeTag, signContext, type SchemeTag } from '../../crypto/keys.ts';
 import type { Verifier, VerifyJob } from '../../crypto/verifier.ts';
-import { decodeHistory, encodeHistory, ObjectDatabase, type Changes, type UndoSession } from '../../db/database.ts';
+import { decodeHistory, encodeHistory, estimateTiers, ObjectDatabase, type Changes, type UndoSession } from '../../db/database.ts';
 import { idToString, type ObjectId } from '../../db/id.ts';
 import { DbError, type ObjectType } from '../../db/index.ts';
 import { key } from '../../db/keys.ts';
@@ -54,7 +54,7 @@ import { authoritySatisfied, collectKeys, type AuthorityLookup } from './authori
 import { applyTransaction, getDynamic, getGlobal, pruneExpiredTxs, requiredAuthorities, TxError } from './evaluate.ts';
 import { beginBlock, endBlock } from './staking.ts';
 import { exportSnapshot, manifestToBytes } from './snapshot.ts';
-import { historyEntryFromBytes, historyEntryToBytes, HistoryRecorder, type HistoryEntry } from './history.ts';
+import { HistoryLog, HistoryRecorder, type HistoryEntry } from './history.ts';
 import { applyGenesis, parseAppGenesis, type AppGenesis } from './genesis.ts';
 import { decodeTransaction, txBodyBytes, txIdOf, type Transaction } from './tx.ts';
 import { txHash } from '../../types/block.ts';
@@ -73,6 +73,15 @@ export interface CoreAppOptions {
   indexTrees?: boolean;
   /** Start with the Merkle trees dropped, read from the store (STATE-PAGING.md section 5); default resident. */
   trees?: boolean;
+  /** The most bytes the arena of encoded objects may take, the rest read from the store (STATE-PAGING.md section 3.4); unbounded by default. */
+  arenaBytes?: number;
+  /**
+   * Bytes of heap the index trees, the Merkle trees and the history window may take when a store is opened. A tier
+   * estimated to need more is left dropped, and the history window is then not read back either (it grows again a
+   * block at a time): a state too large for the heap opens paged instead of running out while it loads. Unset, every
+   * tier is opened as `indexTrees` and `trees` say.
+   */
+  heapRoom?: number;
   /** Export a snapshot every this many blocks; 0 disables. */
   snapshotInterval?: number;
   snapshotsKept?: number;
@@ -91,7 +100,7 @@ const SIG_CACHE_SIGNATURES = 40_000;
  */
 const SIG_CACHE_VARIANTS = 4;
 
-// Key layout of the app store: 'm' meta, 'o' id, 'c' type, 'h' version, 'a' account history, 'q' history sequence,
+// Key layout of the app store: 'm' meta, 'o' id, 'c' type, 'h' version, 'l' 'p' 'L' the account history's log (history.ts),
 // 'i' index entry (db/indexstore.ts), 't' dense tree chunk (db/merkle.ts), 'n' sparse tree node (db/smt.ts).
 const META_KEY = key((k) => k.u8(0x6d));
 const OBJECT_PREFIX = key((k) => k.u8(0x6f));
@@ -101,8 +110,6 @@ const HISTORY_PREFIX = key((k) => k.u8(0x68));
 const objectKey = (id: ObjectId) => key((k) => k.u8(0x6f).u64(id));
 const counterKey = (type: number) => key((k) => k.u8(0x63).u16(type));
 const historyKey = (version: number) => key((k) => k.u8(0x68).u64(BigInt(version)));
-const accountHistoryKey = (account: ObjectId, sequence: bigint) => key((k) => k.u8(0x61).u64(account).u64(sequence));
-const sequenceKey = (account: ObjectId) => key((k) => k.u8(0x71).u64(account));
 // 's' snapshot manifest by height, 'k' snapshot chunk by height, type and index.
 const MANIFEST_PREFIX = key((k) => k.u8(0x73));
 const manifestKey = (height: bigint) => key((k) => k.u8(0x73).u64(height));
@@ -121,7 +128,9 @@ export interface OpenedDatabase {
   /** History versions found in the store that are outside the window; the writer deletes them. */
   staleHistory: number[];
   /** How long the phases of opening took, for the startup log. */
-  timing: { objects: number; importMs: number; rootMs: number; historyMs: number };
+  timing: { objects: number; importMs: number; rootMs: number; historyMs: number; indexVersions: 'records' | 'replay' | 'none' };
+  /** What was left out because `heapRoom` had no room for it: 'indexTrees', 'trees', 'history'. Empty when everything was opened. */
+  paged: string[];
 }
 
 /** How to open a store: the database's options, and how the trees come back. */
@@ -129,6 +138,10 @@ export interface OpenOptions {
   retainVersions?: number;
   indexTrees?: boolean;
   trees?: boolean;
+  /** As CoreAppOptions.arenaBytes: objects beyond it are left in the store instead of being loaded. */
+  arenaBytes?: number;
+  /** As CoreAppOptions.heapRoom: a tier that does not fit is opened dropped, and the history window with it. */
+  heapRoom?: number;
   /**
    * Take the Merkle trees from their chunks and nodes in the store (the default) instead of hashing every object and
    * inserting every index key again. Either way the root must equal the stored app hash; a store written before the
@@ -161,7 +174,22 @@ export function openObjectDatabase(kv: KvStore, types: ObjectType<any>[], opts: 
   if (!m) return null;
   const meta = decode(m, (r) => ({ height: r.u64(), appHash: r.fixed(HASH_SIZE) }));
   const { retainVersions } = opts;
-  const db = new ObjectDatabase(types, { retainVersions, indexStore: kv, indexTrees: opts.indexTrees, trees: opts.trees });
+  // With a figure for the heap's room, a tier estimated not to fit is opened dropped rather than built and then
+  // dropped by the memory guard, which would be too late: the index trees first, then the Merkle trees with what is left.
+  let { indexTrees, trees } = opts;
+  const paged: string[] = [];
+  if (opts.heapRoom !== undefined) {
+    const counter = (type: number) => {
+      const c = kv.get(counterKey(type));
+      return c ? Number(decode(c, (r) => r.u64())) : 0;
+    };
+    const est = estimateTiers(types, counter);
+    let room = opts.heapRoom;
+    if (indexTrees === undefined && est.indexTrees > room) (indexTrees = false), paged.push('indexTrees');
+    else if (indexTrees !== false) room -= est.indexTrees;
+    if (trees === undefined && est.trees > room) (trees = false), paged.push('trees');
+  }
+  const db = new ObjectDatabase(types, { retainVersions, indexStore: kv, indexTrees, trees, objectStore: (id) => kv.get(objectKey(id)), arenaBytes: opts.arenaBytes, historyStore: (version) => kv.get(historyKey(version)) });
   // A store written before the index entries were (STATE-PAGING.md phase two) has none: the objects are decoded for
   // their keys as they always were, and the entries written once below. An empty prefix in a store that has objects
   // means exactly that, because every write of objects carries their entries in the same transaction. The same holds
@@ -201,14 +229,34 @@ export function openObjectDatabase(kv: KvStore, types: ObjectType<any>[], opts: 
   db.dropChanges();
   const t2 = performance.now();
   const staleHistory: number[] = [];
+  // Reading the window back puts every tree node and object the last hundred blocks overwrote into the heap, which
+  // under a scattered load is more than the trees themselves: a store opened with a tier left out for want of room
+  // starts with an empty window instead, which fills again as blocks are applied. The records stay in the store until
+  // they age out, and the database reads a past version from them there (ObjectDatabase.past), so the heights stay
+  // provable.
+  const withHistory = paged.length === 0;
+  if (!withHistory) paged.push('history');
+  const oldest = db.currentVersion - (retainVersions ?? 100);
+  const found = new Map<number, Uint8Array | null>();
   for (const [k, v] of kv.range(HISTORY_PREFIX, prefixEnd(HISTORY_PREFIX))) {
     const version = Number(decode(k, (r) => (r.u8(), r.u64())));
-    if (version > db.currentVersion - (retainVersions ?? 100) && version <= db.currentVersion) db.loadHistory(version, decode(v, decodeHistory));
+    if (version > oldest && version <= db.currentVersion) found.set(version, withHistory ? v : null);
     else staleHistory.push(version);
   }
-  db.rebuildIndexVersions();
-  const timing = { objects, importMs: Math.round(t1 - t0), rootMs: Math.round(t2 - t1), historyMs: Math.round(performance.now() - t2) };
-  return { db, height: meta.height, appHash, staleHistory, timing };
+  // The records serve the heights from the lowest one that has every record up to the current height: one missing
+  // in between (a damaged store) would make every height below it read what the missing record overwrote as it is
+  // now, so the heights below it are not provable and their records go.
+  let from = db.currentVersion + 1;
+  while (found.has(from - 1)) from--;
+  for (const version of found.keys()) if (version < from) staleHistory.push(version);
+  for (let version = from; version <= db.currentVersion; version++) {
+    if (withHistory) db.loadHistory(version, decode(found.get(version)!, decodeHistory));
+    else db.noteStoredHistory(version);
+  }
+  found.clear();
+  const restored = withHistory ? db.restoreIndexVersions() : 'none';
+  const timing = { objects, importMs: Math.round(t1 - t0), rootMs: Math.round(t2 - t1), historyMs: Math.round(performance.now() - t2), indexVersions: restored };
+  return { db, height: meta.height, appHash, staleHistory, timing, paged };
 }
 
 type Decoded = { tx: Transaction; txId: Uint8Array } | { error: string };
@@ -228,6 +276,7 @@ export class CoreApp implements Application {
   private readonly sigCache = new Map<string, Map<string, Set<string>>>();
   /** Signature hashes held across sigCache, for its bound. */
   private sigCacheSignatures = 0;
+  private readonly historyLog: HistoryLog;
   private toPersist: { changes: Changes; meta: Meta; history: [ObjectId, HistoryEntry][] } | null = null;
   private staleHistory: number[] = [];
   private readonly recorder = new HistoryRecorder();
@@ -243,10 +292,11 @@ export class CoreApp implements Application {
     this.context = signContext(this.chainId, 'tx');
     this.log = opts.log ?? silentLogger;
     this.kv = opts.kv ?? new MemoryKv();
+    this.historyLog = new HistoryLog(this.kv);
     this.snapshotInterval = Math.max(0, opts.snapshotInterval ?? 1000);
     this.snapshotsKept = Math.max(1, opts.snapshotsKept ?? 2);
     this.snapshotChunkObjects = Math.max(1, opts.snapshotChunkObjects ?? 2000);
-    const stored = openObjectDatabase(this.kv, CORE_TYPES, { retainVersions: opts.retainVersions, indexTrees: opts.indexTrees, trees: opts.trees });
+    const stored = openObjectDatabase(this.kv, CORE_TYPES, { retainVersions: opts.retainVersions, indexTrees: opts.indexTrees, trees: opts.trees, arenaBytes: opts.arenaBytes, heapRoom: opts.heapRoom });
     if (stored) {
       this.db = stored.db;
       // The state holds the scheme genesis fixed, and the node derives its keys from the genesis it was given: the two
@@ -256,13 +306,13 @@ export class CoreApp implements Application {
       this.height = stored.height;
       this.appHash = stored.appHash;
       this.staleHistory = stored.staleHistory;
-      this.log('info', 'loaded application state', { height: this.height, appHash: this.appHash, provableFrom: this.db.lowestVersion, ...stored.timing });
+      this.log('info', 'loaded application state', { height: this.height, appHash: this.appHash, provableFrom: this.db.lowestVersion, ...stored.timing, ...(stored.paged.length > 0 ? { paged: stored.paged.join(', ') } : {}) });
     } else {
       if (opts.genesis.appStateFile && !opts.appGenesis) throw new Error('the application genesis is in a file; parse it with loadAppGenesis first');
       const t0 = performance.now();
       const g = opts.appGenesis ?? parseAppGenesis(opts.genesis.appState);
       const t1 = performance.now();
-      this.db = new ObjectDatabase(CORE_TYPES, { retainVersions: opts.retainVersions, indexStore: this.kv, indexTrees: opts.indexTrees, trees: opts.trees });
+      this.db = new ObjectDatabase(CORE_TYPES, { retainVersions: opts.retainVersions, indexStore: this.kv, indexTrees: opts.indexTrees, trees: opts.trees, objectStore: (id) => this.kv.get(objectKey(id)), arenaBytes: opts.arenaBytes, historyStore: (version) => this.kv.get(historyKey(version)) });
       applyGenesis(this.db, g, opts.genesis.genesisTime, schemeTag(opts.genesis.signatureScheme ?? 'ml-dsa-44'));
       const t2 = performance.now();
       this.appHash = this.db.root(0);
@@ -424,13 +474,7 @@ export class CoreApp implements Application {
 
   private persist(p: { changes: Changes; meta: Meta; history: [ObjectId, HistoryEntry][] }): void {
     this.kv.write((w) => {
-      const next = new Map<ObjectId, bigint>();
-      for (const [account, entry] of p.history) {
-        const seq = next.get(account) ?? this.nextSequence(account);
-        w.put(accountHistoryKey(account, seq), historyEntryToBytes(entry));
-        next.set(account, seq + 1n);
-      }
-      for (const [account, seq] of next) w.put(sequenceKey(account), encode((wr) => wr.u64(seq)));
+      this.historyLog.append(w, p.history);
       for (const c of p.changes.objects) {
         if (c.bytes) w.put(objectKey(c.id), c.bytes);
         else w.del(objectKey(c.id));
@@ -447,7 +491,8 @@ export class CoreApp implements Application {
       for (const [type, next] of p.changes.counters) w.put(counterKey(type), encode((wr) => wr.u64(BigInt(next))));
       if (p.changes.history) w.put(historyKey(p.changes.version), encode((wr) => encodeHistory(wr, p.changes.history!)));
       // History that no longer serves any provable height: the version that just left the window, and leftovers found at startup.
-      if (this.db.lowestVersion > 0) w.del(historyKey(this.db.lowestVersion));
+      // The store's window is the full one even while the memory guard has trimmed the one in memory, so a restart has it back.
+      if (this.db.lastStaleVersion > 0) w.del(historyKey(this.db.lastStaleVersion));
       for (const v of this.staleHistory) w.del(historyKey(v));
       this.staleHistory = [];
       w.put(META_KEY, encode((wr) => wr.u64(p.meta.height).fixed(p.meta.appHash)));
@@ -455,27 +500,9 @@ export class CoreApp implements Application {
     this.db.dropChanges();
   }
 
-  private nextSequence(account: ObjectId): bigint {
-    const v = this.kv.get(sequenceKey(account));
-    return v ? decode(v, (r) => r.u64()) : 0n;
-  }
-
   /** An account's history, oldest first from `from`, or newest first when reversed. */
   accountHistory(account: ObjectId, from = 0n, limit = 100, reverse = false): { entries: (HistoryEntry & { sequence: bigint })[]; total: bigint } {
-    const total = this.nextSequence(account);
-    const entries: (HistoryEntry & { sequence: bigint })[] = [];
-    if (reverse) {
-      for (let seq = total - 1n - from; seq >= 0n && entries.length < limit; seq--) {
-        const v = this.kv.get(accountHistoryKey(account, seq));
-        if (v) entries.push({ ...historyEntryFromBytes(v), sequence: seq });
-      }
-    } else {
-      for (const [k, v] of this.kv.range(accountHistoryKey(account, from), accountHistoryKey(account, total))) {
-        if (entries.length >= limit) break;
-        entries.push({ ...historyEntryFromBytes(v), sequence: decode(k, (r) => (r.u8(), r.u64(), r.u64())) });
-      }
-    }
-    return { entries, total };
+    return this.historyLog.read(account, from, limit, reverse);
   }
 
   // ---- queries, all against committed state ----

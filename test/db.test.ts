@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { sha256, toHex } from '../src/crypto/hash.ts';
-import { ObjectDatabase, type UndoSession } from '../src/db/database.ts';
+import { decodeHistory, encodeHistory, ObjectDatabase, type UndoSession } from '../src/db/database.ts';
 import { MemoryKv } from '../src/store/kv.ts';
 import { instanceOf, objectId } from '../src/db/id.ts';
 import { DbError, type ObjectType } from '../src/db/index.ts';
@@ -8,6 +8,7 @@ import { key } from '../src/db/keys.ts';
 import { BPlusTree } from '../src/db/bptree.ts';
 import { ChunkCache, DenseMerkleTree, EMPTY, heightFor, innerHash, rootFromPath, type StoreChange } from '../src/db/merkle.ts';
 import { encodeKeyProof, keyProofToBytes, proofFromBytes, proofToBytes, verifyKeyProof, verifyObjectProof } from '../src/db/proof.ts';
+import { decode } from '../src/codec/reader.ts';
 import { encode } from '../src/codec/writer.ts';
 import { nodeHeader, SparseMerkleTree, smtProofRoot, type SmtProof } from '../src/db/smt.ts';
 
@@ -1076,6 +1077,27 @@ describe('sparse merkle tree', () => {
     }
     expect(() => t.rootAt(2)).toThrow(/not available/);
   });
+
+  it('counts the nodes its past versions hold while resident, and gives them up with the window', () => {
+    const t = new SparseMerkleTree(4);
+    for (let i = 0; i < 8; i++) {
+      t.set(k(`a${i}`), v(i));
+      t.commit(i, true);
+      t.takeRecords();
+    }
+    // Four past versions, each commit having replaced at least the root.
+    const held = t.historyNodes;
+    expect(held).toBeGreaterThanOrEqual(4);
+    t.setWindow(1);
+    expect(t.historyNodes).toBeGreaterThanOrEqual(1);
+    expect(t.historyNodes).toBeLessThan(held);
+    t.setWindow(0);
+    expect(t.historyNodes).toBe(0);
+    // Commits that do not list their changes are not counted, as before.
+    const silent = new SparseMerkleTree(4);
+    for (let i = 0; i < 4; i++) (silent.set(k(`a${i}`), v(i)), silent.commit(i));
+    expect(silent.historyNodes).toBe(0);
+  });
 });
 
 describe('sparse merkle tree: dropped', () => {
@@ -1165,3 +1187,303 @@ function keyProofBytes(db: ObjectDatabase, name: string): Uint8Array {
 function keyProofBytesAt(db: ObjectDatabase, name: string, v: number): Uint8Array {
   return encode((w) => encodeKeyProof(w, db.proveKeyAt(ItemType, 'byName', key((k) => k.str(name)), v)));
 }
+
+describe('object database: a trimmed history window', () => {
+  for (const trees of [true, false]) {
+    it(`forgets the older versions at once, answers the same for the ones it keeps, and grows back (trees ${trees ? 'resident' : 'dropped'})`, () => {
+      const make = () => new ObjectDatabase([ItemType, CounterType], { retainVersions: 8, trees });
+      const whole = make();
+      const trimmed = make();
+      const step = (db: ObjectDatabase, v: number) => {
+        if (v === 0) db.create(CounterType, (id) => ({ id, n: 0n }));
+        for (let i = 0; i < 40; i++) mk(db, `v${v}-${i}`, i % 3, BigInt(i));
+        if (v > 0) for (let i = 0; i < 10; i++) db.remove(ItemType, objectId(7, 40 * (v - 1) + 3 * i));
+        if (v > 0) db.modify(ItemType, objectId(7, 40 * (v - 1) + 1), (o) => ({ ...o, value: BigInt(1000 + v) }));
+        db.modify(CounterType, objectId(3, 0), (c) => ({ ...c, n: BigInt(v) }));
+        return toHex(db.root(v));
+      };
+      const names = (v: number) => ['v0-1', 'v0-3', `v${v}-7`, 'absent'];
+      for (let v = 0; v <= 12; v++) expect(step(trimmed, v)).toBe(step(whole, v));
+      expect(trimmed.lowestVersion).toBe(4);
+      expect(trimmed.historyEstimate()).toBeGreaterThan(0);
+      const held = trimmed.historyEstimate();
+
+      trimmed.setHistoryWindow(2);
+      expect(trimmed.memory()).toMatchObject({ history: 'trimmed', historyWindow: 2, lowestVersion: 10 });
+      expect(trimmed.historyEstimate()).toBeLessThan(held);
+      for (let v = 10; v <= 12; v++) expect(proofsAt(trimmed, v, names(v))).toBe(proofsAt(whole, v, names(v)));
+      expect(() => trimmed.proofAt(objectId(7, 0), 9)).toThrow(/not available/);
+      expect(() => trimmed.getAt(ItemType, objectId(7, 1), 9)).toThrow(/not available/);
+      expect(() => trimmed.proveKeyAt(ItemType, 'byName', key((k) => k.str('v0-1')), 9)).toThrow(/not available/);
+
+      // Trimmed, the window moves with the roots and stays two wide; every root still reports its history record.
+      for (let v = 13; v <= 15; v++) {
+        expect(step(trimmed, v)).toBe(step(whole, v));
+        expect(trimmed.lastChanges!.history).toEqual(whole.lastChanges!.history);
+        expect(trimmed.lowestVersion).toBe(v - 2);
+        for (let old = v - 2; old <= v; old++) expect(proofsAt(trimmed, old, names(old))).toBe(proofsAt(whole, old, names(old)));
+        expect(() => trimmed.rootAt(v - 3)).toThrow(/not available/);
+      }
+      // What a store may forget is still counted from the full window.
+      expect(trimmed.lastStaleVersion).toBe(15 - 8);
+
+      // Let grow again, it does not take back what it forgot, and reaches its full width a root at a time.
+      trimmed.setHistoryWindow(Infinity);
+      expect(trimmed.memory()).toMatchObject({ history: 'resident', historyWindow: 8, lowestVersion: 13 });
+      for (let v = 16; v <= 26; v++) {
+        expect(step(trimmed, v)).toBe(step(whole, v));
+        expect(trimmed.lowestVersion).toBe(Math.max(13, v - 8));
+        for (let old = trimmed.lowestVersion; old <= v; old++) expect(proofsAt(trimmed, old, names(old))).toBe(proofsAt(whole, old, names(old)));
+      }
+      expect(trimmed.lowestVersion).toBe(whole.lowestVersion);
+      // Dropping or rebuilding the trees with the window trimmed keeps what the window holds.
+      trimmed.setHistoryWindow(3);
+      if (trees) trimmed.dropTrees();
+      else trimmed.rebuildTrees();
+      for (let old = 23; old <= 26; old++) expect(proofsAt(trimmed, old, names(old))).toBe(proofsAt(whole, old, names(old)));
+      expect(step(trimmed, 27)).toBe(step(whole, 27));
+      for (let old = 24; old <= 27; old++) expect(proofsAt(trimmed, old, names(old))).toBe(proofsAt(whole, old, names(old)));
+    });
+  }
+});
+
+describe('object database: past versions from the store', () => {
+  const historyKey = (v: number) => encode((w) => w.u8(0x68).u64(BigInt(v)));
+  /** Write a root's tree changes and its history record to the store as the application does, and forget the record that left the window. */
+  const persist = (db: ObjectDatabase, kv: MemoryKv) => {
+    const changes = db.lastChanges!;
+    kv.write((w) => {
+      for (const c of [...changes.indices, ...changes.trees]) {
+        if (c.value) w.put(c.key, c.value);
+        else w.del(c.key);
+      }
+      if (changes.history) w.put(historyKey(changes.version), encode((wr) => encodeHistory(wr, changes.history!)));
+      if (db.lastStaleVersion > 0) w.del(historyKey(db.lastStaleVersion));
+    });
+    db.dropChanges();
+  };
+  const step = (db: ObjectDatabase, v: number) => {
+    if (v === 0) db.create(CounterType, (id) => ({ id, n: 0n }));
+    for (let i = 0; i < 40; i++) mk(db, `v${v}-${i}`, i % 3, BigInt(i));
+    if (v > 0) for (let i = 0; i < 10; i++) db.remove(ItemType, objectId(7, 40 * (v - 1) + 3 * i));
+    if (v > 0) db.modify(ItemType, objectId(7, 40 * (v - 1) + 1), (o) => ({ ...o, value: BigInt(1000 + v) }));
+    // A name passed on: the sparse tree's leaf for it changes hands in one version.
+    if (v > 1) {
+      db.modify(ItemType, objectId(7, 40 * (v - 2) + 2), (o) => ({ ...o, name: `moved-${v}` }));
+      db.modify(ItemType, objectId(7, 40 * (v - 1) + 2), (o) => ({ ...o, name: `v${v - 2}-2` }));
+    }
+    db.modify(CounterType, objectId(3, 0), (c) => ({ ...c, n: BigInt(v) }));
+    return toHex(db.root(v));
+  };
+  const names = (v: number) => ['v0-1', 'v0-2', 'v0-3', `v${v}-7`, `v${v - 2}-2`, `moved-${v}`, 'absent'];
+  const values = (db: ObjectDatabase, v: number) => [1, 2, 3, 41, 42, 80].map((i) => JSON.stringify(db.getAt(ItemType, objectId(7, i), v), (_k, x) => (typeof x === 'bigint' ? `${x}` : x))).join(' ');
+
+  for (const trees of [true, false]) {
+    it(`answers for every version the store has a record of, whatever the window in memory holds (trees ${trees ? 'resident' : 'dropped'})`, () => {
+      const kv = new MemoryKv();
+      const whole = new ObjectDatabase([ItemType, CounterType], { retainVersions: 8, trees });
+      const paged = new ObjectDatabase([ItemType, CounterType], { retainVersions: 8, trees, indexStore: kv, historyStore: (v) => kv.get(historyKey(v)) });
+      const same = (v: number) => {
+        expect(paged.lowestVersion).toBe(whole.lowestVersion);
+        for (let old = whole.lowestVersion; old <= v; old++) {
+          expect(proofsAt(paged, old, names(old)), `version ${old} at ${v}`).toBe(proofsAt(whole, old, names(old)));
+          expect(values(paged, old)).toBe(values(whole, old));
+        }
+        expect(() => paged.rootAt(whole.lowestVersion - 1)).toThrow(/not available/);
+      };
+      for (let v = 0; v <= 12; v++) {
+        expect(step(paged, v)).toBe(step(whole, v));
+        persist(paged, kv);
+      }
+      const held = paged.historyEstimate();
+      // Trimmed to two versions, then to none: what the window has forgotten the records still say.
+      for (const window of [2, 0]) {
+        paged.setHistoryWindow(window);
+        expect(paged.memory()).toMatchObject({ history: 'trimmed', historyWindow: window, lowestVersion: 4 });
+        expect(paged.historyEstimate()).toBeLessThan(held);
+        same(12);
+      }
+      // The window moves with the roots, in memory and in the store; a root whose record the store does not have yet is answered for too.
+      for (let v = 13; v <= 16; v++) {
+        expect(step(paged, v)).toBe(step(whole, v));
+        same(v);
+        persist(paged, kv);
+        same(v);
+      }
+      // Growing back, the window in memory takes over from the records a version at a time, and both agree throughout.
+      paged.setHistoryWindow(Infinity);
+      for (let v = 17; v <= 22; v++) {
+        expect(step(paged, v)).toBe(step(whole, v));
+        persist(paged, kv);
+        same(v);
+        if (v === 19) {
+          if (trees) paged.dropTrees();
+          else paged.rebuildTrees();
+          same(v);
+        }
+      }
+      // A version whose record the store no longer has is not answered for from what is left.
+      kv.write((w) => w.del(historyKey(20)));
+      paged.setHistoryWindow(0);
+      expect(toHex(paged.rootAt(21))).toBe(toHex(whole.rootAt(21)));
+      expect(() => paged.rootAt(19)).toThrow(/no history record of version 20/);
+      expect(() => paged.proofAt(objectId(7, 1), 19)).toThrow(/no history record of version 20/);
+    });
+
+    it(`gives a reopened database its sparse trees' past versions from the records, or by replay without them (trees ${trees ? 'resident' : 'dropped'})`, () => {
+      const kv = new MemoryKv();
+      const options = (store: MemoryKv) => ({ retainVersions: 8, trees, indexStore: store, historyStore: (v: number) => store.get(historyKey(v)) });
+      const db = new ObjectDatabase([ItemType, CounterType], options(kv));
+      for (let v = 0; v <= 12; v++) {
+        step(db, v);
+        persist(db, kv);
+      }
+      for (const how of ['records', 'replay'] as const) {
+        // Its own copy of the store, as a restart finds it.
+        const copy = new MemoryKv();
+        copy.write((w) => {
+          for (const [k, v] of kv.range(Uint8Array.of(0), Uint8Array.of(0xff))) w.put(k, v);
+        });
+        const fresh = new ObjectDatabase([ItemType, CounterType], options(copy));
+        for (const [id, bytes] of db.exportObjects()) fresh.importObject(id, bytes, true);
+        for (const [t, n] of db.counters()) fresh.setCounter(t, n);
+        fresh.loadTrees(true);
+        fresh.loadIndexEntries(true);
+        expect(toHex(fresh.root(12))).toBe(toHex(db.rootAt(12)));
+        fresh.dropChanges();
+        for (let v = 5; v <= 12; v++) {
+          const record = decode(copy.get(historyKey(v))!, decodeHistory);
+          // One record as it was written before the sparse nodes were kept: nothing can be taken from the records then.
+          fresh.loadHistory(v, how === 'replay' && v === 9 ? { ...record, nodes: null } : record);
+        }
+        expect(fresh.restoreIndexVersions()).toBe(how);
+        expect(fresh.lowestVersion).toBe(db.lowestVersion);
+        for (let old = db.lowestVersion; old <= 12; old++) {
+          expect(proofsAt(fresh, old, names(old)), `${how}, version ${old}`).toBe(proofsAt(db, old, names(old)));
+          expect(values(fresh, old)).toBe(values(db, old));
+        }
+        // And it goes on from there as the first would have, past versions moving out of the window as they should.
+        const further = new ObjectDatabase([ItemType, CounterType], { retainVersions: 8, trees });
+        for (let v = 0; v <= 15; v++) {
+          const root = step(further, v);
+          if (v > 12) {
+            expect(step(fresh, v)).toBe(root);
+            persist(fresh, copy);
+            for (let old = further.lowestVersion; old <= v; old++) expect(proofsAt(fresh, old, names(old)), `${how}, version ${old} at ${v}`).toBe(proofsAt(further, old, names(old)));
+            expect(() => fresh.rootAt(further.lowestVersion - 1)).toThrow(/not available/);
+          }
+        }
+      }
+    });
+  }
+
+  it('reads a record written before the sparse tree nodes were kept, and refuses to prove a key from it', () => {
+    const kv = new MemoryKv();
+    const db = new ObjectDatabase([ItemType, CounterType], { retainVersions: 8, indexStore: kv, historyStore: (v) => kv.get(historyKey(v)) });
+    for (let v = 0; v <= 3; v++) {
+      step(db, v);
+      const record = db.lastChanges!.history;
+      persist(db, kv);
+      // As such a record was written: the same bytes, without the last section.
+      if (record) kv.write((w) => w.put(historyKey(v), encode((wr) => encodeHistory(wr, { ...record, nodes: null })).subarray(0, -1)));
+    }
+    const root = toHex(db.rootAt(1));
+    const counter = toHex(proofToBytes(db.proofAt(objectId(CounterType.id, 0), 1)));
+    db.setHistoryWindow(0);
+    expect(decode(kv.get(historyKey(2))!, decodeHistory).nodes).toBeNull();
+    // The dense trees and the objects are in the record; a type with no authenticated index needs nothing else.
+    expect(toHex(db.rootAt(1))).toBe(root);
+    expect(toHex(proofToBytes(db.proofAt(objectId(CounterType.id, 0), 1)))).toBe(counter);
+    expect(() => db.proveKeyAt(ItemType, 'byName', key((k) => k.str('v0-1')), 1)).toThrow(/not available/);
+    expect(() => db.proofAt(objectId(7, 1), 1)).toThrow(/not available/);
+  });
+});
+
+describe('object database: an arena within a byte limit', () => {
+  /** Write a root's objects to the store as the application does, then say so. */
+  const persistObjects = (db: ObjectDatabase, kv: MemoryKv) => {
+    const changes = db.lastChanges!;
+    kv.write((w) => {
+      for (const c of changes.objects) {
+        const k = encode((wr) => wr.u8(0x6f).u64(c.id));
+        if (c.bytes) w.put(k, c.bytes);
+        else w.del(k);
+      }
+      for (const c of [...changes.indices, ...changes.trees]) {
+        if (c.value) w.put(c.key, c.value);
+        else w.del(c.key);
+      }
+    });
+    db.dropChanges();
+  };
+  const objectStore = (kv: MemoryKv) => (id: bigint) => kv.get(encode((wr) => wr.u8(0x6f).u64(id)));
+
+  it('reads released objects from the store, gives the same roots and proofs, and takes written objects back', () => {
+    const kv = new MemoryKv();
+    const whole = new ObjectDatabase([ItemType, CounterType], { retainVersions: 3 });
+    const bounded = new ObjectDatabase([ItemType, CounterType], { retainVersions: 3, indexStore: kv, objectStore: objectStore(kv), arenaBytes: 0, hotObjects: 50 });
+    const pad = 'x'.repeat(40);
+    const step = (db: ObjectDatabase, v: number) => {
+      for (let i = 0; i < 4000; i++) mk(db, `${pad}v${v}-${i}`, i % 5, BigInt(i));
+      if (v > 0) {
+        for (let i = 0; i < 300; i++) db.remove(ItemType, objectId(7, 4000 * (v - 1) + 7 * i));
+        for (let i = 0; i < 300; i++) db.modify(ItemType, objectId(7, 4000 * (v - 1) + 7 * i + 1), (o) => ({ ...o, value: o.value + 1000n, group: 9 }));
+      }
+      return toHex(db.root(v));
+    };
+    const names = (v: number) => [`${pad}v0-1`, `${pad}v${v}-8`, 'absent'];
+    for (let v = 0; v < 6; v++) {
+      expect(step(bounded, v)).toBe(step(whole, v));
+      // Until the store has the root, nothing is released: the bytes are nowhere else.
+      const before = bounded.memory().storedObjects;
+      bounded.setArenaLimit(0);
+      expect(bounded.memory().storedObjects).toBe(before);
+      persistObjects(bounded, kv);
+      for (let old = Math.max(0, v - 3); old <= v; old++) expect(proofsAt(bounded, old, names(old)).length).toBe(proofsAt(whole, old, names(old)).length);
+      expect(proofsAt(bounded, v, names(v))).toBe(proofsAt(whole, v, names(v)));
+    }
+    const m = bounded.memory();
+    expect(m.arenaLimit).toBe(0);
+    expect(m.arena.slabs).toBe(1);
+    expect(m.storedObjects).toBeGreaterThan(15_000);
+    expect(whole.memory()).toMatchObject({ arenaLimit: Infinity, storedObjects: 0 });
+    // Every read answers the same: by id, by unique key, by scan, at past versions, in an export.
+    for (const i of [0, 1, 7, 8, 3999, 4001, 12_345, 23_999]) expect(bounded.get(ItemType, objectId(7, i))).toEqual(whole.get(ItemType, objectId(7, i)));
+    expect(byName(bounded, `${pad}v2-17`)).toEqual(byName(whole, `${pad}v2-17`));
+    expect(inGroup(bounded, 9)).toEqual(inGroup(whole, 9));
+    expect(bounded.getAt(ItemType, objectId(7, 16_001), 4)).toEqual(whole.getAt(ItemType, objectId(7, 16_001), 4));
+    expect([...bounded.exportObjects()].map(([id, b]) => `${id}=${toHex(b)}`)).toEqual([...whole.exportObjects()].map(([id, b]) => `${id}=${toHex(b)}`));
+    expect(toHex(bounded.encodeSnapshot(5n, bounded.rootAt(5)))).toBe(toHex(whole.encodeSnapshot(5n, whole.rootAt(5))));
+    // An object only in the store is written and removed like any other, undo included.
+    for (const db of [bounded, whole]) {
+      const s = db.startSession();
+      db.modify(ItemType, objectId(7, 5), (o) => ({ ...o, value: 77n }));
+      db.remove(ItemType, objectId(7, 6));
+      s.undo();
+      db.modify(ItemType, objectId(7, 2), (o) => ({ ...o, name: 'renamed', value: 5n }));
+      db.remove(ItemType, objectId(7, 3));
+    }
+    const stored = bounded.memory().storedObjects;
+    expect(toHex(bounded.root(6))).toBe(toHex(whole.root(6)));
+    // The removed one is no longer counted; the written one is back in the arena until the next release.
+    expect(bounded.memory().storedObjects).toBe(stored - 2);
+    persistObjects(bounded, kv);
+    expect(bounded.get(ItemType, objectId(7, 3))).toBeNull();
+    expect(byName(bounded, 'renamed')?.value).toBe(5n);
+    expect(proofsAt(bounded, 6, ['renamed', `${pad}v0-2`])).toBe(proofsAt(whole, 6, ['renamed', `${pad}v0-2`]));
+    // Lifting the limit releases nothing more, and a store that lost an object is found out when it is read.
+    bounded.setArenaLimit(Infinity);
+    kv.write((w) => w.del(encode((wr) => wr.u8(0x6f).u64(objectId(7, 9)))));
+    expect(() => bounded.get(ItemType, objectId(7, 9))).toThrow(/neither in the arena nor in the store/);
+  });
+
+  it('ignores the limit without a store to read from', () => {
+    const db = new ObjectDatabase([ItemType, CounterType], { arenaBytes: 0 });
+    for (let i = 0; i < 12_000; i++) mk(db, `${'y'.repeat(40)}${i}`, 0);
+    db.root(0);
+    db.dropChanges();
+    db.setArenaLimit(0);
+    expect(db.memory()).toMatchObject({ storedObjects: 0, arenaLimit: Infinity });
+    expect(db.memory().arena.slabs).toBeGreaterThan(1);
+  });
+});

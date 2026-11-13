@@ -38,7 +38,7 @@ import { BlockSync } from '../sync/blocksync.ts';
 import type { Genesis } from '../types/genesis.ts';
 import { makeLogger, type Logger, type LogLevel } from '../util/log.ts';
 import { BlockExecutor } from './executor.ts';
-import { GcScheduler, MemoryGuard, type GcSchedulerOptions, type MemoryGuardOptions, type MemoryLevel, type MemoryStats } from './memory.ts';
+import { GcScheduler, heapInUse, heapLimitFlag, MemoryGuard, memoryStats, type GcSchedulerOptions, type MemoryGuardOptions, type MemoryLevel, type MemoryStats } from './memory.ts';
 
 export interface NodeConfig {
   name: string;
@@ -58,10 +58,22 @@ export interface NodeConfig {
   env?: KvEnv;
   /** Join from a snapshot: a header the operator trusts, with backfill of older blocks afterwards. */
   stateSync?: { trustHeight: bigint; trustHash: Uint8Array; backfill?: boolean };
-  /** Retention: blocks kept behind the latest (all when unset), provable heights, snapshots kept. */
-  retain?: { blocks?: number; versions?: number; snapshots?: number };
+  /**
+   * Retention: blocks kept behind the latest (all when unset), provable heights, snapshots kept; and how many of the
+   * provable heights are kept in memory (all of them when unset), the store answering for the rest.
+   */
+  retain?: { blocks?: number; versions?: number; snapshots?: number; memoryVersions?: number };
   /** Export a state snapshot every this many blocks; 0 disables. */
   snapshotInterval?: number;
+  /** The most bytes the application's arena of encoded objects may take, the rest read from the store; unbounded by default. */
+  arenaBytes?: number;
+  /**
+   * Where the application's secondary indices are read from. 'memory' (the default) keeps their B+ trees in the heap
+   * while they fit, dropped under memory pressure and rebuilt after it: index reads (an account by name, a scan) are
+   * fastest. 'store' never builds them and reads LMDB: a node that mostly applies blocks commits up to a tenth more
+   * than it does while it has them (docs/benchmarks.md section 4.13), and opens with a third less in its heap.
+   */
+  indexTrees?: 'memory' | 'store';
   verifier?: Verifier;
   timeouts?: Partial<ConsensusTimeouts>;
   limits?: Partial<ValidationLimits>;
@@ -246,8 +258,15 @@ export class Node {
         retainVersions: this.cfg.retain?.versions,
         snapshotInterval: this.cfg.snapshotInterval,
         snapshotsKept: this.cfg.retain?.snapshots,
+        arenaBytes: this.cfg.arenaBytes,
+        indexTrees: this.cfg.indexTrees === 'store' ? false : undefined,
+        // Under a heap limit, a stored state whose trees would not fit below the warn line is opened paged.
+        heapRoom: heapLimitFlag() === null ? undefined : Math.max(0, Node.OPEN_FILL * memoryStats().heapLimit - heapInUse(memoryStats())),
       });
     }
+    if (this.app instanceof CoreApp && this.cfg.indexTrees === 'store') this.app.db.dropIndexTrees();
+    // A window in memory shorter than the provable one, when asked for: never longer than what the store was opened with.
+    if (this.app instanceof CoreApp && this.historyInMemory < this.app.db.historyWindow) this.app.db.setHistoryWindow(this.historyInMemory);
     this.mempool = new Mempool(this.app);
     this.executor = await BlockExecutor.open(
       {
@@ -257,6 +276,8 @@ export class Node {
         evidencePool: this.evidencePool,
         log: this.log,
         retainBlocks: this.cfg.retain?.blocks,
+        // The node's own application keeps its state in the node's environment: a block's writes and its are one transaction.
+        transaction: this.cfg.app ? undefined : (fn) => this.env.transaction(fn),
         protectedHeight: () => (this.app instanceof CoreApp ? (this.app.snapshotHeights().at(-1) ?? 0n) : 0n),
         evidenceAgeMs: () => limits.maxEvidenceAgeMs,
       },
@@ -272,11 +293,13 @@ export class Node {
       onLevel: (level, stats) => this.onMemoryLevel(level, stats),
       onSample: (level, stats) => {
         if (!(this.app instanceof CoreApp)) return;
-        const est = this.app.db.rebuildEstimate();
-        if (est.indexTrees === 0 && est.trees === 0) return;
-        // While something is dropped, the heap of the last few samples: garbage between collections included, since
-        // that is what the levels are taken from.
-        this.recentHeap.push(stats.heapUsed);
+        const est = this.rebuildEstimate(this.app.db);
+        this.sinceRebuild++;
+        if (est.indexTrees === 0 && est.trees === 0 && this.historyHeld === 0) return;
+        // While something is dropped or trimmed, the heap of the last few samples, as the levels are taken from it: the
+        // old generation's garbage between major collections included.
+        this.sinceDrop = level === 'ok' ? this.sinceDrop + 1 : 0;
+        this.recentHeap.push(heapInUse(stats));
         if (this.recentHeap.length > Node.REBUILD_WINDOW) this.recentHeap.shift();
         if (level === 'ok') this.rebuildWhatFits(stats);
       },
@@ -358,8 +381,8 @@ export class Node {
       return out;
     };
     this.network.on('inv', (peer, m) => {
-      // Under memory pressure the mempool admits nothing, so there is no point fetching what peers announce.
-      const want = m.kind === InvKind.Tx ? (this.mempool.paused ? [] : wanted(m.hashes, (h) => this.mempool.seen(h))) : m.kind === InvKind.Evidence ? wanted(m.hashes, (h) => this.evidencePool.hasHash(h)) : [];
+      // A mempool that would refuse them (full, or its limit lowered under memory pressure) fetches nothing peers announce.
+      const want = m.kind === InvKind.Tx ? (!this.mempool.accepting ? [] : wanted(m.hashes, (h) => this.mempool.seen(h))) : m.kind === InvKind.Evidence ? wanted(m.hashes, (h) => this.evidencePool.hasHash(h)) : [];
       for (let i = 0; i < want.length; i += 256) peer.send({ type: 'fetch', kind: m.kind, hashes: want.slice(i, i + 256) });
     });
     this.network.on('fetch', (peer, m) => {
@@ -418,6 +441,9 @@ export class Node {
     this.networkStarted = true;
     this.blockSync.start();
     this.consensus.start();
+    // Opening a store leaves garbage several times what it keeps (every stored entry read and checked), and the
+    // guard's first sample would take it for a full heap and stop a node that fits: collect it first.
+    await this.gcScheduler.major();
     this.memoryGuard.start();
     this.gcScheduler.start();
     this.log('info', 'node started', {
@@ -465,7 +491,7 @@ export class Node {
     return this.memoryGuard.level;
   }
 
-  /** True while load is shed: the mempool admits nothing, costly RPC methods and new streams are refused. */
+  /** True while load is shed: the mempool's limit is lowered, costly RPC methods and new streams are refused. */
   get isShedding(): boolean {
     return this.shedding;
   }
@@ -473,52 +499,107 @@ export class Node {
   /** The database's hot cache of decoded objects: unbounded while memory is fine, capped as it fills (STATE-PAGING.md section 7). */
   static readonly HOT_OBJECTS = { ok: Infinity, warn: 100_000, pressure: 10_000, critical: 10_000 } as const;
 
+  /**
+   * The share of its limit the mempool admits up to at each level. Every pooled transaction holds its bytes, its
+   * writes in the pending state and its overlay entries, so the pool's size is a dial like the others; lowered in
+   * steps, the node goes on admitting at the rate its blocks take transactions out instead of refusing everything
+   * and then everything at once. At `critical` nothing is admitted: the node is about to stop.
+   */
+  static readonly MEMPOOL_SHARE = { ok: 1, warn: 0.5, pressure: 0.1, critical: 0 } as const;
+
   private onMemoryLevel(level: MemoryLevel, stats: MemoryStats): void {
     if (level === 'warn' || level === 'pressure') void this.gcScheduler.major();
+    this.mempool.setLimit(this.mempool.maxTxs * Node.MEMPOOL_SHARE[level]);
+    if (level === 'critical') this.mempool.pause('node out of memory');
+    else this.mempool.resume();
     if (this.app instanceof CoreApp) {
       const db = this.app.db;
       db.setHotLimit(Node.HOT_OBJECTS[level]);
-      // The second and third dials: from `pressure` on the index trees are dropped, every index read going to LMDB
-      // through the overlay of the block in progress, and then the Merkle trees, every root and proof reading its
-      // paths from LMDB (STATE-PAGING.md section 7); back at `ok` both are rebuilt from LMDB. `warn` leaves them.
-      if (level === 'pressure' || level === 'critical') {
+      // The second dial, from `warn` on: the index trees are dropped, every index read going to LMDB through the
+      // overlay of the block in progress, and the window of past versions is cut to the last few, the store answering
+      // for the rest. A loaded node commits more that way than with both in its heap (docs/benchmarks.md section
+      // 4.13), so it does not wait for `pressure` to get there. The third, from `pressure` on: the Merkle trees are
+      // dropped, every root and proof reading its paths from LMDB (STATE-PAGING.md section 7). Back at `ok` each is
+      // rebuilt from LMDB when it fits.
+      if (level !== 'ok') {
         db.dropIndexTrees();
-        db.dropTrees();
+        if (level !== 'warn') db.dropTrees();
+        // What the window held, for letting it grow back.
+        if (db.historyWindow > Node.HISTORY_WHEN_PAGED) {
+          this.historyHeld = Math.max(1, this.historyHeld, db.historyEstimate());
+          db.setHistoryWindow(Node.HISTORY_WHEN_PAGED);
+        }
         this.deferredRebuild = null;
         this.recentHeap = [];
+        // How long the node ran since it last had something rebuilt (or since it started) is how long the heap took
+        // to fill: nothing is rebuilt until it has stayed at `ok` for as long again.
+        this.rebuildAfter = Math.min(Node.REBUILD_WAIT_MAX, Math.max(Node.REBUILD_WINDOW, this.sinceRebuild));
+        this.sinceDrop = 0;
       }
     }
     this.shed(level === 'pressure' || level === 'critical');
     for (const fn of this.memoryListeners) fn(level, stats);
   }
 
+  /** The share of the heap limit a stored state's trees may fill when it is opened: the guard's warn line. */
+  static readonly OPEN_FILL = 0.7;
+  /** How many past versions stay in memory from `warn` on: enough for a proof at the height a client just read. */
+  static readonly HISTORY_WHEN_PAGED = 2;
+  /** About the heap the window of past versions held when it was trimmed, 0 while it is whole: what letting it grow back will take. */
+  private historyHeld = 0;
   /** What the last deferred rebuild was waiting for, so the log says it once rather than at every sample. */
   private deferredRebuild: string | null = null;
+  /** Guard samples since something was last rebuilt (or the node started), and samples in a row at `ok` with something dropped. */
+  private sinceRebuild = 0;
+  private sinceDrop = 0;
+  /** How many samples after the last drop the node waits before it rebuilds anything; set at each drop, REBUILD_WINDOW at least. */
+  private rebuildAfter = 0;
+  /** The longest that wait gets: ten minutes at the default interval. */
+  static readonly REBUILD_WAIT_MAX = 600;
+  /** How many past versions the operator wants in memory (`retain.memoryVersions`); all of the window when unset. */
+  private get historyInMemory(): number {
+    return this.cfg.retain?.memoryVersions ?? Infinity;
+  }
   /** Heap used at each guard sample since the last drop, the latest REBUILD_WINDOW of them. */
   private recentHeap: number[] = [];
   /** How many samples after a drop the heap is watched before anything is rebuilt: ten seconds at the default interval. */
   static readonly REBUILD_WINDOW = 10;
+  /**
+   * The share of the heap limit a rebuild may fill. Well below the warn line: what is rebuilt up to that line leaves
+   * the load no room, and a node whose index trees just fitted spent minutes between `warn` and `pressure`, the
+   * collector working on a nearly full old generation, committing a fifth less than it did with them dropped.
+   */
+  static readonly REBUILD_FILL = 0.5;
+
+  /** What rebuilding the dropped tiers would take; index trees kept in the store by choice are not waiting to be rebuilt. */
+  private rebuildEstimate(db: CoreApp['db']): { indexTrees: number; trees: number } {
+    const est = db.rebuildEstimate();
+    return this.cfg.indexTrees === 'store' ? { ...est, indexTrees: 0 } : est;
+  }
 
   /**
    * At `ok`, rebuild what was dropped, but only what fits: dropping can take the heap from above the pressure line to
    * below the ok line in one go, and rebuilding all of it then would take it straight back, and the node would drop
-   * and rebuild at every sample. One sample is not enough to judge by either: right after a major collection the heap
-   * reads a few hundred MiB lower than it will a second later. So nothing is rebuilt until REBUILD_WINDOW samples
-   * have been seen since the drop, and then a tier is rebuilt when its estimated heap
-   * (ObjectDatabase.rebuildEstimate) fits under the warn line beside the highest of those samples, the index trees
-   * first; otherwise it stays dropped, which the node runs fine on, and the guard asks again at every sample while
-   * the level is `ok`.
+   * and rebuild at every sample. One sample is not enough to judge by either: right after a major collection the old
+   * generation reads lower than it will once the load has refilled it. And a load that filled the heap once fills
+   * it again: trees rebuilt ten seconds after a drop were dropped again a few minutes later, the node committing less
+   * while it had them. So nothing is rebuilt until the heap has stayed at `ok` for as long as the node had run before
+   * the drop (`rebuildAfter`: REBUILD_WINDOW samples at least, REBUILD_WAIT_MAX at most), and then a tier is rebuilt when its estimated heap
+   * (ObjectDatabase.rebuildEstimate) fits within REBUILD_FILL of the limit beside the highest of those samples, the
+   * index trees first; otherwise it stays dropped, which the node runs fine on, and the guard asks again at every
+   * sample while the level is `ok`.
    */
   private rebuildWhatFits(stats: MemoryStats): void {
     if (!(this.app instanceof CoreApp)) return;
     const db = this.app.db;
-    const est = db.rebuildEstimate();
-    if (est.indexTrees === 0 && est.trees === 0) return;
-    if (this.recentHeap.length < Node.REBUILD_WINDOW) return;
+    const est = this.rebuildEstimate(db);
+    if (est.indexTrees === 0 && est.trees === 0 && this.historyHeld === 0) return;
+    if (this.recentHeap.length < Node.REBUILD_WINDOW || this.sinceDrop < this.rebuildAfter) return;
     const peak = Math.max(...this.recentHeap);
-    let room = this.memoryGuard.o.warnAt * stats.heapLimit - peak;
+    let room = Math.min(Node.REBUILD_FILL, this.memoryGuard.o.warnAt) * stats.heapLimit - peak;
     if (est.indexTrees > 0 && est.indexTrees <= room) {
       db.rebuildIndexTrees();
+      this.sinceRebuild = 0;
       room -= est.indexTrees;
       // The samples from before it do not count for the next tier: the heap is larger by that much now.
       this.recentHeap = this.recentHeap.map((h) => h + est.indexTrees);
@@ -526,22 +607,31 @@ export class Node {
     }
     if (est.trees > 0 && est.trees <= room) {
       db.rebuildTrees();
+      this.sinceRebuild = 0;
+      room -= est.trees;
+      this.recentHeap = this.recentHeap.map((h) => h + est.trees);
       this.log('info', 'memory: Merkle trees rebuilt', { estimate: `${Math.round(est.trees / 1048576)} MiB` });
     }
-    const left = db.rebuildEstimate();
-    const waiting = left.indexTrees + left.trees > 0 ? `${Math.round((left.indexTrees + left.trees) / 1048576)} MiB` : null;
-    if (waiting && waiting !== this.deferredRebuild) this.log('info', 'memory: staying paged until the heap has room to rebuild', { needs: waiting, room: `${Math.round(Math.max(0, room) / 1048576)} MiB` });
+    const left = this.rebuildEstimate(db);
+    // Last, with both tiers back: the window of past versions is let grow again, a root at a time, if what it held fits.
+    if (this.historyHeld > 0 && left.indexTrees + left.trees === 0 && this.historyHeld <= room) {
+      db.setHistoryWindow(this.historyInMemory);
+      this.sinceRebuild = 0;
+      this.log('info', 'memory: history window restored', { estimate: `${Math.round(this.historyHeld / 1048576)} MiB`, provableFrom: db.lowestVersion });
+      this.historyHeld = 0;
+    }
+    const needs = left.indexTrees + left.trees + this.historyHeld;
+    const waiting = needs > 0 ? `${Math.round(needs / 1048576)} MiB` : null;
+    // Said once per drop: what is needed grows with the state, and a line at every MiB of it filled the log.
+    if (waiting && this.deferredRebuild === null) this.log('info', 'memory: staying paged until the heap has room to rebuild', { needs: waiting, room: `${Math.round(Math.max(0, room) / 1048576)} MiB` });
     this.deferredRebuild = waiting;
   }
 
   private shed(on: boolean): void {
     if (on === this.shedding) return;
     this.shedding = on;
-    if (on) {
-      this.mempool.pause('node under memory pressure');
-      if (this.app instanceof CoreApp) this.app.dropSignatureCache();
-    } else this.mempool.resume();
-    this.log(on ? 'warn' : 'info', on ? 'shedding load: mempool paused, costly requests refused' : 'load shedding over', { mempool: this.mempool.size });
+    if (on && this.app instanceof CoreApp) this.app.dropSignatureCache();
+    this.log(on ? 'warn' : 'info', on ? 'shedding load: mempool limit lowered, costly requests refused' : 'load shedding over', { mempool: this.mempool.size, limit: this.mempool.currentLimit });
   }
 
   get genesis(): Genesis {

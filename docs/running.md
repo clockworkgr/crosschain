@@ -17,7 +17,7 @@ the subject of the [tutorial](tutorial/00-overview.md); design decisions are in
 ```sh
 git clone <this repository> crosschain && cd crosschain
 npm install
-npm test                 # 160 tests, about a minute
+npm test                 # 203 tests, about a minute
 CHAIN_SCHEME=secp256k1 npm test   # the same suite on secp256k1 keys (one ML-DSA-only case is skipped)
 INDEX_TREES=0 npm test   # the same suite with every index B+ tree dropped from the start: lookups and scans through the store
 TREES=0 npm test         # and with every Merkle tree dropped: roots and proofs from the stored chunks and nodes; the two combine
@@ -78,9 +78,10 @@ node src/cli.ts start ./testnet/node0
 node src/cli.ts start ./testnet/node1
 node src/cli.ts start ./testnet/node2
 node src/cli.ts start ./testnet/node3 --heap 2048   # a heap limit of your own, in MiB
+node src/cli.ts start ./testnet/node3 --heap 2048 --arena 512   # and at most 512 MiB of encoded objects in memory
 ```
 
-`start <nodeDir> [--heap <MiB>]` first runs itself again as a child process under a heap limit,
+`start <nodeDir> [--heap <MiB>] [--arena <MiB>]` first runs itself again as a child process under a heap limit,
 because V8's own default is a few gigabytes whatever the machine has, and a state that outgrows
 it aborts the process with no chance to stop cleanly: `--max-old-space-size` of three quarters
 of physical memory, or the `--heap` figure in MiB (a whole number, at least 256), together with
@@ -90,13 +91,21 @@ the node under a N MiB heap limit (--heap <MiB> changes it), collections schedul
 commits`, passes `SIGINT` and `SIGTERM` on to the child, whose shutdown runs once however many
 it gets, and exits with the child's code. When `--max-old-space-size` is already in effect (in
 `node`'s own arguments or in `NODE_OPTIONS`, quoted or not, with dashes or V8's underscores),
-or `CROSSCHAIN_CHILD` is set, it runs in place instead. The node then reads `config.json` and the `genesis.json` in the parent directory, opens
+or `CROSSCHAIN_CHILD` is set, it runs in place instead. `--arena <MiB>` (a whole number, at
+least 16) bounds the encoded objects the database keeps in memory outside the heap; without it
+all of them are kept, and with it the rest are read from the store (section 12). The node then reads `config.json` and the `genesis.json` in the parent directory, opens
 LMDB under `nodeN/data/lmdb` (the application state comes back from the store with its indices
-and trees, every tree node, leaf and index entry checked against the objects; section 12), connects to the seeds, and serves
-RPC on the configured address.
+and trees, every tree node, leaf and index entry checked against the objects, and with the
+window of past heights from the history records, the line `loaded application state` saying
+with `indexVersions=records` that the name trees' past versions were taken from them and
+with `indexVersions=replay` that they were rebuilt from the accounts instead; section 12), connects to the seeds, and serves
+RPC on the configured address. A stored state whose trees are estimated not to fit the heap is
+opened paged, with those trees left in the store, and the line `loaded application state` then
+ends with `paged=` and what was left out (section 12). Past heights stay provable either way.
 Every five seconds it logs a status line: height, peers, mempool size, consensus round, active
-validator count, the community pool, `heap=<used>/<limit> MiB` (the limit being the
-`--max-old-space-size` figure, section 12), `memory=<level>` (the memory
+validator count, the community pool, `heap=<used>/<limit> MiB` (the old generation's use
+against its limit, the `--max-old-space-size` figure, which is what the guard's levels are
+taken from; section 12), `memory=<level>` (the memory
 guard's level, section 12) and `gc=<n> pauses, <total> ms, longest <max> ms` (every garbage
 collection V8 ran since start). `SIGINT` or `SIGTERM` shuts down cleanly; so does the guard's
 `critical` level, with exit code 3, so a supervisor can restart the node with a larger `--heap`,
@@ -145,7 +154,7 @@ their operator account.
 | command | what it does |
 |---|---|
 | `init [dir=./testnet] [validators=4] [basePort=26656] [--scheme ml-dsa-44\|secp256k1]` | writes a genesis, a keystore and one directory per validator, every key of the named scheme, ML-DSA-44 when absent (section 3.1) |
-| `start <nodeDir> [--heap <MiB>]` | runs a node with its RPC under a heap limit of three quarters of memory, or the given size in MiB (section 3.2); stops cleanly with exit code 3 when the heap nears the limit |
+| `start <nodeDir> [--heap <MiB>] [--arena <MiB>]` | runs a node with its RPC under a heap limit of three quarters of memory, or the given size in MiB (section 3.2); stops cleanly with exit code 3 when the heap nears the limit. `--arena` bounds the encoded objects kept in memory outside the heap (at least 16 MiB; all of them by default), the rest being read from the store (section 12) |
 | `join <dir> <nodeN> <seedAddr> <trustHeight> <trustHash> [basePort=26700]` | writes a directory for a node that joins by state sync from a header the operator trusts (section 9); refuses to touch a directory that already has a `config.json` |
 | `keys list` | names, schemes and addresses in the keystore (`--keystore <path>`, default `./keystore.json`, for every `keys` command) |
 | `keys add <name> [--scheme ml-dsa-44\|secp256k1]` | generates a key under that name, of the given scheme (ML-DSA-44 when absent); it must be the chain's, which `status` reports |
@@ -203,7 +212,9 @@ exit with status 1. Transactions expire 60 seconds after they are built, or half
 | `validatorSeed` | the seed of the consensus key; `null` makes a full node that follows but does not vote |
 | `stateSync` | present only for a node that joins from a snapshot; see section 9 |
 | `retain.blocks` | how many blocks behind the latest to keep (the latest and that many before it); unset keeps all. Blocks whose time is within the evidence window (the unbonding period) and the newest snapshot's height are kept whatever the setting, since evidence of double signing must still be checked against them. A pruned node answers `lowestHeight` in `status`; `block`, `commit`, `tx` and event replay stop there, while validator sets, account history and the provable application versions are kept on their own terms. Below its lowest block a node that joined by state sync keeps the headers alone that evidence may still name (section 9); they are pruned by the evidence window, not by this setting, a backfilled block replaces each, and `header` serves them |
-| `retain.versions` | how many past heights stay provable, beyond the current one (default 100): the window for proofs at past heights and for the light client's queries |
+| `retain.versions` | how many past heights stay provable, beyond the current one (default 100): the window for proofs at past heights and for the light client's queries. Under memory pressure the node keeps only the last two in memory until the heap has room again (section 12); the store keeps the whole window, and a proof or query at an older height in it is read from the store's history records, slower |
+| `retain.memoryVersions` | how many of the `retain.versions` past heights are kept in memory; unset keeps all of them until memory fills. The store keeps the whole window either way, so every height in `retain.versions` stays provable: a proof or query at a height older than the ones in memory is read from the store's history records, about 0.2 ms per height back against under 0.1 ms from memory. For a node with a large heap, which never reaches `warn` and would otherwise keep the whole window in its heap (section 12). What a short window buys is memory and pause length: measured at 514,000 accounts under twice the resident heap, two versions in memory instead of a hundred took about 500 MiB off the heap (a peak of 1,630 against 2,140 MiB) and the longest collection pause from 290 to 300 ms down to 190 to 200 ms. What it costs is slower proofs at past heights, 12 to 28 ms fifty and a hundred heights back instead of under 0.2 ms. Throughput is the same either way. When the node has trimmed the window under memory pressure and restores it, it restores it to this setting |
+| `indexTrees` | where the application's secondary indices (an account by name, scans) are read from: `memory` (the default) or `store`. With `memory` the node keeps their B+ trees in its heap while they fit, drops them at `warn` and rebuilds them once the heap has had room for long enough (section 12). With `store` it never builds them: index reads go to LMDB from the start, and the guard has no index trees to drop or rebuild. For a validator or a node that mostly applies blocks and serves few index lookups, or for a small heap. Measured at 192,000 accounts under 2.5 times the resident heap for ten minutes, the node opened with 258 MiB of heap in use instead of 398, a third less, and committed 1,552 transfers a second against 1,485, which is within what two runs differ by. What it costs is index reads from memory; proofs and the Merkle trees are unaffected |
 | `retain.snapshots` | how many state snapshots to keep (default 2, never fewer than 1) |
 | `snapshotInterval` | export a state snapshot every this many blocks (default 1000; `0` disables), in chunks of 2,000 objects. Peers need snapshots to serve state sync |
 
@@ -353,7 +364,7 @@ mixes them with requests is answered for the requests alone. `GET /health` answe
 
 | method | parameters | result | costly |
 |---|---|---|---|
-| `status` | | chain id, protocol version, `signatureScheme` (`ml-dsa-44` or `secp256k1`), latest height, hash, time and app hash, `catchingUp`, `lowestHeight` kept, `joinedAt` (state sync; forgotten at a restart), peer count, this node's validator address, `memory` (`level`, `shedding`, and in bytes `heapUsed`, `heapLimit`, `heapTotal`, `arrayBuffers`, `external`, `rss`; and `database`, the object database's own figures: `arena` with its `slabs` and, in bytes, their `capacity`, the `used` bytes written into them and the `dead` ones among those; `objects`, `resident` while every decoded object is kept or `capped` under the guard's cap, with `hotObjects` and `hotLimit` for the decoded objects cached and the cap, `null` while unbounded; `historyBytes` for the past values the provable window keeps; `indexTrees`, `resident`, `dropped` or `partial` (dropped for some types), and `trees`, `resident` or `dropped`, for the secondary indices' B+ trees and the Merkle trees; `treeChunks` and `treeChunkLimit` for the dense tree chunks cached while the trees are dropped and how many may be (256); and `hotHits`, `hotMisses`, `chunkHits` and `chunkMisses`, the reads the decoded-object cache and the chunk cache answered and the reads that went to the arena or the store, from which the hit rates follow; `database` is `null` for an application other than the core one), `gc` (`available`; the collections V8 ran since start as `collections`, `minor`, `major`, `incremental`, their pauses as `totalMs`, `maxMs`, `lastMs`; the `scheduledMinor` and `scheduledMajor` ones the node asked for), `rpcVersion` | |
+| `status` | | chain id, protocol version, `signatureScheme` (`ml-dsa-44` or `secp256k1`), latest height, hash, time and app hash, `catchingUp`, `lowestHeight` kept, `joinedAt` (state sync; forgotten at a restart), peer count, this node's validator address, `memory` (`level`, `shedding`, and in bytes `heapUsed`, `heapLimit`, `heapTotal`, `arrayBuffers`, `external`, `rss` and, under a heap limit as `start` sets one, `heapOld`, the old generation's use, which is the figure the level is taken from; and `database`, the object database's own figures: `arena` with its `slabs` and, in bytes, their `capacity`, the `used` bytes written into them and the `dead` ones among those; `arenaLimit`, the most bytes the slabs may take (`start --arena`), `null` while unbounded, and `storedObjects`, how many objects have their bytes only in the store because of it; `objects`, `resident` while every decoded object is kept or `capped` under the guard's cap, with `hotObjects` and `hotLimit` for the decoded objects cached and the cap, `null` while unbounded; `historyBytes` for the past values the provable window keeps; `history`, `resident` while the whole window of past versions is kept in memory or `trimmed` while the guard has cut it, with `historyWindow`, how many past versions are kept in memory just now, and `lowestVersion`, the oldest height that can be proven, which trimming does not change because older heights are read from the store's history records; `indexTrees`, `resident`, `dropped` or `partial` (dropped for some types), and `trees`, `resident` or `dropped`, for the secondary indices' B+ trees and the Merkle trees; `treeChunks` and `treeChunkLimit` for the dense tree chunks cached while the trees are dropped and how many may be (4,096); and `hotHits`, `hotMisses`, `chunkHits` and `chunkMisses`, the reads the decoded-object cache and the chunk cache answered and the reads that went to the arena or the store, from which the hit rates follow; `database` is `null` for an application other than the core one), `gc` (`available`; the collections V8 ran since start as `collections`, `minor`, `major`, `incremental`, their pauses as `totalMs`, `maxMs`, `lastMs`; the `scheduledMinor` and `scheduledMajor` ones the node asked for), `rpcVersion` | |
 | `genesis` | | the genesis document (without any application state file path) | |
 | `header` | `height?` | the header; below the lowest block, one the node keeps alone when it has it (section 9) | |
 | `block` | `height?` | header, transactions (hex), last commit, evidence, commit | yes |
@@ -368,7 +379,7 @@ mixes them with requests is answered for the requests alone. `GET /health` answe
 | `balance` | `account`, `asset?` | one balance | |
 | `accountHistory` | `account`, `from?`, `limit?` (default 20, max 100), `reverse?` | history entries with sequence numbers, oldest first from sequence `from`; with `reverse`, newest first, and `from` counts entries back from the newest | yes |
 | `tx` | `hash`, `prove?` | where the transaction landed, its result, the decoded operations, and inclusion and result proofs | yes |
-| `broadcastTx` | `tx` (hex), `mode?` (`sync`, the default, or `commit`), `timeoutMs?` (default 30,000, at most 120,000) | `sync`: the mempool's verdict, `added` or `seen`; `commit`: waits for inclusion and returns height, position and result; `-32004` while the mempool is paused under memory pressure | yes |
+| `broadcastTx` | `tx` (hex), `mode?` (`sync`, the default, or `commit`), `timeoutMs?` (default 30,000, at most 120,000) | `sync`: the mempool's verdict, `added` or `seen`; `commit`: waits for inclusion and returns height, position and result; `-32004` when the mempool is full at a limit lowered because memory is short | yes |
 | `accounts` | `limit?` (default 50, max 200), `after?` | accounts by name with their core balance, paged by name; `after` is the last name of the previous page and is not repeated | yes |
 | `parameters` | | the core asset, the fee schedule and the staking parameters in force | |
 | `proposals` | | open parameter proposals with the full parameters each would adopt | yes |
@@ -394,10 +405,15 @@ the node no longer has a provable version for), `-32001` not found, `-32002` the
 the transaction (the message says why), `-32003` not included before the timeout, `-32004` rate
 limited.
 
-While the node sheds load under memory pressure (section 12), `broadcastTx` and every costly
-method answer `-32004` with `node under memory pressure` before the rate limiter is consulted,
-and `GET /events` answers HTTP 503; the cheap methods, `/health` and the streams already open
-keep working, and everything resumes once the heap eases.
+While the node sheds load under memory pressure (section 12), every costly method but
+`broadcastTx` answers `-32004` with `node under memory pressure` before the rate limiter is
+consulted, and `GET /events` answers HTTP 503; the cheap methods, `/health` and the streams
+already open keep working, and everything resumes once the heap eases. `broadcastTx` is still
+served, because the mempool's limit is what throttles it then: from the guard's `warn` level
+the mempool admits up to a lowered limit (section 12), and a `broadcastTx` that
+finds it full at that limit answers `-32004` with `mempool full: its limit is lowered while the
+node is short of memory` rather than `-32002`: the transaction is not at fault, and the client
+tries again later.
 
 Limits per client address: a token bucket of 100 refilled at 50 a second. Every HTTP request
 spends one token, and is refused with HTTP 429 when it cannot; each costly method in it spends 4
@@ -560,21 +576,27 @@ node's answer, unproven.
   dropped. On disk the same accounts were 3.3 KB and 190 bytes each before the index entries,
   chunks and nodes were stored; those add about 1 KB an account.
 - **The memory guard.** The node samples its heap every second and holds a level by how full
-  it is; each level turns the object database's dials (STATE-PAGING.md section 7), so a
+  it is (the old generation's use against its limit; below); each level turns the object database's dials (STATE-PAGING.md section 7), so a
   filling heap trades speed for room before anything is refused. `ok`: the database keeps
   every object it has decoded and its index and Merkle trees resident. `warn`, at 70% of the
   limit (`memory: heap filling`): a major collection is started and the database's cache of
   decoded objects is capped at 100,000, the rest evicted at once; an object evicted and read
-  again is decoded afresh from the arena of encoded bytes, about a microsecond for an account.
-  `pressure`, at 85% (`memory: shedding load`): the cache is capped at 10,000; the secondary
-  indices' B+ trees are dropped, every lookup becoming one LMDB read and every scan an LMDB
-  cursor merged with the writes of the block in progress; then the Merkle trees are dropped,
+  again is decoded afresh from the arena of encoded bytes, about a microsecond for an account;
+  the secondary indices' B+ trees are dropped, every lookup becoming one LMDB read and every
+  scan an LMDB cursor merged with the writes of the block in progress; the window of past
+  versions kept in memory is cut to the last two (below);
+  and the mempool admits up to half its limit, 5,000 transactions. Nothing is refused at
+  `warn`: a block of transfers looks up no index and reads no past version, and a loaded
+  node commits more with both in the store than in its heap.
+  `pressure`, at 85% (`memory: shedding load`): the cache is capped at 10,000; the Merkle trees are dropped as well,
   every root and proof reading its paths from the chunks and nodes in the store through a
-  cache of 256 chunks; and the mempool stops admitting transactions and fetches none that
-  peers announce, costly RPC methods and new event streams are refused, and the signature
+  cache of 4,096 chunks (at most 128 MiB of buffers, outside the heap, enough to hold the
+  dense trees of about two million objects whole); and the mempool admits up to a tenth of its limit, 1,000 transactions, costly RPC
+  methods (all but `broadcastTx`, which the mempool's limit throttles) and new event streams are refused, and the signature
   cache is dropped, while consensus and block sync go on with whatever is pooled, so a
   validator keeps voting and a full node keeps following, now through the store. `critical`,
-  at 95% (`memory: heap at the limit; stopping before the process aborts`): the CLI stops the
+  at 95% (`memory: heap at the limit; stopping before the process aborts`): the mempool is
+  paused and the CLI stops the
   node cleanly, RPC, node, store and verifier in that order, and exits with code 3, so a
   supervisor restarts it with a larger heap instead of finding a process V8 aborted; it is
   reached only when one block's working set does not fit. A level is left only once the heap
@@ -583,40 +605,153 @@ node's answer, unproven.
   lifted at once, but the trees are rebuilt only when they fit: dropping them frees so much
   (130 to 175 MiB for the index trees and 190 to 220 MiB for the Merkle trees at 192,000
   accounts) that a node which rebuilt them at the first `ok` sample went straight back to
-  `pressure`, over and over. So the node waits ten samples after a drop, then rebuilds a tier
+  `pressure`, over and over. And a load that filled the heap once fills it again: trees
+  rebuilt a few seconds after a drop were dropped again a few minutes later, the node
+  committing about a tenth less while it had its index trees. So the node waits after a drop until the level has
+  been `ok` for as many samples in a row as it had run since it last rebuilt something
+  (or since it started), at least ten and at most 600, which is ten minutes at the default
+  interval. Then it rebuilds a tier
   when its estimated heap (210 bytes per index entry, 2,000 per name-tree leaf and 500 per
-  record of a past version it must build again) fits under the
-  `warn` line beside the highest of those ten samples, the index trees first (`memory: index
+  record of a past version it must build again) fits within half
+  the heap limit beside the highest of the last ten samples, the index trees first; a tier
+  rebuilt right up to the `warn` line left the load no room, and a node that did so
+  committed about a fifth less than with the tier left dropped (`memory: index
   trees rebuilt`, `memory: Merkle trees rebuilt`); what does not fit stays dropped, the node
   running on the store at `ok`, and the guard says once what it is waiting for (`memory:
-  staying paged until the heap has room to rebuild`, with `needs` and `room` in MiB) and asks
-  again at every sample. What paging costs (docs/benchmarks.md sections 4.11 to 4.13): with
+  staying paged until the heap has room to rebuild`, with `needs` and `room` in MiB, once
+  per drop) and asks again at every sample. The mempool's limit follows the level rather than the pool being
+  paused: lowering it evicts nothing, what is pooled is still reaped, and transactions are
+  admitted again as soon as blocks have taken the pool below the limit; while the pool would
+  refuse, the node fetches none that peers announce. A refusal at a lowered limit says so
+  (`mempool full: its limit is lowered while the node is short of memory`). The history
+  window: from `warn` the database keeps only the last two past versions in memory and
+  forgets the older ones at once (past object values and the records of overwritten tree
+  nodes, which are what still grew with everything else dropped). Nothing consensus does reads
+  a past version. The store is not trimmed: it keeps the whole `retain.versions` window, with
+  a history record for each height that says what that height overwrote (object bytes,
+  counters, tree nodes). What notices the cut is a proof or a query at a height older than
+  the last two: it is no longer answered from memory but from those records, by scanning the
+  record of every height after the one asked about, so it gives the same answer, takes
+  longer the further back the height is, and costs no memory, since nothing read is kept.
+  Measured at 192,000 accounts under full blocks, a proof takes about 0.2 ms per height back, 19 ms at the oldest of a hundred, against a tenth of a millisecond from memory (docs/benchmarks.md section 4.13). Every height in
+  `retain.versions` therefore stays provable while the window is cut; `status` shows
+  `history: trimmed`, the number of versions in memory as `historyWindow`, and the oldest
+  provable height, unchanged, as `lowestVersion`. In the running node what was forgotten
+  stays forgotten in memory: once both tiers of trees are rebuilt and the node's estimate of
+  what the window held fits in the room left within half the heap limit, the window is let grow again (`memory:
+  history window restored`), one block at a time, up to `retain.memoryVersions` when that
+  is set, and a restart with enough heap reads the
+  whole window back, the name trees' past versions from the nodes the history records
+  hold (`indexVersions=records` in the line `loaded application state`) without replaying
+  the accounts. One exception: a store written by a build from before the history
+  records carried the name tree's nodes cannot prove an account or a name from those
+  records (`... is not available: the record of version N was written without the sparse
+  tree nodes`); they age out after `retain.versions` blocks. A node with a large heap
+  never reaches `warn`, so it never trims the window and keeps all of it in its heap.
+  `retain.memoryVersions` in
+  `config.json` sets how many past versions such a node keeps in memory from the start;
+  the store answers for the rest as it does while the window is cut, and `status` shows
+  `history: trimmed` with that number as `historyWindow`. Measured at 514,000 accounts
+  under a heap of 3,126 MiB, twice the resident heap, for two minutes, twice each way:
+  with the whole window in memory the node committed 1,355 and 1,255 transfers a second
+  on a heap that peaked at 2,140 MiB with a longest collection pause of 290 to 300 ms;
+  with two versions, 1,369 and 1,241 on a peak of 1,630 MiB with a longest pause of 190
+  to 200 ms. A short window does not change throughput. It saves about 500 MiB at that
+  size and shortens the pauses, and a proof fifty or a hundred heights back takes 12 to
+  28 ms instead of under 0.2 ms. Whether the index trees are in memory at all is a setting
+  as well: `indexTrees` in `config.json`, `memory` by default. With `store` the node never
+  builds them, reads every index from LMDB as it does after a drop, and does not count
+  them among what it waits to rebuild, so `status` shows `indexTrees: dropped` for good.
+  Choose it for a validator or a node that mostly applies blocks and serves few index
+  lookups (accounts by name, scans), or for a small heap. Measured at 192,000 accounts
+  under a heap of 1,488 MiB, 2.5 times the resident heap, for ten minutes: by default the
+  node opened with 398 MiB of heap in use, committed 1,485 transfers a second in 1,780
+  blocks and reached `warn` twice, with a longest collection pause of 132 ms; with `store`
+  it opened with 258 MiB, a third less, committed 1,552 a second in 1,823 blocks and
+  reached `warn` once, at 40 s, from the history window and the cache, with a longest
+  pause of 155 ms. Over the whole run the two rates are within what two runs differ by
+  (4.5%); the default run's own stretches show the cost of the trees (below). After that
+  one `warn` the node has nothing to rebuild but the window. What the setting gives up is
+  index reads from memory, which were not measured under it; proofs and the Merkle trees
+  are unaffected. What paging costs (docs/benchmarks.md sections 4.11 to 4.13): with
   the cache capped a block of transfers among random accounts takes about twice as long; the
   index trees dropped cost a block of transfers nothing (a lookup through LMDB costs about
   what a resident one does, a scan four to six times as much, still under a microsecond an
-  entry); the Merkle trees dropped cost 5 to 20% of throughput, all of it in the commit, which
-  reads its chunks from LMDB instead of writing in place (a root over 1,000 changes 54 ms
-  against 20, a name proof four times as much); and with everything dropped the database runs
+  entry); the Merkle trees dropped cost less than a tenth of throughput now that their chunk cache
+  holds every chunk (10.3 against 10.9 blocks a second of 500 transfers; with a cache of 256
+  chunks it was 7.7 against 9.4), the first root after a drop reading its chunks from LMDB
+  (a root over 1,000 changes 54 ms against 20 on average, 24 at the median) and a name proof
+  costing four times as much; and with everything dropped the database runs
   on 40 to 50% of its resident heap. What the guard buys is a node that keeps committing at
-  its limit instead of aborting, slower, and a clean stop with a reason when even that is not
-  enough. Two things to know. The limit the node measures against and reports is the old
+  its limit instead of aborting, at the throughput it has resident within a tenth, and a
+  clean stop with a reason when even that is not enough. Two things to know. The limit the node measures against and reports is the old
   generation's, the `--max-old-space-size` figure `start` passes (`--heap 512` shows as
   512 MiB), because V8's own `heap_size_limit` adds the young generation's reserve, 192 MiB
   with the 64 MiB semi-spaces, which long-lived objects never fill, and a guard measured
-  against it put `pressure` past the point of the abort. And a store cannot yet be opened with
-  its tiers already dropped: a node builds every tier resident before the guard samples, so a
-  `--heap` below what opening the store takes, about two thirds of the resident heap
-  (docs/benchmarks.md section 4.13), still aborts at startup; above that the node opens and
-  pages from its first samples, down to 0.8 times the resident heap in the measured runs, at 15
-  to 25% of throughput. Give the node a `--heap` the resident state fits under when you can,
-  and the guard pages only what the load adds. What no dial sheds is the
-  version history window (`retain.versions`) and the recent transaction ids, which grow with
-  every block of scattered transfers; a node that lives at its limit under load alternates
-  between `warn` and `pressure` on them, and a smaller window or a larger heap is the fix.
+  against it put `pressure` past the point of the abort. The use it is compared with, and
+  the `heap=` of the status line, is the old generation's as well (`heapOld` in `status`):
+  V8's used heap, `heapUsed`, also counts the young generation, which between two minor
+  collections holds up to 64 MiB of garbage that never reaches the old generation, and
+  on a small heap that read as full (a node under a 153 MiB limit logged `critical` at
+  `162/153 MiB` a moment before a collection left 42). So `heapUsed` in `status` can be
+  above the figure in the status line. And a store too large for the heap
+  is opened paged. The guard cannot page anything while the store is opened, so the node
+  decides beforehand: it takes 0.7 of the heap limit less the old generation's heap in use as the room, and
+  estimates the index trees and the Merkle trees from the object counts in the store (210
+  bytes per index entry, 2,000 per name-tree leaf). If the index trees do not fit they are
+  left in the store, then the Merkle trees if they do not fit what remains. When either is left
+  out the history window is not read back either, because reading it takes more heap than the
+  trees: the node starts with no window in memory, which fills again a block at a time. The
+  records stay in the store until they age out, and the heights before the one the node
+  opened at are proven from them as under a cut window, so `lowestVersion` is what it would
+  have been. The line
+  `loaded application state` then carries `paged=indexTrees, trees, history`, naming what was
+  left out, and the trees are rebuilt later if room appears, as after a drop. Measured
+  (docs/benchmarks.md section 4.13), a 192,000-account state that takes 595 MiB resident
+  opened and ran under a `--heap` of a quarter of that (149 MiB: every tier left in the
+  store, 34 MiB of heap after opening, 1,193 transfers a second for a minute without reaching
+  `pressure`), and at the resident figure or 0.8 times
+  it committed 1,620 and 1,520 transfers a second for ten minutes with nothing refused after
+  the first two seconds and no visit to `pressure`. A `--heap` below the resident state
+  costs a loaded node no throughput: at 192,000 accounts it committed 1,650 to 1,800
+  transfers a second at every limit from 0.8 to 2.0 times its resident heap, which is the
+  spread between runs. What it costs is the reads that go through the store,
+  scans, name proofs and proofs at heights the trimmed window no longer holds. What the
+  `warn` level is for is the slow stretch of a long run. While the index trees were dropped
+  only at `pressure`, under a sustained full load
+  the rate fell by a third over the first minutes, while the index trees were resident and
+  the heap climbed towards the pressure line (each transfer adds two entries to them, and
+  collections took 7 to 12% of the time), and returned to 1,330 to 1,560 transfers a second,
+  level, once they were dropped; they are now dropped at `warn`, with the history window,
+  and the same ten-minute run holds 1,530 to 1,780 transfers a second from its first minute
+  to its last, at `ok` but for half a second at `warn` every two minutes or so. Under a
+  heap of 2.5 times the resident state the same run shows the wait before a rebuild: the
+  index trees were dropped at `warn` 34 seconds in and rebuilt 30 seconds later, dropped
+  again at 211 seconds and, after a wait as long as the node had run since the rebuild,
+  left in the store for want of room. The node committed 1,310 to 1,440 transfers a
+  second while they were resident and 1,420 to 1,600 while they were not: resident index
+  trees cost such a load about a tenth, and in return index reads (accounts by name,
+  scans) are served from memory.
+  The store's part in that was small: LMDB's own work for the
+  application's commit grew by half over 400 blocks (17 to 26 ms), most of it the account
+  history, whose entries were keyed by account and came to dirty a page each. The account
+  history is now one log in block order, a block's entries appended to its end, a few pages
+  a block, and the same commit grows from 15.1 to 19.4 ms. The larger and noisier part
+  of a commit is the flush to the device, of which a block now pays one (the block and the
+  application's state are one transaction) where it paid two.
   Array buffers (ML-DSA keys, stored bytes, the database's arena) live outside the V8 heap and
   outside the guard's fraction, so a machine that runs out of physical memory for them meets
   the operating system's killer, not the guard; `status` reports `arrayBuffers` and `rss`
-  beside the heap figures. Collections are scheduled as well: right after every commit, the
+  beside the heap figures. The arena, the encoded bytes of every object, is the part of them
+  that grows with the state, and since the guard does not see it, it is bounded by hand:
+  `start --arena <MiB>` (at least 16) holds its slabs within that many MiB. After each commit
+  the slabs beyond the limit are released whole, those nothing has read since the last pass
+  first and never the one being filled, and an object whose slab was released is read from the
+  store (one LMDB read and a decode) when it is not among the decoded objects cached; it is
+  kept in the arena again when it is next written. At startup, objects beyond the limit are
+  left in the store instead of being loaded. `status` shows the limit and how many objects are
+  only in the store (`arenaLimit`, `storedObjects`). Without `--arena` nothing is released. Measured on a 192,000-account secp256k1 state (docs/benchmarks.md section 4.13), budgets of 32 and 16 MiB cost no throughput that could be measured (1,520 and 1,500 transfers a second against 1,511 without one), and 16 MiB, a quarter of what the arena otherwise grew to, saved 48 MiB of array buffers; it matters more for an ML-DSA-44 state, whose keys are most of the arena.
+  Collections are scheduled as well: right after every commit, the
   idle moment before the next proposal, a minor collection runs, and a major one is started
   once the heap has grown by 256 MiB or a tenth of the limit since the last; the status line
   and `status` count every pause V8 takes, scheduled or not.
@@ -627,7 +762,7 @@ node's answer, unproven.
   status line and `status` also count the garbage collection pauses since start with their
   total and longest duration (`gc`), so a node whose pauses grow can be seen before it stalls,
   and `status` reports under `memory.database` which tiers of the state are resident or
-  dropped and how often the caches hit (section 8), so a node that is paging can be seen too.
+  dropped, whether the history window is trimmed and how often the caches hit (section 8), so a node that is paging can be seen too.
 - **Upgrades.** There is no deployed network and encodings may change between versions. A node
   whose data directory belongs to another chain id refuses to start; a block from another
   protocol version is rejected by validation.
@@ -642,11 +777,17 @@ node's answer, unproven.
 | no blocks, round numbers climbing in `status` | two thirds or less of the voting power is online; more than two thirds is needed |
 | `rate limited` (`-32004`) | the client exceeded the token bucket: a request spends one token and each costly call four more, from 100 refilled at 50 a second |
 | `node under memory pressure` (`-32004`), or HTTP 503 from `/events` | the node is shedding load at the guard's `pressure` level (section 12): broadcasts, costly calls and new event streams are refused until the heap eases; cheap calls and `/health`, which reports the level, still answer |
-| `memory: heap filling` | the heap is 70% full (`warn`); a major collection was started and the database's cache capped at 100,000 decoded objects. Watch `heap=` in the status line, and plan a larger `--heap` if it keeps climbing |
-| `memory: shedding load`, then `shedding load: mempool paused, costly requests refused` | the heap is 85% full (`pressure`): the mempool admits and fetches nothing, costly RPC calls and new streams are refused, the signature cache is dropped, the database's cache is capped at 10,000 decoded objects and its index trees and Merkle trees are dropped, lookups, scans, roots and proofs reading the store; consensus and block sync go on. `memory: easing` and `load shedding over` follow once the heap falls 5 points below the threshold; the trees come back only when they fit (next row) |
-| `memory: staying paged until the heap has room to rebuild` | the heap eased to `ok` with the index trees or the Merkle trees dropped, and rebuilding them (`needs`) does not fit under the `warn` line beside the heap of the last ten samples (`room`). Nothing is wrong: the node runs on the store, slower (section 12), and rebuilds when the room appears (`memory: index trees rebuilt`, `memory: Merkle trees rebuilt`); a larger `--heap` brings the trees back for good |
+| `mempool full: its limit is lowered while the node is short of memory` (`-32004`) | the heap is at `warn` or above and the mempool already holds as many transactions as it admits at that level (half its limit at `warn`). Nothing is wrong with the transaction: send it again once blocks have taken some out |
+| `... is not available: the record of version N was written without the sparse tree nodes`, for a height inside `retain.versions` | the history window in memory was trimmed at `warn` or above (`status` shows `history: trimmed`), is kept short by `retain.memoryVersions`, or the store was opened paged without it, so the height is read from the store's history records, and the record named was written by an earlier build that did not keep what a proof of an account or a name needs. Such records age out after `retain.versions` blocks; a restart with enough heap reads the whole window into memory and proves the height at once |
+| `... is not available: the store has no history record of version V`, or after a restart a `provableFrom` in the line `loaded application state` (`lowestVersion` in `status`) higher than `retain.versions` gives | the store has lost a history record (a damaged store). A height whose proof would need the missing record is refused, since answering from the records that are left would give a wrong proof. At the next start the node uses only the records that are unbroken up to the current height: the heights below the gap are not provable, their records are deleted with the next commit, and the window fills again as blocks are applied |
+| a proof or query at a past height is slow | the same situation with current records: heights older than the window in memory (`historyWindow` in `status`) are read from the store's history records (section 12). The window grows back a block at a time once the heap has room (`memory: history window restored`), up to `retain.memoryVersions` when that is set |
+| `memory: heap filling` | the heap is 70% full (`warn`); a major collection was started, the database's cache capped at 100,000 decoded objects, its index trees dropped, lookups and scans reading the store, the history window in memory cut to the last two versions, and the mempool's limit halved. Nothing is refused. Watch `heap=` in the status line, and plan a larger `--heap` if it keeps climbing |
+| `memory: shedding load`, then `shedding load: mempool limit lowered, costly requests refused` | the heap is 85% full (`pressure`): the mempool admits up to a tenth of its limit (`limit` in the line) and fetches nothing while it holds that many, costly RPC calls and new streams are refused, the signature cache is dropped, the database's cache is capped at 10,000 decoded objects, and its Merkle trees are dropped after the index trees that went at `warn`, roots and proofs reading the store like lookups and scans, the history window in memory staying at the last two versions; consensus and block sync go on. `memory: easing` and `load shedding over` follow once the heap falls 5 points below the threshold; the trees come back only when they fit (next row) |
+| `memory: staying paged until the heap has room to rebuild` | the heap eased to `ok` with the index trees or the Merkle trees dropped or the history window trimmed, and rebuilding them (`needs`) does not fit within half the heap limit beside the heap of the last ten samples (`room`). The line comes once per drop, after the wait at `ok` that precedes any rebuild (section 12). Nothing is wrong: the node runs on the store, its blocks at the rate they have resident within a tenth and its scans and proofs slower (section 12), and rebuilds when the room appears (`memory: index trees rebuilt`, `memory: Merkle trees rebuilt`); a larger `--heap` brings the trees back for good |
 | `memory: heap at the limit; stopping before the process aborts (raise --max-old-space-size or --heap)`, then exit code 3 | the heap is 95% full (`critical`); the node stopped cleanly rather than wait for V8 to abort it. Start it again with a larger `--heap`, or on a machine with more memory: one block's working set did not fit even with every tier dropped, and nothing but the limit changes that |
-| the process aborts while loading the state (V8's out-of-memory error), or reaches `critical` as soon as it starts | the `--heap` is below what opening the store takes, about two thirds of the resident heap: a store is opened with every tier resident before the guard can page anything (section 12). Start with a larger `--heap`; from about 0.8 times the resident heap upward the node opens and pages, and with the resident state under the limit the guard pages only what the load adds |
+| `loaded application state` with `paged=indexTrees, trees, history` | the trees named were estimated not to fit the heap and were left in the store, and the history window was not read back (section 12). Nothing is wrong: the node runs on the store, its blocks at the rate they have resident within a tenth and its scans and proofs slower, proves the heights before the one it opened at from the store's history records, and rebuilds the trees if room appears. A larger `--heap` opens the state whole |
+| the process aborts while loading the state (V8's out-of-memory error), or reaches `critical` as soon as it starts | the `--heap` is below what opening the store takes even with the trees left in the store (the node opens a state paged when its trees do not fit; section 12). Start with a larger `--heap`; with the resident state under the limit the guard pages only what the load adds |
+| `--arena takes a size in MiB, at least 16` | `--arena` was given something other than a whole number of MiB of 16 or more |
 | `--heap takes a size in MiB, at least 256` | `--heap` was given something other than a whole number of MiB of 256 or more |
 | `gc: not exposed; collections run when V8 decides (start with --expose-gc to schedule them after commits)` | the node runs without `--expose-gc`: `start` found `--max-old-space-size` already set and did not wrap itself, or the node is embedded in a program. Nothing is wrong; collections are simply not scheduled after commits |
 | `operation 0 states a fee of X, the schedule requires Y` | the fee schedule changed after the transaction was built; rebuild it |

@@ -2,12 +2,18 @@ import { describe, expect, it } from 'vitest';
 import { Arena, HEADER, MAX_ENTRY, packRef, slabOf, type ArenaOwner } from '../src/db/arena.ts';
 
 /** An owner holding one reference per (type, instance). */
-function owner(): ArenaOwner & { refs: Map<string, number> } {
+function owner(): ArenaOwner & { refs: Map<string, number>; gone: string[] } {
   const refs = new Map<string, number>();
+  const gone: string[] = [];
   return {
     refs,
+    gone,
     refOf: (type, instance) => refs.get(`${type}/${instance}`) ?? -1,
     relocate: (type, instance, ref) => void refs.set(`${type}/${instance}`, ref),
+    released: (type, instance) => {
+      refs.delete(`${type}/${instance}`);
+      gone.push(`${type}/${instance}`);
+    },
   };
 }
 
@@ -72,7 +78,7 @@ describe('arena reclamation', () => {
   it('releases every fully dead slab at a root without copying from it, however many there are', () => {
     const o = owner();
     let asked = 0;
-    const counting: ArenaOwner = { refOf: (t, i) => (asked++, o.refOf(t, i)), relocate: o.relocate };
+    const counting: ArenaOwner = { refOf: (t, i) => (asked++, o.refOf(t, i)), relocate: o.relocate, released: o.released };
     const a = new Arena(counting);
     // Entries that fill a slab each: three objects rewritten at every root leave three slabs wholly dead.
     const big = bytesOf(MAX_ENTRY, 7);
@@ -138,5 +144,41 @@ describe('arena reclamation', () => {
     expect(top % 2 ** 24).toBe(2 ** 24 - 1);
     expect(() => packRef(2 ** 29, 0)).toThrow(RangeError);
     expect(() => packRef(0, 2 ** 24)).toThrow(RangeError);
+  });
+});
+
+describe('arena as a cache', () => {
+  it('releases whole slabs down to a byte limit, unread ones first, and tells the owner of every live entry', () => {
+    const o = owner();
+    const a = new Arena(o);
+    // Slabs of 256 KiB, 512 KiB, 1 MiB and 2 MiB: one entry of 200,000 bytes fills the first, then two, five, ten.
+    const entry = bytesOf(200_000, 3);
+    for (let i = 0; i < 12; i++) o.refs.set(`1/${i}`, a.alloc(1, i, entry));
+    expect(a.stats.slabs).toBe(4);
+    const capacity = a.stats.capacity;
+    // A dead entry in a released slab is not reported, only the live ones.
+    a.free(o.refs.get('1/1')!);
+    o.refs.delete('1/1');
+    // Nothing to do while it fits.
+    expect(a.shrink(capacity)).toBe(0);
+    // The second slab (entries 1 and 2) was read, so the first and third go before it.
+    a.read(o.refs.get('1/2')!);
+    const released = a.shrink(capacity - 1);
+    expect(released).toBe(256 * 1024);
+    expect(o.gone).toEqual(['1/0']);
+    expect(a.shrink(2 * 1024 * 1024 + 512 * 1024)).toBe(1024 * 1024);
+    expect(o.gone).toEqual(['1/0', '1/3', '1/4', '1/5', '1/6', '1/7']);
+    expect(a.read(o.refs.get('1/2')!).length).toBe(200_000);
+    // To nothing: every slab but the current one goes, read or not, and what it held is reported once.
+    a.read(o.refs.get('1/2')!);
+    a.shrink(0);
+    expect(o.gone).toEqual(['1/0', '1/3', '1/4', '1/5', '1/6', '1/7', '1/2']);
+    expect(a.stats.slabs).toBe(1);
+    expect([...o.refs.keys()]).toEqual(['1/8', '1/9', '1/10', '1/11']);
+    for (const k of o.refs.keys()) expect(a.read(o.refs.get(k)!)[0]).toBe(3);
+    // The freed slots are used again, and a reference into a slab that went is refused.
+    o.refs.set('1/20', a.alloc(1, 20, bytesOf(1_900_000, 9)));
+    expect(a.read(o.refs.get('1/20')!)[5]).toBe(9);
+    expect(a.stats.slabs).toBe(2);
   });
 });

@@ -69,7 +69,21 @@ A node can die at any instruction. What has to hold on restart: no block is appl
  * missing blocks, checking that the app hash comes out the same.
 ```
 
-Dying before step 2 loses nothing: the block was decided by the network and will be fetched by block sync, and the validator's own votes are protected by the signing guard of chapter 4. Dying between 2 and 3 is the case `replayToApp` handles. Dying after 3 is a clean state. `DESIGN.md` section 2 calls this the "crash recovery handshake" and section 4 confirms the order. The application's `info()` is the handshake: it reports the height and hash it last committed.
+Dying before step 2 loses nothing: the block was decided by the network and will be fetched by block sync, and the validator's own votes are protected by the signing guard of chapter 4. Dying between 2 and 3 is the case `replayToApp` handles. Dying after 3 is a clean state.
+
+The header goes on to say when steps 2 and 3 are one write:
+
+```ts
+ * When the application keeps its state in the same store environment as the
+ * chain (a node with its own CoreApp), steps 2 and 3 run inside one store
+ * transaction (ExecutorDeps.transaction): both land or neither does, and the
+ * device is flushed once per block instead of twice, which is most of what a
+ * commit costs. The order inside it is the same, and so is the recovery: an
+ * application that writes later than that, or elsewhere, is still never
+ * ahead of the chain state.
+```
+
+Every store transaction ends with a flush to the device (`F_FULLFSYNC` on macOS), and the flush measured as the larger and by far the noisier part of a commit: the application's commit of a 500-transfer block at 192,000 accounts was 17 to 26 ms of LMDB's own work and 40 to 120 ms with the flush when this was measured (15 to 19 ms of LMDB's own work since the account history became a log, [chapter 11](11-application.md)). With steps 2 and 3 in separate transactions a block paid for two flushes; in one it pays for one, and the block and the application state it produced land atomically, so for such a node there is no "between 2 and 3" on disk. The case does not go away. An application that keeps its state somewhere else (the key-value application's JSON file, a `CoreApp` handed to the node with its own store) still commits after the chain store has, and a `commit()` that fails leaves the chain's writes in place, so `open` still compares heights through `info()` and replays. `DESIGN.md` section 2 calls this the "crash recovery handshake" and section 4 confirms the order. The application's `info()` is the handshake: it reports the height and hash it last committed.
 
 ### Retention
 
@@ -131,7 +145,7 @@ The app hash:
 
 Sorted entries through the deterministic codec, then `sha256`: every node that applied the same blocks reports the same hash, whatever order the keys were inserted in. The initial hash is `sha256` of nothing.
 
-`parse(tx)` decodes with `TextDecoder('utf-8', { fatal: true })` so invalid UTF-8 is an error rather than replacement characters, then recognises the two forms and validates the public key with `isPublicKey` (a known scheme tag followed by exactly that scheme's key, [chapter 2](02-crypto.md)) and that the power is decimal digits. `checkTx` is `parse` and nothing more: it is stateless, so the post-commit recheck can never evict anything for this application. `initChain` loads `genesis.appState` as a JSON object of string keys into `committed`, persists, and returns the app hash with no validators (the engine uses the genesis list). `finalizeBlock`:
+`parse(tx)` decodes with `TextDecoder('utf-8', { fatal: true })` so invalid UTF-8 is an error rather than replacement characters, then recognises the two forms and validates the public key with `isPublicKey` (a known scheme tag followed by exactly that scheme's key, which for secp256k1 must also be a point on the curve, [chapter 2](02-crypto.md)) and that the power is decimal digits. `checkTx` is `parse` and nothing more: it is stateless, so the post-commit recheck can never evict anything for this application. `initChain` loads `genesis.appState` as a JSON object of string keys into `committed`, persists, and returns the app hash with no validators (the engine uses the genesis list). `finalizeBlock`:
 
 ```ts
   async finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult> {
@@ -165,17 +179,73 @@ The working copy starts as a copy of the committed map, so a block's effects are
 
 ### src/mempool.ts
 
-**`MempoolOptions`**: `maxTxs` (10 000), `maxTxBytes` (1 MiB), `cacheSize` (100 000 hashes). **`AddTxStatus`** is `'added' | 'seen' | 'invalid' | 'full' | 'too-large' | 'paused'` and **`AddTxResult`** carries the status, the hash, and the application's error for `invalid` or, for `paused`, the reason the pool is not admitting. The RPC's `broadcast` methods and `Node.submitTx` return this result to the client.
+**`MempoolOptions`**: `maxTxs` (10 000), `maxTxBytes` (1 MiB), `cacheSize` (100 000 hashes). **`AddTxStatus`** is `'added' | 'seen' | 'invalid' | 'full' | 'too-large' | 'paused'` and **`AddTxResult`** carries the status, the hash, and the application's error for `invalid`, for `paused` the reason the pool is not admitting, or for `full` whether the pool is simply full or full at a limit that was lowered. The RPC's `broadcast` methods and `Node.submitTx` return this result to the client.
 
-**`Mempool`** extends `EventEmitter` with one typed event, `tx: [hash, tx, source]`, emitted on every admission; `Node.init` listens and broadcasts an inventory announcement to every peer except `source`, the peer the transaction came from. State: `txs`, a `Map` from hex hash to bytes whose insertion order is the FIFO order; `cache`, a `Set` of hex hashes; `cacheOrder`, the array that lets the cache evict its oldest entry; `pausedReason`, null while the pool admits and otherwise the reason it does not.
+**`Mempool`** extends `EventEmitter` with one typed event, `tx: [hash, tx, source]`, emitted on every admission; `Node.init` listens and broadcasts an inventory announcement to every peer except `source`, the peer the transaction came from. State: `txs`, a `Map` from hex hash to bytes whose insertion order is the FIFO order; `cache`, a `Set` of hex hashes; `cacheOrder` and `cacheHead`, the hashes in the order they came and the position of the oldest, which let the cache evict its oldest entry; `pausedReason`, null while the pool admits and otherwise the reason it does not; `limit`, how many transactions the pool admits up to just now, `maxTxs` unless the node has lowered it.
 
 - `size`: pending count.
 - `has(hash)`: in the pool.
 - `seen(hash)`: in the cache, which includes everything in the pool and everything recently rejected or committed; the node's inventory handler fetches only hashes that are not seen.
 - `get(hash)`: the bytes, for serving a peer's fetch.
-- `remember(key)` (private): add to the cache and evict from the front past `cacheSize`.
+- `remember(key)` (private): add to the cache, and once the cache holds `cacheSize` hashes, forget the oldest to make room.
 
-Admission can be suspended as a whole. The node pauses the pool while it sheds load under memory pressure ([chapter 8](08-node.md)) and resumes it when the heap eases; what is pooled stays, is still reaped by the proposer and still rechecked after each commit, so a validator keeps producing blocks from what it already holds, and only new admissions are refused:
+```ts
+  private remember(key: string): void {
+    if (this.cache.has(key)) return;
+    this.cache.add(key);
+    if (this.cacheOrder.length < this.opts.cacheSize) {
+      this.cacheOrder.push(key);
+      return;
+    }
+    // Full: the newest takes the oldest's place. Shifting an array of this size for every transaction instead cost
+    // a node under load a twelfth of its time (docs/benchmarks.md section 4.13).
+    if (this.opts.cacheSize === 0) {
+      this.cache.delete(key);
+      return;
+    }
+    this.cache.delete(this.cacheOrder[this.cacheHead]!);
+    this.cacheOrder[this.cacheHead] = key;
+    this.cacheHead = (this.cacheHead + 1) % this.opts.cacheSize;
+  }
+```
+
+`cacheOrder` is a ring, an array of fixed length used in a circle. Until the cache is full a hash is appended. From then on `cacheHead` is the position of the oldest hash: the new hash is written over it, the old one leaves the set, and the head moves on one place, wrapping at `cacheSize`, so the next oldest is under it. Each step costs the same whatever the size. The first version appended to the array and removed the oldest with `cacheOrder.shift()`, which moves every remaining element down one place: with 100,000 hashes that is 100,000 moves for each transaction once the cache is full. A profile of a ten-minute run found the shift taking about 8% of the node's CPU from the 100,000th transaction on. A `cacheSize` of 0 means no cache: the hash is taken out again at once.
+
+The pool's size is a dial the node turns as its heap fills ([chapter 8](08-node.md)): every pooled transaction holds its bytes and, in the core application, its writes in the pending state, so a node short of memory admits fewer.
+
+```ts
+  /** The most the pool may hold, whatever it admits up to just now. */
+  get maxTxs(): number {
+    return this.opts.maxTxs;
+  }
+
+  /** How many transactions the pool admits up to just now. */
+  get currentLimit(): number {
+    return this.limit;
+  }
+
+  /**
+   * Admit up to this many transactions from now on (never more than maxTxs). The memory guard lowers it as the heap
+   * fills, since every pooled transaction holds its bytes and its writes in the pending state. Lowering it evicts
+   * nothing: what is pooled stays and is reaped, and admission begins again once blocks have taken the pool below it.
+   */
+  setLimit(limit: number): void {
+    this.limit = Math.max(0, Math.min(this.opts.maxTxs, Math.floor(limit)));
+  }
+
+  /** Whether a transaction arriving now could be admitted: not paused, and room under the limit. */
+  get accepting(): boolean {
+    return this.pausedReason === null && this.txs.size < this.limit;
+  }
+
+  private get fullReason(): string {
+    return this.limit < this.opts.maxTxs ? 'mempool full: its limit is lowered while the node is short of memory' : 'mempool full';
+  }
+```
+
+`setLimit` clamps to between zero and `maxTxs` and rounds down. It only changes what `addTx` compares the pool's size with: a pool already larger than a lowered limit keeps what it holds, the proposer reaps it and the recheck after each commit goes on, and once blocks have taken the pool below the limit transactions are admitted again. `accepting` is the question the node's inventory handler asks before fetching what a peer announces: there is no point fetching a transaction that would be refused. `fullReason` is the `error` of a `full` result, and it differs when the limit is lowered, because that refusal is the node's doing and not the transaction's, and the RPC answers it differently ([chapter 12](12-rpc.md)).
+
+Admission can also be suspended as a whole. The node pauses the pool only at the memory guard's last level, when it is about to stop; what is pooled stays, is still reaped by the proposer and still rechecked after each commit, and only new admissions are refused:
 
 ```ts
   /** While paused nothing new is admitted (the node is shedding load); what is pooled stays and is still reaped. */
@@ -199,28 +269,37 @@ Admission can be suspended as a whole. The node pauses the pool while it sheds l
     if (this.pausedReason !== null) return { status: 'paused', hash, error: this.pausedReason };
     if (tx.length > this.opts.maxTxBytes) return { status: 'too-large', hash };
     if (this.cache.has(key)) return { status: 'seen', hash };
-    if (this.txs.size >= this.opts.maxTxs) return { status: 'full', hash };
+    if (this.txs.size >= this.limit) return { status: 'full', hash, error: this.fullReason };
     // Mark before the await so a concurrent duplicate is not checked twice.
     this.remember(key);
+    // The application asks this again after its last wait, so a transaction refused here is not applied to its
+    // pending state either.
+    const admit = () => this.pausedReason ?? (this.txs.size >= this.limit ? this.fullReason : null);
     let res: Awaited<ReturnType<Application['checkTx']>>;
     try {
-      res = await this.app.checkTx(tx);
+      res = await this.app.checkTx(tx, { admit });
     } catch (e) {
       this.cache.delete(key); // nothing was decided about it; the next submission checks again
       throw e;
     }
-    if (!res.ok) return { status: 'invalid', hash, error: res.error };
-    if (this.txs.size >= this.opts.maxTxs) {
-      this.cache.delete(key); // the pool filled while we checked; let the sender try again rather than hear "seen"
-      return { status: 'full', hash };
+    // Load shedding may have begun while it was checked: it is refused as one arriving now would be, neither pooled
+    // nor gossiped, and forgotten, so it is checked again once the node admits again.
+    if (this.pausedReason !== null) {
+      this.cache.delete(key);
+      return { status: 'paused', hash, error: this.pausedReason };
     }
+    if (this.txs.size >= this.limit) {
+      this.cache.delete(key); // the pool filled while we checked; let the sender try again rather than hear "seen"
+      return { status: 'full', hash, error: this.fullReason };
+    }
+    if (!res.ok) return { status: 'invalid', hash, error: res.error };
     this.txs.set(key, tx);
     this.emit('tx', hash, tx, source);
     return { status: 'added', hash };
   }
 ```
 
-Order of the checks: paused first, before anything else, so a pool that is not admitting does no work at all and leaves no trace in the cache, and the reason travels back in `error` (the RPC turns it into `-32004`, [chapter 12](12-rpc.md)); then size (cheapest, and a huge transaction must not even be hashed into the cache), seen, full, then the application. The hash is cached *before* the await so that a second copy arriving while `checkTx` runs is answered `seen` rather than checked again; that also means an `invalid` transaction stays in the cache and is not re-checked when a peer announces it again. A `checkTx` that *throws* (the verifier pool closed underneath it, say) decided nothing, so the `catch` removes the hash from the cache before rethrowing; otherwise the transaction would be `seen` on this node for as long as the cache remembered it without ever having been judged, and a client resubmitting a perfectly good transaction would be told it was already known. The second `full` check, after the await, covers the pool filling while this transaction was being checked; because the hash was already cached, that refusal deletes it again, so a resubmission hears `full` (and `added` once there is room) rather than `seen` (review finding 38).
+Order of the checks: paused first, before anything else, so a pool that is not admitting does no work at all and leaves no trace in the cache, and the reason travels back in `error` (the RPC turns it into `-32004`, [chapter 12](12-rpc.md)); then size (cheapest, and a huge transaction must not even be hashed into the cache), seen, full (against `limit`, which is `maxTxs` unless the node lowered it), then the application. The hash is cached *before* the await so that a second copy arriving while `checkTx` runs is answered `seen` rather than checked again; that also means an `invalid` transaction stays in the cache and is not re-checked when a peer announces it again. A `checkTx` that *throws* (the verifier pool closed underneath it, say) decided nothing, so the `catch` removes the hash from the cache before rethrowing; otherwise the transaction would be `seen` on this node for as long as the cache remembered it without ever having been judged, and a client resubmitting a perfectly good transaction would be told it was already known. The second `full` check, after the await, covers the pool filling, or its limit being lowered, while this transaction was being checked; because the hash was already cached, that refusal deletes it again, so a resubmission hears `full` (and `added` once there is room) rather than `seen` (review finding 38). The check before it does the same for a pause that began during the await. Both come before the application's verdict is looked at, so a transaction the pool would not take is refused as `paused` or `full`, which a sender may retry, whatever the application said. The `admit` function handed to `checkTx` asks the same two questions from inside the application, after its last wait and just before the transaction would be applied to the pending state (`CoreApp.checkTx` in `src/app/core/app.ts`; the key-value test app ignores the option): a transaction the pool no longer takes must not leave its writes there for later checks to run against.
 
 ```ts
   /** Take transactions in FIFO order up to a byte budget. They stay in the pool until committed. */
@@ -256,7 +335,17 @@ There is no expiry by time or height in the mempool itself; a transaction that s
 
 ### src/node/executor.ts
 
-**`ExecutorDeps`**: `app`, `store` (a `BlockStore`, chapter 10), `mempool`, `evidencePool`, `log`, optional `retainBlocks` ("Keep only this many blocks behind the latest; undefined keeps all"), `protectedHeight` ("A height that pruning must not pass (the newest snapshot)") and `evidenceAgeMs` (how old evidence may be; pruning keeps every block the window can still name and drops the headers kept alone once it has passed them). The node supplies the core application's newest snapshot height and `() => limits.maxEvidenceAgeMs`, the same limit consensus reads.
+**`ExecutorDeps`**: `app`, `store` (a `BlockStore`, chapter 10), `mempool`, `evidencePool`, `log`, optional `retainBlocks` ("Keep only this many blocks behind the latest; undefined keeps all"), `protectedHeight` ("A height that pruning must not pass (the newest snapshot)"), `evidenceAgeMs` (how old evidence may be; pruning keeps every block the window can still name and drops the headers kept alone once it has passed them) and `transaction`:
+
+```ts
+  /**
+   * Runs writes to the chain store and to the application's store as one transaction (KvEnv.transaction), for an
+   * application whose store is in the chain store's environment. Without it each commits, and flushes, on its own.
+   */
+  transaction?: (fn: () => void) => void;
+```
+
+The node supplies the core application's newest snapshot height, `() => limits.maxEvidenceAgeMs`, the same limit consensus reads, and its environment's `transaction` when the application is the one it created itself ([chapter 8](08-node.md)); the engine tests, which build an executor over the key-value application, leave `transaction` out.
 
 **`BlockExecutor`** has a public `state: ChainState`, the chain's view between blocks, read by consensus (`getState`) and the node (`height`). The constructor is private; instances come from `open`.
 
@@ -274,6 +363,10 @@ There is no expiry by time or height in the mempool itself; a transaction that s
       deps.log('info', 'initialised from genesis', { chainId: state.chainId, validators: state.validators.size });
     } else if (state.chainId !== genesis.chainId) {
       throw new Error(`data directory is for chain ${state.chainId}, genesis is for ${genesis.chainId}`);
+    } else if (state.scheme !== schemeTag(genesis.signatureScheme ?? 'ml-dsa-44')) {
+      // The node and validator keys are derived under genesis's scheme; under another one they are other keys, and
+      // the validator would no longer be one of the set it was in.
+      throw new Error(`data directory is for a ${schemeName(state.scheme)} chain, genesis names ${genesis.signatureScheme ?? 'ml-dsa-44'}`);
     }
     const exec = new BlockExecutor(deps, state);
     await exec.replayToApp();
@@ -281,7 +374,7 @@ There is no expiry by time or height in the mempool itself; a transaction that s
   }
 ```
 
-A fresh data directory runs `initChain` and builds genesis state (chapter 3's `genesisState`, which takes the application's validators if it supplied any). Validator sets are saved twice: by hash, because headers name sets by hash and evidence verification looks them up that way, and by the height they sign *with their proposer priorities*, because a node joining by state sync must continue consensus with the exact priorities (`RPC-SYNC-PROOFS.md`, settled during implementation). An existing directory for another chain is refused. Then `replayToApp` reconciles the application.
+A fresh data directory runs `initChain` and builds genesis state (chapter 3's `genesisState`, which takes the application's validators if it supplied any). Validator sets are saved twice: by hash, because headers name sets by hash and evidence verification looks them up that way, and by the height they sign *with their proposer priorities*, because a node joining by state sync must continue consensus with the exact priorities (`RPC-SYNC-PROOFS.md`, settled during implementation). An existing directory for another chain is refused, and so is one whose state was made under another signature scheme than the one genesis names. Then `replayToApp` reconciles the application.
 
 - `onCommitted(fn)`: register a listener for `(block, commit, results, updates)`; the node (`src/node/node.ts`) and the RPC event streams (`src/rpc/events.ts`) hang off this.
 - `getLastCommit()`: the stored commit of `lastHeight`, or null at genesis. Consensus builds the next block's `lastCommit` from it; because `updateCommit` rewrites the stored commit, this is where late precommits reach the next block.
@@ -366,13 +459,30 @@ Evidence this node cannot place, because it holds neither the block nor the head
     const newState = nextState(this.state, block, res.validatorUpdates, res.appHash, resultsRoot(res.txResults));
 
     // Block, commit, results, the next set and the new state land together or not at all.
-    this.d.store.batch(() => {
-      this.d.store.saveBlock(block, commit, res.txResults);
-      this.d.store.saveValidatorSet(newState.nextValidators);
-      this.d.store.saveValidatorsAt(h + 2n, newState.nextValidators);
-      this.d.store.saveState(newState);
-    });
-    await this.d.app.commit();
+    const save = () =>
+      this.d.store.batch(() => {
+        this.d.store.saveBlock(block, commit, res.txResults);
+        this.d.store.saveValidatorSet(newState.nextValidators);
+        this.d.store.saveValidatorsAt(h + 2n, newState.nextValidators);
+        this.d.store.saveState(newState);
+      });
+    let persisted: Promise<void>;
+    if (this.d.transaction) {
+      // One transaction and one flush for the chain's writes and the application's. commit() is called inside it:
+      // what the application writes before its first await joins the transaction (CoreApp writes everything there),
+      // and what it writes after lands on its own afterwards, as without a shared transaction. A commit that fails
+      // rejects the promise, not the transaction: the chain's writes stay, and the restart replays the block.
+      let inside!: Promise<void>;
+      this.d.transaction(() => {
+        save();
+        inside = this.d.app.commit();
+      });
+      persisted = inside;
+    } else {
+      save();
+      persisted = this.d.app.commit();
+    }
+    await persisted;
 
     this.state = newState;
     this.prune();
@@ -391,9 +501,23 @@ Evidence this node cannot place, because it holds neither the block nor the head
   }
 ```
 
-This is the persistence order from the file header. `nextState` (chapter 3) applies the updates to `nextValidators` to get the set for `h + 2`, increments its proposer priority once, and shifts the three sets down: the block's validators become `lastValidators`, `nextValidators` becomes `validators`. The new `h + 2` set is saved by hash and by height. the end of the batch is the moment the chain officially advances; `app.commit()` follows; `this.state` is replaced only after both, so a caller that reads `state` during the apply still sees the old height (block sync relies on this: it reads `getState().lastHeight` to decide what block to apply next). Then pruning, evidence bookkeeping, the mempool update, and the listeners. The executor does not check `res.appHash` against anything here; the check is social, by every other validator at the next proposal, and local, on replay.
+This is the persistence order from the file header. `nextState` (chapter 3) applies the updates to `nextValidators` to get the set for `h + 2`, increments its proposer priority once, and shifts the three sets down: the block's validators become `lastValidators`, `nextValidators` becomes `validators`. The new `h + 2` set is saved by hash and by height. The chain store's batch is the write that advances the chain; `app.commit()` follows it, inside the same transaction when the executor was given one and after it otherwise; `this.state` is replaced only after both, so a caller that reads `state` during the apply still sees the old height (block sync relies on this: it reads `getState().lastHeight` to decide what block to apply next). Then pruning, evidence bookkeeping, the mempool update, and the listeners. The executor does not check `res.appHash` against anything here; the check is social, by every other validator at the next proposal, and local, on replay.
 
 The four saves run inside `store.batch`, one store transaction: `KvBlockStore.batch` opens a single `kv.write` and every save called inside it joins that writer instead of opening its own ([chapter 10](10-store.md) documents the method). This is what `DESIGN.md` section 4 promises ("save block + commit + new chain state (one transaction)") and what review finding 39 restored: before it, a crash between four separate writes could leave a block and its transaction index entries without the state that goes with them.
+
+`save` is that batch as a function, so that it can run in either of two places. Without `d.transaction` it runs, the chain store's transaction commits and flushes, and then `app.commit()` runs and the application commits and flushes its own: two transactions and two flushes per block, the order of the file header. With `d.transaction` both calls are made inside the callback. `KvEnv.transaction` opens a write transaction on the environment's root, and a `write` made by any named store while it is open becomes a child of it (chapter 10), so the chain store's batch and the application's write are one transaction on disk with one flush at its end, the chain's writes first and the application's after them.
+
+`commit()` is asynchronous and the transaction is not: the callback returns when `commit()` returns its promise, which is at its first `await`. What the application wrote before that point is inside the transaction and what it writes after is not. That is the contract `Application.commit` states in `src/app/types.ts`:
+
+```ts
+  /**
+   * Persist the block just finalized. An application that keeps its state in the engine's store environment does
+   * its writes before its first await, so that they join the transaction the engine saves the block in (executor.ts).
+   */
+  commit(): Promise<void>;
+```
+
+`CoreApp.commit` does all of its writing to the store before it awaits anything ([chapter 11](11-application.md)). An application that awaits first loses nothing but the saving: its writes land in a transaction of their own after the chain's, which is the two-transaction order again and is covered by the same replay. The promise is kept in `inside` and awaited after the transaction has closed, so a `commit()` that rejects does not throw out of the callback and does not abort the transaction: the block, the commit and the chain state stay written, `doApply` rejects before `this.state` is replaced, and the next start finds the application one block behind and replays it.
 
 ```ts
   private prune(): void {
@@ -471,13 +595,15 @@ Three cases. The application ahead of the chain is impossible under the persiste
 
 `test/units.test.ts`, "mempool dedupes, rejects invalid, reaps FIFO, and drops committed transactions": with `maxTxBytes: 64` and the key-value application, `a=1` is `added`, a second `a=1` is `seen`, `bad` (no `=`) is `invalid`, 100 zero bytes are `too-large`, `b=2` is `added`; `reap` with a large budget returns `[a=1, b=2]` in order and with a budget of 8 bytes returns one (`a=1` costs 3 + 4 = 7; adding `b=2` would exceed 8); `update([a=1])` leaves one.
 
+`test/units.test.ts`, "remembers the last transactions it saw, the newest taking the oldest one's place": with `cacheSize: 3`, three transactions are added and committed through `update`; submitted again, each is `seen`, since a committed transaction stays in the cache. Seven more transactions take the ring round more than twice. The three newest are still `seen`, and `seen(hash)` is false for the one before them and for the first three.
+
 `test/consensus.test.ts`:
 
 - "transactions gossip to every node and land in state": `submitTx` returns `added`, every node's `KvStoreApp.get('hello')` becomes `'world'`, and `no-equals-sign` is `invalid`. This covers admission, the `tx` event into inventory gossip, reaping, `finalizeBlock` and `commit` on every node.
 - "adds a validator through the application and it starts signing" and "removes a validator and the set shrinks": `val:` transactions produce validator updates that `nextState` applies, visible in `executor.state.validators.size` and in the commit signature count two heights later. These are the H+2 tests.
 - "a late-joining full node catches up through block sync": block sync drives `applyBlock` for a node that was never in consensus; `StaleHeightError` protects the hand-over to live consensus.
 
-`test/recovery.test.ts`, "a validator restarted from disk resumes with its state, key guard and app intact": after a stop and a rebuild from the same data directory, `height` equals the stopped height and the application still holds the key written before the stop; `open` found the store's state and `replayToApp` found the application at the same height. "double-sign evidence is built, included in a block, and handed to the app" checks `buildRequest`'s `misbehavior` translation: every `KvStoreApp.slashed` entry carries the victim's address and the infraction height, and `markCommitted` empties the pool.
+`test/recovery.test.ts`, "a validator restarted from disk resumes with its state, key guard and app intact": after a stop and a rebuild from the same data directory, `height` equals the stopped height and the application still holds the key written before the stop; `open` found the store's state and `replayToApp` found the application at the same height. "saves a block and the application's state in one store transaction when the node holds the application, and in two otherwise": a one-validator chain of the core application is run twice over an environment that wraps `MemoryEnv` and notes, for every `write` to one of its stores, the store's name and whether one of the environment's transactions was open. With the node's own application every block is one transaction holding a `chain` write and then an `app` write, in that order, and the only application write outside a transaction is the one genesis made. With a `CoreApp` built over a separate `MemoryKv` and handed to the node, the environment sees no transaction at all and only `chain` writes, each alone, which is the path `doApply` takes when `d.transaction` is absent. "double-sign evidence is built, included in a block, and handed to the app" checks `buildRequest`'s `misbehavior` translation: every `KvStoreApp.slashed` entry carries the victim's address and the infraction height, and `markCommitted` empties the pool.
 
 `test/engine.test.ts`:
 
@@ -491,7 +617,7 @@ Three cases. The application ahead of the chain is impossible under the persiste
 
 `test/review.test.ts`, "keeps per-block results so a repeated transaction proves its real outcome at each position": the `results` array the executor passes to `saveBlock` is stored per block, and a transaction repeated within a block owns its index entry at its first position (review finding 18). "does not remember a transaction it refused because the pool filled while checking it": with `maxTxs: 1` and a `checkTx` held open by a gate, two transactions are admitted concurrently; the first is `added`, the second `full`, resubmitting the second is `full` again rather than `seen`, and after `update` removes the first it is `added` (finding 38). "saves everything a height needs to the block store in one transaction": a counting `MemoryKv` sees one `write` for a `batch` of three saves and a second for a save outside it (finding 39; `doApply` is the batch's caller). "checks a transaction again after a check that threw, instead of calling it seen": an application whose first `checkTx` throws makes `addTx` reject, and the same bytes submitted again are checked and `added` rather than answered `seen`.
 
-`test/memory.test.ts`, "sheds load, keeps following the chain, and resumes when the heap eases": a node whose memory guard is fed a heap at 90% of its limit has `mempool.paused` true and `submitTx` answering `paused`; at 50% the pool is resumed and the same transaction is `added`. The pause is the node's doing (chapter 8); the pool only honours it.
+`test/memory.test.ts`, "sheds load, keeps following the chain, and resumes when the heap eases": a node whose memory guard is fed a heap at 90% of its limit has `mempool.paused` false and `mempool.currentLimit` a tenth of `maxTxs`; with the limit set to zero by the test, `submitTx` answers `full`. Back at `ok` the limit is `maxTxs` again and a transaction is no longer refused as `full`. The limit is the node's doing (chapter 8); the pool only honours it.
 
 ## Limitations and ideas
 
@@ -500,7 +626,7 @@ Three cases. The application ahead of the chain is impossible under the persiste
 - The post-commit recheck is sequential and runs inside `doApply`, so a 10 000-transaction pool adds 10 000 `checkTx` calls to the commit path before the listeners (and the `status` broadcast) run.
 - No `PrepareProposal` or `ProcessProposal`: the application cannot reorder, drop or veto transactions in a proposal; it sees them when decided and can only mark them failed.
 - Validator sets by hash are kept forever; pruning covers blocks, results, the transaction index and the headers kept alone below the lowest block.
-- The pool is bounded by count, not bytes: 10 000 transactions of up to 1 MiB each is the ceiling, and under memory pressure the node pauses admission rather than trimming what is pooled.
+- The pool is bounded by count, not bytes: 10 000 transactions of up to 1 MiB each is the ceiling, and under memory pressure the node lowers the count it admits up to rather than trimming what is pooled.
 
 Exercises:
 

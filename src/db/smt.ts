@@ -136,7 +136,19 @@ function childOf(e: Uint8Array, side: number): Uint8Array {
   return e.subarray(1 + 32 * side, 33 + 32 * side);
 }
 
+/**
+ * What the store's history records say of a tree's nodes as of a version the window in memory no longer holds
+ * (ObjectDatabase, "past versions from the store"): by nodeString of its store key, the encoding of each node asked
+ * about that a later commit changed, or null where there was none. A node not in it is what it is now.
+ */
+export type PastNodes = Map<string, Uint8Array | null>;
+
+/** What one commit recorded for the store: before it, the node under this store key was this encoding, or absent. */
+export type NodeRecord = [Uint8Array, Uint8Array | null];
+
 /** A map key for a store key. */
+export const nodeString = (key: Uint8Array): string => str(key);
+
 function str(b: Uint8Array): string {
   return Buffer.from(b.buffer, b.byteOffset, b.byteLength).toString('latin1');
 }
@@ -236,11 +248,15 @@ function remove(node: Node | null, keyHash: Uint8Array, depth: number): Node | n
 export class SparseMerkleTree {
   private root: Node | null = null;
   private readonly versions = new Map<number, Node | null>();
+  /** How many past versions the tree may keep, and how many it keeps just now (setWindow). */
   private readonly retain: number;
+  private window: number;
   private version = -1;
   /** Where this tree's nodes live in the store: 'n', type, index position. */
   private readonly header: Uint8Array;
   private nodeChanges: StoreChange[] = [];
+  /** What the last commit overwrote, for the store's history record; null if that commit did not list its changes. */
+  private records: NodeRecord[] | null = null;
   // ---- while dropped ----
   /** The store the nodes are read from; null while the tree is resident. */
   private source: TreeSource | null = null;
@@ -248,19 +264,41 @@ export class SparseMerkleTree {
   private readonly pending = new Map<string, PendingWrite>();
   /** The root hash as of each retained version. */
   private readonly roots = new Map<number, Uint8Array>();
-  /** The oldest version the records can describe. */
+  /** The oldest version the tree can describe: set when it is dropped or first committed dropped, raised when the window is trimmed. */
   private floor = 0;
   /** Per node key (as a string): before version v the node was enc (null: absent). Ascending by v. */
   private readonly history = new Map<string, { v: number; enc: Uint8Array | null }[]>();
   private readonly historyByVersion = new Map<number, string[]>();
   /** How many records `history` holds: about the nodes a rebuild makes for the versions before the last commit. */
   private historyCount = 0;
+  /**
+   * While resident: per retained commit, how many nodes it replaced. Those nodes are what the version before it
+   * holds that the newer ones do not share, so their sum is what trimming the window gives back.
+   */
+  private readonly replaced = new Map<number, number>();
   /** The nodes the commit in progress wrote, by key. */
   private work: Map<string, NodeWrite> | null = null;
 
   constructor(retainVersions = 0, header: Uint8Array = new Uint8Array(0)) {
     this.retain = Math.max(0, retainVersions);
+    this.window = this.retain;
     this.header = header;
+  }
+
+  /**
+   * Keep only the last `versions` past versions from now on (never more than the tree was made to retain). Lowering
+   * it forgets the older ones at once; raising it again lets the window grow back one commit at a time.
+   */
+  setWindow(versions: number): void {
+    this.window = Math.max(0, Math.min(this.retain, versions));
+    if (this.version < 0) return;
+    const min = this.version - this.window;
+    if (min > this.floor) this.floor = min;
+    if (this.source) this.pruneDropped(min);
+    else {
+      for (const v of this.versions.keys()) if (v < min) this.versions.delete(v);
+      for (const v of this.replaced.keys()) if (v <= min) this.replaced.delete(v);
+    }
   }
 
   get currentVersion(): number {
@@ -268,17 +306,22 @@ export class SparseMerkleTree {
   }
 
   get lowestVersion(): number {
-    if (this.source) return this.retain > 0 ? Math.max(this.floor, this.version - this.retain) : this.version;
-    return this.retain > 0 ? Math.max(0, this.version - this.retain) : this.version;
+    return Math.max(this.floor, this.version - this.window, 0);
   }
 
   get resident(): boolean {
     return this.source === null;
   }
 
-  /** While dropped: the records of past versions, each about one node a rebuild makes besides the current tree's. */
+  /**
+   * About how many nodes the past versions hold besides the current tree's: while dropped the records kept for them,
+   * each a node a rebuild makes; while resident the nodes the retained commits replaced, as far as they reported them.
+   */
   get historyNodes(): number {
-    return this.historyCount;
+    if (this.source) return this.historyCount;
+    let n = 0;
+    for (const count of this.replaced.values()) n += count;
+    return n;
   }
 
   /** The store a dropped tree reads, for a tree that replaces it. */
@@ -334,13 +377,23 @@ export class SparseMerkleTree {
     if (version <= this.version) throw new Error(`version ${version} is not after ${this.version}`);
     if (this.source) return this.commitDropped(version);
     this.nodeChanges = [];
+    this.records = null;
     if (report) {
       const before = this.version >= 0 ? (this.versions.get(this.version) ?? null) : null;
-      walkChanged(before, this.root, this.header, new Uint8Array(32), 0, (key, _a, b) => this.nodeChanges.push({ key, value: b ? encodingOf(b) : null }));
+      // The first commit overwrites nothing a past version could ask for.
+      const records: NodeRecord[] | null = this.version >= 0 ? [] : null;
+      walkChanged(before, this.root, this.header, new Uint8Array(32), 0, (key, a, b) => {
+        this.nodeChanges.push({ key, value: b ? encodingOf(b) : null });
+        records?.push([key, a ? encodingOf(a) : null]);
+      });
+      this.records = records;
+      if (records) this.replaced.set(version, records.length);
     }
     this.version = version;
     this.versions.set(version, this.root);
-    for (const v of this.versions.keys()) if (v < version - this.retain) this.versions.delete(v);
+    if (version - this.window > this.floor) this.floor = version - this.window;
+    for (const v of this.versions.keys()) if (v < version - this.window) this.versions.delete(v);
+    for (const v of this.replaced.keys()) if (v <= version - this.window) this.replaced.delete(v);
     return this.rootHash();
   }
 
@@ -349,6 +402,45 @@ export class SparseMerkleTree {
     const out = this.nodeChanges;
     this.nodeChanges = [];
     return out;
+  }
+
+  /** What the last commit overwrote (takeNodes says what it wrote), handed over once; null if it kept no list. */
+  takeRecords(): NodeRecord[] | null {
+    const out = this.records;
+    this.records = null;
+    return out;
+  }
+
+  /** The store key of the root node. */
+  get rootKey(): Uint8Array {
+    return nodeKey(this.header, EMPTY, 0);
+  }
+
+  /** The store keys rootAt and, with a key, proveAt may read at a past version: the root's, and every node's down the key's path. */
+  pastKeys(key?: Uint8Array): Uint8Array[] {
+    const out = [this.rootKey];
+    if (key) {
+      const keyHash = sha256(key);
+      for (let d = 1; d < KEY_BITS; d++) out.push(nodeKey(this.header, keyHash, d));
+    }
+    return out;
+  }
+
+  /**
+   * The nodes down a key's path as of a version older than the window: the returned function, called with depth 0,
+   * 1, 2 and so on, gives each node as the store's records have it, or, where no later commit changed it, as it is now.
+   */
+  private pastPath(keyHash: Uint8Array, past: PastNodes): (depth: number) => Uint8Array | null {
+    // While resident, the node at the depth last asked for in the tree as last committed.
+    let n: Node | null = this.source ? null : (this.versions.get(this.version) ?? null);
+    let at = 0;
+    return (depth) => {
+      for (; at < depth; at++) n = n && !n.leaf ? (bit(keyHash, at) ? n.right : n.left) : null;
+      const key = nodeKey(this.header, keyHash, depth);
+      const recorded = past.get(str(key));
+      if (recorded !== undefined) return recorded;
+      return this.source ? (this.source.get(key) ?? null) : n ? encodingOf(n) : null;
+    };
   }
 
   private rootOf(version: number): Node | null {
@@ -364,7 +456,12 @@ export class SparseMerkleTree {
     }
   }
 
-  rootAt(version: number): Uint8Array {
+  /** The root as of a version; with `past`, one older than the window, answered from the store's records. */
+  rootAt(version: number, past?: PastNodes): Uint8Array {
+    if (past) {
+      const e = this.pastPath(EMPTY, past)(0);
+      return e ? hashOfEncoding(e) : EMPTY.slice();
+    }
     if (this.source) {
       this.checkDropped(version);
       return this.roots.get(version)!.slice();
@@ -373,13 +470,14 @@ export class SparseMerkleTree {
   }
 
   /** Membership or absence proof for a key as of a version. Every buffer in it is a copy; the tree's own stay untouched. */
-  proveAt(key: Uint8Array, version: number): SmtProof {
+  proveAt(key: Uint8Array, version: number, past?: PastNodes): SmtProof {
     const keyHash = sha256(key);
     const siblings: Uint8Array[] = [];
-    if (this.source) {
-      this.checkDropped(version);
+    if (this.source || past) {
+      if (!past) this.checkDropped(version);
+      const node = past ? this.pastPath(keyHash, past) : (d: number) => this.nodeAt(nodeKey(this.header, keyHash, d), version);
       for (let d = 0; ; d++) {
-        const e = this.nodeAt(nodeKey(this.header, keyHash, d), version);
+        const e = node(d);
         if (!e) return { siblings, leaf: null };
         if (e[0] === LEAF) return { siblings, leaf: { keyHash: e.slice(1, 33), value: e.slice(33) } };
         const side = bit(keyHash, d);
@@ -455,6 +553,7 @@ export class SparseMerkleTree {
     }
     this.root = null;
     this.versions.clear();
+    this.replaced.clear();
     this.source = source;
   }
 
@@ -483,6 +582,7 @@ export class SparseMerkleTree {
     this.pending.clear();
     this.roots.clear();
     this.history.clear();
+    for (const [v, keys] of this.historyByVersion) this.replaced.set(v, keys.length);
     this.historyByVersion.clear();
     this.historyCount = 0;
     for (const [v, n] of built) this.versions.set(v, n);
@@ -498,6 +598,61 @@ export class SparseMerkleTree {
     if (this.version >= 0 || this.source || this.root) throw new Error('nodes are loaded only into a fresh resident tree');
     const e = source.get(nodeKey(this.header, EMPTY, 0));
     this.root = e ? this.build((k) => source.get(k) ?? null, new Uint8Array(32), 0, hashOfEncoding(e), null, check) : null;
+  }
+
+  /**
+   * Give a tree that holds only its current version the versions before it, from what each later commit overwrote
+   * (the store's history records, a restart): `records` by the version of the commit that made them, `lowest` the
+   * oldest version they describe. A commit's records are what the version before it differs by, so each older
+   * version is built against the next newer one from that commit's records alone, newest first, sharing every
+   * subtree the commit left alone; a dropped tree keeps the records as its own. Every node taken from a record
+   * must hash to what its parent says, and a node a version needs that no record holds is an error: the caller
+   * falls back on replaying the keys.
+   */
+  loadVersions(lowest: number, records: Map<number, NodeRecord[]>): void {
+    if (this.version < 0 || this.pending.size > 0) throw new Error('past versions are loaded into a committed tree');
+    if ((this.source ? this.roots.size : this.versions.size) > 1) throw new Error('past versions are loaded into a tree that holds none');
+    if (lowest >= this.version) return;
+    const versions = [...records.keys()].filter((v) => v > lowest && v <= this.version).sort((a, b) => a - b);
+    const rootString = str(this.rootKey);
+    const path = new Uint8Array(32);
+    let newer: Node | null = this.source ? null : (this.versions.get(this.version) ?? null);
+    let hash = this.source ? this.storedRootHash() : (newer?.hash ?? EMPTY);
+    // Newest first: before commit v the tree was what it is after, with v's records in place of what v wrote.
+    let upTo = this.version;
+    for (let i = versions.length - 1; i >= 0; i--) {
+      const v = versions[i]!;
+      const before = new Map<string, Uint8Array | null>();
+      for (const [key, enc] of records.get(v)!) before.set(str(key), enc);
+      if (!this.source) this.replaced.set(v, before.size);
+      // The versions from v up to the next recorded one are the tree as built so far.
+      for (let u = upTo - 1; u >= v; u--) this.source ? this.roots.set(u, hash.slice()) : this.versions.set(u, newer);
+      upTo = v;
+      if (before.size === 0) continue;
+      const rootEnc = before.get(rootString);
+      if (rootEnc !== undefined) hash = rootEnc ? hashOfEncoding(rootEnc) : EMPTY;
+      if (!this.source) {
+        const read = (k: Uint8Array): Uint8Array | null => before.get(str(k)) ?? null;
+        newer = isEmpty(hash) ? null : this.build(read, path, 0, hash, newer, true);
+      }
+    }
+    for (let u = upTo - 1; u >= lowest; u--) this.source ? this.roots.set(u, hash.slice()) : this.versions.set(u, newer);
+    if (this.source) {
+      // The records themselves are what a dropped tree answers past versions from; per node they must ascend.
+      for (const v of versions) {
+        const keys: string[] = [];
+        for (const [key, enc] of records.get(v)!) {
+          const s = str(key);
+          let entries = this.history.get(s);
+          if (!entries) this.history.set(s, (entries = []));
+          entries.push({ v, enc });
+          this.historyCount++;
+          keys.push(s);
+        }
+        if (keys.length > 0) this.historyByVersion.set(v, keys);
+      }
+    }
+    this.floor = lowest;
   }
 
   /**
@@ -588,12 +743,14 @@ export class SparseMerkleTree {
       hash = (p.value ? this.insertAt(0, p.keyHash, p.value, e, hash) : this.removeAt(0, p.keyHash, e, hash)).hash;
     }
     this.pending.clear();
-    const keep = this.retain > 0 && this.version >= 0;
+    const keep = this.window > 0 && this.version >= 0;
     const changes: StoreChange[] = [];
     const keys: string[] = [];
+    const records: NodeRecord[] | null = this.version >= 0 ? [] : null;
     for (const [s, w] of this.work) {
       if (bytesEqual(w.before, w.enc)) continue;
       changes.push({ key: w.key, value: w.enc });
+      records?.push([w.key, w.before]);
       if (keep) {
         let entries = this.history.get(s);
         if (!entries) this.history.set(s, (entries = []));
@@ -605,15 +762,23 @@ export class SparseMerkleTree {
     this.work = null;
     if (keys.length > 0) this.historyByVersion.set(version, keys);
     this.nodeChanges = changes;
+    this.records = records;
     if (this.version < 0) this.floor = version;
     this.version = version;
     this.roots.set(version, hash.slice());
-    const min = version - this.retain;
+    if (version - this.window > this.floor) this.floor = version - this.window;
+    this.pruneDropped(version - this.window);
+    return hash.slice();
+  }
+
+  /** While dropped: forget the roots before `min` and the records that only serve versions before it. */
+  private pruneDropped(min: number): void {
     for (const v of this.roots.keys()) if (v < min) this.roots.delete(v);
     for (const [v, list] of this.historyByVersion) {
       if (v > min) continue;
       for (const s of list) {
-        const entries = this.history.get(s)!;
+        const entries = this.history.get(s);
+        if (!entries) continue; // emptied by an earlier version's pass, when several are pruned at once
         while (entries.length > 0 && entries[0]!.v <= min) {
           entries.shift();
           this.historyCount--;
@@ -622,7 +787,6 @@ export class SparseMerkleTree {
       }
       this.historyByVersion.delete(v);
     }
-    return hash.slice();
   }
 
   /** Put a key into the subtree at `depth` on its path, whose root is `e` with hash `hash`, writing what changes. */

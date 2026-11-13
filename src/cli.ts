@@ -5,10 +5,12 @@
  *       Writes genesis.json with a funded faucet and one validator per node,
  *       a keystore with the faucet and operator keys, and a directory per
  *       node with its consensus key and config. Prints the keystore passphrase.
- *   node src/cli.ts start <dir>/<nodeN> [--heap <MiB>]
+ *   node src/cli.ts start <dir>/<nodeN> [--heap <MiB>] [--arena <MiB>]
  *       Runs the node under a heap limit (three quarters of memory unless --heap says
  *       otherwise) with collections scheduled after commits; stops cleanly when the
- *       heap nears the limit, with exit code 3.
+ *       heap nears the limit, with exit code 3. A stored state too large for the heap
+ *       is opened paged. --arena bounds the encoded objects kept in memory outside the
+ *       heap (all of them by default); the rest are read from the store.
  *       Runs that node with its RPC on the p2p port plus one.
  *
  * Every other command takes a target: a node directory (its RPC URL and the
@@ -61,7 +63,7 @@ import { keyProofFromBytes } from './db/proof.ts';
 import { LightClient } from './light/client.ts';
 import { RpcProvider } from './light/rpc-provider.ts';
 import { Node } from './node/node.ts';
-import { heapLimitFlag } from './node/memory.ts';
+import { heapInUse, heapLimitFlag } from './node/memory.ts';
 import { TcpTransport } from './p2p/tcp.ts';
 import { RpcClient } from './rpc/client.ts';
 import { commitFromJson, headerFromJson, txQueryFromJson } from './rpc/json.ts';
@@ -83,7 +85,9 @@ interface NodeFiles {
   /** Join from a snapshot instead of replaying: a header the operator trusts. */
   stateSync?: { trustHeight: string; trustHash: string; backfill?: boolean };
   /** Blocks kept behind the latest (all when unset), provable heights, snapshots kept. */
-  retain?: { blocks?: number; versions?: number; snapshots?: number };
+  retain?: { blocks?: number; versions?: number; snapshots?: number; memoryVersions?: number };
+  /** 'store' reads the application's secondary indices from LMDB and never builds their trees in memory; 'memory' is the default. */
+  indexTrees?: 'memory' | 'store';
   snapshotInterval?: number;
 }
 
@@ -202,6 +206,8 @@ function startUnderHeapLimit(): boolean {
 }
 
 async function start(nodeDir: string): Promise<void> {
+  const arenaMb = flags.has('arena') ? Number(flags.get('arena')) : null;
+  if (arenaMb !== null && !(Number.isInteger(arenaMb) && arenaMb >= 16)) throw new Error('--arena takes a size in MiB, at least 16');
   if (startUnderHeapLimit()) return;
   const cfg = JSON.parse(readFileSync(join(nodeDir, 'config.json'), 'utf8')) as NodeFiles;
   const genesis = loadGenesisFile(join(nodeDir, '..', 'genesis.json'));
@@ -223,6 +229,8 @@ async function start(nodeDir: string): Promise<void> {
     stateSync: cfg.stateSync ? { trustHeight: BigInt(cfg.stateSync.trustHeight), trustHash: fromHex(cfg.stateSync.trustHash), backfill: cfg.stateSync.backfill } : undefined,
     retain: cfg.retain,
     snapshotInterval: cfg.snapshotInterval,
+    arenaBytes: arenaMb === null ? undefined : arenaMb * 1048576,
+    indexTrees: cfg.indexTrees,
   });
   const app = node.app as CoreApp;
   let rpc: RpcServer | null = null;
@@ -262,7 +270,7 @@ async function start(nodeDir: string): Promise<void> {
       round: node.consensus.round,
       validators: app.dynamic().active.length,
       pool: app.dynamic().communityPool,
-      heap: `${Math.round(m.heapUsed / 2 ** 20)}/${Math.round(m.heapLimit / 2 ** 20)} MiB`,
+      heap: `${Math.round(heapInUse(m) / 2 ** 20)}/${Math.round(m.heapLimit / 2 ** 20)} MiB`,
       memory: node.memoryLevel,
       gc: `${gc.collections} pauses, ${gc.totalMs.toFixed(0)} ms, longest ${gc.maxMs.toFixed(1)} ms`,
     });

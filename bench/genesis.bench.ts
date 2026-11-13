@@ -124,7 +124,7 @@ export async function run(): Promise<void> {
     const env2 = new LmdbEnv(join(dir, 'lmdb'));
     t = performance.now();
     app = new CoreApp({ genesis: loaded, verifier, kv: env2.store('app'), snapshotInterval: 0, log });
-    fact('restart from LMDB', `${fmtMs(performance.now() - t)} (read ${timings.objects} objects ${timings.importMs} ms, indices and root ${timings.rootMs} ms, history ${timings.historyMs} ms), height ${app.lastHeight}`);
+    fact('restart from LMDB', `${fmtMs(performance.now() - t)} (read ${timings.objects} objects ${timings.importMs} ms, indices and root ${timings.rootMs} ms, history ${timings.historyMs} ms, the sparse trees' past versions by ${timings.indexVersions}), height ${app.lastHeight}`);
     fact('memory after restart', await memory());
     // The ways a store can be reopened (STATE-PAGING.md 5.3): the trees from their chunks and nodes with every object
     // hashed against its leaf (what CoreApp does, above), the same without the leaf check, and the trees computed from
@@ -140,7 +140,7 @@ export async function run(): Promise<void> {
       let opened = openObjectDatabase(env2.store('app'), CORE_TYPES, { retainVersions: 100, ...opts });
       const ms = performance.now() - t;
       const tm = opened!.timing;
-      fact(`reopen the database: ${what}`, `${fmtMs(ms)} (read ${tm.importMs} ms, indices, trees and root ${tm.rootMs} ms, history ${tm.historyMs} ms)`);
+      fact(`reopen the database: ${what}`, `${fmtMs(ms)} (read ${tm.importMs} ms, indices, trees and root ${tm.rootMs} ms, history ${tm.historyMs} ms, by ${tm.indexVersions})`);
       opened = null;
       await memory();
     }

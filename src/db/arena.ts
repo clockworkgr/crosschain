@@ -22,6 +22,14 @@
  * generation is what refuses a stale reference into a slot used again; it
  * wraps after 8,192 reuses of one slot, which is harmless because the owner
  * never keeps a reference into a released slab (compaction moves them all).
+ *
+ * The arena is a cache when the owner has a store behind it (STATE-PAGING.md
+ * section 3.4): shrink() releases whole slabs until the arena is within a
+ * byte limit, telling the owner of every live entry in them that its bytes
+ * are now only in the store. Which slab goes is CLOCK again, a bit per slab
+ * set by every read: a slab nothing has read since the last pass goes first.
+ * The slabs are ArrayBuffers, outside V8's heap, so the limit is the owner's
+ * to set in bytes; the memory guard, which watches the heap, does not see them.
  */
 export const HEADER = 10;
 const FIRST_SLAB = 256 * 1024;
@@ -40,6 +48,8 @@ const MIN_COPY = MAX_SLAB;
 export interface ArenaOwner {
   refOf(type: number, instance: number): number;
   relocate(type: number, instance: number, ref: number): void;
+  /** The slab holding an entry's bytes was released by shrink(): they are now only in the owner's store. */
+  released(type: number, instance: number): void;
 }
 
 interface Slab {
@@ -49,6 +59,8 @@ interface Slab {
   dead: number;
   /** Counted up each time the slot is given a new slab, so a reference into an older one is refused. */
   generation: number;
+  /** Read since shrink() last passed over it. */
+  touched: boolean;
 }
 
 /** A reference from a slab number (its generation and slot, generation * 2^16 + slot) and an offset; refused if either does not fit. */
@@ -105,11 +117,12 @@ export class Arena {
       const s = this.slabs[slot]!;
       s.buf = new Uint8Array(size);
       s.generation = (s.generation + 1) % GENERATIONS;
+      s.touched = false;
       this.current = slot;
       return;
     }
     if (this.slabs.length >= SLOTS) throw new RangeError(`the arena holds at most ${SLOTS} slabs at once`);
-    this.slabs.push({ buf: new Uint8Array(size), used: 0, dead: 0, generation: 0 });
+    this.slabs.push({ buf: new Uint8Array(size), used: 0, dead: 0, generation: 0, touched: false });
     this.current = this.slabs.length - 1;
   }
 
@@ -175,6 +188,7 @@ export class Arena {
   /** The encoding an entry holds: a view into the slab, valid until the next compaction. */
   read(ref: number): Uint8Array {
     const h = this.header(ref);
+    this.slabs[slabOf(ref) % SLOTS]!.touched = true;
     return h.buf.subarray(h.at + HEADER, h.at + HEADER + h.length);
   }
 
@@ -216,6 +230,38 @@ export class Arena {
       released += this.release(s);
     }
     this.written = 0;
+    return released;
+  }
+
+  /**
+   * Release whole slabs until the arena's capacity is within `limit` bytes, never the current one (so the least it
+   * comes down to is that slab, 16 MiB at most). Each live entry of a released slab is handed to the owner as
+   * released: the caller must know that its store holds every committed encoding. Slabs nothing has read since the
+   * last call go first, in slot order; the others lose their mark and go on a second pass if the first was not
+   * enough. Returns the bytes released.
+   */
+  shrink(limit: number): number {
+    let capacity = 0;
+    for (const s of this.slabs) if (s.buf) capacity += s.buf.length;
+    let released = 0;
+    for (let pass = 0; pass < 2 && capacity > limit; pass++) {
+      for (let s = 0; s < this.slabs.length && capacity > limit; s++) {
+        const slab = this.slabs[s]!;
+        if (s === this.current || !slab.buf) continue;
+        if (pass === 0 && slab.touched) {
+          slab.touched = false;
+          continue;
+        }
+        for (let at = 0; at < slab.used; ) {
+          const h = this.header(this.refAt(s, at));
+          if (this.owner.refOf(h.type, h.instance) === this.refAt(s, at)) this.owner.released(h.type, h.instance);
+          at += HEADER + h.length;
+        }
+        const size = this.release(s);
+        capacity -= size;
+        released += size;
+      }
+    }
     return released;
   }
 }
