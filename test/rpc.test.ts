@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -249,5 +249,11 @@ describe('keystore', () => {
     expect(() => Keystore.open(path, 'wrong')).toThrow(/wrong passphrase/);
     const raw = JSON.parse(readFileSync(path, 'utf8'));
     expect(JSON.stringify(raw)).not.toContain(toHex(seedFor('ks/bob')));
+    // A file of another version is refused, by a fresh open and by a handle that was open when it changed.
+    writeFileSync(path, JSON.stringify({ ...raw, version: 2 }));
+    expect(() => Keystore.open(path, 'correct horse')).toThrow(/unsupported keystore/);
+    expect(() => again.add('carol')).toThrow(/unsupported keystore/);
+    expect(JSON.parse(readFileSync(path, 'utf8')).keys.carol).toBeUndefined();
+    expect(existsSync(`${path}.lock`)).toBe(false);
   });
 });

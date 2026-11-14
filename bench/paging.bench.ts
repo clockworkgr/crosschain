@@ -94,6 +94,13 @@ export async function run(): Promise<void> {
       for (const l of lines.filter((l) => l.event === 'log')) fact(`node log at ${l.s} s`, `${l.msg}${l.heap ? ` (${l.heap})` : ''}${l.needs ? ` (needs ${l.needs}, room ${l.room})` : ''}`);
       const proofs = lines.find((l) => l.event === 'proofs');
       if (proofs) fact('node: an account proof after the run', `${proofs.newestMs} ms at the newest height (${proofs.height}), ${proofs.middleMs} ms halfway back, ${proofs.oldestMs} ms at the oldest provable (${proofs.oldest}); history window ${proofs.history}, ${proofs.window} versions kept in memory`);
+      const fmt = (r: any) => (r ? `${r.n} reads, mean ${r.mean} us, median ${r.p50}, 99th percentile ${r.p99}, longest ${r.max}` : 'none');
+      for (const w of lines.filter((l) => l.event === 'window' && l.reads)) {
+        const r = w.reads as Record<string, any>;
+        fact(`node reads, ${String(w.s).padStart(5)} s`, `index trees ${w.indexTrees}; by name: ${fmt(r.name)}; balance: ${fmt(r.balance)}; page of 20: ${fmt(r.page)}`);
+      }
+      const reads = lines.find((l) => l.event === 'reads');
+      if (reads) fact(`node: index reads beside the load (${reads.perSecond} of each kind a second)`, `account by name: ${fmt(reads.name)}; balance by owner and asset: ${fmt(reads.balance)}; page of twenty accounts in name order: ${fmt(reads.page)}`);
       const sum = lines.find((l) => l.event === 'summary');
       // The rate is over the time the run took by the clock, not the seconds it was asked for.
       if (sum) fact(`node: ${sum.seconds} s in all (${NODE_SECONDS} asked)`, `${sum.blocks} blocks, ${sum.txs} transfers (${(Number(sum.txs) / Number(sum.seconds)).toFixed(0)}/s); ${sum.pagedBlocks} blocks holding ${sum.pagedTxs} transfers committed with the Merkle trees dropped; ${sum.submitted} submitted, ${sum.refused} refused; levels: ${sum.levels || 'none'}`);

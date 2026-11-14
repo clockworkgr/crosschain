@@ -361,8 +361,11 @@ heap for ten minutes, the node opens with 258 MiB of heap in use against 398 MiB
 third less, commits 1,552 transfers a second against 1,485, which is within what two
 runs differ by (4.5%), and reaches `warn` once against twice, with nothing to rebuild
 but the window (docs/benchmarks.md section 4.13). What it gives up is index reads from
-memory, which were not measured under the setting; proofs and the Merkle trees are
-unaffected.
+memory, measured with 200 reads a second of each kind beside the load: a lookup by key
+takes 5 microseconds at the median either way, a page of twenty accounts in name order
+33 microseconds from the store against 17 from memory, and the three runs with the
+setting commit 8% more than the three without (1,503 against 1,395 transfers a second).
+Proofs and the Merkle trees are unaffected.
 
 Two things are decided outside the guard's levels. The arena's slabs are `ArrayBuffer`s
 outside V8's heap, which the guard does not see, so the arena is bounded by a byte budget
@@ -914,7 +917,7 @@ misbehaviour list than every other node and diverge the state. Validator sets ar
 also stored by the height they sign, priorities included, because a state-synced
 node must continue consensus with the exact proposer priorities.
 
-## 10. Implementation status (2026-11-12)
+## 10. Implementation status (2026-11-14)
 
 Everything above is implemented in TypeScript under `src/`. 203 tests in 24 files
 pass, and the whole suite passes under either signature scheme
@@ -1072,7 +1075,8 @@ done about each finding.
   starts with its index trees resident when they fit and rebuilds them when the heap has
   stayed at `ok` long enough, index reads being served from memory then; an operator
   who prefers write throughput sets `indexTrees: 'store'` and the node never builds them,
-  though index reads from the store have not been measured on a node under load. A store whose
+  and gives up little: beside the load a lookup by key takes 5 microseconds either way and a
+  page of twenty 33 against 17 (docs/benchmarks.md section 4.13). A store whose
   tiers do not fit the heap is now opened with them dropped and without its history
   window in memory, the heights before the one it opened at proven from the records in
   the store and the window filling a block at a time; that took the floor for `--heap` from two thirds of the

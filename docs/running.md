@@ -672,8 +672,11 @@ node's answer, unproven.
   pause of 155 ms. Over the whole run the two rates are within what two runs differ by
   (4.5%); the default run's own stretches show the cost of the trees (below). After that
   one `warn` the node has nothing to rebuild but the window. What the setting gives up is
-  index reads from memory, which were not measured under it; proofs and the Merkle trees
-  are unaffected. What paging costs (docs/benchmarks.md sections 4.11 to 4.13): with
+  index reads from memory, and that is little: read 200 times a second of each kind while
+  the node commits, a lookup by key (an account by name, a balance) takes 5 microseconds
+  at the median with either setting, and a page of twenty accounts in name order takes 33
+  microseconds from the store against 17 from memory; the runs with `store` committed 8%
+  more. Proofs and the Merkle trees are unaffected. What paging costs (docs/benchmarks.md sections 4.11 to 4.13): with
   the cache capped a block of transfers among random accounts takes about twice as long; the
   index trees dropped cost a block of transfers nothing (a lookup through LMDB costs about
   what a resident one does, a scan four to six times as much, still under a microsecond an

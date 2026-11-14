@@ -691,8 +691,12 @@ As built (`src/node/node.ts`, `onMemoryLevel`):
   1,552 transfers a second against 1,485, which is within what two runs differ by (4.5%),
   and reaches `warn` once, at 40 s, from the history window and the cache, against twice,
   with nothing to rebuild but the window (docs/benchmarks.md section 4.13). What it gives
-  up is index reads from memory, which were not measured under the setting. Proofs and the
-  Merkle trees are unaffected.
+  up is index reads from memory. With 200 reads a second of each kind beside the load
+  (`BENCH_PAGING_READS=200`, 2,380 MiB of heap so that the default node keeps its trees) a
+  lookup by key takes 5 microseconds at the median either way, a page of twenty accounts in
+  name order 33 microseconds from the store against 17 from memory (about 200 against 47 at
+  the 99th percentile), and the three runs with the setting commit 8% more than the three
+  without, 1,503 against 1,395 transfers a second. Proofs and the Merkle trees are unaffected.
 - **The limit is the old generation's.** V8's `heap_size_limit` adds the young generation's
   reserve to `--max-old-space-size` (192 MiB on the machine measured), which long-lived
   objects never fill; a process aborts when the old generation is full. With the CLI's
@@ -837,7 +841,7 @@ reached `critical`; the 192,000-account node commits 1,650 to 1,800 transfers a 
 every one of the five limits, the spread between runs, having reached `warn` once and run
 on with its index trees in the store and two versions of history in memory. Held for ten
 minutes at 1.0 and 2.5 times its resident heap it commits 1,619 and 1,485 transfers a
-second (1,524 at 0.8 times, in the build before the last), refuses nothing after its
+second (1,608 at 0.8 times), refuses nothing after its
 first two seconds and never reaches `pressure`: each `warn`, five and two in the two
 runs, is followed by `ok` within half a second. Within the run at the resident figure
 every window of twenty seconds is between 1,530 and 1,780 transfers a second. The run at

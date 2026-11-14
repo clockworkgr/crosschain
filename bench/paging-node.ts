@@ -6,7 +6,10 @@
  * guard as a node runs it, keeps its mempool fed with transfers among random
  * accounts, and prints one JSON line per two seconds (blocks, transfers, the
  * guard's level, each tier's mode, the heap), one per guard message, and a
- * summary at the end.
+ * summary at the end. With BENCH_PAGING_READS=<per second> it also reads the
+ * indices at that rate while the node commits (an account by name, a balance
+ * by owner and asset, a page of twenty accounts in name order) and reports
+ * what each kind of read took, per window and over the run.
  */
 import './scheme.ts';
 import { writeFileSync } from 'node:fs';
@@ -14,16 +17,17 @@ import { Session } from 'node:inspector/promises';
 import { join } from 'node:path';
 import type { CoreApp } from '../src/app/core/app.ts';
 import { signedTxBytes, withFees } from '../src/app/core/client.ts';
-import { TYPE } from '../src/app/core/types.ts';
+import { AccountType, TYPE } from '../src/app/core/types.ts';
 import { keyPairFromSeed } from '../src/crypto/keys.ts';
 import { WorkerVerifier } from '../src/crypto/verifier.ts';
 import { objectId } from '../src/db/id.ts';
+import { key } from '../src/db/keys.ts';
 import { Node } from '../src/node/node.ts';
 import { heapInUse, memoryStats } from '../src/node/memory.ts';
 import { MemoryHub } from '../src/p2p/memory.ts';
 import { loadGenesisFile, type Genesis } from '../src/types/genesis.ts';
 import { seed } from './fixtures.ts';
-import { CHAIN_ID, POOL, poolKeys } from './bigstate.ts';
+import { accountName, CHAIN_ID, POOL, poolKeys } from './bigstate.ts';
 
 const TIMEOUTS = { proposeMs: 400, proposeDeltaMs: 200, prevoteMs: 200, prevoteDeltaMs: 100, precommitMs: 200, precommitDeltaMs: 100, commitMs: 50, gossipMs: 150 };
 const NETWORK = { connectIntervalMs: 100, pingIntervalMs: 1000, idleTimeoutMs: 5000, desiredOutbound: 16, maxInbound: 32 };
@@ -41,6 +45,8 @@ const WINDOW_S = Number(process.env.BENCH_PAGING_WINDOW ?? 2);
 const ARENA = process.env.BENCH_PAGING_ARENA ? Number(process.env.BENCH_PAGING_ARENA) * 1048576 : undefined;
 /** BENCH_PAGING_MEMORY_VERSIONS keeps that many past versions in memory, as `retain.memoryVersions` does. */
 const MEMORY_VERSIONS = process.env.BENCH_PAGING_MEMORY_VERSIONS ? Number(process.env.BENCH_PAGING_MEMORY_VERSIONS) : undefined;
+/** BENCH_PAGING_READS is how many index reads of each kind are made a second while the node commits. */
+const READS = Number(process.env.BENCH_PAGING_READS ?? 0);
 /** BENCH_PAGING_PROFILE names a directory: a CPU profile of the run's first 30 seconds and one of its last 30 are written there. */
 const PROFILE = process.env.BENCH_PAGING_PROFILE;
 const t0 = performance.now();
@@ -110,6 +116,39 @@ const feeder = setInterval(() => {
     );
   }
 }, 20);
+// Index reads beside the load: each tick makes a twentieth of a second's share of each kind, timed one by one.
+const READ_KINDS = ['name', 'balance', 'page'] as const;
+const reads: Record<(typeof READ_KINDS)[number], { all: number[]; window: number[] }> = { name: { all: [], window: [] }, balance: { all: [], window: [] }, page: { all: [], window: [] } };
+const timed = (kind: (typeof READ_KINDS)[number], fn: () => void) => {
+  const t = performance.now();
+  fn();
+  const ms = performance.now() - t;
+  reads[kind].all.push(ms);
+  reads[kind].window.push(ms);
+};
+const reader =
+  READS > 0
+    ? setInterval(() => {
+        for (let i = 0; i < Math.max(1, Math.round(READS / 20)); i++) {
+          timed('name', () => void (app.accountByName(accountName(rnd())) ?? fail('no account by that name')));
+          timed('balance', () => void app.balance(objectId(TYPE.account, rnd())));
+          timed('page', () => {
+            let n = 0;
+            for (const _ of app.db.scanFrom(AccountType, 'byName', key((k) => k.str(accountName(rnd()))))) if (++n === 20) break;
+          });
+        }
+      }, 50)
+    : null;
+function fail(msg: string): never {
+  throw new Error(msg);
+}
+/** Mean, median, 99th percentile and longest, in microseconds. */
+const spread = (ms: number[]) => {
+  if (ms.length === 0) return null;
+  const sorted = ms.slice().sort((a, b) => a - b);
+  const us = (v: number) => Math.round(v * 1000);
+  return { n: ms.length, mean: us(ms.reduce((a, b) => a + b, 0) / ms.length), p50: us(sorted[sorted.length >> 1]!), p99: us(sorted[Math.floor(sorted.length * 0.99)]!), max: us(sorted[sorted.length - 1]!) };
+};
 let lastBlocks = 0;
 let lastTxs = 0;
 let lastRefused = 0;
@@ -165,7 +204,9 @@ for (let s = WINDOW_S; s <= seconds; s += WINDOW_S) {
     gcPauses: gc.collections - lastGc.collections,
     gcMs: Math.round(gc.totalMs - lastGc.totalMs),
     gcMax: Math.round(gc.maxMs * 10) / 10,
+    ...(reader ? { reads: Object.fromEntries(READ_KINDS.map((k) => [k, spread(reads[k].window)])) } : {}),
   });
+  for (const k of READ_KINDS) reads[k].window = [];
   lastBlocks = blocks;
   lastTxs = committed;
   lastRefused = refused;
@@ -173,6 +214,10 @@ for (let s = WINDOW_S; s <= seconds; s += WINDOW_S) {
   lastAt = now;
 }
 clearInterval(feeder);
+if (reader) {
+  clearInterval(reader);
+  emit({ event: 'reads', perSecond: READS, ...Object.fromEntries(READ_KINDS.map((k) => [k, spread(reads[k].all)])) });
+}
 // Proofs of random accounts at the newest height and at the oldest provable one, which a trimmed window reads from the store's records.
 {
   const time = (height: bigint) => {

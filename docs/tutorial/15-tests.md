@@ -1843,7 +1843,9 @@ reported schedule commits; a transfer priced from `DEFAULT_FEES` is refused with
 `Keystore.create(path, 'correct horse')`; `add('alice')` with a random seed and `add('bob', seed)`
 with a given one; `list()` names both; adding `alice` again throws `/already exists/`. Reopened
 with the passphrase, it returns the same address, seed and public key; the wrong passphrase
-throws `/wrong passphrase/`; and the raw JSON file does not contain bob's seed in hex.
+throws `/wrong passphrase/`; and the raw JSON file does not contain bob's seed in hex. The file
+is then rewritten with `version: 2`: `open` throws `/unsupported keystore/`, so does `add('carol')`
+on the handle opened before, the file gains no `carol`, and no lock file is left behind.
 
 ### test/sync.test.ts
 
