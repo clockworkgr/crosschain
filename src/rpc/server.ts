@@ -197,8 +197,10 @@ export class RpcServer {
       return;
     }
     const responses: unknown[] = [];
-    for (const r of requests) {
-      const answer = await this.one(r, remote);
+    // The HTTP request paid for its first call; each further call of a batch pays for itself, so that a batch
+    // costs what its calls would have cost one by one.
+    for (const [i, r] of requests.entries()) {
+      const answer = await this.one(r, remote, i > 0);
       if (answer !== undefined) responses.push(answer);
     }
     // Notifications alone leave nothing to answer: no content, as JSON-RPC over HTTP has it.
@@ -210,7 +212,7 @@ export class RpcServer {
   }
 
   /** One request's response, or undefined for a notification (a request without an id), which is carried out but not answered. */
-  private async one(r: unknown, remote: string): Promise<unknown> {
+  private async one(r: unknown, remote: string, charge: boolean): Promise<unknown> {
     const hasId = !!r && typeof r === 'object' && 'id' in r;
     const rawId = hasId ? (r as { id: unknown }).id : null;
     const id = typeof rawId === 'string' || typeof rawId === 'number' || rawId === null ? rawId : null;
@@ -221,6 +223,7 @@ export class RpcServer {
     }
     const answer = hasId ? reply : () => undefined;
     const { method, params } = r as { method: string; params?: unknown };
+    if (charge && !this.allow(remote, 1)) return answer({ code: RATE_LIMITED, message: 'rate limited' });
     const m = this.methods[method];
     if (!m) return answer({ code: -32601, message: `unknown method ${method}` });
     if (params !== undefined && (typeof params !== 'object' || params === null || Array.isArray(params))) return answer({ code: INVALID_PARAMS, message: 'params must be an object' });

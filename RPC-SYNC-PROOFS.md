@@ -16,7 +16,7 @@ out of this round; proofs stay ICS23-shaped for the latter.
 |---|---|
 | transaction proofs | Merkle data hash for inclusion; a results hash in the next header for success and error, deferred like the app hash |
 | header | breaking change now, with a protocol `version` field added at the same time and checked by validation |
-| transaction index | by hash in the chain store; per-account operation history in the app store, one entry per operation, including virtual operations |
+| transaction index | by hash in the chain store, one entry per block a transaction is in; per-account operation history in the app store, one entry per operation, including virtual operations |
 | wire protocol | JSON-RPC 2.0 over HTTP, decoded objects as JSON, proofs and raw transactions as hex of the binary encoding |
 | broadcast | `sync` (after checkTx) and `commit` (after inclusion, with the result) |
 | push | Server-Sent Events: blocks, transaction results, account history, validator set changes |
@@ -61,15 +61,31 @@ shape; existing data directories are discarded.
 - `ResultProof { height, index, ok, error, siblings }` verifies against
   `header(height + 1).lastResultsHash`.
 
-Both are ordinary dense-tree path proofs; `src/types/txproof.ts` holds the two verifiers,
+Both are ordinary dense-tree path proofs. Neither states how many transactions the
+block has: the root commits to the tree's height, which is the path's length, and not
+to the count, so a proof carrying one would state something it does not prove. The
+verifiers require the index to be one the path's length can address (`index <
+2 ** siblings.length`), and the decoders read at most 32 siblings; a leaf is hashed
+apart from an inner node, so a path of another length cannot lead to the same root.
+`src/types/txproof.ts` holds the two verifiers,
 and `src/light/client.ts` gains `verifyTx`, which verifies headers `height` and
 `height + 1` and checks both legs. The transaction hash is `sha256` of the raw bytes,
 which the mempool already uses.
 
 ### 2.3 Transaction index
 
-The chain store gains `'t' || txHash -> (height u64, index u32, ok u8, error string)`,
-written by the executor in the same transaction as the block. It is derived data,
+The chain store gains `'t' || txHash || height u64 -> (height u64, index u32, ok u8,
+error string)`, written by the executor in the same transaction as the block. A
+transaction that failed can be included again, so one hash can have several entries,
+one per block that carries it: `txLocations(hash)` lists every block still held that
+carries the transaction, oldest first, and `txLocation(hash)` is the block it
+succeeded in if there is one, else the newest. Pruning a block removes that block's
+entry only. The index was first keyed `'t' || txHash`, one entry per hash, the last
+block written winning; a store of that layout has its entries moved to the new keys
+once, when it is next opened (`migrateTxIndex`), 5,000 entries a write, and `'T'`
+records the layout last, so a move that was cut short is taken up again. A store that
+cannot be written is left as it is and read in the old layout, the short key lying
+under the same prefix. It is derived data,
 outside the state root, and is rebuilt by replay or by backfill (section 4.2).
 
 ### 2.4 Account history
@@ -153,12 +169,15 @@ the memory guard's level (`memory`). Default bind `127.0.0.1`
 on the p2p port plus one; config `rpcListen` sets host and port. Responses carry
 `Access-Control-Allow-Origin: *`. Bodies over 1 MB are rejected with HTTP 413. Each
 remote address has a token bucket of 50 tokens per second with a burst of 100: every
-HTTP request costs one token, and a costly method (`block`, `object`, `key`,
-`account`, `delegation`, `accountHistory`, `tx`, `broadcastTx`, `accounts`,
-`proposals`, whether or not a proof is requested) costs four more when it is
-dispatched, so a batch of cheap methods costs one token in all. An empty bucket at
-the request stage returns HTTP 429 with a `-32004` error body; at the dispatch stage
-it returns the `-32004` error for that method inside an HTTP 200 response. At most 8
+HTTP request costs one token, which covers its first call; each further call of a
+batch costs one more, taken before its method is looked up; and a costly method
+(`block`, `object`, `key`, `account`, `validator`, `delegation`, `balance`,
+`accountHistory`, `tx`, `broadcastTx`, `accounts`, `proposals`, whether or not a
+proof is requested) costs four more when it is dispatched, so a batch costs what its
+calls would have cost one by one. An empty bucket at
+the request stage returns HTTP 429 with a `-32004` error body; at the dispatch stage,
+or for a further call of a batch that cannot pay,
+it returns the `-32004` error for that call in its place inside an HTTP 200 response. At most 8
 event streams per address, and a reconnect that asks for replay pays the costly
 price; over either limit the stream request gets HTTP 429. While the node sheds load
 under memory pressure (DESIGN.md section 4), a costly method is answered `-32004` with
@@ -183,9 +202,8 @@ the streams already open are unaffected.
 - headers and commits: JSON with hex fields; a missing signature is `null`.
 - errors: JSON-RPC error objects; `-32700` parse error (HTTP 400), `-32600` invalid
   request (a batch outside 1 to 20 is refused whole with HTTP 400; a malformed member
-  is answered in its place), `-32601` unknown method, `-32602` for bad parameters,
-  including a proof requested for a height outside the provable window, `-32001`
-  not found, `-32002` check failed (with the application's message), `-32003`
+  is answered in its place), `-32601` unknown method, `-32602` for bad parameters, `-32001`
+  not found, including a state query for a height the application does not hold, `-32002` check failed (with the application's message), `-32003`
   timeout, `-32004` rate limited.
 
 ### 3.3 Methods
@@ -200,27 +218,42 @@ the streams already open are unaffected.
 | validators | height? | the set that signs that height: hash, total power, proposer address, members with address, public key and power (no priorities) |
 | validatorSet | hash | a set by hash, same shape |
 | object | id, height?, prove? | type, height, the object as of that height or null, with `proof` hex when asked |
-| key | type, index, key (hex), height?, prove? | `{ height, id, proof? }`: the object id the key maps to now (`"type.n"`) or null, with the key proof at `height` when asked |
-| account | name, height?, prove? | account object or null; with it the balances (asset symbol, id, precision, amount), the operated validator's id or null, and the history count, all current; the name proof at `height` when asked |
-| validator | operator (name) or id (validator id) | validator object with status, active flag, power, self-bond, delegator count, operator name; current state only |
-| delegation | delegator, validator, height?, prove? | the delegation with its tokens' worth or null, and the pending unbonding entries, current; the key proof at `height` when asked |
-| balance | account, asset? | account id, asset id, amount; current state only |
+| key | type, index, key (hex), height?, prove? | `{ height, id, proof? }`: the object id the key mapped to at `height` (`"type.n"`) or null, read from the key proof at `height`, which is returned when asked |
+| account | name, height?, prove? | `height`, the account object or null; with it the balances (asset symbol, id, precision, amount), the operated validator's id or null, and the history count, all as of `height`; the name proof at `height` when asked |
+| validator | operator (name) or id (validator id), height? | `height`, the validator object with status, active flag, power, self-bond and operator name as of `height`; `delegators`, a count at the latest height and null at a past one |
+| delegation | delegator, validator, height?, prove? | `height`, the delegation with its tokens' worth as of `height` or null; `unbonding`, the pending entries at the latest height and null at a past one; the key proof at `height` when asked |
+| balance | account, asset?, height? | `height`, account id, asset id, amount as of `height` |
 | accountHistory | account, from?, limit?, reverse? | entries with sequence numbers, and the total; pagination below |
-| tx | hash, prove? | `{ hash, height, index, ok, error, tx, decoded, proof? }`; `proof` holds `txProof`, the signed header, and `resultProof` with the next signed header, or nulls for those while the next block does not exist |
+| tx | hash, prove? | `{ hash, height, index, ok, error, tx, decoded, attempts?, proof? }`: the block the transaction succeeded in if there is one, else the newest that carries it; `attempts` lists height, index, ok and error for every block still held that carries it, oldest first, when there is more than one; `proof` holds `txProof`, the signed header, and `resultProof` with the next signed header, or nulls for those while the next block does not exist |
 | broadcastTx | tx hex, mode? (`sync` default, or `commit`), timeoutMs? (default 30 000, at most 120 000) | `sync`: `{ hash, status }`; `commit`: `{ hash, height, index, ok, error }` once included; `-32004` while the mempool is paused under memory pressure |
 | accounts | after? (name cursor, exclusive), limit? | accounts by name with id and core balance |
 | parameters | | height, core asset (id, symbol, precision), maximum transaction expiration, the fee schedule and the staking parameters in force |
 | proposals | | open proposals, soonest to expire first, each with the full parameters it would adopt |
 | mempool | | count, bytes, the first 100 hashes |
-| peers | | connected peers: id, address, direction, height, latency |
+| peers | | connected peers: id, address, direction, height, latency, and `clockOffsetMs`, how far the peer's clock is ahead of this node's by its last pong (null before the first) |
 | snapshots | | reserved: an empty list (snapshot heights are exchanged over p2p, not the RPC) |
 
 Omitted heights default to the latest. An `account` or `delegator` parameter takes
 an account name or id; a `validator` parameter takes the operator's name or the
-validator's id; the `account` method itself takes a name. `object` reads the object as of the requested height;
-`key`, `account` and `delegation` look the key up in the live index and return
-current objects, and only their proof is about the requested height, so an answer
-about a past height is read from the proof, not from the object fields.
+validator's id; the `account` method itself takes a name. Every state query (`object`,
+`key`, `account`, `validator`, `delegation`, `balance`) answers as of one height, the
+one in `height` or the last committed one, and returns it, so a value and the proof
+beside it are about the same state. A height outside what the application holds, from
+its lowest provable height to the last committed one, is refused with `-32001` and
+`the state at height H is not kept (heights A to B are)`. A unique index is read at
+the height from the index's own tree: the key proof is made first and the id taken
+from its leaf, and the live index, which holds the writes of the block in progress
+and says nothing of a past height, is not asked. `account` finds the account through
+the name index at the height and reads it, its balances, its validator and its
+history count as of it; a balance object is never removed, so the balances the
+account has now are all it ever had, each read as it was then, one created since
+reading as absent. A name no account can have gives `account: null`, and with `prove`
+a `-32602` error, there being nothing to prove. `balance` by a name that had no
+account at the height is `-32001`; by id it is 0. Two fields are given for the latest
+height only and are null at a past one, because the objects behind them are removed:
+`validator`'s `delegators` (a delegation goes with its last share) and `delegation`'s
+`unbonding` (an entry goes when it matures). `accountHistory` and the listings read
+the latest state.
 
 Pagination: `accountHistory` returns 20 entries by default and at most 100, oldest
 first from sequence `from` (default 0); with `reverse`, entries come newest first and
@@ -285,7 +318,9 @@ pair is derived under; a key sealed before the field existed has none and is rea
 ML-DSA-44. The passphrase comes from `--passphrase-file`, the `CHAIN_PASSPHRASE`
 variable, or a hidden prompt. Commands: `keys add <name> [--scheme <name>]`, `keys
 list` (name, scheme, address), `keys import <name> <seed hex> [--scheme <name>]`,
-`keys export <name>`; `--scheme` is ML-DSA-44 when absent, and a chain refuses a key
+`keys export <name>`, `keys remove <name>` (prints `removed <name> <address>`; the
+seed goes with the entry, and a name that is not there is refused with `no key named
+<name>`); `--scheme` is ML-DSA-44 when absent, and a chain refuses a key
 of the other scheme. `init [--scheme <name>]` writes the faucet and operator keys, of
 the chain's scheme, into the testnet's keystore and prints the passphrase it chose.
 
@@ -428,7 +463,10 @@ drift is not checked on synced blocks.
 ### 4.4 Evidence gossip
 
 Evidence becomes an inventory item kind next to transactions: announce by key,
-fetch, verify against the validator set at its height, add to the pool, pass on. A
+fetch, verify against the validator set at its height, add to the pool, pass on. The
+pool lets go of evidence, pending or committed, and of its inventory entry once it is
+older than the evidence age, on every node after every commit, and holds at most
+1,000 pending pieces (`EvidencePool.MAX_PENDING`), refusing more. A
 hash a peer announces is fetched at most once while a fetch for it is outstanding
 (ten seconds, or until the item or a not-found arrives), in batches of 256. A newly
 connected peer receives every pending evidence key, in `inv` messages of 256, with
@@ -521,7 +559,14 @@ two keystore handles over one file keeping each other's keys and leaving no lock
 behind, a lone notification answered with 204 and a mixed batch answered only for
 the request with an id, and a light client walking back from its anchor, refusing a
 height before genesis, one after the anchor and one beyond `maxBackwardSteps`, and
-catching a header that is not the one the header above names. The CLI is not driven
+catching a header that is not the one the header above names. `test/review4.test.ts`
+(nine cases) adds the state queries at a height with their proofs, a height not kept,
+the peers' clock offsets and a batch paying for each of its calls; the transaction
+index with one transaction in three blocks and an index of the old layout moved when
+the store is opened; a snapshot
+with a section missing, repeated or out of order; the evidence pool's pruning and
+bound; the codec's `u53` and `i53`; `Keystore.remove`; a peer clock read from its
+pong; and a node that makes and closes its own verifier pool. The CLI is not driven
 by a test, and no test compares the index or history with a replayed node's.
 
 Stage three (`test/sync.test.ts`): a node joins a running testnet from a snapshot,

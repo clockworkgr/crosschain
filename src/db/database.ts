@@ -197,12 +197,12 @@ export function decodeHistory(r: Reader): HistoryRecord {
     trees: r.array((r) => ({
       tree: r.u16(),
       records: {
-        sizeBefore: r.option((r) => Number(r.u64())),
-        nodes: r.array((r) => [r.u8(), Number(r.u64()), r.fixed(HASH_SIZE)] as [number, number, Uint8Array]),
+        sizeBefore: r.option((r) => r.u53()),
+        nodes: r.array((r) => [r.u8(), r.u53(), r.fixed(HASH_SIZE)] as [number, number, Uint8Array]),
       },
     })),
     objects: r.array((r) => [r.u64(), r.option((r) => r.bytes())] as [ObjectId, Uint8Array | null]),
-    counters: r.array((r) => [r.u16(), Number(r.u64())] as [number, number]),
+    counters: r.array((r) => [r.u16(), r.u53()] as [number, number]),
     // A record written before the sparse nodes were kept ends here.
     nodes: r.remaining() === 0 ? null : r.option((r) => r.array((r) => [r.bytes(), r.option((r) => r.bytes())] as NodeRecord)),
   };
@@ -1548,9 +1548,14 @@ export class ObjectDatabase {
       if (v !== SNAPSHOT_VERSION) throw new DbError(`snapshot version ${v}`);
       const height = r.u64();
       const appHash = r.fixed(HASH_SIZE);
+      // One section for every registered type, in the order encodeSnapshot writes them: a snapshot that leaves a
+      // type out, repeats one or names one this database does not have is refused here, before the root is compared.
+      let sections = 0;
       r.array((r) => {
         const type = r.u16();
-        const next = Number(r.u64());
+        if (sections >= this.order.length || type !== this.order[sections]) throw new DbError(`snapshot section ${sections} is of type ${type}, where type ${this.order[sections] ?? 'none'} belongs`);
+        sections++;
+        const next = r.u53();
         r.array((r) => {
           const id = r.u64();
           if (typeOf(id) !== type || instanceOf(id) >= next) throw new DbError('snapshot object out of range');
@@ -1558,6 +1563,7 @@ export class ObjectDatabase {
         });
         this.setCounter(type, next);
       }, this.order.length);
+      if (sections !== this.order.length) throw new DbError(`snapshot has ${sections} of ${this.order.length} type sections`);
       return { height, appHash };
     });
   }

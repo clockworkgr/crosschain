@@ -43,7 +43,7 @@ export function decodeProposal(r: Reader): Proposal {
   return {
     height: r.u64(),
     round: r.u32(),
-    polRound: Number(r.i64()),
+    polRound: r.i53(),
     block: decodeBlock(r),
     signature: decodeSignature(r),
   };

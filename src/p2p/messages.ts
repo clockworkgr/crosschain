@@ -39,7 +39,8 @@ export type Message =
   | { type: 'addrRequest' }
   | { type: 'addrResponse'; addrs: string[] }
   | { type: 'ping'; time: bigint }
-  | { type: 'pong'; time: bigint }
+  /** The ping's time echoed, and the answerer's own clock when it answered: the asker reads its round trip from the first and the other's clock offset from both. */
+  | { type: 'pong'; time: bigint; now: bigint }
   | { type: 'status'; height: bigint }
   | { type: 'inv'; kind: number; hashes: Uint8Array[] }
   | { type: 'fetch'; kind: number; hashes: Uint8Array[] }
@@ -161,8 +162,10 @@ export function encodeMessage(m: Message): Uint8Array {
         w.array(m.addrs, (w, a) => w.string(a));
         break;
       case 'ping':
-      case 'pong':
         w.u64(m.time);
+        break;
+      case 'pong':
+        w.u64(m.time).u64(m.now);
         break;
       case 'status':
         w.u64(m.height);
@@ -266,8 +269,9 @@ export function decodeMessage(buf: Uint8Array): Message {
       case 'addrResponse':
         return { type, addrs: r.array((r) => r.string(256), 256) };
       case 'ping':
-      case 'pong':
         return { type, time: r.u64() };
+      case 'pong':
+        return { type, time: r.u64(), now: r.u64() };
       case 'status':
         return { type, height: r.u64() };
       case 'inv':

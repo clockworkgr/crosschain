@@ -335,7 +335,7 @@ There is no expiry by time or height in the mempool itself; a transaction that s
 
 ### src/node/executor.ts
 
-**`ExecutorDeps`**: `app`, `store` (a `BlockStore`, chapter 10), `mempool`, `evidencePool`, `log`, optional `retainBlocks` ("Keep only this many blocks behind the latest; undefined keeps all"), `protectedHeight` ("A height that pruning must not pass (the newest snapshot)"), `evidenceAgeMs` (how old evidence may be; pruning keeps every block the window can still name and drops the headers kept alone once it has passed them) and `transaction`:
+**`ExecutorDeps`**: `app`, `store` (a `BlockStore`, chapter 10), `mempool`, `evidencePool`, `log`, optional `retainBlocks` ("Keep only this many blocks behind the latest; undefined keeps all"), `protectedHeight` ("A height that pruning must not pass (the newest snapshot)"), `evidenceAgeMs` (how old evidence may be; pruning keeps every block the window can still name and drops the headers kept alone once it has passed them, and after every commit the evidence pool lets go of what is older) and `transaction`:
 
 ```ts
   /**
@@ -487,6 +487,15 @@ Evidence this node cannot place, because it holds neither the block nor the head
     this.state = newState;
     this.prune();
     this.d.evidencePool.markCommitted(block.evidence);
+    // What the pool holds that is now too old for any later block goes, on every node: the proposer prunes before
+    // it picks evidence, but a node that never proposes would otherwise keep all it ever saw.
+    const age = this.d.evidenceAgeMs?.();
+    if (age !== undefined) {
+      this.d.evidencePool.pruneIf((ev) => {
+        const at = ev.voteA.height === newState.lastHeight ? newState.lastBlockTime : this.blockTimeAt(ev.voteA.height);
+        return at !== null && newState.lastBlockTime - at > age;
+      });
+    }
     this.d.log('info', 'committed', {
       h,
       hash: blockHash(block),
@@ -501,7 +510,7 @@ Evidence this node cannot place, because it holds neither the block nor the head
   }
 ```
 
-This is the persistence order from the file header. `nextState` (chapter 3) applies the updates to `nextValidators` to get the set for `h + 2`, increments its proposer priority once, and shifts the three sets down: the block's validators become `lastValidators`, `nextValidators` becomes `validators`. The new `h + 2` set is saved by hash and by height. The chain store's batch is the write that advances the chain; `app.commit()` follows it, inside the same transaction when the executor was given one and after it otherwise; `this.state` is replaced only after both, so a caller that reads `state` during the apply still sees the old height (block sync relies on this: it reads `getState().lastHeight` to decide what block to apply next). Then pruning, evidence bookkeeping, the mempool update, and the listeners. The executor does not check `res.appHash` against anything here; the check is social, by every other validator at the next proposal, and local, on replay.
+This is the persistence order from the file header. `nextState` (chapter 3) applies the updates to `nextValidators` to get the set for `h + 2`, increments its proposer priority once, and shifts the three sets down: the block's validators become `lastValidators`, `nextValidators` becomes `validators`. The new `h + 2` set is saved by hash and by height. The chain store's batch is the write that advances the chain; `app.commit()` follows it, inside the same transaction when the executor was given one and after it otherwise; `this.state` is replaced only after both, so a caller that reads `state` during the apply still sees the old height (block sync relies on this: it reads `getState().lastHeight` to decide what block to apply next). Then pruning, evidence bookkeeping, the mempool update, and the listeners. The evidence bookkeeping is two steps: `markCommitted` moves the block's evidence out of the pending set, and, when an evidence age is configured, `pruneIf` drops from the pool everything whose height's block time is more than that age before the block just committed, pending or committed, with its inventory entry. Evidence whose height's time the node cannot find stays. The proposer prunes before it picks evidence (chapter 4); this prune runs on every node, since a node that never proposes would otherwise keep all it ever saw. The executor does not check `res.appHash` against anything here; the check is social, by every other validator at the next proposal, and local, on replay.
 
 The four saves run inside `store.batch`, one store transaction: `KvBlockStore.batch` opens a single `kv.write` and every save called inside it joins that writer instead of opening its own ([chapter 10](10-store.md) documents the method). This is what `DESIGN.md` section 4 promises ("save block + commit + new chain state (one transaction)") and what review finding 39 restored: before it, a crash between four separate writes could leave a block and its transaction index entries without the state that goes with them.
 

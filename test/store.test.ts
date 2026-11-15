@@ -71,6 +71,8 @@ describe('key-value stores', () => {
     expect(new TextDecoder().decode(again.store('t').get(new TextEncoder().encode('c')))).toBe('three');
     const ro = new LmdbEnv(join(tmp, 'env'), { readOnly: true });
     expect(ro.store('t').get(new TextEncoder().encode('a'))).toBeUndefined();
+    // A read-only environment cannot create a database, and says so where it is asked for one.
+    expect(() => ro.store('missing')).toThrow(/no database named missing/);
     await ro.close();
     await again.close();
   });

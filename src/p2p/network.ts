@@ -48,6 +48,8 @@ export interface NetworkConfig {
   idleTimeoutMs?: number;
   handshakeTimeoutMs?: number;
   userAgent?: string;
+  /** This node's clock in milliseconds, for pings; the system's unless a test gives another. */
+  clock?: () => number;
 }
 
 export interface Peer {
@@ -58,6 +60,12 @@ export interface Peer {
   readonly direction: 'in' | 'out';
   height: bigint;
   latencyMs: number;
+  /**
+   * How far the peer's clock is ahead of this node's, in milliseconds (negative when behind), from the last pong:
+   * its clock when it answered, plus half the round trip, less this node's clock on receipt. Null before the first.
+   * The peer states its own clock, so this is what it claims, good for noticing a wrong clock and nothing more.
+   */
+  clockOffsetMs: number | null;
   lastRecv: number;
   readonly connectedAt: number;
   send(m: Message): void;
@@ -70,6 +78,8 @@ class HandshakeError extends Error {}
 
 /** A duplicate connection older than this is assumed to belong to a peer that restarted. */
 const STALE_DUPLICATE_MS = 2000;
+/** A peer whose clock is this far from this node's is logged once, when it is first seen to be. */
+export const CLOCK_WARN_MS = 2000;
 export const BAN_THRESHOLD = 100;
 export const BAN_MS = 3_600_000;
 
@@ -132,6 +142,10 @@ export class Network {
   private timers: NodeJS.Timeout[] = [];
   private running = false;
 
+  private clock(): number {
+    return this.cfg.clock();
+  }
+
   constructor(cfg: NetworkConfig) {
     this.cfg = {
       desiredOutbound: 8,
@@ -140,6 +154,7 @@ export class Network {
       pingIntervalMs: 10_000,
       idleTimeoutMs: 45_000,
       handshakeTimeoutMs: 10_000,
+      clock: Date.now,
       userAgent: 'crosschain/0.1',
       ...cfg,
       advertiseAddr: cfg.advertiseAddr ?? cfg.listenAddr ?? '',
@@ -351,6 +366,7 @@ export class Network {
       direction,
       height: their.height,
       latencyMs: 0,
+      clockOffsetMs: null,
       lastRecv: Date.now(),
       connectedAt: Date.now(),
       send(m: Message) {
@@ -457,11 +473,21 @@ export class Network {
   private handleControl(peer: Peer, m: Message): void {
     switch (m.type) {
       case 'ping':
-        peer.send({ type: 'pong', time: m.time });
+        peer.send({ type: 'pong', time: m.time, now: BigInt(this.clock()) });
         break;
-      case 'pong':
-        peer.latencyMs = Date.now() - Number(m.time);
+      case 'pong': {
+        const now = this.clock();
+        const trip = now - Number(m.time);
+        // A pong that echoes a time this node cannot have sent says nothing about the trip or the clock.
+        if (trip < 0 || trip > this.cfg.idleTimeoutMs) break;
+        peer.latencyMs = trip;
+        const offset = Math.round(Number(m.now) + trip / 2 - now);
+        if (Math.abs(offset) >= CLOCK_WARN_MS && (peer.clockOffsetMs === null || Math.abs(peer.clockOffsetMs) < CLOCK_WARN_MS)) {
+          this.cfg.log('warn', 'peer clock differs from this node', { peer: peer.id.slice(0, 8), offsetMs: offset });
+        }
+        peer.clockOffsetMs = offset;
         break;
+      }
       case 'status':
         peer.height = m.height;
         break;
@@ -508,7 +534,7 @@ export class Network {
         this.cfg.log('info', 'dropping idle peer', { peer: p.id.slice(0, 8) });
         p.close();
       } else {
-        p.send({ type: 'ping', time: BigInt(now) });
+        p.send({ type: 'ping', time: BigInt(this.clock()) });
       }
     }
   }

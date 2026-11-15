@@ -52,7 +52,11 @@ export class LmdbEnv implements KvEnv {
   }
 
   store(name: string): KvStore {
-    return new LmdbStore(this.root.openDB<Buffer, Buffer>({ name, keyEncoding: 'binary', encoding: 'binary' }));
+    // A read-only environment cannot create a database: asked for one that is not there, lmdb-js hands back
+    // undefined, and the first read would fail far from here with nothing to say why.
+    const db = this.root.openDB<Buffer, Buffer>({ name, keyEncoding: 'binary', encoding: 'binary' }) as Database<Buffer, Buffer> | undefined;
+    if (!db) throw new Error(`the store has no database named ${name}${this.readOnly ? ', and a read-only environment cannot create it' : ''}`);
+    return new LmdbStore(db);
   }
 
   transaction(fn: () => void): void {

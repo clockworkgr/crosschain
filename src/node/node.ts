@@ -22,7 +22,7 @@ import { getGlobal } from '../app/core/state.ts';
 import { FileSignStateStore, MemorySignStateStore, PrivValidator } from '../consensus/privval.ts';
 import type { ValidationLimits } from '../consensus/validate.ts';
 import { keyPairFromSeed, schemeTag, type KeyPair } from '../crypto/keys.ts';
-import { InlineVerifier, type Verifier } from '../crypto/verifier.ts';
+import { WorkerVerifier, type Verifier } from '../crypto/verifier.ts';
 import { Mempool, type AddTxResult } from '../mempool.ts';
 import { InvKind, MAX_HEADERS } from '../p2p/messages.ts';
 import { Network, type NetworkConfig } from '../p2p/network.ts';
@@ -75,6 +75,11 @@ export interface NodeConfig {
    * pressure and rebuilt after it, for a node that mostly serves scans.
    */
   indexTrees?: 'memory' | 'store';
+  /**
+   * What checks signatures. Left out, the node makes a pool of worker threads of its own and closes it when it
+   * stops: signatures are most of what a block costs, and checked inline they hold the event loop, consensus
+   * timers and all. Several nodes in one process should share one pool and pass it here.
+   */
   verifier?: Verifier;
   timeouts?: Partial<ConsensusTimeouts>;
   limits?: Partial<ValidationLimits>;
@@ -143,6 +148,8 @@ export class Node {
   readonly privValidator: PrivValidator | null;
   readonly nodeKey: KeyPair;
   readonly verifier: Verifier;
+  /** The pool this node made because it was given none; closed by stop(). */
+  private readonly ownVerifier: WorkerVerifier | null;
   readonly log: Logger;
   executor!: BlockExecutor;
   consensus!: Consensus;
@@ -156,7 +163,8 @@ export class Node {
     this.name = cfg.name;
     this.chainId = cfg.genesis.chainId;
     this.log = cfg.log ?? makeLogger(cfg.name, cfg.logLevel ?? 'info');
-    this.verifier = cfg.verifier ?? new InlineVerifier();
+    this.ownVerifier = cfg.verifier ? null : new WorkerVerifier();
+    this.verifier = cfg.verifier ?? this.ownVerifier!;
     // One scheme per chain, genesis's, for the node identity and the validator key alike.
     const scheme = schemeTag(cfg.genesis.signatureScheme ?? 'ml-dsa-44');
     this.nodeKey = keyPairFromSeed(cfg.nodeKeySeed, scheme);
@@ -472,6 +480,7 @@ export class Node {
     // A block being applied finishes its writes before the store goes away.
     await this.executor?.idle();
     if (this.ownsEnv) await this.env.close();
+    await this.ownVerifier?.close();
   }
 
   get height(): bigint {

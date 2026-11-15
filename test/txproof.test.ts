@@ -16,7 +16,11 @@ describe('transaction proofs', () => {
       expect(verifyTxProof(root, txProofFromBytes(txProofToBytes(p)))).toBe(true);
       expect(verifyTxProof(root, { ...p, tx: new Uint8Array([9]) })).toBe(false);
       expect(verifyTxProof(root, { ...p, index: (i + 1) % txs.length })).toBe(false);
-      expect(verifyTxProof(root, { ...p, count: 16 })).toBe(false); // a different tree height
+      // The path's length is the tree's height, and the position must be one that length can address.
+      expect(verifyTxProof(root, { ...p, siblings: [...p.siblings, EMPTY] })).toBe(false);
+      expect(verifyTxProof(root, { ...p, siblings: p.siblings.slice(0, -1) })).toBe(false);
+      expect(verifyTxProof(root, { ...p, index: i + 8 })).toBe(false);
+      expect(verifyTxProof(root, { ...p, index: -1 })).toBe(false);
       expect(verifyTxProof(txsRoot(txs.slice(0, 6)), p)).toBe(false);
     }
     expect(toHex(txsRoot(txs))).not.toBe(toHex(txsRoot([...txs].reverse())));

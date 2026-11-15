@@ -1013,7 +1013,15 @@ further up, and this run fell from 1,590 to about 1,400 over its first four minu
 window at 839 and its longest pause of 443 ms in its last minute, with the heap between 360
 and 960 MiB and one visit to `warn`. Nothing in the node differs between the two runs (the
 opening rule does not bear on a heap this size), so the two together are the spread of a
-ten-minute run with the Merkle trees and a full heap in memory: about a tenth.
+ten-minute run with the Merkle trees and a full heap in memory: about a tenth. A third run of
+the same row, with a CPU profile of its first and its last thirty seconds
+(`BENCH_PAGING_PROFILE`), committed 1,493 with no decline: 1,585 in its first twenty seconds,
+then 1,380 to 1,580 in every window to the end, 1,494 in the last, the longest pause 174 ms.
+The two profiles are alike. The main thread is busy for all thirty seconds in both, and the
+largest differences are the collector, 1.9 seconds of the thirty early and 2.2 late with the
+heap grown from about 700 to 980 MiB, and the signature cache, 0.2 and 0.4 seconds once it is
+full and every new transaction evicts an old one. Nothing in the node grows slower over ten
+minutes at this size; the run at 1,400 was a slow run.
 
 The window in memory, measured directly. `retain.memoryVersions` sets how many of the provable
 versions a node keeps in memory, the store answering for the rest. The node that never reaches

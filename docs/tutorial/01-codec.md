@@ -179,6 +179,25 @@ The `DataView` is built with the array's `byteOffset` and `byteLength`. That is 
 
 This is the canonical-decoding rule from the Concepts section: `0x02` is not a second way to spell `true`.
 
+**`u53()`** and **`i53()`** read a `u64` or an `i64` that the caller is going to use as a JavaScript number, and refuse one that a number cannot hold exactly:
+
+```ts
+  u53(): number {
+    const v = this.u64();
+    if (v > BigInt(Number.MAX_SAFE_INTEGER)) throw new CodecError(`number out of range: ${v}`);
+    return Number(v);
+  }
+
+  /** The same for an i64. */
+  i53(): number {
+    const v = this.i64();
+    if (v > BigInt(Number.MAX_SAFE_INTEGER) || v < BigInt(Number.MIN_SAFE_INTEGER)) throw new CodecError(`number out of range: ${v}`);
+    return Number(v);
+  }
+```
+
+The decoders used to write `Number(r.u64())`, which rounds anything beyond 2^53 − 1 to the nearest double. Rounded, two different encodings decode to one value, which is the canonical-decoding rule broken again, and a count or an index is accepted here to be found wrong, or not, somewhere later. The callers are a proposal's `polRound` and a validator set's proposer index ([chapter 3](03-types.md)), a snapshot chunk's `from`, `to` and instance numbers ([chapter 11](11-application.md)), the database's snapshot counters and history records ([chapter 9](09-database.md)), and the counters and versions `src/app/core/app.ts` reads from its store. A field that stays a `bigint` (a height, an amount, an object id) is still read with `u64()`.
+
 **`fixed(n)`** reads exactly `n` bytes and returns `this.buf.slice(...)`, a copy:
 
 ```ts
@@ -227,7 +246,7 @@ Both options matter. `fatal: true` makes invalid UTF-8 a thrown `TypeError` rath
   }
 ```
 
-Two checks, for two reasons. `maxCount` is the semantic limit a caller chooses: `ValidatorSet.decode` passes `10_000`, `decodeBlock` passes `1000` for evidence, `decodeTxProof` passes `64` for siblings. The second check is the structural one: even under the semantic limit, a count larger than the remaining bytes cannot be honest, so the `new Array(n)` allocation is bounded by the size of the input the peer actually sent. The comment states the invariant that makes this sound: every element type in this codebase consumes at least one byte (an absent `option` is one flag byte; an empty `bytes` is a four-byte prefix).
+Two checks, for two reasons. `maxCount` is the semantic limit a caller chooses: `ValidatorSet.decode` passes `10_000`, `decodeBlock` passes `1000` for evidence, `decodeTxProof` passes `32` for siblings. The second check is the structural one: even under the semantic limit, a count larger than the remaining bytes cannot be honest, so the `new Array(n)` allocation is bounded by the size of the input the peer actually sent. The comment states the invariant that makes this sound: every element type in this codebase consumes at least one byte (an absent `option` is one flag byte; an empty `bytes` is a four-byte prefix).
 
 **`finish()`** throws `CodecError('N trailing bytes')` unless the whole buffer was consumed. **`decode(buf, f)`** runs a decoder and then `finish()`:
 
@@ -257,7 +276,7 @@ The defaults on `bytes`, `string` and `array` are the outer fence. The real fenc
 | `src/types/block.ts` `decodeBlock` | each transaction | `bytes()` (64 MiB default) |
 | `src/types/validator.ts` `decode` | validators | `array(..., 10_000)` |
 | `src/crypto/keys.ts` `decodePublicKey`, `decodeSignature` | every key and signature | one tag byte, then that scheme's size: 1,312 or 33 for a key, 2,420 or 64 for a signature |
-| `src/types/txproof.ts` `decodeTxProof`, `decodeResultProof` | `siblings` | `array(..., 64)` |
+| `src/types/txproof.ts` `decodeTxProof`, `decodeResultProof` | `siblings` | `array(..., 32)` |
 | `src/types/state.ts` `decodeState` | `chainId` | `string(256)` |
 | `src/p2p/messages.ts` hello fields | chain id, address, user agent | `string(256)` |
 | `src/p2p/messages.ts` | address list | `array(string(256), 256)` |
@@ -312,6 +331,8 @@ Two bytes where four are needed; one byte left over; a `bytes` length of 4,294,9
 **`round-trips p2p messages`** encodes and decodes five message shapes from `src/p2p/messages.ts`, which proves the primitives compose into real messages with strings, arrays of strings, `bigint` heights and arrays of hashes.
 
 `test/review.test.ts`, **`decodes a string to exactly what was encoded, byte-order mark included, and refuses malformed UTF-8`**, is the regression for finding 41. It encodes `'﻿name'`, decodes it and asserts strict equality, then encodes the two bytes `0xff 0xfe` with `bytes` and asserts that reading them back as a `string` throws. The second half is the `fatal: true` guarantee: those bytes are not UTF-8, and the decoder says so instead of inventing characters. The same file's **`encodes only well-formed strings`** is the writer's side: `w.string('\uD800')`, a lone high surrogate, throws `/well-formed/`, while a string with a real astral character (`'ok \u{1F600}'`, a surrogate pair) round-trips unchanged.
+
+`test/review4.test.ts`, **`refuses a number too large to hold exactly where a 64-bit field is used as one`**, covers `u53` and `i53`: 2^53 − 1 reads as `Number.MAX_SAFE_INTEGER` and 2^53 throws `out of range`; −1 reads as −1 and −2^53 and 2^62 throw; and a proposal encoded with a lock round of 2^60 is refused by `decodeProposal` before its block is read.
 
 Beyond that, the codec is exercised indirectly by every other suite, because every block, vote, validator set, state record and proof goes through it. One test uses it to build *malformed* input on purpose: `test/review.test.ts`, `rejects decoded validator sets with duplicate members, wrong order or a bad proposer index`, hand-encodes validator sets with `encode((w) => w.array(...).i64(...))` to feed `ValidatorSet.decode` a duplicate member, a reversed order and an out-of-range proposer index. That is the pattern to copy when writing a test for any decoder: `encode` lets you write bytes the honest encoder would never produce.
 

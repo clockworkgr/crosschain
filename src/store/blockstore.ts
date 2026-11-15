@@ -10,7 +10,7 @@
  *
  * Key layout: 'b' height, 'h' blockHash, 'v' validatorSetHash, 'V' height
  * (the set that signs it, with its proposer priorities, for state sync),
- * 's' state, 'l' lowest height, 't' txHash (height, position, result),
+ * 's' state, 'l' lowest height, 't' txHash and height (height, position, result), 'T' the layout of 't',
  * 'r' height (the block's execution results, for result proofs), 'H' height
  * (a header kept without its block, below the lowest block a state-synced
  * node holds, as far back as evidence may reach), 'L' the lowest such height.
@@ -19,11 +19,11 @@ import { decode } from '../codec/reader.ts';
 import { encode } from '../codec/writer.ts';
 import { key } from '../db/keys.ts';
 import type { TxResult } from '../app/types.ts';
-import { toHex } from '../crypto/hash.ts';
+import { HASH_SIZE, toHex } from '../crypto/hash.ts';
 import { blockHash, decodeBlock, decodeCommit, decodeHeader, encodeBlock, encodeCommit, encodeHeader, txHash, type Block, type Commit, type Header } from '../types/block.ts';
 import { decodeState, encodeState, type ChainState } from '../types/state.ts';
 import { ValidatorSet } from '../types/validator.ts';
-import { MemoryKv, type KvStore } from './kv.ts';
+import { MemoryKv, prefixEnd, type KvStore } from './kv.ts';
 import type { KvWriter } from './kv.ts';
 
 /** Where a transaction landed. `ok` is null for a block stored without executing it. */
@@ -43,7 +43,13 @@ export interface BlockStore {
    */
   saveBlock(block: Block, commit: Commit, results?: TxResult[] | null): void;
   heightOf(hash: Uint8Array): bigint | null;
+  /**
+   * Where a transaction landed: the block it succeeded in if there is one, otherwise the newest block that carries
+   * it. A transaction that failed can be included again, so one hash can have several locations.
+   */
   txLocation(hash: Uint8Array): TxLocation | null;
+  /** Every block still held that carries the transaction, oldest first. */
+  txLocations(hash: Uint8Array): TxLocation[];
   /** The execution results of a block applied here, null if it was only stored. */
   loadResults(height: bigint): TxResult[] | null;
   loadState(): ChainState | null;
@@ -80,7 +86,21 @@ const blockKey = (h: bigint) => key((k) => k.u8(0x62).u64(h));
 const hashKey = (hash: Uint8Array) => key((k) => k.u8(0x68).fixed(hash));
 const valsetKey = (hash: Uint8Array) => key((k) => k.u8(0x76).fixed(hash));
 const valsetAtKey = (height: bigint) => key((k) => k.u8(0x56).u64(height));
-const txKey = (hash: Uint8Array) => key((k) => k.u8(0x74).fixed(hash));
+/**
+ * One entry per block a transaction is in. A store written before that has one entry per hash, without the height
+ * in its key; its entries are moved once, when the store is next opened (migrateTxIndex), and 'T' records that.
+ */
+const TX_LAYOUT_KEY = Uint8Array.of(0x54);
+const txKey = (hash: Uint8Array, height: bigint) => key((k) => k.u8(0x74).fixed(hash).u64(height));
+const txPrefix = (hash: Uint8Array) => key((k) => k.u8(0x74).fixed(hash));
+const encodeTx = (height: bigint, index: number, r: TxResult | null | undefined) => encode((wr) => wr.u64(height).u32(index).u8(r ? (r.ok ? 1 : 0) : 2).string(r?.error ?? ''));
+const decodeTx = (v: Uint8Array): TxLocation =>
+  decode(v, (r) => {
+    const height = r.u64();
+    const index = r.u32();
+    const ok = r.u8();
+    return { height, index, ok: ok === 2 ? null : ok === 1, error: r.string() };
+  });
 const resultsKey = (h: bigint) => key((k) => k.u8(0x72).u64(h));
 const headerKey = (h: bigint) => key((k) => k.u8(0x48).u64(h));
 const LOWEST_HEADER_KEY = key((k) => k.u8(0x4c));
@@ -92,6 +112,39 @@ export class KvBlockStore implements BlockStore {
 
   constructor(kv: KvStore) {
     this.kv = kv;
+    this.migrateTxIndex();
+  }
+
+  /**
+   * Move a transaction index of the old layout, one entry per hash, to one entry per hash and height, a few
+   * thousand entries a write; the marker goes in last, so a move that was cut short is taken up again. A store that
+   * cannot be written (opened read-only) is left as it is: txLocations reads either layout.
+   */
+  private migrateTxIndex(): void {
+    if (this.kv.get(TX_LAYOUT_KEY)) return;
+    const end = prefixEnd(Uint8Array.of(0x74));
+    // Each pass goes on from the last entry the one before it moved, whose new key sorts right after it.
+    let from: Uint8Array = Uint8Array.of(0x74);
+    try {
+      for (;;) {
+        const old: [Uint8Array, Uint8Array][] = [];
+        for (const [k, v] of this.kv.range(from, end)) {
+          if (k.length === 1 + HASH_SIZE) old.push([k, v]);
+          if (old.length === 5000) break;
+        }
+        this.kv.write((w) => {
+          for (const [k, v] of old) {
+            w.put(txKey(k.subarray(1), decodeTx(v).height), v);
+            w.del(k);
+          }
+          if (old.length < 5000) w.put(TX_LAYOUT_KEY, Uint8Array.of(2));
+        });
+        if (old.length < 5000) return;
+        from = old[old.length - 1]![0];
+      }
+    } catch {
+      // not writable
+    }
   }
 
   batch(fn: () => void): void {
@@ -139,7 +192,7 @@ export class KvBlockStore implements BlockStore {
           if (seen.has(k)) return;
           seen.add(k);
           const r = results?.[i];
-          w.put(txKey(hash), encode((wr) => wr.u64(h).u32(i).u8(r ? (r.ok ? 1 : 0) : 2).string(r?.error ?? '')));
+          w.put(txKey(hash, h), encodeTx(h, i, r));
         });
         if (results) w.put(resultsKey(h), encode((wr) => wr.array(results, (wr, r) => wr.bool(r.ok).string(r.error ?? ''))));
       }
@@ -151,15 +204,14 @@ export class KvBlockStore implements BlockStore {
     return v ? decode(v, (r) => r.array((r) => ({ ok: r.bool(), error: r.string() }))) : null;
   }
 
+  txLocations(hash: Uint8Array): TxLocation[] {
+    const prefix = txPrefix(hash);
+    return Array.from(this.kv.range(prefix, prefixEnd(prefix)), ([, v]) => decodeTx(v)).sort((a, b) => (a.height < b.height ? -1 : a.height > b.height ? 1 : 0));
+  }
+
   txLocation(hash: Uint8Array): TxLocation | null {
-    const v = this.kv.get(txKey(hash));
-    if (!v) return null;
-    return decode(v, (r) => {
-      const height = r.u64();
-      const index = r.u32();
-      const ok = r.u8();
-      return { height, index, ok: ok === 2 ? null : ok === 1, error: r.string() };
-    });
+    const all = this.txLocations(hash);
+    return all.find((l) => l.ok === true) ?? all[all.length - 1] ?? null;
   }
 
   heightOf(hash: Uint8Array): bigint | null {
@@ -214,7 +266,7 @@ export class KvBlockStore implements BlockStore {
       w.del(blockKey(height));
       w.del(hashKey(blockHash(stored.block)));
       w.del(resultsKey(height));
-      for (const tx of stored.block.txs) w.del(txKey(txHash(tx)));
+      for (const tx of stored.block.txs) w.del(txKey(txHash(tx), height));
     });
   }
 

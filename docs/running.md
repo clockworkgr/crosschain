@@ -17,7 +17,7 @@ the subject of the [tutorial](tutorial/00-overview.md); design decisions are in
 ```sh
 git clone <this repository> crosschain && cd crosschain
 npm install
-npm test                 # 203 tests, about a minute
+npm test                 # 212 tests, about a minute
 CHAIN_SCHEME=secp256k1 npm test   # the same suite on secp256k1 keys (one ML-DSA-only case is skipped)
 INDEX_TREES=0 npm test   # the same suite with every index B+ tree dropped from the start: lookups and scans through the store
 TREES=0 npm test         # and with every Merkle tree dropped: roots and proofs from the stored chunks and nodes; the two combine
@@ -160,8 +160,9 @@ their operator account.
 | `keys add <name> [--scheme ml-dsa-44\|secp256k1]` | generates a key under that name, of the given scheme (ML-DSA-44 when absent); it must be the chain's, which `status` reports |
 | `keys import <name> <seedHex> [--scheme ml-dsa-44\|secp256k1]` | adds a key from a 32-byte seed, derived under the given scheme (ML-DSA-44 when absent) |
 | `keys export <name>` | prints a key's seed |
+| `keys remove <name>` | removes a key from the keystore and prints `removed <name> <address>`; the seed goes with the entry, so only an export made beforehand brings the key back. A name that is not there is refused with `no key named <name>` |
 | `show <target>` | chain status, the active validators, and the first 50 accounts by name with their balances |
-| `account <target> <name>` | the account, its balances and its validator, with the proof that the name maps to this account (or to none) verified by the light client; the balances themselves are the node's answer, not proven |
+| `account <target> <name>` | the account, its balances and its validator, with the proof that the name maps to this account (or to none) verified by the light client; the command asks one height back, and the balances and the history count are those of that same height; the balances themselves are the node's answer, not proven |
 | `history <target> <account>` | the newest 50 entries of the account's history: operations it took part in and virtual events (rewards, slashes, matured unbondings); the `accountHistory` RPC method pages further back |
 | `tx <target> <hash>` | where a transaction landed: height, position, result, decoded operations |
 | `verify-tx <target> <hash>` | the inclusion and result proofs checked by the light client, at any height before or after its anchor (section 11); prints the proven height and result (for the position and the operations, use `tx`) |
@@ -372,25 +373,33 @@ mixes them with requests is answered for the requests alone. `GET /health` answe
 | `validators` | `height?` | the validator set that signs that height: its hash, total power, members with their powers, and the proposer of its first round (proposer priorities are not included) | |
 | `validatorSet` | `hash` | a set by its hash, for light clients following set changes | |
 | `object` | `id`, `height?`, `prove?` | any object by id as JSON, with an object proof on request | yes |
-| `key` | `type`, `index`, `key`, `height?`, `prove?` | a lookup in an authenticated unique index (`account`/`byName`, `asset`/`bySymbol`, ...), with a key proof | yes |
-| `account` | `name`, `height?`, `prove?` | account, balances (each with its asset's precision), its validator, history count, and a proof that the name maps to this account or to none | yes |
-| `validator` | `operator` or `id` | the validator with status, power, self-bond, delegator count | |
-| `delegation` | `delegator`, `validator`, `height?`, `prove?` | the delegation (shares and current token value) and pending unbondings, with a key proof | yes |
-| `balance` | `account`, `asset?` | one balance | |
+| `key` | `type`, `index`, `key`, `height?`, `prove?` | a lookup in an authenticated unique index (`account`/`byName`, `asset`/`bySymbol`, ...) as of the height, with a key proof; the id is the one the proof proves | yes |
+| `account` | `name`, `height?`, `prove?` | account, balances (each with its asset's precision), its validator, history count, all as of the height, and a proof that the name maps to this account or to none | yes |
+| `validator` | `operator` or `id`, `height?` | the validator with status, power, self-bond and operator name as of the height; `delegators`, a count at the latest height and `null` at a past one | yes |
+| `delegation` | `delegator`, `validator`, `height?`, `prove?` | the delegation (shares and their token value as of the height), with a key proof; `unbonding`, the pending entries at the latest height and `null` at a past one | yes |
+| `balance` | `account`, `asset?`, `height?` | one balance as of the height | yes |
 | `accountHistory` | `account`, `from?`, `limit?` (default 20, max 100), `reverse?` | history entries with sequence numbers, oldest first from sequence `from`; with `reverse`, newest first, and `from` counts entries back from the newest | yes |
-| `tx` | `hash`, `prove?` | where the transaction landed, its result, the decoded operations, and inclusion and result proofs | yes |
+| `tx` | `hash`, `prove?` | where the transaction landed (the block it succeeded in if there is one, else the newest that carries it), its result, the decoded operations, and inclusion and result proofs; `attempts`, the height, position and result in every block still held that carries it, oldest first, when there is more than one | yes |
 | `broadcastTx` | `tx` (hex), `mode?` (`sync`, the default, or `commit`), `timeoutMs?` (default 30,000, at most 120,000) | `sync`: the mempool's verdict, `added` or `seen`; `commit`: waits for inclusion and returns height, position and result; `-32004` when the mempool is full at a limit lowered because memory is short | yes |
 | `accounts` | `limit?` (default 50, max 200), `after?` | accounts by name with their core balance, paged by name; `after` is the last name of the previous page and is not repeated | yes |
 | `parameters` | | the core asset, the fee schedule and the staking parameters in force | |
 | `proposals` | | open parameter proposals with the full parameters each would adopt | yes |
 | `mempool` | | count, bytes and the first hundred hashes | |
-| `peers` | | connected peers with addresses, direction, height and latency | |
+| `peers` | | connected peers with addresses, direction, height, latency and `clockOffsetMs`: how far the peer's clock is ahead of this node's in milliseconds (negative when behind), from its last pong, `null` before the first. It is what the peer claims, good for noticing a wrong clock and nothing more | |
 
 `account` takes a name; the account parameters of `balance`, `accountHistory` and `delegation`
 take a name or an id (`3.n`); a validator is named by its operator (`validator.operator`,
-`delegation.validator`) or by its own id (`validator.id`). On `object`, `height` selects the
-object's value at that height; on `key`, `account` and `delegation` it selects the height of the
-proof only, while the id, the account, its balances and the delegation are the current values.
+`delegation.validator`) or by its own id (`validator.id`). Every state query (`object`, `key`,
+`account`, `validator`, `delegation`, `balance`) answers as of one height, the one in `height` or
+the last committed one, and returns that `height`, so a value and the proof beside it are about
+the same state. A height outside what the node holds (`memory.database.lowestVersion` in `status`
+to the latest) is refused with `-32001`, `the state at height H is not kept (heights A to B are)`.
+An account's balances at a past height are the balances it has now, each read as it was then; a
+name no account can have gives `account: null`, and with `prove` a `-32602` error, since there is
+nothing to prove. `balance` by a name that had no account at the height answers `-32001`, and by
+id 0. `validator`'s `delegators` and `delegation`'s `unbonding` are given for the latest height
+only, because a delegation is removed when its last share goes and an unbonding entry when it
+matures.
 
 The `seen` verdict of `broadcastTx` means the node has the hash in its recent cache, which
 includes transactions it rejected; it does not mean the transaction is pending or included. In
@@ -400,8 +409,8 @@ with `-32002`, and a timeout does not remove a pending transaction from the memp
 should broadcast in sync mode and poll `tx`.
 
 Errors carry JSON-RPC codes: `-32700` unparsable body, `-32600` malformed request (also a batch
-outside 1 to 20 requests), `-32601` unknown method, `-32602` bad parameters (including a `height`
-the node no longer has a provable version for), `-32001` not found, `-32002` the mempool refused
+outside 1 to 20 requests), `-32601` unknown method, `-32602` bad parameters, `-32001` not found (including a `height`
+whose state the node does not hold), `-32002` the mempool refused
 the transaction (the message says why), `-32003` not included before the timeout, `-32004` rate
 limited.
 
@@ -416,9 +425,11 @@ node is short of memory` rather than `-32002`: the transaction is not at fault, 
 tries again later.
 
 Limits per client address: a token bucket of 100 refilled at 50 a second. Every HTTP request
-spends one token, and is refused with HTTP 429 when it cannot; each costly method in it spends 4
-more, answered as a `-32004` error inside the HTTP 200 response. A batch of up to 20 requests
-therefore costs one token plus 4 per costly call, and its requests run one after another. Request
+spends one token, which pays for its first call, and is refused with HTTP 429 when it cannot;
+each further call of a batch spends one more, and each costly method 4 more, a call that cannot
+pay being answered with a `-32004` error in its place inside the HTTP 200 response. A batch of up
+to 20 requests therefore costs one token per call plus 4 per costly call, what its calls would
+have cost one by one, and its requests run one after another. Request
 bodies up to 1 MiB; 8 event streams. `RpcServer` takes other values; the defaults are for a
 public endpoint.
 
@@ -787,7 +798,8 @@ node's answer, unproven.
 | the keystore refuses to open | wrong passphrase; `CHAIN_PASSPHRASE` or `--passphrase-file` must match the one `init` printed |
 | `connection refused` in the log | a seed is not running yet; the node keeps dialling and starts once it has peers |
 | no blocks, round numbers climbing in `status` | two thirds or less of the voting power is online; more than two thirds is needed |
-| `rate limited` (`-32004`) | the client exceeded the token bucket: a request spends one token and each costly call four more, from 100 refilled at 50 a second |
+| `rate limited` (`-32004`) | the client exceeded the token bucket: a request spends one token, each further call of a batch one more and each costly call four more, from 100 refilled at 50 a second |
+| `peer clock differs from this node` in the log, with `offsetMs` | a peer's clock, as its pong states it, is 2 seconds or more from this node's (`clockOffsetMs` in `peers`). The line comes once when a peer is first seen to be that far off. The offset is what the peer claims. A node tolerates 15 s of clock drift on a fresh proposal (section 5), so a clock that is off should be set right before it reaches that |
 | `node under memory pressure` (`-32004`), or HTTP 503 from `/events` | the node is shedding load at the guard's `pressure` level (section 12): broadcasts, costly calls and new event streams are refused until the heap eases; cheap calls and `/health`, which reports the level, still answer |
 | `mempool full: its limit is lowered while the node is short of memory` (`-32004`) | the heap is at `warn` or above and the mempool already holds as many transactions as it admits at that level (half its limit at `warn`). Nothing is wrong with the transaction: send it again once blocks have taken some out |
 | `... is not available: the record of version N was written without the sparse tree nodes`, for a height inside `retain.versions` | the history window in memory was trimmed at `warn` or above (`status` shows `history: trimmed`), is kept short by `retain.memoryVersions`, or the store was opened paged without it, so the height is read from the store's history records, and the record named was written by an earlier build that did not keep what a proof of an account or a name needs. Such records age out after `retain.versions` blocks; a restart with enough heap reads the whole window into memory and proves the height at once |

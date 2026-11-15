@@ -181,7 +181,7 @@ export function openObjectDatabase(kv: KvStore, types: ObjectType<any>[], opts: 
   if (opts.heapRoom !== undefined) {
     const counter = (type: number) => {
       const c = kv.get(counterKey(type));
-      return c ? Number(decode(c, (r) => r.u64())) : 0;
+      return c ? decode(c, (r) => r.u53()) : 0;
     };
     const est = estimateTiers(types, counter);
     let room = opts.heapRoom;
@@ -210,7 +210,7 @@ export function openObjectDatabase(kv: KvStore, types: ObjectType<any>[], opts: 
   }
   for (const t of types) {
     const c = kv.get(counterKey(t.id));
-    if (c) db.setCounter(t.id, Number(decode(c, (r) => r.u64())));
+    if (c) db.setCounter(t.id, decode(c, (r) => r.u53()));
   }
   const t1 = performance.now();
   // The trees come from their chunks and nodes: no object is hashed and no index key inserted into a sparse tree,
@@ -239,7 +239,7 @@ export function openObjectDatabase(kv: KvStore, types: ObjectType<any>[], opts: 
   const oldest = db.currentVersion - (retainVersions ?? 100);
   const found = new Map<number, Uint8Array | null>();
   for (const [k, v] of kv.range(HISTORY_PREFIX, prefixEnd(HISTORY_PREFIX))) {
-    const version = Number(decode(k, (r) => (r.u8(), r.u64())));
+    const version = decode(k, (r) => (r.u8(), r.u53()));
     if (version > oldest && version <= db.currentVersion) found.set(version, withHistory ? v : null);
     else staleHistory.push(version);
   }
@@ -503,6 +503,11 @@ export class CoreApp implements Application {
   /** An account's history, oldest first from `from`, or newest first when reversed. */
   accountHistory(account: ObjectId, from = 0n, limit = 100, reverse = false): { entries: (HistoryEntry & { sequence: bigint })[]; total: bigint } {
     return this.historyLog.read(account, from, limit, reverse);
+  }
+
+  /** How many history entries an account had as of a height. */
+  accountHistoryTotalAt(account: ObjectId, height: bigint): bigint {
+    return height >= this.lastHeight ? this.historyLog.total(account) : this.historyLog.totalAt(account, height);
   }
 
   // ---- queries, all against committed state ----

@@ -204,6 +204,15 @@ export class BlockExecutor {
     this.state = newState;
     this.prune();
     this.d.evidencePool.markCommitted(block.evidence);
+    // What the pool holds that is now too old for any later block goes, on every node: the proposer prunes before
+    // it picks evidence, but a node that never proposes would otherwise keep all it ever saw.
+    const age = this.d.evidenceAgeMs?.();
+    if (age !== undefined) {
+      this.d.evidencePool.pruneIf((ev) => {
+        const at = ev.voteA.height === newState.lastHeight ? newState.lastBlockTime : this.blockTimeAt(ev.voteA.height);
+        return at !== null && newState.lastBlockTime - at > age;
+      });
+    }
     this.d.log('info', 'committed', {
       h,
       hash: blockHash(block),

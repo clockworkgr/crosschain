@@ -17,7 +17,7 @@
  * testnet keystore are found from it) or an RPC URL, with --keystore <path>,
  * --passphrase-file <path> or CHAIN_PASSPHRASE for signing keys.
  *
- *   keys list | add <name> | import <name> <seedHex> | export <name>   (--scheme names the chain's scheme for add and import)
+ *   keys list | add <name> | import <name> <seedHex> | export <name> | remove <name>   (--scheme names the chain's scheme for add and import)
  *   show <target>                       status, validators, accounts
  *   account <target> <name>             an account with balances and a verified name proof
  *   history <target> <account>          what happened to an account
@@ -390,7 +390,7 @@ async function proposedParameters(rpc: RpcClient, overrides: string[]) {
 async function keys(): Promise<void> {
   const path = flags.get('keystore') ?? resolve('keystore.json');
   const sub = need(0, 'keys subcommand');
-  if ((sub === 'list' || sub === 'export') && !existsSync(path)) throw new Error(`no keystore at ${path}`);
+  if ((sub === 'list' || sub === 'export' || sub === 'remove') && !existsSync(path)) throw new Error(`no keystore at ${path}`);
   const ks = await openKeystore(path);
   // Keys are made for a chain's scheme: --scheme names it (ML-DSA-44 when absent); the chain refuses a key of the other.
   const scheme = schemeTag(flags.get('scheme') ?? 'ml-dsa-44');
@@ -411,6 +411,14 @@ async function keys(): Promise<void> {
     case 'export':
       console.log(toHex(ks.seedOf(need(1, 'name'))));
       break;
+    case 'remove': {
+      // The seed is gone with the entry: only an export made beforehand brings the key back.
+      const name = need(1, 'name');
+      const address = toHex(ks.get(name).address);
+      ks.remove(name);
+      console.log(`removed ${name} ${address}`);
+      break;
+    }
     default:
       throw new Error(`unknown keys subcommand ${sub}`);
   }

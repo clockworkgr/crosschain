@@ -116,8 +116,13 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
     once instead of waiting for the old socket to time out.
 - **Keepalive:** a ping every 10 s carrying the sender's time, echoed by the pong,
   which gives the round-trip latency per peer; a peer silent for 45 s is dropped.
-  There is no clock-offset measurement; block times are checked against the local
-  clock alone.
+  The pong also carries the answerer's clock, from which the asker reads how far the
+  peer's clock is ahead of its own: the peer's clock when it answered, plus half the
+  round trip, less its own clock on receipt (`Peer.clockOffsetMs`, in the RPC's
+  `peers`). A pong whose round trip is negative or longer than the idle timeout is
+  ignored, and a peer first seen 2 s or more off is logged once. The offset is what
+  the peer claims, good for noticing a wrong clock and nothing more; block times are
+  checked against the local clock alone.
 - **Gossip, two modes:**
   - **Inventory (announce hash, peer fetches):** transactions. Seen-cache per item type.
     "Item not available" as the negative reply. Committed blocks are announced by a
@@ -150,12 +155,18 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   Round timeouts are setTimeout.
 - **Worker pool, verification only:** Node worker_threads, size = cpu count - 1. A job
   is a batch of (sig, msg, pubkey, context) and returns booleans. The main thread never
-  calls verify directly outside tests. Signing stays on the main thread: once per
+  calls verify directly outside tests. A node given no verifier makes a pool of its
+  own and closes it when it stops; several nodes in one process share one and pass
+  it. Signing stays on the main thread: once per
   consensus step, ~2 ms under ML-DSA-44 and a tenth of that under secp256k1, and it
   keeps the persist-then-broadcast order of the double-sign guard trivial.
 - **Integers:** heights, times, amounts and voting power are BigInt. Plain numbers are
   doubles and carry only bounded integer fields whose encoding is u8, u16 or u32:
-  rounds, the protocol version, basis-point rates, counters, instance numbers. No
+  rounds, the protocol version, basis-point rates, counters, instance numbers. Where
+  a 64-bit field is used as a plain number (a proposal's lock round, a validator
+  set's proposer index, a snapshot chunk's range, the database's counters), the
+  decoder refuses a value beyond `Number.MAX_SAFE_INTEGER` (`Reader.u53`, `i53`):
+  rounded, two encodings would decode to one value. No
   floats in state.
 - **Codec:** hand-written binary encode/decode per message and per state object,
   Graphene raw-serializer style. Deterministic by construction. JSON is not used for
@@ -176,7 +187,7 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   the owner's pid, so a second node on it is refused; the CLI reads state through the
   RPC (section 9), never by opening the environment. One environment per node holds
   a `chain` store (blocks, commits and transaction results by height, heights by
-  block hash, the transaction index by hash, validator sets by hash and by the
+  block hash, the transaction index by hash and height, validator sets by hash and by the
   height they sign, the lowest retained height, the headers a state-synced node
   keeps alone below its lowest block as far back as evidence may reach, chain
   state) and an `app` store (every object by id, counters, the version history of
@@ -901,7 +912,7 @@ stake as it stood before the proposer bonus.
 Specified in `RPC-SYNC-PROOFS.md` and implemented. The header carries a protocol
 version, a Merkle data hash over transactions and a results hash for the previous
 block's results (`src/types/txproof.ts`); the chain store indexes transactions by
-hash and the application keeps per-account history with virtual entries
+hash, with one entry for every block a transaction is in, and the application keeps per-account history with virtual entries
 (`src/app/core/history.ts`), stored as one log in block order: a block's entries are
 appended to its end, each pointing back at earlier entries of its account, so a block
 writes a few pages of the store where entries keyed by account dirtied one for every
@@ -912,7 +923,9 @@ has an RPC provider. `src/app/core/snapshot.ts` exports chunks with range proofs
 every K blocks; `src/sync/statesync.ts` joins from a trusted header through the
 light client, verifies every chunk, and `src/sync/blocksync.ts` requests windows
 of blocks from several peers, backfills older blocks by hash chain, and serves
-both. Evidence travels by inventory; a block that +2/3 precommitted but was never
+both. Evidence travels by inventory, and the pool lets go of it, pending or
+committed, with its inventory entry once it is older than the evidence age, on every
+node after every commit, and holds at most 1,000 pending pieces; a block that +2/3 precommitted but was never
 proposed to a node is fetched and decided in place; peers are scored and banned
 (`Network.score`); the executor prunes blocks behind a retention window but never
 past the newest snapshot nor into the evidence window (blocks whose time is within
@@ -929,9 +942,9 @@ misbehaviour list than every other node and diverge the state. Validator sets ar
 also stored by the height they sign, priorities included, because a state-synced
 node must continue consensus with the exact proposer priorities.
 
-## 10. Implementation status (2026-11-14)
+## 10. Implementation status (2026-11-15)
 
-Everything above is implemented in TypeScript under `src/`. 203 tests in 24 files
+Everything above is implemented in TypeScript under `src/`. 212 tests in 25 files
 pass, and the whole suite passes under either signature scheme
 (`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there) and with
 either tier of state paging dropped from the start (`INDEX_TREES=0`, `TREES=0`, or
@@ -965,7 +978,7 @@ limit at `warn`, a tenth at `pressure` (a transaction beyond it refused as `full
 `retain.memoryVersions` set keeps that many past versions in memory and proves an older height from the store, and with `indexTrees: 'store'` leaves its index trees there and still finds an account by name. The history
 suite appends blocks of entries to the account history log and pages every account out
 of it in both directions against a model, counts the reads that reach the old end of a
-long history, checks that a block writes the heads of one slice of the account numbers and that a log opened after a stop has the waiting ones back, and moves a store written with the earlier layout into the log. State paging (`STATE-PAGING.md`) has cases of its
+long history, checks that a block writes the heads of one slice of the account numbers and that a log opened after a stop has the waiting ones back, and moves a store written with the earlier layout into the log. The fourth review's suite (`test/review4.test.ts`) asks a node for a balance, an account, a key, a validator and a delegation as of past heights and checks their proofs against the next header's app hash, spends a rate limit with batches, indexes one transaction in three blocks, refuses a snapshot without every type's section and a number too large to hold exactly, prunes and bounds the evidence pool, removes a key from the keystore, reads a peer clock seven seconds ahead from its pong and runs a node on a verifier pool of its own. State paging (`STATE-PAGING.md`) has cases of its
 own: the arena suite grows slabs, counts dead bytes and compacts, and releases whole
 slabs down to a byte limit, unread ones first; the database suite
 evicts clean objects and never dirty ones, keeps history as bytes, checks that the
@@ -1051,8 +1064,6 @@ done about each finding.
 - A validator restarted in the middle of a height forgets its lock: the sign state keeps what
   was signed, not the locked block, so after a restart it may prevote another block in a later
   round of that height. Tendermint's accountability for this (amnesia evidence) is not implemented.
-- The node defaults to the inline verifier; the CLI, the local network script and the
-  benchmarks pass the worker pool. A node built from code should do the same.
 - Index roots inside a type leaf are the SMT roots at that height; the B+ tree indices used for lookups are not authenticated.
 - The version history window is trimmed in memory as the heap fills: from `warn` until
   the window has grown back, proofs and queries at heights older than the last two are

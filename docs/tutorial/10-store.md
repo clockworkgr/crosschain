@@ -180,7 +180,11 @@ Results are copied into fresh `Uint8Array`s (`new Uint8Array(v)`), which is the 
   }
 
   store(name: string): KvStore {
-    return new LmdbStore(this.root.openDB<Buffer, Buffer>({ name, keyEncoding: 'binary', encoding: 'binary' }));
+    // A read-only environment cannot create a database: asked for one that is not there, lmdb-js hands back
+    // undefined, and the first read would fail far from here with nothing to say why.
+    const db = this.root.openDB<Buffer, Buffer>({ name, keyEncoding: 'binary', encoding: 'binary' }) as Database<Buffer, Buffer> | undefined;
+    if (!db) throw new Error(`the store has no database named ${name}${this.readOnly ? ', and a read-only environment cannot create it' : ''}`);
+    return new LmdbStore(db);
   }
 ```
 
@@ -198,7 +202,7 @@ Binary key encoding is what makes LMDB's order the bytewise order the keys were 
 
 lmdb-js nests transactions: a `transactionSync` opened on a sub-database while one is open on the root becomes a child of it, so every `write` the callback makes, on whichever named store, joins the environment-wide transaction, and a throw out of `fn` aborts them together (this was probed before it was relied on: nothing lands). There are two callers. State sync's install writes the application store, the validator sets, block H, the lowest heights and the chain state inside `env.transaction`, so a crash leaves either a complete join or nothing, and a restart simply joins again (chapter 7). And the executor of a node that created its own application saves each block and has the application commit inside one ([chapter 5](05-mempool-executor.md)): the block and the state it produced land together, and LMDB flushes to the device once for the block where two transactions flushed twice. The flush, not the writing, is most of what a commit costs: at 192,000 accounts the application's commit of a 500-transfer block measured 17 to 26 ms of LMDB's own work and 40 to 100 ms with the flush (`F_FULLFSYNC` on macOS). The `MemoryEnv` version just runs the callback, which is the right stand-in: in memory there is no crash to recover from, and the store the tests see is the same whether the writes were one transaction or several.
 
-Two behaviours of lmdb-js to know. `openDB` builds a new database object on every call, so two calls to `store('app')` give two wrappers over the same named database; nothing in `LmdbEnv` caches them, and the node calls `store` once per name in the normal path. And in a read-only environment, `openDB` of a name that does not exist returns `undefined` rather than throwing, so a wrapper built over it fails on first use with a type error instead of a clear message; the test opens a name that exists.
+Two behaviours of lmdb-js to know. `openDB` builds a new database object on every call, so two calls to `store('app')` give two wrappers over the same named database; nothing in `LmdbEnv` caches them, and the node calls `store` once per name in the normal path. And in a read-only environment, `openDB` of a name that does not exist returns `undefined` rather than throwing, so a wrapper built over it would fail on first use with a type error; `store` checks for that and throws `the store has no database named X, and a read-only environment cannot create it` where the database is asked for. The test opens a name that exists and one that does not.
 
 ### src/store/blockstore.ts
 
@@ -207,7 +211,7 @@ Purpose: the chain's persistent records on a `KvStore`.
 Exports:
 
 - `interface TxLocation { height; index; ok: boolean | null; error }`: where a transaction landed. `ok` is null for a block stored without executing it here (a backfilled block).
-- `interface BlockStore`: `loadBlock`, `saveBlock`, `heightOf`, `txLocation`, `loadResults`, `loadState`, `saveState`, `loadValidatorSet`, `saveValidatorSet`, `loadValidatorsAt`, `saveValidatorsAt`, `lowestHeight`, `setLowestHeight`, the header records `loadHeader`, `saveHeader`, `deleteHeader`, `lowestHeaderHeight` and `setLowestHeaderHeight`, `deleteBlock`, and `batch(fn)`, which runs several saves as one store transaction "so a crash leaves all or none of them".
+- `interface BlockStore`: `loadBlock`, `saveBlock`, `heightOf`, `txLocation` and `txLocations`, `loadResults`, `loadState`, `saveState`, `loadValidatorSet`, `saveValidatorSet`, `loadValidatorsAt`, `saveValidatorsAt`, `lowestHeight`, `setLowestHeight`, the header records `loadHeader`, `saveHeader`, `deleteHeader`, `lowestHeaderHeight` and `setLowestHeaderHeight`, `deleteBlock`, and `batch(fn)`, which runs several saves as one store transaction "so a crash leaves all or none of them".
 - `class KvBlockStore implements BlockStore` over any `KvStore`.
 - `class MemoryBlockStore extends KvBlockStore`: the same on a fresh `MemoryKv`.
 
@@ -220,13 +224,27 @@ const blockKey = (h: bigint) => key((k) => k.u8(0x62).u64(h));
 const hashKey = (hash: Uint8Array) => key((k) => k.u8(0x68).fixed(hash));
 const valsetKey = (hash: Uint8Array) => key((k) => k.u8(0x76).fixed(hash));
 const valsetAtKey = (height: bigint) => key((k) => k.u8(0x56).u64(height));
-const txKey = (hash: Uint8Array) => key((k) => k.u8(0x74).fixed(hash));
+/**
+ * One entry per block a transaction is in. A store written before that has one entry per hash, without the height
+ * in its key; its entries are moved once, when the store is next opened (migrateTxIndex), and 'T' records that.
+ */
+const TX_LAYOUT_KEY = Uint8Array.of(0x54);
+const txKey = (hash: Uint8Array, height: bigint) => key((k) => k.u8(0x74).fixed(hash).u64(height));
+const txPrefix = (hash: Uint8Array) => key((k) => k.u8(0x74).fixed(hash));
+const encodeTx = (height: bigint, index: number, r: TxResult | null | undefined) => encode((wr) => wr.u64(height).u32(index).u8(r ? (r.ok ? 1 : 0) : 2).string(r?.error ?? ''));
+const decodeTx = (v: Uint8Array): TxLocation =>
+  decode(v, (r) => {
+    const height = r.u64();
+    const index = r.u32();
+    const ok = r.u8();
+    return { height, index, ok: ok === 2 ? null : ok === 1, error: r.string() };
+  });
 const resultsKey = (h: bigint) => key((k) => k.u8(0x72).u64(h));
 const headerKey = (h: bigint) => key((k) => k.u8(0x48).u64(h));
 const LOWEST_HEADER_KEY = key((k) => k.u8(0x4c));
 ```
 
-In ASCII: `'s'` state, `'l'` lowest height, `'b'` block by height, `'h'` height by block hash, `'v'` validator set by hash, `'V'` validator set by the height it signs, `'t'` transaction location by hash, `'r'` results by height, `'H'` a header kept without its block, `'L'` the lowest height with such a header. Because heights are big-endian u64, the blocks sort by height and a range over `'b'` walks the chain in order. The prefixes are the same letters the application store uses for different things (`'h'` is a block hash here and a history version there); that is fine because the two live in different named stores.
+In ASCII: `'s'` state, `'l'` lowest height, `'b'` block by height, `'h'` height by block hash, `'v'` validator set by hash, `'V'` validator set by the height it signs, `'t'` transaction location by hash and height, `'T'` the layout of `'t'`, `'r'` results by height, `'H'` a header kept without its block, `'L'` the lowest height with such a header. Because heights are big-endian u64, the blocks sort by height and a range over `'b'` walks the chain in order. The prefixes are the same letters the application store uses for different things (`'h'` is a block hash here and a history version there); that is fine because the two live in different named stores.
 
 Every save goes through a private `write` that either joins a batch in progress or opens its own transaction:
 
@@ -295,22 +313,62 @@ A block and its commit are stored as one value, the block's encoding followed by
           if (seen.has(k)) return;
           seen.add(k);
           const r = results?.[i];
-          w.put(txKey(hash), encode((wr) => wr.u64(h).u32(i).u8(r ? (r.ok ? 1 : 0) : 2).string(r?.error ?? '')));
+          w.put(txKey(hash, h), encodeTx(h, i, r));
         });
         if (results) w.put(resultsKey(h), encode((wr) => wr.array(results, (wr, r) => wr.bool(r.ok).string(r.error ?? ''))));
       }
 ```
 
-The location value is the height, the position, a status byte (1 ok, 0 failed, 2 not executed) and the error string. The `seen` set and the per-block results array are review finding 18: with one location per hash, a block containing `[T, T]` used to overwrite T's successful first position with the failing second one, so the RPC reported a failure and the result proof did not verify. Now the first position owns the index entry and `loadResults(height)` returns every position's result, from which a result proof for any position can be built. `txLocation(hash)` decodes the status byte back:
+The location value is the height, the position, a status byte (1 ok, 0 failed, 2 not executed) and the error string. The `seen` set and the per-block results array are review finding 18: with one location per hash, a block containing `[T, T]` used to overwrite T's successful first position with the failing second one, so the RPC reported a failure and the result proof did not verify. Now the first position owns the block's index entry and `loadResults(height)` returns every position's result, from which a result proof for any position can be built.
+
+The key carries the height after the hash, so there is one entry for every block a transaction is in. A transaction that failed has no effect and can be included again, in a later block, where it may succeed or fail once more; with one entry per hash the last block written used to win. `txLocations(hash)` ranges over the hash's prefix and `txLocation(hash)` picks one:
 
 ```ts
-    return decode(v, (r) => {
-      const height = r.u64();
-      const index = r.u32();
-      const ok = r.u8();
-      return { height, index, ok: ok === 2 ? null : ok === 1, error: r.string() };
-    });
+  txLocations(hash: Uint8Array): TxLocation[] {
+    const prefix = txPrefix(hash);
+    return Array.from(this.kv.range(prefix, prefixEnd(prefix)), ([, v]) => decodeTx(v)).sort((a, b) => (a.height < b.height ? -1 : a.height > b.height ? 1 : 0));
+  }
+
+  txLocation(hash: Uint8Array): TxLocation | null {
+    const all = this.txLocations(hash);
+    return all.find((l) => l.ok === true) ?? all[all.length - 1] ?? null;
+  }
 ```
+
+`txLocations` is every block still held that carries the transaction, oldest first; `txLocation` is the block it succeeded in if there is one, otherwise the newest. `decodeTx` turns the status byte back into `ok`, null for 2.
+
+A store written before the height was in the key has one entry per hash. The constructor calls the private `migrateTxIndex`, which moves them once:
+
+```ts
+  private migrateTxIndex(): void {
+    if (this.kv.get(TX_LAYOUT_KEY)) return;
+    const end = prefixEnd(Uint8Array.of(0x74));
+    // Each pass goes on from the last entry the one before it moved, whose new key sorts right after it.
+    let from: Uint8Array = Uint8Array.of(0x74);
+    try {
+      for (;;) {
+        const old: [Uint8Array, Uint8Array][] = [];
+        for (const [k, v] of this.kv.range(from, end)) {
+          if (k.length === 1 + HASH_SIZE) old.push([k, v]);
+          if (old.length === 5000) break;
+        }
+        this.kv.write((w) => {
+          for (const [k, v] of old) {
+            w.put(txKey(k.subarray(1), decodeTx(v).height), v);
+            w.del(k);
+          }
+          if (old.length < 5000) w.put(TX_LAYOUT_KEY, Uint8Array.of(2));
+        });
+        if (old.length < 5000) return;
+        from = old[old.length - 1]![0];
+      }
+    } catch {
+      // not writable
+    }
+  }
+```
+
+An old key is the prefix byte and the 32-byte hash and nothing more, which is how it is told from a new one. Each entry is rewritten under its own height's key, 5,000 a write, and the marker `'T'` goes in with the last write, so a move that was cut short is taken up again at the next open and a store that has the marker is not scanned. A new, empty store writes the marker at once, which is one write at open. A store that cannot be written is left as it is, and `txLocations` reads either layout, since the short key lies under the same prefix.
 
 The rest are one-key reads and writes: `heightOf(hash)`, `loadState` / `saveState` (the `ChainState` encoding from `src/types/state.ts`, whose last byte names the chain's signature scheme and is refused on read when it names none the code knows), `loadValidatorSet` / `saveValidatorSet` keyed by `set.hash()`, `loadValidatorsAt` / `saveValidatorsAt` keyed by height, `lowestHeight`, which defaults to 1 when nothing was stored, and the header records: `loadHeader` / `saveHeader` keyed by the header's own height (the `Header` encoding from `src/types/block.ts`), `deleteHeader`, and the marker of the lowest one, which unlike `lowestHeight` has no default, because a node that never state-synced has no such records:
 
@@ -335,12 +393,12 @@ Setting the marker to `null` deletes the key, which is what header pruning does 
       w.del(blockKey(height));
       w.del(hashKey(blockHash(stored.block)));
       w.del(resultsKey(height));
-      for (const tx of stored.block.txs) w.del(txKey(txHash(tx)));
+      for (const tx of stored.block.txs) w.del(txKey(txHash(tx), height));
     });
   }
 ```
 
-Something to notice: the transaction index has one entry per hash across all blocks. If a transaction that succeeded at height h is included again at a later height (it would fail there as a replay), the later `saveBlock` overwrites its entry with the failing location, and a later `deleteBlock` of that block removes the entry although the earlier inclusion is still stored. The `seen` guard covers repeats inside one block only; the mempool does not admit a committed transaction again, so this needs a proposer to include one deliberately. Validator sets are never deleted; they are small in number and needed for evidence at any retained height.
+Deleting a block removes that block's index entries only: a transaction that is also in another block still held keeps its entry there. Validator sets are never deleted; they are small in number and needed for evidence at any retained height.
 
 ### src/store/files.ts
 
@@ -385,10 +443,12 @@ The file is either the old content or the new content, never a mix: the data goe
 `test/store.test.ts`:
 
 - "memory store orders keys bytewise and makes writes atomic": `exerciseKv` puts keys out of order, reads one back, finds a missing key undefined, scans the prefix `b` with `prefixEnd` and gets the two `b/` keys in order, scans `[a, z)` and gets four, throws inside a `write` and finds the key it put absent, and deletes a key.
-- "lmdb store does the same and survives reopening": the same exercise on an `LmdbEnv` in a temporary directory, then a reopen reads a value back, and a second, read-only environment on the same directory sees the deletion.
+- "lmdb store does the same and survives reopening": the same exercise on an `LmdbEnv` in a temporary directory, then a reopen reads a value back, a second, read-only environment on the same directory sees the deletion, and asking that environment for a store named `missing` throws `/no database named missing/`.
 - "block store finds blocks by height and by hash on both backends": five blocks saved on a `MemoryBlockStore` and on a `KvBlockStore` over LMDB; `loadBlock(3)` returns the block with its commit, `heightOf` finds block 4 and returns null for an unknown hash, `loadBlock(9)` and `loadState` return null.
 
-`test/review.test.ts`, "keeps per-block results so a repeated transaction proves its real outcome at each position": a block `[T, T]` with results success then failure; `txLocation` points at position 0 with `ok: true`, `loadResults` returns both, and a result proof for position 1 verifies against the results root with `ok: false` (finding 18). Its neighbour "saves everything a height needs to the block store in one transaction" subclasses `MemoryKv` to count calls to `write`: a `batch` holding `saveValidatorSet`, `saveValidatorsAt` and `setLowestHeight` costs one, the values are readable afterwards, and a `setLowestHeight` outside the batch costs another (finding 39).
+`test/review.test.ts`, "keeps per-block results so a repeated transaction proves its real outcome at each position": a block `[T, T]` with results success then failure; `txLocation` points at position 0 with `ok: true`, `loadResults` returns both, and a result proof for position 1 verifies against the results root with `ok: false` (finding 18). Its neighbour "saves everything a height needs to the block store in one transaction" subclasses `MemoryKv` to count calls to `write`: a `batch` holding `saveValidatorSet`, `saveValidatorsAt` and `setLowestHeight` costs one (counted from after the store is opened, which writes the layout of its transaction index once), the values are readable afterwards, and a `setLowestHeight` outside the batch costs another (finding 39).
+
+`test/review4.test.ts` has two cases on the transaction index. "keeps every block a transaction is in, answers with the one it succeeded in, and loses only the pruned one" saves one transaction in blocks 5 (failed), 8 (succeeded, at position 1) and 9 (failed): `txLocations` lists the three in height order, `txLocation` answers block 8, after `deleteBlock(8n)` the list is 5 and 9 and the answer block 9, and after the other two are deleted it is null. "moves an index of the old layout, one entry per hash, when the store is opened, and reads it before that" writes 12,000 entries under the hash alone and opens a `KvBlockStore` on them: no 33-byte key is left, the first and the last entry read back with their heights, positions and results, a transaction given an entry at height 5 by hand that lands again at height 9 has both and keeps the first when block 9 is deleted, a second store opened on the same data makes no range read, and a store whose `write` throws answers from an entry of the old layout.
 
 `test/app.test.ts`, "restarts from the store with the same app hash and keeps producing the same hashes": the application on a `MemoryKv` is reopened from it, serves the same app hash and the same proofs, and after the window slides the history keys under prefix `0x68` are exactly versions 4 to 7, showing that commit deletes the record that left the window. `test/genesis.test.ts` reopens an application from a `MemoryKv` and checks the app hash matches an inline genesis.
 
@@ -397,10 +457,9 @@ The remaining block store methods (state, validator sets by hash and by height, 
 ## Limitations and ideas
 
 - `MemoryKv.write` applies deletes before puts; LMDB applies operations in order. The two agree for every current caller but not in general.
-- The transaction index is one entry per hash across the chain; a transaction included twice in different blocks keeps only the later location, and deleting the later block removes it.
 - Values carry no checksum of their own; the chain trusts LMDB's page-level integrity and checks the application state against the stored app hash on start.
 - A block and its commit share one value, so storing a fuller commit rewrites the whole block.
-- `LmdbEnv.store(name)` returns a new wrapper on every call and does not cache; a read-only open of a missing name yields a wrapper that fails on use (noted and left in REVIEW-2026-10-28.md).
+- `LmdbEnv.store(name)` returns a new wrapper on every call and does not cache.
 - `batch` is per `KvBlockStore` and therefore per named store. What makes a block and the application's commit one transaction is `KvEnv.transaction` around both, which the executor uses only when the node created the application on its own environment's `app` store. An application handed to the node commits in a separate transaction, or outside LMDB altogether, so a crash between the block store's batch and `app.commit` is still possible there and is still repaired by replay, as DESIGN.md section 4 describes.
 - A transaction that encloses an asynchronous `commit()` holds only what the application wrote before its first `await`; nothing checks that an application in the environment's store keeps to that, and one that does not silently pays the second flush.
 - There is no compaction or map-size management beyond lmdb-js's defaults.
@@ -408,10 +467,10 @@ The remaining block store methods (state, validator sets by hash and by height, 
 Exercises:
 
 1. Make `MemoryKv.write` apply operations in the order the callback issued them, and add a test to `exerciseKv` that puts and then deletes one key in a single `write` on both backends.
-2. Give the transaction index a per-block entry (`'t' || hash || height`) and make `txLocation` return the earliest successful one; then make `deleteBlock` remove only its own.
+2. `deleteBlock` loads the block to find the index entries of its transactions. Keep a block's transaction hashes under a key of their own by height so that it need not, and measure what that costs a commit.
 3. Add a third backend (for example SQLite or a log-structured file) behind `KvStore` and run `test/store.test.ts` against it unchanged.
 4. Measure `write` latency on LMDB with and without the sync (lmdb-js exposes options for it) and relate the difference to what crash recovery in [chapter 8](08-node.md) would have to replay. Then time a block's commit with the executor's `transaction` left out, so that the chain store and the application each flush, and compare it with the one flush per block the node pays now.
-5. Write a tool that opens a node's `data/lmdb` read-only, as the test does, and prints the key layout of each store with counts per prefix byte; then make `LmdbEnv` report a missing name clearly.
+5. Write a tool that opens a node's `data/lmdb` read-only, as the test does, and prints the key layout of each store with counts per prefix byte.
 6. Add a checksum (for example the first 8 bytes of SHA-256) in front of every value of the block store and verify it on read; measure the cost in the block sync benchmark.
 
 ## Where to next

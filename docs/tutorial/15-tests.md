@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-four files, 203 cases, about 6,500 lines counting the shared harness
+`test/**/*.test.ts`: twenty-five files, 212 cases, about 6,850 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes (111.5 s, all
 passing, on the run this chapter was checked against, under the default ML-DSA-44 keys); nearly
 all of that time is the network scenarios, which run real consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (202 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (211 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -26,7 +26,8 @@ guard's dials on the object database show; `chain`, `app`, `staking`, `staking-n
 the external review and the later cases of the same kind, `review2` five more that each
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
-by title at the end of the suites. Files run one after another, never in parallel, for a reason explained
+by title at the end of the suites, and `review4` the nine cases for the items the first review
+noted and left. Files run one after another, never in parallel, for a reason explained
 below.
 
 ## The harness
@@ -515,7 +516,9 @@ The decisive point is the aborted write: a batch that throws leaves nothing behi
 
 **`it('lmdb store does the same and survives reopening')`**. The same routine on an `LmdbEnv`
 in a temporary directory, then the environment is closed and reopened and `c` still reads
-`three`; a second, read-only environment on the same path sees the deleted `a` as `undefined`.
+`three`; a second, read-only environment on the same path sees the deleted `a` as `undefined`,
+and asked for a store named `missing` it throws `/no database named missing/`: a read-only
+environment cannot create a database, and says so where it is asked for one.
 The temporary directory is removed in `afterEach`.
 
 **`it('block store finds blocks by height and by hash on both backends')`**. For a
@@ -1768,8 +1771,11 @@ Two tests on transaction inclusion and result proofs in `src/types/txproof.ts`
 
 **`it('proves inclusion against the data hash and rejects tampering')`**. `txsRoot([])` is
 `EMPTY`. For each index, `txProofFor(7n, txs, i)` verifies against the root and survives the
-byte round-trip; a different transaction, a different index, a `count` of 16 (another tree
-height) and the root of only six transactions all fail. Reversing the order changes the root.
+byte round-trip; a different transaction, a different index, a path with one more sibling
+(`EMPTY` appended) or one fewer, an index of `i + 8` (the same low bits, but beyond what three
+siblings can address), an index of −1 and the root of only six transactions all fail. The
+proof carries no count: the path's length is the tree's height, and the position must be one
+that length can address. Reversing the order changes the root.
 
 **`it('proves results, including failures, against the results hash')`**. `resultsRoot([])` is
 `EMPTY`; each result proof carries the right `ok`, verifies, round-trips, and fails when `ok` is
@@ -2099,7 +2105,8 @@ the second is `'full'` again, not `'seen'`, and once `update` removes the first 
 DESIGN.md says a decided height's block, commit and state land in one store transaction, but
 the executor wrote them in four, so a crash in between could leave a block indexed without the
 state that goes with it. A `Counting` subclass of `MemoryKv` counts calls to `write`. Inside
-`store.batch(() => { ... })` the test saves a validator set, the set at height 3 and the lowest
+`store.batch(() => { ... })` (the count set back to 0 once the store is open, since opening a new
+store writes the layout of its transaction index once) the test saves a validator set, the set at height 3 and the lowest
 height; `kv.writes` is 1 and `loadValidatorsAt(3n)` reads the set back. A `setLowestHeight`
 outside a batch costs a second write. The executor saves every decided height inside such a
 batch.
@@ -2283,6 +2290,116 @@ p2p handshake`: "connects peers of the chain scheme and refuses a peer keyed und
 one, in either direction". `a keystore entry whose scheme was changed`: "fails to open rather
 than give another key under the same name". `CHAIN_SCHEME`: "is not read by the node code, so a
 stray value cannot stop a node from starting".
+
+### test/review4.test.ts
+
+Nine tests for the thirteen items the first review noted and left (REVIEW-2026-10-28.md,
+"Fourth pass: the judgement calls"), listed by group and title with what each sets up and
+asserts.
+
+`state queries at a height, and a batch that pays for its calls`, one case on a testnet with an
+`RpcServer`, both stopped in `afterEach`.
+
+**`it('answers balance, account, key, validator and delegation as of the height asked for, with the proof of that height')`**.
+Four validators of the core application, made with `engineValidators: false` and a staking
+genesis (a faucet, four operators `op0` to `op3`, each validator with a self-bond of 200), and
+an RPC server on node 0. Four transactions go in through `broadcastTx` in commit mode, so the
+height of each is known: `created` registers alice, `paid` transfers her 5,000 base units,
+`delegated` delegates 300 tokens from the faucet to `op0`'s validator, `paidAgain` transfers 700
+more; a `validator` answer for `op0` is kept from before the delegation. `balance` for alice is
+`5700` now and `5000` at `paid`, with `height` echoed; by id `3.5` at `created - 1` it is `0`,
+and by name there it is `-32001`, since the name led nowhere before the account existed. A
+height of 99,999 is `-32001` with `/is not kept/` on `balance`, and `-32001` on `object`. `key`
+on `account`/`byName` for alice's name gives `3.5` at `created` and `null` at `created - 1`,
+with a proof that `verifyKeyProof` accepts as absence (`null`) against the app hash of header
+`created`; `account` at `created - 1` is `null` with a proof that verifies the same way. At
+`paid`, `account` has id `3.5`, one balance of `CORE` at `5000`, `history` of `'2'`, and a proof
+that verifies against header `paid + 1` to the encoding of alice's id; with no height it has
+`5700` and `'3'`. `account` for `NOT A NAME` is `null`. `validator` for `op0` at
+`delegated - 1` has the tokens of the answer kept from before, a `delegators` of `null`, the
+self-bond it has now and `operatorName` `op0`; now it has 300 tokens more and two delegators.
+`delegation` of the faucet to `op0` at `delegated - 1` is `{ delegation: null, unbonding: null }`
+with a proof of absence against header `delegated`; now its `tokens` are the amount delegated
+and `unbonding` is `[]`. Then the test waits until every peer of node 0 has a `clockOffsetMs`
+and requires the absolute value of each one `peers` returns to be under 1,000: the nodes share one
+clock.
+Last, a second server on the same node with `ratePerSecond: 0.001` and `burst: 6` is sent two
+batches of five `status` calls: the first has five answers and no `-32004`; the second has ids
+`[0, 1, 2, 3, 4]` and four `-32004`, one call being answered with the token the first batch
+left.
+
+`the transaction index`, two cases on block stores, with a `block(height, txs)` helper that
+builds a header of zero hashes with the transactions' data hash and a commit for it.
+
+**`it('keeps every block a transaction is in, answers with the one it succeeded in, and loses only the pruned one')`**.
+On a `MemoryBlockStore`, one transaction is saved in block 5 with a failed result
+(`insufficient balance`), and `txLocation` gives height 5, `ok: false` and that error. It is
+saved again in block 8 at position 1 with success and in block 9 with `duplicate transaction`.
+`txLocations` is `[5, 0, false]`, `[8, 1, true]`, `[9, 0, false]`, and `txLocation` is height 8,
+index 1, `ok: true`: the success, not the newest. After `deleteBlock(8n)` the heights are 5 and
+9 and `txLocation` is height 9, `ok: false`; after blocks 5 and 9 are deleted it is `null`, as
+it is for the other transaction of block 8.
+
+**`it('moves an index of the old layout, one entry per hash, when the store is opened, and reads it before that')`**.
+A `MemoryKv` is filled by hand with 12,000 entries of the old layout, the hash alone as the key
+and the height (5, 6 or 7) in the value, and a `KvBlockStore` is opened on it. No key of 33
+bytes is left under `'t'`; the first hash reads height 5, index 0, `ok: false`, `too early` and
+the last height 7, index 11,999, `ok: true`. A transaction given an entry at height 5 by hand is
+then saved in block 9 with success: `txLocations` is `[5, false]`, `[9, true]`, and after
+`deleteBlock(9n)` `txLocation` is the entry of height 5. A second `KvBlockStore` opened over the
+same data through a wrapper that counts range reads makes none, the marker saying nothing is
+left to move. And a store over a key-value store whose `write` throws, holding one entry of the
+old layout, answers `txLocation` from it: height 6, index 1, `ok: true`.
+
+`snapshots, evidence, the codec`, three unit cases.
+
+**`it('refuses a snapshot that leaves a type out, repeats one or names one out of order')`**.
+An `ObjectDatabase` over `CORE_TYPES` with nothing in it is rooted at version 0 and encoded
+with `encodeSnapshot`; a fresh database loads the bytes and reports height 0. The bytes are a
+version, a height and an app hash (44 bytes), a section count equal to `CORE_TYPES.length`, and
+one 14-byte section per type (a type, a counter and an empty count), which the test checks
+before it rebuilds the snapshot from chosen sections. Without the last section `loadSnapshot`
+throws `/of \d+ type sections/`; with the last replaced by a copy of the first,
+`/snapshot section/`; with the first two swapped, `/snapshot section 0/`.
+
+**`it('lets go of pending and committed evidence and its inventory once it is too old, and bounds what waits')`**.
+On an `EvidencePool` by itself, with evidence built from two prevotes for different hashes at
+a height, their signatures placeholders: `add` of height 3 is `true` and a second is `false`; `add` of height 4 is
+`true`. `markCommitted` is given the evidence of height 3 and one of height 5 that was never
+pending here, and `held` is `{ pending: 1, committed: 2, inventory: 3 }`; `add` of the
+height-5 evidence is `false`, and `hasHash` of its id is `true`. `pruneIf` for heights up to 4
+leaves `{ pending: 0, committed: 1, inventory: 1 }` and `hasHash` of the height-3 id `false`;
+`pruneIf(() => true)` leaves all three at 0. Then `MAX_PENDING + 10` pieces for different
+validators are added: `size` and `held.inventory` are both `MAX_PENDING`.
+
+**`it('refuses a number too large to hold exactly where a 64-bit field is used as one')`**.
+A `Reader` over an encoded u64 of 2^53 − 1 gives `Number.MAX_SAFE_INTEGER` from `u53()`, and
+over 2^53 throws `/out of range/`. Over an i64, `i53()` gives −1 for −1 and throws for −2^53 and
+for 2^62. `decodeProposal` over a height, a round and a lock round of 2^60 throws
+`/out of range/`: such a proposal is refused before its block is read.
+
+`the keystore`, one case.
+
+**`it('removes a key by name, for good, and says so when there is none by that name')`**. A
+keystore created in a temporary directory gets `keep` and `drop`; `remove('drop')` succeeds, a
+second `remove('drop')` throws `/no key named drop/` and `remove('never')` throws
+`/no key named never/`. A handle opened afresh lists `['keep']`, and no `keystore.json.lock` is
+left. The directory is removed in `finally`.
+
+`the network and the node`, two cases.
+
+**`it('reads a peer clock that runs ahead from its pong')`**. Two bare `Network`s on a
+`MemoryHub`, pinging every 100 ms, `b` seeded with `a` and given a `clock` of `Date.now() + 7000`.
+Once each has a `clockOffsetMs` for the other, `a`'s for `b` is within 500 of 7,000 and `b`'s
+for `a` within 500 of −7,000: `b`'s clock is seven seconds ahead, `a` sees it ahead and `b` sees
+`a` behind, each within the trip. `a`'s `latencyMs` for `b` is under 500. Both are stopped in
+`finally`.
+
+**`it('makes a verifier pool of its own when it is given none, and closes it when it stops')`**.
+`Node.create` with one validator, no data directory and no `verifier` in its config. The
+node's verifier is a `WorkerVerifier` by its constructor's name; started, the node reaches
+height 2, its blocks signed and checked through the pool; after `stop()`, a `verify` on the
+verifier rejects with `/closed/`.
 
 ## Writing a new test
 

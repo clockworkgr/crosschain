@@ -967,6 +967,31 @@ For each entry the account's head comes from `heads` if the block has already wr
 
 Both directions are read the same way: work out the newest sequence wanted, `locate` it from the head, then follow `prev` down. Newest first, the newest wanted is `total − 1 − from` and the walk may go down to 0. Oldest first, the page is the sequences from `from` to `from + limit − 1`, or to the newest if the account has fewer, and it stops at `from`; the entries come out newest first and are reversed at the end. With ten entries, `from` 2 and a limit of 3: the newest wanted is 4, `locate` goes from 9 to 4 (9 skips to 8, 8 would skip to 0 and pass, so 7, 7 skips to 6, 6 skips to 4), entries 4, 3 and 2 are read, and the result is 2, 3, 4. A limit of zero or less, a negative `from`, or a `from` past the end gives no entries and the total. Each entry is returned with its `sequence`, which a client passes back as `from` to page on.
 
+**`totalAt(account, height)`** is how many entries an account had when the block at `height` had been written, which the RPC's `account` reports for a past height:
+
+```ts
+  totalAt(account: ObjectId, height: bigint): bigint {
+    const head = this.head(account);
+    let index = head.last;
+    for (let sequence = head.count - 1n; sequence >= 0n; ) {
+      const r = decode(this.stored(index), decodeRecord);
+      if (r.entry.height <= height) return sequence + 1n;
+      if (sequence === 0n) break;
+      const skipped = sequence & (sequence - 1n);
+      if (skipped < sequence - 1n && decode(this.stored(r.skip), decodeRecord).entry.height > height) {
+        index = r.skip;
+        sequence = skipped;
+      } else {
+        index = r.prev;
+        sequence -= 1n;
+      }
+    }
+    return 0n;
+  }
+```
+
+An account's entries are in height order, so the answer is one more than the sequence of its newest entry at or below the height. The walk starts at the newest entry and goes down as `locate` does: by the skip pointer while the entry it leads to is still above the height, and by the previous entry otherwise, so an account with a long history after the height is not read entry by entry.
+
 **`migrate()`** (private) is for a store written with the earlier layout, `'a'`, account and sequence for an entry and `'q'` and account for a count. The first time such a store is opened every old entry is read, the list is sorted by height, then account, then sequence, appended to the log through `append` with `flush` set, so the heads are stored with it and not left waiting, and the old keys are deleted, all in one write. Each account's entries keep their order, so they keep their sequence numbers. Every entry is held in memory for it, once; the next open finds no old keys and returns.
 
 ### src/app/core/staking.ts
@@ -1267,7 +1292,7 @@ export interface SnapshotTypeInfo {
 }
 ```
 
-**`SnapshotManifest`** is `{ format, height, appHash, chunkObjects, types }`. **`SnapshotChunk`** is `{ height, type, index, from, to, objects, siblings }` where `objects` are the present instances in `[from, to)` with their encodings and `siblings` the range proof. **`encodeManifest`** / **`decodeManifest`** and **`encodeChunk`** / **`decodeChunk`**, with the byte helpers **`manifestToBytes`**, **`manifestFromBytes`**, **`chunkToBytes`**, **`chunkFromBytes`**, give both a wire form; the decoders bound index roots at 16, top siblings at 64, chunk hashes at a million and chunk siblings at 128.
+**`SnapshotManifest`** is `{ format, height, appHash, chunkObjects, types }`. **`SnapshotChunk`** is `{ height, type, index, from, to, objects, siblings }` where `objects` are the present instances in `[from, to)` with their encodings and `siblings` the range proof. **`encodeManifest`** / **`decodeManifest`** and **`encodeChunk`** / **`decodeChunk`**, with the byte helpers **`manifestToBytes`**, **`manifestFromBytes`**, **`chunkToBytes`**, **`chunkFromBytes`**, give both a wire form; the decoders bound index roots at 16, top siblings at 64, chunk hashes at a million and chunk siblings at 128, and `decodeChunk` reads `from`, `to` and each instance number with `u53()` ([chapter 1](01-codec.md)), refusing a number too large to hold exactly.
 
 **`exportSnapshot(db, types, height, chunkObjects)`** walks `db.typeOrder`, asks the database for each type's leaf at that height (`typeLeafProofAt`), and for every range of `chunkObjects` instances collects the encodings of the objects present at that height and attaches `rangeProofAt(type, from, to, height)`. The encodings come from `bytesAt`, straight from the database's arena or its history of past values, so nothing is decoded and encoded again:
 
@@ -1383,7 +1408,7 @@ export interface OpenOptions {
   if (opts.heapRoom !== undefined) {
     const counter = (type: number) => {
       const c = kv.get(counterKey(type));
-      return c ? Number(decode(c, (r) => r.u64())) : 0;
+      return c ? decode(c, (r) => r.u53()) : 0;
     };
     const est = estimateTiers(types, counter);
     let room = opts.heapRoom;
@@ -1412,7 +1437,7 @@ export interface OpenOptions {
   }
   for (const t of types) {
     const c = kv.get(counterKey(t.id));
-    if (c) db.setCounter(t.id, Number(decode(c, (r) => r.u64())));
+    if (c) db.setCounter(t.id, decode(c, (r) => r.u53()));
   }
   const t1 = performance.now();
   // The trees come from their chunks and nodes: no object is hashed and no index key inserted into a sparse tree,
@@ -1448,7 +1473,7 @@ The database is given the store itself as `indexStore`, the read-only view it fa
   const oldest = db.currentVersion - (retainVersions ?? 100);
   const found = new Map<number, Uint8Array | null>();
   for (const [k, v] of kv.range(HISTORY_PREFIX, prefixEnd(HISTORY_PREFIX))) {
-    const version = Number(decode(k, (r) => (r.u8(), r.u64())));
+    const version = decode(k, (r) => (r.u8(), r.u53()));
     if (version > oldest && version <= db.currentVersion) found.set(version, withHistory ? v : null);
     else staleHistory.push(version);
   }
@@ -1642,6 +1667,8 @@ History: **`accountHistory(account, from = 0n, limit = 100, reverse = false)`** 
 ```
 
 The application keeps one `HistoryLog` over its store (`historyLog`, made in the constructor before the database is opened, which is also when a store with the earlier layout is moved into the log) and the method is its `read`: oldest first from sequence `from`, or with `reverse` newest first, `from` then counting entries back from the newest, which is what a wallet showing recent activity wants. `total` is the account's count and every entry carries its `sequence`. A reader decodes an `operation` entry's `data` with `decodeOperation` and a virtual entry's with `decodeVirtualData`, as the RPC and the network test do. The newest twenty entries of an account are read at about a million a second on the gigabyte state (1,023,000, docs/benchmarks.md section 4.8; 930,000 to 991,000 with the earlier layout, the entries keyed by account), most accounts of that state having no entries.
+
+**`accountHistoryTotalAt(account, height)`** is how many history entries an account had as of a height: the log's `total` for the last height or a later one, its `totalAt` for an earlier one.
 
 Queries: `lastHeight`, `lastAppHash`, `lowestProvableHeight` (the oldest height a proof can be made for), `coreAsset`, **`stakingParameters()`**, **`global()`**, **`feeSchedule()`**, **`chainParameters()`**, **`dynamic()`**, **`accountByName(name)`** (a name that cannot be an index key, one with a zero byte, returns null rather than throwing), **`account(id)`**, **`balance(owner, asset = core)`**. What "committed" means here needs stating precisely, because two views are in play. `global()`, `dynamic()`, `account(id)`, `accountByName` and `balance` return objects read through `db.getCommitted`, which looks through every open session back to the last `root()`, so a transfer sitting in the pending session is invisible and the test `checks pending transactions in sequence` asserts exactly that. The indices, though, are live: `accountByName` finds the id through the live `byName` index and `balance` through the live `byOwnerAsset` index, and only then reads the object behind that id committed. The difference shows for an object the pending session created: the live index finds it, `getCommitted` says it did not exist at the last root, and the query answers null, which is the right answer. `coreAsset` and `stakingParameters()` read the live `global` object, which only a block ever modifies, so outside `finalizeBlock` the live and committed values are one and the same. The RPC in [chapter 12](12-rpc.md) follows the same rule for everything it derives from these objects: a validator's self-bond and delegator count, a delegation's unbonding entries and an account's balances are assembled from committed objects, with the live indices used only to find which ids to read. Proofs: **`proof(id)`** against the current app hash, **`proofAt(id, height)`** for a past height inside the window ("Verify it against header height+1"), **`proveAccountName(name, height)`**, **`proveAssetSymbol(symbol, height)`**, **`proveValidatorAddress(address, height)`** and **`proveDelegation(delegator, validator, height)`** over the four authenticated indices; a key proof proves the 8-byte id the key maps to, or its absence.
 

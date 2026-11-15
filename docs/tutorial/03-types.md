@@ -208,7 +208,7 @@ The private **`rescalePriorities(diffMax)`** finds the spread between the highes
     }, 10_000);
     ValidatorSet.assertUnique(vals);
     for (let i = 1; i < vals.length; i++) if (byPowerThenAddress(vals[i - 1]!, vals[i]!) >= 0) throw new Error('validator set out of order');
-    const proposerIndex = Number(r.i64());
+    const proposerIndex = r.i53();
     if (vals.length > 0 && (proposerIndex < 0 || proposerIndex >= vals.length)) throw new Error('validator set proposer index out of range');
     return new ValidatorSet(vals, proposerIndex);
   }
@@ -369,7 +369,7 @@ export function proposalSignBytes(chainId: string, p: UnsignedProposal): Uint8Ar
 }
 ```
 
-Signing the hash keeps the sign bytes small and lets a re-proposal of a locked block (review finding 4) be signed by a different proposer without the block changing. **`encodeProposal`**/**`decodeProposal`** carry the block inline and the signature last, read back with `decodeSignature`; the decoder converts `polRound` with `Number(r.i64())` and does not range-check it, leaving validation to consensus.
+Signing the hash keeps the sign bytes small and lets a re-proposal of a locked block (review finding 4) be signed by a different proposer without the block changing. **`encodeProposal`**/**`decodeProposal`** carry the block inline and the signature last, read back with `decodeSignature`; the decoder reads `polRound` with `r.i53()` ([chapter 1](01-codec.md)), which refuses a value too large to hold exactly, and does not range-check it further, leaving validation to consensus.
 
 ### src/types/state.ts
 
@@ -518,7 +518,7 @@ The CLI writes `genesis.json` with `genesisToJson` at `init` and loads it at `st
 
 ### src/types/txproof.ts
 
-This file builds the two Merkle roots in the header and the proofs against them. It imports `DenseMerkleTree`, `EMPTY`, `heightFor`, `leafHash` and `rootFromPath` from `src/db/merkle.ts` and the `TxResult` type from `src/app/types.ts`, which makes it the one place where the chain types depend on the application interface (a type-only import).
+This file builds the two Merkle roots in the header and the proofs against them. It imports `DenseMerkleTree`, `EMPTY`, `leafHash` and `rootFromPath` from `src/db/merkle.ts` and the `TxResult` type from `src/app/types.ts`, which makes it the one place where the chain types depend on the application interface (a type-only import).
 
 The private `indexKey(i)` is the leaf key, a big-endian `u32` position. **`txResultBytes(r)`** is the leaf value for a result: `u8(ok)` then `string(error ?? '')`, the shape `RPC-SYNC-PROOFS.md` section 2.1 specifies as `encode(ok: u8, error: string)`. The private `build(values)` makes the tree:
 
@@ -536,22 +536,23 @@ Each leaf is `leafHash(key, value)`, the ICS23 leaf `H(0x00 || varint(len key) |
 
 **`txsRoot(txs)`** and **`resultsRoot(results)`** are what the proposer puts in `dataHash` (`src/consensus/consensus.ts`), what validation recomputes, and what the executor stores as `lastResultsHash` for the next header.
 
-**`interface TxProof`** is `height`, `index`, `tx`, `count` ("Transactions in the block; fixes the tree height") and `siblings`. **`interface ResultProof`** is `height`, `index`, `ok`, `error`, `count`, `siblings`. **`txProofFor(height, txs, index)`** and **`resultProofFor(height, results, index)`** rebuild the tree and take `tree.path(index)`; the node's RPC calls them when a `tx` query asks for proofs.
+**`interface TxProof`** is `height`, `index`, `tx` and `siblings`. **`interface ResultProof`** is `height`, `index`, `ok`, `error`, `siblings`. Neither states how many transactions the block has. The file's header comment gives the reason: "the root commits to the tree's height, which the path's length gives, but not to the count, so a proof carrying one would be stating something it does not prove." **`txProofFor(height, txs, index)`** and **`resultProofFor(height, results, index)`** rebuild the tree and take `tree.path(index)`; the node's RPC calls them when a `tx` query asks for proofs.
 
 The private `pathMatches` is the verifier both public functions share:
 
 ```ts
-function pathMatches(root: Uint8Array, value: Uint8Array, index: number, count: number, siblings: Uint8Array[]): boolean {
-  if (index >= count || siblings.length !== heightFor(count)) return false;
+function pathMatches(root: Uint8Array, value: Uint8Array, index: number, siblings: Uint8Array[]): boolean {
+  // The position must be one the path's length can address: rootFromPath reads only that many bits of it.
+  if (!Number.isSafeInteger(index) || index < 0 || siblings.length > 32 || index >= 2 ** siblings.length) return false;
   return bytesEqual(rootFromPath(leafHash(indexKey(index), value), index, siblings), root);
 }
 ```
 
-`heightFor(count)` is the height of a tree with `count` leaves (3 for 5 to 8 leaves, 4 for 9 to 16), so the proof must carry exactly that many siblings; `rootFromPath` folds the leaf up through them, using the bits of `index` to decide which side the leaf is on at each level. **`verifyTxProof(dataHash, p)`** checks against "the dataHash of the header at proof.height"; **`verifyResultProof(lastResultsHash, p)`** against "the lastResultsHash of the header at proof.height + 1", the deferred-execution rule once more. `src/light/client.ts` verifies both headers and then both legs, and additionally requires the two proofs to name the same index.
+The path's length is the tree's height (3 siblings for 5 to 8 leaves, 4 for 9 to 16). `rootFromPath` folds the leaf up through the siblings, using the bits of `index` to decide which side the leaf is on at each level, and it reads only as many bits as there are siblings, so the guard requires `index` to be below `2 ** siblings.length`: without it, an index eight too high would fold along the same path as the true one in a tree of height 3. A path of the wrong length cannot reach the root either, because a leaf is hashed apart from an inner node. **`verifyTxProof(dataHash, p)`** checks against "the dataHash of the header at proof.height"; **`verifyResultProof(lastResultsHash, p)`** against "the lastResultsHash of the header at proof.height + 1", the deferred-execution rule once more. `src/light/client.ts` verifies both headers and then both legs, and additionally requires the two proofs to name the same index.
 
-One subtlety: `count` is only bound through `heightFor(count)`. A proof for a 7-transaction block verifies equally with `count` set to 5, 6 or 8, since the tree shape is the same; it fails with 16 (the test's case) because the height differs. The root is the authority; `count` should be read as "a count consistent with the tree", not as a proven transaction count.
+The proofs once carried a `count`, which was bound only through the tree height it implied: a proof for a 7-transaction block verified equally with `count` set to 5, 6 or 8. The field is gone from the interfaces and from the encoding, so a proof says where a transaction is and what it is, and nothing it does not prove.
 
-**`encodeTxProof`**/**`decodeTxProof`** and **`encodeResultProof`**/**`decodeResultProof`** are chained writer calls; the decoders cap siblings at 64. **`txProofToBytes`**, **`txProofFromBytes`**, **`resultProofToBytes`** and **`resultProofFromBytes`** wrap them with `encode` and `decode`, and the RPC sends proofs as hex of exactly these bytes so that "The RPC never re-serialises a proof" (`RPC-SYNC-PROOFS.md` section 3.2).
+**`encodeTxProof`**/**`decodeTxProof`** and **`encodeResultProof`**/**`decodeResultProof`** are chained writer calls; the decoders cap siblings at 32. **`txProofToBytes`**, **`txProofFromBytes`**, **`resultProofToBytes`** and **`resultProofFromBytes`** wrap them with `encode` and `decode`, and the RPC sends proofs as hex of exactly these bytes so that "The RPC never re-serialises a proof" (`RPC-SYNC-PROOFS.md` section 3.2).
 
 ### src/util/log.ts
 
@@ -577,7 +578,7 @@ A hash prints as its first six bytes, a `bigint` height as a number, a nil block
 
 **`test/review.test.ts`, `rejects decoded validator sets with duplicate members, wrong order or a bad proposer index`** hand-encodes three malformed sets with the codec and asserts `ValidatorSet.decode` throws `/duplicate/`, `/out of order/` and `/proposer index/`. It is the regression for review finding 1. `refuses validator powers whose total a priority could not track` calls `create` with two validators of 2^63 each and expects `/total power/`: the sum is above `MAX_TOTAL_POWER`. The same file's `keeps per-block results so a repeated transaction proves its real outcome at each position` builds a block whose `dataHash` is `txsRoot([raw, raw])`, stores it with results `[ok, duplicate failure]`, and asserts a result proof for position 1 verifies and says `ok: false` (review finding 18).
 
-**`test/txproof.test.ts`.** `proves inclusion against the data hash and rejects tampering` uses seven small transactions: the empty root is `EMPTY`; every position's proof verifies, survives a byte round-trip, and fails with a different transaction, a different index, `count: 16` ("a different tree height") and a root over six transactions; reversing the list changes the root. `proves results, including failures, against the results hash` does the same for results with every third one failing, and asserts flipping `ok` or appending to `error` breaks the proof.
+**`test/txproof.test.ts`.** `proves inclusion against the data hash and rejects tampering` uses seven small transactions: the empty root is `EMPTY`; every position's proof verifies, survives a byte round-trip, and fails with a different transaction, a different index, a path one sibling longer or one shorter, an index eight too high (one the path's length cannot address), an index of −1 and a root over six transactions; reversing the list changes the root. `proves results, including failures, against the results hash` does the same for results with every third one failing, and asserts flipping `ok` or appending to `error` breaks the proof.
 
 **`test/engine.test.ts`.** `rejects a block from another protocol version` bumps `header.version` on a real block and asserts `validateBlockStructure` reports `/protocol version/`, and that the node's state version is `PROTOCOL_VERSION`. `refuses a genesis with no validators from either side` calls `genesisState` with no genesis validators and no override, and with an empty override, expecting `/no validators/`. `drops evidence older than the configured age by block time, and keeps young evidence` forges two conflicting prevotes with `voteSignBytes` and `signContext(chainId, 'vote')`, wraps them with `makeDuplicateVoteEvidence`, and checks that stale evidence is discarded and young evidence reaches every application.
 
@@ -601,8 +602,8 @@ Known simplifications:
 - Only duplicate-vote evidence exists. Amnesia evidence is deferred (`DESIGN.md` section 10).
 - Votes carry no timestamp, so there is no BFT time; block time is the proposer's word, bounded by validation's clock-drift window.
 - Proposals carry whole blocks; there are no block parts, so a block must fit in one p2p frame.
-- `decodeVote` and `decodeProposal` do not range-check `round`, `validatorIndex` or `polRound`; consensus does, after decoding.
-- A `TxProof`'s `count` is bound only up to the tree height.
+- `decodeVote` and `decodeProposal` do not range-check `round`, `validatorIndex` or `polRound`, beyond refusing a `polRound` too large to hold exactly; consensus does, after decoding.
+- A `TxProof` does not say how many transactions its block has; the root commits to the tree's height and not to the count.
 - `genesisFromJson` validates little beyond the chain id and the scheme name; bad keys and powers surface later with less helpful messages.
 - `src/types/state.ts` imports `EMPTY` from the database and `src/types/txproof.ts` imports `TxResult` from the application interface, so the types layer is not quite the bottom of the dependency graph.
 
@@ -613,7 +614,7 @@ Exercises:
 3. Add a `fullHash()` to `ValidatorSet` that covers priorities and the proposer index, and work out what the light client and state sync would need to change to use it instead of the proposer check.
 4. Add a `timestamp` to `Vote` and `voteSignBytes`, collect the precommit timestamps in a commit, and compute Tendermint's BFT time (the power-weighted median). Decide what the header's `time` should then be.
 5. Define an amnesia evidence type (a precommit for a block in round R from a validator that had prevoted nil in R while locked), with a canonical form, a shape check and a codec, mirroring `src/types/evidence.ts`.
-6. Make `TxProof.count` provable: put the transaction count in the header, or into the leaf value, and update `pathMatches` and the tests.
+6. Make the transaction count provable: put it in the header, or into the leaf value, give `TxProof` a `count` that is checked against it, and update `pathMatches` and the tests.
 7. Give `genesisFromJson` a schema check with clear messages and a test file of bad documents.
 8. Make `makeLogger` emit JSON lines when `out` is not a terminal, keeping `fmt`'s rules for hashes and `bigint`s.
 

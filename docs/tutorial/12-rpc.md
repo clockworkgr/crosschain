@@ -12,9 +12,9 @@ The RPC is the node's door for programs that are not peers: wallets, explorers, 
 
 **Deferred execution and the `height` parameter.** As chapter 11 explained, the state after block N is committed by the app hash in header N+1 (`DESIGN.md` section 6, "Deferred execution caveat"). So a proof about height N must be checked against header N+1. The methods that take a `height` and a `prove` flag serve the proof at that height; it is the caller's job to fetch header N+1 and its commit, and the light client's job to decide whether that header can be trusted.
 
-**Committed versus live views.** The application's database keeps a pending session open while transactions are being checked for the mempool (chapter 11). A query that reads through that session would show state that no block has committed. The review of 2026-10-28 (`REVIEW-2026-10-28.md` finding 19) found several methods doing just that, "exposing speculative state and labelling current values with historical heights". The fix was to read objects with `app.db.getCommitted` ("the object as of the last `root()`, looking through every open session"). The index lookups that find an object by name or by owner still go through the live indices, which is why the finding is recorded as "fixed for account, validator and delegation; accounts list still scans live names". Keep this in mind when reading `methods.ts`: a lookup finds an id live, and the object behind it is then read committed.
+**Committed versus live views.** The application's database keeps a pending session open while transactions are being checked for the mempool (chapter 11). A query that reads through that session would show state that no block has committed. The review of 2026-10-28 (`REVIEW-2026-10-28.md` finding 19) found several methods doing just that, "exposing speculative state and labelling current values with historical heights". The fix was to read objects with `app.db.getCommitted` ("the object as of the last `root()`, looking through every open session"). The index lookups that find an object by name or by owner still go through the live indices, which is why the finding is recorded as "fixed for account, validator and delegation; accounts list still scans live names". That was the state of things until the state queries were given a height of their own: `object`, `key`, `account`, `validator`, `delegation` and `balance` now answer as of one height, the one asked for or the last committed one, and find an object through an authenticated index by reading that index's own tree at the height, not the live index. The live indices remain where the code only needs to know where to look (an account's balance ids, the listings), and the object behind such an id is then read committed or as of the height.
 
-**Token-bucket rate limiting.** Each remote address has a bucket holding at most `burst` tokens, refilled continuously at `ratePerSecond`. A request spends tokens; if the bucket cannot pay, the request is refused. The scheme lets a client burst briefly and then settle to the steady rate, and costs almost nothing to keep (one small object per address, dropped after ten idle minutes). Costly methods (proofs, history, broadcast) spend `costlyCost` tokens instead of one. This is a plain defence against a careless or hostile client on a loopback or proxied endpoint; `DESIGN.md` section 10 lists "The RPC has no authentication; it is meant for loopback or a query node behind a proxy" among the known simplifications.
+**Token-bucket rate limiting.** Each remote address has a bucket holding at most `burst` tokens, refilled continuously at `ratePerSecond`. A request spends tokens; if the bucket cannot pay, the request is refused. The scheme lets a client burst briefly and then settle to the steady rate, and costs almost nothing to keep (one small object per address, dropped after ten idle minutes). Costly methods (state queries, proofs, history, broadcast) spend `costlyCost` tokens instead of one, and every call of a batch after the first spends one of its own. This is a plain defence against a careless or hostile client on a loopback or proxied endpoint; `DESIGN.md` section 10 lists "The RPC has no authentication; it is meant for loopback or a query node behind a proxy" among the known simplifications.
 
 **Body limits.** A request body is refused in two places: if the declared `Content-Length` is already over the limit, before anything is read; and while reading, if the bytes received exceed it (a client can lie about the length or send chunked encoding). An aborted body used to escape the handler as an unhandled rejection and could take the process down (finding 13); the server now attaches an error handler to every request and catches everything from `handle`.
 
@@ -196,12 +196,16 @@ function bool(p: Record<string, unknown>, name: string): boolean {
 
   The parameters are typed strictly, with no coercion, and `-32602` is what the JSON-RPC specification reserves for exactly this: "invalid method parameter(s)". A server that coerced would accept a call and then silently do something other than what was asked. `prove: "false"` is a non-empty string, so a truthy test would build a proof the caller did not want and charge for it; `limit: "5"` would become `NaN` in a comparison and fall through to whatever the code did with that. Refusing the call with a message naming the parameter costs the client one round trip and makes the mistake visible at the first attempt.
 - `typeByName(name)` finds an object type in `CORE_TYPES` by its name (`'account'`, `'validator'`, ...).
-- `accountRef(app, ref)` accepts a name or a `"type.n"` id string and returns an id; a name that does not exist is `NOT_FOUND`. `validatorRef(app, ref)` accepts a validator id or an operator account name or id, resolving through `validatorByOperator`.
+- `stateHeight(app, p)` is the height a state query is about: the last committed one unless `height` names another, which must be one the application still holds, from `lowestProvableHeight` to `lastHeight`; outside that it throws `NOT_FOUND` with `the state at height H is not kept (heights A to B are)`.
+- `keyAt(app, type, index, k, height)` reads an authenticated unique index at a height and returns `{ id, proof }`; it is shown below.
+- `objectAt(app, type, id, height)` is an object as of a height: `getCommitted` at the last height, `getAt` at a past one.
+- `accountRef(app, ref, height)` accepts a name or a `"type.n"` id string and returns an id; a name is looked up with `keyAt` in the `byName` index at the height, and one that has no account then, or that no account can have, is `NOT_FOUND`. `validatorRef(app, ref, height)` accepts a validator id or an operator account name or id, resolving through `keyAt` on the `byOperator` index.
+- `balancesAt(app, owner, height)` is an account's balances as of a height. Its comment gives the reasoning: "A balance object is never removed, so the ones the account has now are all it ever had, and each is read as it was then; one created since reads as absent."
 - `decodeHistoryEntry(e)` decodes a history entry's `data`: an operation for kind `operation`, otherwise the virtual operation's fields through `decodeVirtualData`.
 
 **`makeMethods(node, events)`** builds the method table. It closes over `stored(height)`, which loads a block and its commit from the store or throws `NOT_FOUND` with `` `no block ${height}` ``.
 
-The complete reference follows. "Costly" means the method spends `costlyCost` (default 5) tokens of the caller's bucket; `RPC-SYNC-PROOFS.md` section 3.1 names them, "object, key, account, delegation, accountHistory, tx, accounts, proposals, whether or not a proof is requested", plus `broadcastTx`. Parameters marked `?` are optional. All heights, amounts and times are decimal strings unless noted; hashes, keys and proofs are hex; ids are `"type.n"`.
+The complete reference follows. "Costly" means the method spends `costlyCost` (default 5) tokens of the caller's bucket; `RPC-SYNC-PROOFS.md` section 3.1 names them: `block`, `object`, `key`, `account`, `validator`, `delegation`, `balance`, `accountHistory`, `tx`, `broadcastTx`, `accounts` and `proposals`, whether or not a proof is requested. Parameters marked `?` are optional. All heights, amounts and times are decimal strings unless noted; hashes, keys and proofs are hex; ids are `"type.n"`.
 
 | method | parameters | result | errors | costly |
 |---|---|---|---|---|
@@ -212,23 +216,23 @@ The complete reference follows. "Costly" means the method spends `costlyCost` (d
 | `commit` | `height?` | `{ height, round (number), blockHash, signatures: (hex or null)[] }` | `-32001` | no |
 | `validators` | `height?` | `{ height, hash, totalPower, proposer (address), validators: [{ address, publicKey, power }] }`: the set that signs that height | `-32001` no set for that height | no |
 | `validatorSet` | `hash` | the same shape without `height`, for a set stored by hash | `-32001`; bad hex is `-32602` | no |
-| `object` | `id`, `height?`, `prove?` | `{ type (name), height, object (decoded or null), proof? }` | `-32001` not core app; `-32602` unknown type, bad id, or a height outside the provable window | yes |
-| `key` | `type` (name), `index` (name), `key` (hex), `height?`, `prove?` | `{ height, id (or null), proof? }` | `-32602` unknown type or index, bad hex | yes |
-| `account` | `name`, `height?`, `prove?` | `{ height, account (or null), balances: [{ asset (symbol), assetId, precision (number), amount }], validator (id or null), history (count), proof? }`; the last three only when the account exists | `-32602` name not a string | yes |
-| `validator` | `operator` or `id` | the committed validator object plus `status` (`candidate`, `jailed`, `tombstoned`), `active` (bool), `power`, `selfBond` (from the committed delegation), `delegators` (number of committed delegations), `operatorName` | `-32001` no such validator or operator | no |
-| `delegation` | `delegator`, `validator`, `height?`, `prove?` | `{ height, delegation (committed object plus `tokens`, or null), unbonding: [committed entries], proof? }` | `-32001` no such validator or account | yes |
-| `balance` | `account`, `asset?` (default the core asset) | `{ account, asset, amount }` | `-32001` no such account | no |
+| `object` | `id`, `height?`, `prove?` | `{ type (name), height, object (decoded or null), proof? }` | `-32001` not core app, or a height whose state is not kept; `-32602` unknown type or bad id | yes |
+| `key` | `type` (name), `index` (name), `key` (hex), `height?`, `prove?` | `{ height, id (or null), proof? }`: the id the key mapped to at `height`, which is what the proof proves | `-32001` a height whose state is not kept; `-32602` unknown type or index, bad hex | yes |
+| `account` | `name`, `height?`, `prove?` | `{ height, account (or null), balances: [{ asset (symbol), assetId, precision (number), amount }], validator (id or null), history (count), proof? }`; the last three only when the account exists, and all of it as of `height` | `-32001` a height whose state is not kept; `-32602` name not a string, or `prove` for a name no account can have | yes |
+| `validator` | `operator` or `id`, `height?` | `height` and the validator object as of it, plus `status` (`candidate`, `jailed`, `tombstoned`), `active` (bool), `power`, `selfBond` (from the operator's delegation at the height), `delegators` (number of committed delegations at the latest height, null at a past one), `operatorName` | `-32001` no such validator or operator, or a height whose state is not kept | yes |
+| `delegation` | `delegator`, `validator`, `height?`, `prove?` | `{ height, delegation (the object as of `height` plus `tokens`, or null), unbonding: [committed entries] at the latest height and null at a past one, proof? }` | `-32001` no such validator or account, or a height whose state is not kept | yes |
+| `balance` | `account`, `asset?` (default the core asset), `height?` | `{ height, account, asset, amount }`, the amount as of `height`; 0 for an id that had no such balance then | `-32001` no account of that name at the height, or a height whose state is not kept | yes |
 | `accountHistory` | `account`, `from?` (sequence, default 0), `limit?` (default 20, at most 100), `reverse?` | `{ account, total, entries: [{ sequence, height, position (number or null), opIndex, kind, txHash (or null), data }] }` | `-32001`; `-32602` bad limit | yes |
-| `tx` | `hash`, `prove?` | `{ hash, height, index, ok, error, tx (hex), decoded (or null), proof? }` where `proof` is `txQueryToJson` or null | `-32001` unknown transaction | yes |
+| `tx` | `hash`, `prove?` | `{ hash, height, index, ok, error, tx (hex), decoded (or null), attempts?, proof? }` where `attempts` is `[{ height, index, ok, error }]` for every block still held that carries the transaction, oldest first, present when there is more than one, and `proof` is `txQueryToJson` or null | `-32001` unknown transaction | yes |
 | `broadcastTx` | `tx` (hex), `mode?` (`sync` default, or `commit`), `timeoutMs?` (default 30000, capped at 120000) | sync: `{ hash, status }` with status `added` or `seen`; commit: `{ hash, height, index, ok, error }` | `-32002` check failed (`invalid`, `too-large`, `full`, with the application's reason), or seen before but neither pending nor committed; `-32003` timeout; `-32004` too many commit waits outstanding, or the mempool full at a limit lowered because the node is short of memory (with the mempool's reason); `-32602` bad mode | yes |
 | `accounts` | `limit?` (default 50, at most 200; 0 returns an empty page), `after?` (name) | `[{ name, id, balance }]` in name order, resuming just past `after` | none | yes |
 | `parameters` | none | `{ height, coreAsset: { id, symbol, precision (number) }, maxTxExpirationMs, fees, staking }` | `-32001` not core app | no |
 | `proposals` | none | the open proposals, soonest to expire first, each with its full `parameters` | `-32001` not core app | yes |
 | `mempool` | none | `{ count, bytes (number), hashes (first 100) }` | none | no |
-| `peers` | none | `[{ id, addr, direction, height, latencyMs }]` | none | no |
+| `peers` | none | `[{ id, addr, direction, height, latencyMs, clockOffsetMs (number, or null before the first pong) }]` | none | no |
 | `snapshots` | none | `[]`, always | none | no |
 
-Errors that any method can produce: `-32600` for a request whose `id` is not a string, a number or null, `-32601` for an unknown method, `-32602` when `params` is present but not an object or when a parameter has the wrong JSON type, and `-32004` when the bucket cannot pay for a costly call or, with the message `node under memory pressure`, for any costly call while the node sheds load. The first three and the last are produced by the server, not by the table. `block` is costly for the reason the code gives in a comment: a full block of transactions is as much work to serve as any query.
+Errors that any method can produce: `-32600` for a request whose `id` is not a string, a number or null, `-32601` for an unknown method, `-32602` when `params` is present but not an object or when a parameter has the wrong JSON type, and `-32004` when the bucket cannot pay for a costly call or for a call of a batch after the first or, with the message `node under memory pressure`, for any costly call while the node sheds load. The first three and the last are produced by the server, not by the table. `block` is costly for the reason the code gives in a comment: a full block of transactions is as much work to serve as any query.
 
 Some methods deserve a closer look.
 
@@ -250,7 +254,18 @@ A node that joined by state sync holds no blocks below its snapshot height until
 
 `status` computes `catchingUp` from the peers' reported heights: true when some peer is more than one block ahead. `lowestHeight` is the oldest block the store still has (retention, chapter 10), and `joinedAt` is the height a state-synced node started from, or null for one that replayed from genesis. `signatureScheme` is the name of the scheme the chain state carries (`schemeName(state.scheme)`), the one genesis fixed: a wallet must know it before it makes a key for the chain, and the CLI's `create` and `create-validator` ask `status` for it (chapter 14). `memory` is the memory guard's last sample with its level and whether the node is shedding load, the sizes in bytes, and under `database` what the core application's object database reports through `memory()` ([chapter 9](09-database.md)): its arena's slab count, the bytes those slabs can hold, the bytes written into them and how many of those are dead, awaiting compaction; `arenaLimit`, the most bytes the slabs may take when the node was started with `--arena` (`Infinity`, so `null`, otherwise), and `storedObjects`, how many committed objects have their bytes only in the store because of it; the mode of each tier the guard can turn down, `objects` (`resident` while the cache of decoded objects is unbounded, `capped` once the guard has bounded it), `indexTrees` (`resident`, `dropped`, or `partial` when only some types' B+ trees are dropped; `dropped` from the start on a node with the default `indexTrees: 'store'`, which never builds them) and `trees` (`resident` or `dropped`, the dense and sparse Merkle trees together); the decoded objects in its hot cache and their limit (`hotLimit` is `Infinity` while unbounded, and JSON writes that as `null`); the bytes of past values the provable window keeps, with `history` (`resident` while the database keeps every past version it records, `trimmed` while the guard has cut the window in memory), `historyWindow` (how many past versions are kept in memory just now) and `lowestVersion` (the oldest version a proof can be asked for, which is what a client sees refused below; a trimmed window does not raise it, the older versions being read from the store's history records, [chapter 9](09-database.md)); the dense tree chunks cached for dropped trees and how many may be; and the hit and miss counts of both caches since the database was made, `hotHits` and `hotMisses` for the decoded objects, `chunkHits` and `chunkMisses` for the chunks, from which an operator reads a hit rate. It is `null` on an application other than the core one. `gc` is the scheduler's counts: whether collections can be scheduled at all (`--expose-gc`), every collection V8 ran since start by kind with the total, longest and last pause in milliseconds, and the minor and major ones the node itself asked for ([chapter 8](08-node.md)); all of them are JSON numbers, none being a 64-bit quantity a double cannot hold. `rpcVersion: 1` lets a client detect the contract.
 
-`object` is the only method whose `height` selects the object read:
+Every state query takes its height from one helper, so that, as its comment says, "a value and the proof beside it are about the same state":
+
+```ts
+function stateHeight(app: CoreApp, p: Record<string, unknown>): bigint {
+  if (p.height === undefined) return app.lastHeight;
+  const height = parseBigint(p.height, 'height');
+  if (height > app.lastHeight || height < app.lowestProvableHeight) throw new RpcError(NOT_FOUND, `the state at height ${height} is not kept (heights ${app.lowestProvableHeight} to ${app.lastHeight} are)`);
+  return height;
+}
+```
+
+`object` reads the object by id as of that height:
 
 ```ts
 object: {
@@ -260,8 +275,8 @@ object: {
     const id = parseId(p.id);
     const type = CORE_TYPES.find((t) => t.id === typeOf(id));
     if (!type) throw new RpcError(INVALID_PARAMS, 'unknown object type');
-    const height = p.height === undefined ? app.lastHeight : parseBigint(p.height, 'height');
-    const obj = height === app.lastHeight ? app.db.getCommitted(type, id) : app.db.getAt(type, id, Number(height));
+    const height = stateHeight(app, p);
+    const obj = objectAt(app, type, id, height);
     const out: Record<string, unknown> = { type: type.name, height: height.toString(), object: obj ? jsonify(obj) : null };
     if (bool(p, 'prove')) out.proof = toHex(proofToBytes(app.proofAt(id, height)));
     return out;
@@ -269,23 +284,52 @@ object: {
 },
 ```
 
-`getAt` reads the object as of a past version inside the retention window and throws a `RangeError` outside it, which the server reports as `-32602`. The proof is an `ObjectProof` (chapter 9) about that height, to be checked against header `height + 1`.
+`objectAt` calls `getCommitted` for the last height and `getAt` for a past one. `getAt` throws a `RangeError` outside the retention window, which the server would report as `-32602`; `stateHeight` has refused such a height before that, with `-32001` and a message naming the heights that are kept. The proof is an `ObjectProof` (chapter 9) about that height, to be checked against header `height + 1`.
 
-`key`, `account` and `delegation` are different: their `height` chooses the proof only. `key` finds the id with `app.db.lookup` on the live index; `account` resolves the name with `app.accountByName` (live index, committed object) and reads balances through the live `byOwnerAsset` range and `getCommitted`; `delegation` does the same with `delegationOf`. So with an explicit `height` in the past, the object fields describe the latest committed state while `proof` and `height` describe the past one. The proof itself is honest, and the light client checks it, but a reader of the unproven fields should know they are current. This is what remains of review finding 19 after the fix.
-
-The rule for every field these methods derive is the one chapter 11 stated for the application's own queries: the live index says where to look, and everything reported comes from the committed view. `account` walks the live `byOwnerAsset` range for the account's balance ids, reads each balance committed, drops the ones that did not exist at the last root, and reads each asset committed for its symbol and precision; `precision` travels with the amount so a client can format it without a second call. `validator` takes the committed validator, its self-bond from the committed operator delegation (`tokensForShares` over its committed shares), and its delegator count by walking the live `byValidator` index and counting only the delegations that exist committed. `delegation` reads the delegation and every unbonding entry under the live `byDelegatorValidator` range through `getCommitted`. What this buys is that a delegation sitting in the pending session, or an unbonding entry a pending `undelegate` just created, is absent from the answer as it is absent from every block, and a client that acts on the answer acts on something the chain has agreed to.
-
-`account` with `prove` returns a key proof for the name, not an object proof for the account:
+`key`, `account`, `validator` and `delegation` find an object through an authenticated unique index, and they read that index at the height too. `keyAt` is how:
 
 ```ts
-if (bool(p, 'prove')) out.proof = toHex(keyProofToBytes(app.proveAccountName(name, height)));
+function keyAt(app: CoreApp, type: ObjectType<any>, index: string, k: Uint8Array, height: bigint): { id: ObjectId | null; proof: KeyProof } {
+  const proof = app.db.proveKeyAt(type, index, k, Number(height));
+  const folded = smtProofRoot(k, proof.proof);
+  if (!folded) throw new Error('the index gave a proof that does not fold');
+  return { id: folded.value ? decode(folded.value, (r) => r.u64()) : null, proof };
+}
 ```
 
-`proveAccountName` proves what the authenticated `byName` index says at that height: either the 8-byte id the name maps to, or that no account has the name (chapter 9, authenticated indices). That is what makes `account` useful for a name that does not exist: the result has `account: null` and a proof of absence. The CLI's `account` command relies on it.
+It makes the key proof first and takes the id from the proof's leaf (`smtProofRoot`, chapter 9), so the id a method returns is the one the proof beside it proves. The live index is not asked: "it holds the writes of the block in progress, and says nothing about a past height." This closes what was left of review finding 19. Before, these methods looked the key up in the live index and returned current objects with a proof of the height asked for, so the two could disagree, and at the latest height an object created by the block in progress could show.
 
-`validator` reads the committed validator object and decorates it: the status name from `STATUS_NAMES = ['candidate', 'jailed', 'tombstoned']` (indexed by `ValidatorStatus`), whether it is in the application's current active set (`app.dynamic().active`), its power (the active entry's, or `powerOf(tokens, precision)` for a candidate), its operator's self-bond and the number of delegations, the last two from committed objects as described above. The spec lists a `height?` parameter for it that the code does not read.
+`key` is `keyAt` and nothing else:
 
-`tx` finds the transaction's location in the store's index (`txLocation`: height, index, ok, error), loads the block to return the raw bytes, decodes them for convenience (and returns `decoded: null` rather than failing if the bytes do not decode), and with `prove` calls `node.queryTx`, which builds the inclusion proof against the block's `dataHash` and, once the next block exists, the result proof against the next header's `lastResultsHash`. Finding 18 of the review matters here: a transaction included twice gets its index entry from its first position and results are stored per block, so the result proof describes what happened at that position.
+```ts
+        const height = stateHeight(app, p);
+        const { id, proof } = keyAt(app, type, index, k, height);
+        const out: Record<string, unknown> = { height: height.toString(), id: id === null ? null : jsonify(id, 'id') };
+        if (bool(p, 'prove')) out.proof = toHex(keyProofToBytes(proof));
+        return out;
+```
+
+`account` finds the account through the `byName` index at the height and reads it with `objectAt`. Its balances come from `balancesAt`: the live `byOwnerAsset` range says which balance objects the account has, and each is read as of the height, one created since reading as absent; each asset is read as of the height for its symbol and precision, and `precision` travels with the amount so a client can format it without a second call. `validator` is the id the `byOperator` index held for the account at the height, and `history` is the number of entries the account had then (`app.accountHistoryTotalAt`, chapter 11: the account's entries are in height order, and the newest at or below the height is found through the skip pointers). With `prove` the result carries the key proof `keyAt` made for the name, not an object proof for the account: either the 8-byte id the name maps to, or that no account has the name (chapter 9, authenticated indices). That is what makes `account` useful for a name that does not exist: the result has `account: null` and a proof of absence. The CLI's `account` command relies on it. A name no account can have (one `key` cannot encode) gives `account: null`, and with `prove` an invalid-params error, `no proof can be made for that name`.
+
+`validator` reads the validator as of the height and decorates it: the status name from `STATUS_NAMES = ['candidate', 'jailed', 'tombstoned']` (indexed by `ValidatorStatus`), whether it was in the active set (the dynamic properties object read as of the height), its power (the active entry's, or `powerOf(tokens, precision)` for a candidate), its operator's self-bond (the delegation the `byDelegatorValidator` index held for the operator at the height, through `tokensForShares`) and the operator's name. One field cannot be answered for a past height:
+
+```ts
+        // A delegation is removed when its last share goes, so the index of today cannot count those of a past
+        // height: the count is given for the latest height only.
+        let delegators: number | null = null;
+        if (latest) {
+          delegators = 0;
+          for (const d of app.db.scan(DelegationType, 'byValidator', key((k) => k.id(v.id)))) if (app.db.getCommitted(DelegationType, d.id)) delegators++;
+        }
+```
+
+`byValidator` is not an authenticated index, so it has no tree to read at a past height, and unlike a balance a delegation does not stay once it is empty.
+
+`delegation` resolves the delegator and the validator at the height, finds the delegation with `keyAt` on `byDelegatorValidator`, reads it as of the height and values its shares by the validator as of the height; the proof is the one `keyAt` made. `unbonding` is the list of committed entries at the latest height and `null` at a past one, for the same reason as `delegators`: an unbonding entry is removed when it matures. At the latest height both still follow the rule chapter 11 stated for the application's own queries, that the live index says where to look and what is reported comes from the committed view, so a delegation or an unbonding entry sitting in the pending session is absent from the answer as it is absent from every block.
+
+`balance` resolves the account at the height, so an account named that did not exist then is `NOT_FOUND`, and returns the amount of the one asset from `balancesAt`, 0 when there is no such balance, as there is none for an id that had no account yet.
+
+`tx` finds the transaction's location in the store's index (`txLocation`: height, index, ok, error; the block the transaction succeeded in if there is one, else the newest that carries it), loads the block to return the raw bytes, decodes them for convenience (and returns `decoded: null` rather than failing if the bytes do not decode), and with `prove` calls `node.queryTx`, which builds the inclusion proof against the block's `dataHash` and, once the next block exists, the result proof against the next header's `lastResultsHash`. Finding 18 of the review matters here: a transaction included twice gets its index entry from its first position and results are stored per block, so the result proof describes what happened at that position. A transaction that failed can be included again in a later block, and the index keeps an entry for each (chapter 10); when `txLocations` has more than one, `tx` adds them as `attempts`, oldest first, each with its height, index, `ok` and error.
 
 `broadcastTx` is the method with the most moving parts:
 
@@ -460,8 +504,10 @@ then parse, accept an array as a batch, and run the requests one after another w
 
 ```ts
     const responses: unknown[] = [];
-    for (const r of requests) {
-      const answer = await this.one(r, remote);
+    // The HTTP request paid for its first call; each further call of a batch pays for itself, so that a batch
+    // costs what its calls would have cost one by one.
+    for (const [i, r] of requests.entries()) {
+      const answer = await this.one(r, remote, i > 0);
       if (answer !== undefined) responses.push(answer);
     }
     // Notifications alone leave nothing to answer: no content, as JSON-RPC over HTTP has it.
@@ -472,14 +518,14 @@ then parse, accept an array as a batch, and run the requests one after another w
     res.writeHead(200, { ...CORS, 'Content-Type': 'application/json' }).end(JSON.stringify(batch ? responses : responses[0]));
 ```
 
-`one` returns `undefined` for a notification, a request sent without an `id`, which JSON-RPC 2.0 defines as one the client does not want answered. The method still runs; only the answer is dropped. A lone notification, or a batch made of nothing but notifications, is answered with 204 and an empty body, since a 200 with no JSON would be a parse error for the client; a mixed batch is answered with an array holding only the responses of the members that had an id. A batch is limited to 20 requests; note that the batch as a whole costs one token at the HTTP level, and only costly members are charged further inside `one`.
+`one` returns `undefined` for a notification, a request sent without an `id`, which JSON-RPC 2.0 defines as one the client does not want answered. The method still runs; only the answer is dropped. A lone notification, or a batch made of nothing but notifications, is answered with 204 and an empty body, since a 200 with no JSON would be a parse error for the client; a mixed batch is answered with an array holding only the responses of the members that had an id. A batch is limited to 20 requests. The HTTP request paid one token, which covers the first call; `one` is told to charge each further call a token of its own, so a batch of twenty cheap calls costs twenty tokens, what the calls would have cost one by one, where it used to cost one.
 
 All the limits, in one place:
 
 | limit | default | where enforced |
 |---|---|---|
 | body size | `bodyBytes` = 1 MiB | declared length, then while reading |
-| requests per address | `ratePerSecond` = 50, `burst` = 100 | one token per POST, before the body is read |
+| requests per address | `ratePerSecond` = 50, `burst` = 100 | one token per POST, before the body is read; one more per call of a batch after the first, in `one` |
 | costly methods | `costlyCost` = 5 | `costlyCost - 1` more tokens per costly request in a batch |
 | batch size | 1 to 20 | after parsing |
 | event streams per address | `maxStreams` = 8 | when a stream is opened |
@@ -491,10 +537,10 @@ All the limits, in one place:
 | accounts page | 200 | in the method |
 | broadcast commit timeout | 30 s (caller may set, capped at `MAX_COMMIT_WAIT_MS` = 120 s) | in the method |
 
-**`one(r, remote)`** handles a single JSON-RPC request:
+**`one(r, remote, charge)`** handles a single JSON-RPC request:
 
 ```ts
-  private async one(r: unknown, remote: string): Promise<unknown> {
+  private async one(r: unknown, remote: string, charge: boolean): Promise<unknown> {
     const hasId = !!r && typeof r === 'object' && 'id' in r;
     const rawId = hasId ? (r as { id: unknown }).id : null;
     const id = typeof rawId === 'string' || typeof rawId === 'number' || rawId === null ? rawId : null;
@@ -505,6 +551,7 @@ All the limits, in one place:
     }
     const answer = hasId ? reply : () => undefined;
     const { method, params } = r as { method: string; params?: unknown };
+    if (charge && !this.allow(remote, 1)) return answer({ code: RATE_LIMITED, message: 'rate limited' });
     const m = this.methods[method];
     if (!m) return answer({ code: -32601, message: `unknown method ${method}` });
     if (params !== undefined && (typeof params !== 'object' || params === null || Array.isArray(params))) return answer({ code: INVALID_PARAMS, message: 'params must be an object' });
@@ -522,7 +569,7 @@ All the limits, in one place:
   }
 ```
 
-Six things to see. The request `id`, when present, must be a string, a number or null, as JSON-RPC 2.0 requires; an object or an array there makes the whole request invalid (`-32600`, answered with `id: null`), because the server echoes the id back and should not reflect arbitrary JSON a client chose. A well-formed request with no `id` member at all is a notification: `answer` becomes a function that returns `undefined`, so the method is carried out and nothing is answered, not even an error, whether the method is unknown, the parameters are bad, the bucket cannot pay or the call fails; the specification says a notification's sender "is not interested in any response", and that includes the bad news. The distinction between the two cases is `hasId`: an object that is not a request at all (no `jsonrpc: '2.0'`, no string `method`, an id of the wrong type) is still refused with `-32600` and `id: null` through `reply`, since the server cannot know whether the sender wanted an answer and the specification asks for one. Positional parameters (a JSON array) are refused; every method takes a named-parameter object. A costly method is refused outright, with `-32004` and `node under memory pressure`, while the node sheds load (`isShedding`, chapter 8): the costly methods are the ones that serve whole blocks, proofs, listings and history, or hold a commit waiter, all of it memory on the client's behalf, and the check comes before the bucket so the refusal costs the caller nothing; cheap methods, `status` among them, keep answering so a client can see why. A costly method is charged `costlyCost - 1` here because the HTTP request already paid one. And the catch clause is the error contract: an `RpcError` keeps its code, an application `TxError` (thrown by state helpers in chapter 11 when something is missing) becomes not-found, and any other exception, including the plain `Error`s from `parseHex` and `parseBigint` and a `RangeError` from the database, becomes invalid params with its message. Those are logged at `warn` because an unexpected exception may be a bug rather than a bad call.
+Six things to see. The request `id`, when present, must be a string, a number or null, as JSON-RPC 2.0 requires; an object or an array there makes the whole request invalid (`-32600`, answered with `id: null`), because the server echoes the id back and should not reflect arbitrary JSON a client chose. A well-formed request with no `id` member at all is a notification: `answer` becomes a function that returns `undefined`, so the method is carried out and nothing is answered, not even an error, whether the method is unknown, the parameters are bad, the bucket cannot pay or the call fails; the specification says a notification's sender "is not interested in any response", and that includes the bad news. The distinction between the two cases is `hasId`: an object that is not a request at all (no `jsonrpc: '2.0'`, no string `method`, an id of the wrong type) is still refused with `-32600` and `id: null` through `reply`, since the server cannot know whether the sender wanted an answer and the specification asks for one. Positional parameters (a JSON array) are refused; every method takes a named-parameter object. A costly method is refused outright, with `-32004` and `node under memory pressure`, while the node sheds load (`isShedding`, chapter 8): the costly methods are the ones that serve whole blocks, proofs, listings and history, or hold a commit waiter, all of it memory on the client's behalf, and the check comes before the bucket so the refusal costs the caller nothing; cheap methods, `status` among them, keep answering so a client can see why. A costly method is charged `costlyCost - 1` here because the call already paid one: the HTTP request for the first call, and for a further call of a batch the `charge` at the top, which is taken before the method is looked up, so an unknown method in a batch pays too, and a call that cannot pay is answered `-32004` in its place in the batch. And the catch clause is the error contract: an `RpcError` keeps its code, an application `TxError` (thrown by state helpers in chapter 11 when something is missing) becomes not-found, and any other exception, including the plain `Error`s from `parseHex` and `parseBigint` and a `RangeError` from the database, becomes invalid params with its message. Those are logged at `warn` because an unexpected exception may be a bug rather than a bad call.
 
 **`openStream(req, res, url, remote)`** is `GET /events`. Query parameters: `types`, a comma-separated subset of `block`, `tx`, `account`, `validatorSet` (default `block`); `tx=<hash>` to restrict `tx` events to one transaction; `account=<name|id>` to choose the account for `account` events (required for any to be sent; an unknown name is 404). A name outside `EVENT_TYPES` is refused with a plain-text 400 rather than accepted and never matched, so a misspelt `validatorset` fails loudly instead of producing a silent stream:
 
@@ -679,6 +726,8 @@ The server is started in three places: `src/cli.ts` (`start`, on the node's p2p 
 
 `test/review2.test.ts` adds two cases for this chapter. "holds the RPC to its parameter types, seeks listing cursors, and does not wait for a transaction it has already refused" sends `prove` as a string and `limit` as a string and expects `-32602` for each, lists accounts page by page with `after` and checks the pages join up with nothing repeated and nothing skipped, broadcasts a transaction the mempool refuses and then re-broadcasts it in commit mode, which must answer `-32002` at once rather than wait for the timeout, sends a request whose `id` is an object to get `-32600`, and then the notification cases: a `status` request without an `id` is answered 204 with an empty body, and a batch of a notification, a request with `id: 7` and a notification for an unknown method is answered with an array whose only member carries id 7. "refuses a header whose bytes moved between hash fields, and integers a double cannot hold" is about `json.ts`: a header JSON with a 31-byte `appHash` and a 33-byte `evidenceHash` is refused by `headerFromJson`, and `parseBigint` refuses `2 ** 53` as a number while accepting the same value as a string.
 
+`test/review4.test.ts`, "answers balance, account, key, validator and delegation as of the height asked for, with the proof of that height", runs four validators of the core application with a staking genesis and an `RpcServer` on node 0. It creates an account, pays it 5,000, delegates to `op0` and pays 700 more, each in commit mode so the heights are known, and then asks: `balance` is 5,700 now, 5,000 at the height of the first payment, 0 by id before the account existed and `-32001` by name there, and `-32001` with `is not kept` for height 99,999, as is `object`; `key` gives `3.5` at the creation height and null one height before, with a proof of absence that `verifyKeyProof` accepts against the app hash of the next header, and `account` likewise; `account` at the first payment's height has a balance of 5,000, a history of 2 and a proof that verifies to the account's id, and now 5,700 and 3; a name no account can have gives `account: null`; `validator` one height before the delegation has the tokens it had, a null `delegators`, the same self-bond and its operator's name, and now 300 tokens more and two delegators; `delegation` there is null with `unbonding: null` and a proof of absence, and now holds the tokens with an empty `unbonding` list. It then waits for a pong from every peer and requires each `clockOffsetMs` from `peers` to be under a second, and last starts a second server with a burst of 6 refilled at 0.001 a second: a first batch of five `status` calls is answered whole, and of a second, four are answered `-32004` in their places.
+
 `test/chain.test.ts` exercises `node.queryState`, `node.queryAccountName` and `node.queryTx`, which are what the `object`, `account` and `tx` methods serve; see chapter 13 for the cases. `test/schemes.test.ts` starts an `RpcServer` on a chain whose genesis names secp256k1 and expects `status` to report `signatureScheme: 'secp256k1'`.
 
 For numbers, `README.md` ("Steady state at that size") reports the RPC on a gigabyte state with 16 clients and an idle chain at 6,000 `account` calls with proof, 6,500 `object` with proof, 9,600 `accountHistory` and 9,200 `status` per second; `broadcastTx` from 16 clients at 2,150 transactions per second over 8 blocks, and 1,460 per second with 8 more clients reading accounts with proofs throughout. The benchmark (`bench/scale.bench.ts`) runs the server with the limits raised out of the way.
@@ -688,12 +737,10 @@ For numbers, `README.md` ("Steady state at that size") reports the RPC on a giga
 Known simplifications, most of them recorded in `DESIGN.md` section 10 or the review:
 
 - No authentication and open CORS. The server is meant for loopback or behind a proxy that does the gatekeeping.
-- A batch costs one token at the HTTP level; twenty cheap calls in a batch cost the same as one. Only costly members pay more.
-- `accounts` lists names from the live index (the objects it returns are committed), and `key`, `account` and `delegation` read current committed objects while labelling the response with the requested `height`; only `proof` and `object` are truly historical.
+- `accounts` lists names from the live index (the objects it returns are committed), and `accountHistory` and the listings answer for the latest state only. At a past height `validator` cannot count delegators and `delegation` cannot list unbonding entries, since both kinds of object are removed and their indices are not authenticated.
 - `snapshots` always returns `[]`; snapshot heights are advertised over p2p (chapter 7), not here.
 - Only `block` events are replayed on reconnect, and only the last 1000; a client that wants a gapless `tx` or `account` feed, or was away longer, must fetch history for the missed heights itself.
 - A stream dropped for its backlog loses the `tx`, `account` and `validatorSet` events between the drop and the reconnect, since those are not replayed.
-- The `validator` and `balance` methods ignore the `height` the spec lists for them.
 
 Exercises:
 

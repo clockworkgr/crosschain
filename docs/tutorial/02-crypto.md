@@ -444,7 +444,7 @@ export class InlineVerifier implements Verifier {
 }
 ```
 
-The whole test suite shares one instance (`export const verifier = new InlineVerifier()` in `test/helpers.ts`). Something to notice: `src/node/node.ts` defaults to it as well (`this.verifier = cfg.verifier ?? new InlineVerifier()`), and only `src/cli.ts`, `scripts/localnet.ts` and the benchmarks construct a `WorkerVerifier`. `DESIGN.md` section 4 says "The main thread never calls verify directly outside tests"; that is true of a node started by the CLI, but not of a `Node` constructed without a verifier. Section 10 now records this among the known simplifications: "The node defaults to the inline verifier; the CLI, the local network script and the benchmarks pass the worker pool. A node built from code should do the same."
+The whole test suite shares one instance (`export const verifier = new InlineVerifier()` in `test/helpers.ts`). A `Node` constructed without a verifier does not fall back to it: `src/node/node.ts` makes a `WorkerVerifier` of its own (`this.ownVerifier = cfg.verifier ? null : new WorkerVerifier()`) and closes it in `stop()`, so what `DESIGN.md` section 4 says, "The main thread never calls verify directly outside tests", holds for a node built from code as it does for one started by the CLI. Several nodes in one process should share one pool and pass it, which `src/cli.ts`, `scripts/localnet.ts` and the benchmarks do with a `WorkerVerifier` and the test helper does with the inline one.
 
 **`class WorkerVerifier`** spreads batches across a fixed pool. Its state is the `workers` array (one slot per thread; a slot's worker may be replaced), an `inflight` count per slot, a `pending` map from job id to the promise callbacks and the slot that holds the job, a job id counter, a round-robin cursor and a `closed` flag. The constructor fills the slots:
 
@@ -622,7 +622,6 @@ Known simplifications:
 - A batch on a worker that dies is rejected, not retried; the caller must resubmit.
 - Jobs are copied to workers by structured clone; there is no transfer of ownership and no shared memory.
 - `bytesEqual` is not constant-time. That is fine for the values it compares today; it would not be fine for comparing secrets.
-- A `Node` constructed without a `verifier` uses `InlineVerifier` (`src/node/node.ts`), which `DESIGN.md` section 10 lists as a known simplification; the CLI, localnet and benchmarks pass a `WorkerVerifier`.
 - Signing is synchronous and in pure JavaScript, about 2 ms per ML-DSA-44 signature and about 0.2 ms per secp256k1 one; a validator signs at most a few times per block, so this is acceptable, but a wallet signing thousands of ML-DSA-44 transactions would notice.
 - A chain's scheme is fixed by its genesis. There is no migration from one scheme to the other on a running chain, and no chain accepts both at once: the tag is a dispatch byte, not a negotiation.
 - secp256k1 verification is pure JavaScript, like ML-DSA-44's, and nearly as slow. A native binding would make the classical scheme far cheaper to check, as it is on most chains; nothing here uses one.

@@ -87,9 +87,9 @@ export function decodeChunk(r: Reader): SnapshotChunk {
     height: r.u64(),
     type: r.u16(),
     index: r.u32(),
-    from: Number(r.u64()),
-    to: Number(r.u64()),
-    objects: r.array((r) => [Number(r.u64()), r.bytes()] as [number, Uint8Array]),
+    from: r.u53(),
+    to: r.u53(),
+    objects: r.array((r) => [r.u53(), r.bytes()] as [number, Uint8Array]),
     siblings: r.array((r) => r.fixed(HASH_SIZE), 128),
   };
 }

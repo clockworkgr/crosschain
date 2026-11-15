@@ -2158,19 +2158,19 @@ export function decodeHistory(r: Reader): HistoryRecord {
     trees: r.array((r) => ({
       tree: r.u16(),
       records: {
-        sizeBefore: r.option((r) => Number(r.u64())),
-        nodes: r.array((r) => [r.u8(), Number(r.u64()), r.fixed(HASH_SIZE)] as [number, number, Uint8Array]),
+        sizeBefore: r.option((r) => r.u53()),
+        nodes: r.array((r) => [r.u8(), r.u53(), r.fixed(HASH_SIZE)] as [number, number, Uint8Array]),
       },
     })),
     objects: r.array((r) => [r.u64(), r.option((r) => r.bytes())] as [ObjectId, Uint8Array | null]),
-    counters: r.array((r) => [r.u16(), Number(r.u64())] as [number, number]),
+    counters: r.array((r) => [r.u16(), r.u53()] as [number, number]),
     // A record written before the sparse nodes were kept ends here.
     nodes: r.remaining() === 0 ? null : r.option((r) => r.array((r) => [r.bytes(), r.option((r) => r.bytes())] as NodeRecord)),
   };
 }
 ```
 
-A dense node record is 1 + 8 + 32 bytes; a level fits in a u8 because heights are at most 48. The objects carry their full "before" encoding, which is why DESIGN.md's simplification list notes that history is written in full per version. The sparse nodes come last, as an option of an array of key and optional encoding. A record written before the list existed ends after the counters, and `decodeHistory` reads it so: with nothing left to read, `nodes` is null. Every later record carries the option's flag byte, so the two cannot be confused. The fixed layout matters twice: a restart decodes records with `decodeHistory`, and a read of a past version from the store walks the same bytes without decoding them (`scanHistory`, under "Past versions from the store" below).
+A dense node record is 1 + 8 + 32 bytes; a level fits in a u8 because heights are at most 48. The sizes, node indices and counters are plain numbers in memory and u64 in the record, so the decoder reads them with `u53()` ([chapter 1](01-codec.md)), which refuses a value too large to hold exactly where `Number(r.u64())` would round it. The objects carry their full "before" encoding, which is why DESIGN.md's simplification list notes that history is written in full per version. The sparse nodes come last, as an option of an array of key and optional encoding. A record written before the list existed ends after the counters, and `decodeHistory` reads it so: with nothing left to read, `nodes` is null. Every later record carries the option's flag byte, so the two cannot be confused. The fixed layout matters twice: a restart decodes records with `decodeHistory`, and a read of a past version from the store walks the same bytes without decoding them (`scanHistory`, under "Past versions from the store" below).
 
 A session is a small record of what it first touched:
 
@@ -3204,7 +3204,26 @@ Without `indexed` (a snapshot, or a store from before phase two) the object is d
       });
 ```
 
-Each object's bytes come from `bytesFor`, so a snapshot decodes and encodes nothing. It refuses to run with a session open and is deterministic, which `test/db.test.ts` checks by re-encoding the loaded copy. `loadSnapshot(bytes)` is the inverse into a fresh database, rejecting an object whose id does not match its type section or lies at or past the section's counter, and returns the height and app hash the snapshot claims so the caller can compare them with `root()`. It bounds the type array by the number of registered types but does not check that every registered type is present or that sections arrive in `order`. The state-sync path in `src/app/core/snapshot.ts` does not use this format; it uses `importObject` and `setCounter` directly, chunk by chunk, and checks `typeLeafProofAt` for every type against the manifest, whose `verifyManifest` does make the strict check: the manifest must name every registered type exactly once, in id order.
+Each object's bytes come from `bytesFor`, so a snapshot decodes and encodes nothing. It refuses to run with a session open and is deterministic, which `test/db.test.ts` checks by re-encoding the loaded copy. `loadSnapshot(bytes)` is the inverse into a fresh database, rejecting an object whose id does not match its type section or lies at or past the section's counter, and returns the height and app hash the snapshot claims so the caller can compare them with `root()`. It requires one section for every registered type, in the order `encodeSnapshot` writes them:
+
+```ts
+      let sections = 0;
+      r.array((r) => {
+        const type = r.u16();
+        if (sections >= this.order.length || type !== this.order[sections]) throw new DbError(`snapshot section ${sections} is of type ${type}, where type ${this.order[sections] ?? 'none'} belongs`);
+        sections++;
+        const next = r.u53();
+        r.array((r) => {
+          const id = r.u64();
+          if (typeOf(id) !== type || instanceOf(id) >= next) throw new DbError('snapshot object out of range');
+          this.importObject(id, r.bytes());
+        });
+        this.setCounter(type, next);
+      }, this.order.length);
+      if (sections !== this.order.length) throw new DbError(`snapshot has ${sections} of ${this.order.length} type sections`);
+```
+
+A snapshot that leaves a type out, repeats one or names one out of order is refused with a `DbError` here, before the caller compares the root, which used to be the only guard. The section's counter is read with `u53()`. The state-sync path in `src/app/core/snapshot.ts` does not use this format; it uses `importObject` and `setCounter` directly, chunk by chunk, and checks `typeLeafProofAt` for every type against the manifest, whose `verifyManifest` does make the strict check: the manifest must name every registered type exactly once, in id order.
 
 ## How it is tested
 
@@ -3218,6 +3237,7 @@ Each object's bytes come from `bytesFor`, so a snapshot decodes and encodes noth
 - "keeps proofs valid as the tree grows across powers of two, and matches a from-scratch build": the root climbing a level does not break anything, and the root is a function of the state, not of how it was built.
 - "proofs describe committed state while a session is open": the committed view feeds proofs.
 - "snapshots round-trip with the same root and rebuilt indices": `encodeSnapshot` / `loadSnapshot`, including a hole from a removed object, and determinism of the bytes.
+- `test/review4.test.ts`, "refuses a snapshot that leaves a type out, repeats one or names one out of order": the snapshot of an empty database over the core types loads, and is then rebuilt from its sections (each a type, a counter and an empty count, 14 bytes) with the last one dropped (`/of \d+ type sections/`), the last one replaced by a copy of the first (`/snapshot section/`) and the first two swapped (`/snapshot section 0/`); `loadSnapshot` throws each time.
 - "dense merkle tree: matches a naive computation and proves every leaf at every size": `DenseMerkleTree` against a from-scratch fold for 1 to 11 leaves, every path at every size.
 - "releases chunks whose nodes are all empty, and hashes holes like a fresh tree": 4096 leaves allocate 17 chunks (4 + 2 + 1 at levels 0 to 2, one at each of levels 3 to 12); emptying the first half releases 3; the root equals a fresh tree with only the second half; emptying everything reaches `EMPTY` with no chunks.
 - "serves paths at past versions inside the window and forgets older ones": with retention 3, every version in the window reproduces its root and every path, a leaf beyond the old size throws, and a version outside the window is refused.
@@ -3265,7 +3285,6 @@ Known simplifications, from DESIGN.md section 10 and the code:
 - History records are written in full per version; a node down longer than the window starts its window afresh from the height it resumes at.
 - The B+ tree merges but never borrows, so fill can degrade under adversarial delete patterns.
 - Versions must be consecutive for leaf and inner history to agree (`pendingVersion` in `src/db/merkle.ts`); the code relies on callers using heights.
-- `loadSnapshot` does not check that every registered type is present (noted and left in REVIEW-2026-10-28.md).
 - All consensus state is resident by default, by design: README.md measures a 1 GB genesis at about 1.1 GB of process memory at rest, and a node joining by state sync at about three times the state during the join. Every tier is now also in LMDB, a node leaves its index trees there unless its config says `indexTrees: 'memory'` ([chapter 8](08-node.md)), and the memory guard can drop the index trees and the Merkle trees, which took the database to 40 to 50% of its resident heap when that was measured, and a store whose tiers do not fit the heap is opened with them dropped (STATE-PAGING.md section 9.1).
 - A version the window in memory no longer covers is read from the store's history records, and that read scans the record of every later version each time: nothing is cached, and no index says which records name an entry, so the cost grows with how far back the version is and with the size of the blocks since. That is the price of keeping the read free of memory. A record written before the sparse tree nodes were kept cannot serve an object proof for a type with an authenticated index, or a key proof. A store that has lost a record inside the window is refused and not answered for from what is left: the read throws, and at the next opening the heights below the gap are no longer provable ([chapter 11](11-application.md)).
 - The arena's limit is a byte budget set by hand, because the slabs are outside the heap the memory guard watches; nothing lowers it when the machine runs short of memory, the current slab (16 MiB at most) always stays, and an object read from the store is not kept in the arena, so a state read far more than it is written pays an LMDB read on every miss of the hot cache.
@@ -3280,7 +3299,7 @@ Exercises:
 3. Write a property test for range proofs: for random leaf counts and ranges, `rangeProofAt` and `rootFromRange` must agree with `rootAt`, and a proof with one sibling dropped, duplicated or swapped must make `rootFromRange` return null or a different root.
 4. This exercise used to ask for the sparse trees' past versions to be taken from the store at a restart instead of being replayed from the objects. That is done (`restoreIndexVersions` and `SparseMerkleTree.loadVersions`, step 7). What is left of it: measure both paths on a large state by reopening the same store once as it is and once with one history record rewritten without its `nodes`, and compare the `historyMs` the line `loaded application state` reports for `indexVersions: 'records'` and for `'replay'` against the 3.5 s of history STATE-PAGING.md 5.3 reports for the replay and the 2 ms section 7.3 reports for the records.
 5. Authenticate a non-unique index with a sparse tree over `key || id` and design a proof for "every entry with this prefix"; note what the type leaf would have to carry.
-6. Make `loadSnapshot` strict: require every registered type in `order`, and add a test that a snapshot with a missing or extra type is rejected.
+6. `loadSnapshot` now requires every registered type's section in `order`. Give the snapshot a version of its type list, so that a database with one more registered type can load a snapshot written before the type existed, and add the test.
 7. Make the dense tree's chunk size a parameter of the store (STATE-PAGING.md 5.3 suggests smaller chunks on disk would about halve a scattered block's commit): keep 1,024 hashes in memory, write a chunk as several keys, and measure the commit of the scale suite's block of 2,400 random transfers and the cost of a root over dropped trees at each size.
 8. Measure what opening a store paged takes (STATE-PAGING.md section 9.1): start a node on a large state with a `--heap` well below its resident heap, with and without `--arena`, and record the heap and the array buffers once it has opened, which tiers `loaded application state` reports as `paged`, and how long the history window takes to fill again.
 

@@ -252,16 +252,31 @@ A thing to notice: a peer can make the node allocate a `VoteSet` pair for any ro
 
 **`evidenceId(ev)`** is `sha256` of the codec encoding of one piece of evidence; it is the inventory key the p2p layer announces and fetches by (`src/node/node.ts` maps evidence through it for the `onAdded` broadcast and for the pending list a new peer receives). Its comment separates it from `evidenceHash` in `src/types/block.ts`, "the root over a list", which hashes a block's whole evidence list for the header; `consensus.ts` imports that one. Notice that the file defines this function between two groups of imports, which is legal but unusual.
 
-**`EvidencePool`** holds evidence waiting to be included in a block. Three containers: `pending` (keyed by `evidenceKey`, which is `height/round/type/validatorIndex`, so one record per infraction slot), `committed` (keys that have been in a block), and `byHash` (inventory hash to evidence, for serving fetches). Methods:
+**`EvidencePool`** holds evidence waiting to be included in a block. Three containers: `pending` (keyed by `evidenceKey`, which is `height/round/type/validatorIndex`, so one record per infraction slot), `committed` (the evidence that has been in a block, under the same keys, kept so that it is not taken in a second time), and `byHash` (inventory hash to evidence, for serving fetches). **`EvidencePool.MAX_PENDING`**, 1,000, is the most evidence that waits for a block: "a block carries far less, and one piece is enough to punish a validator." Methods:
 
-- `add(ev): boolean` returns false if the key is already pending or committed; otherwise stores it, indexes it by hash, notifies the `onAdded` listeners and returns true. The node's listener broadcasts an inventory announcement (`src/node/node.ts`).
+- `add(ev): boolean` returns false if the key is already pending or committed, or if `MAX_PENDING` pieces already wait (a validator willing to sign twice can do so at every height and round inside the window); otherwise stores it, indexes it by hash, notifies the `onAdded` listeners and returns true. The node's listener broadcasts an inventory announcement (`src/node/node.ts`).
 - `onAdded(fn)`, `getByHash(hash)`, `hasHash(hash)`, `has(ev)`: lookups the gossip code needs.
 - `list(max = 100)`: pending evidence in insertion order, capped. `createBlock` calls it with `MAX_EVIDENCE_PER_BLOCK`, 16.
-- `markCommitted(evs)`: the executor calls this after applying a block, moving keys from pending to committed so the same infraction is never included twice.
-- `pruneIf(stale)`: drops pending evidence for which the predicate is true. `createBlock` uses it with `evidenceAgeOk` so a proposer never includes evidence that validators would reject as too old, and the pool does not keep it forever.
-- `size`: pending count. Tests read it.
+- `markCommitted(evs)`: the executor calls this after applying a block, moving the evidence from pending to committed so the same infraction is never included twice. It also records the inventory entry, so that evidence that came in a block without passing through the pool is served by hash like the rest.
+- `pruneIf(stale)`: forgets evidence for which the predicate is true, pending or committed, and its inventory entry:
 
-Invariant: an infraction key is in at most one of `pending` and `committed`. Note that `byHash` is never pruned, and `committed` only grows; both are bounded in practice by how rarely validators double sign.
+```ts
+  pruneIf(stale: (ev: DuplicateVoteEvidence) => boolean): void {
+    for (const held of [this.pending, this.committed]) {
+      for (const [k, ev] of held) {
+        if (!stale(ev)) continue;
+        held.delete(k);
+        this.byHash.delete(toHex(evidenceId(ev)));
+      }
+    }
+  }
+```
+
+  `createBlock` uses it with `evidenceAgeOk` so a proposer never includes evidence that validators would reject as too old, and the executor calls it after every commit ([chapter 5](05-mempool-executor.md)), so a node that never proposes lets go of what it holds as well.
+- `size`: pending count. Tests read it.
+- `held`: `{ pending, committed, inventory }`, the sizes of the three containers, for tests and status.
+
+Invariant: an infraction key is in at most one of `pending` and `committed`. Everything the pool holds is let go once it is too old for any block to carry. Before, only a proposer pruned, and only what was pending, so `committed` and `byHash` grew for ever.
 
 **`verifyDuplicateVoteEvidence(chainId, ev, valset, verifier)`** is the full check: `checkDuplicateVoteShape` from `src/types/evidence.ts` (same height, round, type and validator; different hashes; canonical order with the lower hash first, nil lowest), then the validator at `voteA.validatorIndex` must exist in `valset` (the set of the infraction height, not the current one), then both signatures are verified in one batch with the vote context. Returns an error string or null. Callers: `verifyBlockSignatures` below, and `Node.acceptEvidence` for gossiped evidence.
 
@@ -795,6 +810,8 @@ The engine tests build several nodes in one process over the in-memory transport
 
 - "a validator restarted from disk resumes with its state, key guard and app intact": node 0 runs with a data directory, is stopped, the others advance three heights, node 0 is rebuilt from disk at the stopped height with its application state, catches up, and within twenty heights its signature appears in a stored commit. The guard file is `priv_validator_state.bin` in that directory.
 - "double-sign evidence is built, included in a block, and handed to the app": two conflicting prevotes are forged with validator 3's key and fed to node 0's `handleVote`; the pool holds one item; every application receives the `misbehavior` for that height; the pool is empty afterwards (`markCommitted`).
+
+`test/review4.test.ts`, "lets go of pending and committed evidence and its inventory once it is too old, and bounds what waits": on a pool by itself, evidence for heights 3 and 4 is added (a second `add` of the first returns false) and `markCommitted` is given the evidence for height 3 and one for height 5 that was never pending; `held` is one pending, two committed, three in the inventory, and the height-5 evidence is refused by `add` and served by `hasHash`. `pruneIf` for heights up to 4 leaves one committed and one inventory entry, `pruneIf(() => true)` leaves nothing, and adding `MAX_PENDING + 10` pieces leaves `MAX_PENDING` pending and as many in the inventory.
 
 `test/engine.test.ts`:
 

@@ -426,6 +426,7 @@ describe('review regressions', () => {
     }
     const kv = new Counting();
     const store = new KvBlockStore(kv);
+    kv.writes = 0; // opening a new store writes the layout of its transaction index once
     const set = ValidatorSet.create([{ publicKey: alice.publicKey, power: 10n }]);
     store.batch(() => {
       store.saveValidatorSet(set);

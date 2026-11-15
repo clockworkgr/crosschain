@@ -287,6 +287,30 @@ export class HistoryLog {
     return index;
   }
 
+  /**
+   * How many entries an account had when the block at `height` had been written: its entries are in height order,
+   * so the newest one at or below that height is found from the newest as any entry is, by the skip pointer while
+   * the entry it leads to is still above the height and by the previous entry otherwise.
+   */
+  totalAt(account: ObjectId, height: bigint): bigint {
+    const head = this.head(account);
+    let index = head.last;
+    for (let sequence = head.count - 1n; sequence >= 0n; ) {
+      const r = decode(this.stored(index), decodeRecord);
+      if (r.entry.height <= height) return sequence + 1n;
+      if (sequence === 0n) break;
+      const skipped = sequence & (sequence - 1n);
+      if (skipped < sequence - 1n && decode(this.stored(r.skip), decodeRecord).entry.height > height) {
+        index = r.skip;
+        sequence = skipped;
+      } else {
+        index = r.prev;
+        sequence -= 1n;
+      }
+    }
+    return 0n;
+  }
+
   private stored(index: bigint): Uint8Array {
     const v = this.kv.get(logKey(index));
     if (!v) throw new Error(`the account history log has no entry ${index}`);

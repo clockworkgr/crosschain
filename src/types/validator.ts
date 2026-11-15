@@ -253,7 +253,7 @@ export class ValidatorSet {
     }, 10_000);
     ValidatorSet.assertUnique(vals);
     for (let i = 1; i < vals.length; i++) if (byPowerThenAddress(vals[i - 1]!, vals[i]!) >= 0) throw new Error('validator set out of order');
-    const proposerIndex = Number(r.i64());
+    const proposerIndex = r.i53();
     if (vals.length > 0 && (proposerIndex < 0 || proposerIndex >= vals.length)) throw new Error('validator set proposer index out of range');
     return new ValidatorSet(vals, proposerIndex);
   }

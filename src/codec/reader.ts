@@ -67,6 +67,24 @@ export class Reader {
     return v;
   }
 
+  /**
+   * A u64 that is used as a JavaScript number: one too large to be held exactly is refused, not rounded. Rounded,
+   * two different encodings would decode to one value, and a count or an index would be accepted here to be found
+   * wrong, or not, somewhere later.
+   */
+  u53(): number {
+    const v = this.u64();
+    if (v > BigInt(Number.MAX_SAFE_INTEGER)) throw new CodecError(`number out of range: ${v}`);
+    return Number(v);
+  }
+
+  /** The same for an i64. */
+  i53(): number {
+    const v = this.i64();
+    if (v > BigInt(Number.MAX_SAFE_INTEGER) || v < BigInt(Number.MIN_SAFE_INTEGER)) throw new CodecError(`number out of range: ${v}`);
+    return Number(v);
+  }
+
   fixed(n: number): Uint8Array {
     this.need(n);
     const out = this.buf.slice(this.pos, this.pos + n);

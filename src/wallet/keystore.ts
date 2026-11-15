@@ -130,8 +130,10 @@ export class Keystore {
     return this.get(name).seed;
   }
 
+  /** Forget a key. Its seed goes with it; the caller has exported it if it is wanted again. */
   remove(name: string): void {
     this.mutate((keys) => {
+      if (!(name in keys)) throw new Error(`no key named ${name}`);
       delete keys[name];
     });
   }

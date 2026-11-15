@@ -6,14 +6,16 @@
 import { schemeName } from '../crypto/keys.ts';
 import { CoreApp } from '../app/core/app.ts';
 import { decodeVirtualData, HISTORY_KIND_NAMES, HistoryKind } from '../app/core/history.ts';
-import { delegationOf, powerOf, precisionOf, selfBondOf, tokensForShares, validatorByOperator } from '../app/core/staking.ts';
+import { powerOf, precisionOf, tokensForShares } from '../app/core/staking.ts';
 import { decodeOperation, decodeTransaction } from '../app/core/tx.ts';
-import { AccountType, AssetType, BalanceType, CORE_TYPES, DelegationType, ProposalType, UnbondingType, ValidatorType } from '../app/core/types.ts';
-import { Reader } from '../codec/reader.ts';
+import { AccountType, AssetType, BalanceType, CORE_TYPES, DelegationType, DYNAMIC_ID, DynamicType, ProposalType, UnbondingType, ValidatorType } from '../app/core/types.ts';
+import { decode, Reader } from '../codec/reader.ts';
 import { toHex } from '../crypto/hash.ts';
 import { typeOf, type ObjectId } from '../db/id.ts';
+import type { ObjectType } from '../db/index.ts';
 import { key } from '../db/keys.ts';
-import { keyProofToBytes, proofToBytes } from '../db/proof.ts';
+import { keyProofToBytes, proofToBytes, type KeyProof } from '../db/proof.ts';
+import { smtProofRoot } from '../db/smt.ts';
 import type { Node } from '../node/node.ts';
 import { blockHash, txHash } from '../types/block.ts';
 import { genesisToJson } from '../types/genesis.ts';
@@ -81,21 +83,68 @@ function typeByName(name: string) {
   return t;
 }
 
-/** An account by name or by id. */
-function accountRef(app: CoreApp, ref: unknown): ObjectId {
-  if (typeof ref !== 'string') throw new RpcError(INVALID_PARAMS, 'account must be a name or an id');
-  if (/^\d+\.\d+$/.test(ref)) return parseId(ref);
-  const a = app.accountByName(ref);
-  if (!a) throw new RpcError(NOT_FOUND, `no account ${ref}`);
-  return a.id;
+/**
+ * The height a state query is about: the last committed one unless `height` names another, which must be one the
+ * application still holds. Everything a method returns is the state as of that height, so that a value and the
+ * proof beside it are about the same state.
+ */
+function stateHeight(app: CoreApp, p: Record<string, unknown>): bigint {
+  if (p.height === undefined) return app.lastHeight;
+  const height = parseBigint(p.height, 'height');
+  if (height > app.lastHeight || height < app.lowestProvableHeight) throw new RpcError(NOT_FOUND, `the state at height ${height} is not kept (heights ${app.lowestProvableHeight} to ${app.lastHeight} are)`);
+  return height;
 }
 
-function validatorRef(app: CoreApp, ref: unknown): ObjectId {
+/**
+ * What an authenticated unique index held under a key at a height, read from the index's own tree at that height
+ * together with the proof of it. The live index is not asked: it holds the writes of the block in progress, and
+ * says nothing about a past height.
+ */
+function keyAt(app: CoreApp, type: ObjectType<any>, index: string, k: Uint8Array, height: bigint): { id: ObjectId | null; proof: KeyProof } {
+  const proof = app.db.proveKeyAt(type, index, k, Number(height));
+  const folded = smtProofRoot(k, proof.proof);
+  if (!folded) throw new Error('the index gave a proof that does not fold');
+  return { id: folded.value ? decode(folded.value, (r) => r.u64()) : null, proof };
+}
+
+/** An object as of a height. */
+function objectAt<T extends { id: ObjectId }>(app: CoreApp, type: ObjectType<T>, id: ObjectId, height: bigint): T | null {
+  return height === app.lastHeight ? app.db.getCommitted(type, id) : app.db.getAt(type, id, Number(height));
+}
+
+/** An account by name or by id, as of a height. */
+function accountRef(app: CoreApp, ref: unknown, height: bigint): ObjectId {
+  if (typeof ref !== 'string') throw new RpcError(INVALID_PARAMS, 'account must be a name or an id');
+  if (/^\d+\.\d+$/.test(ref)) return parseId(ref);
+  let k: Uint8Array;
+  try {
+    k = key((w) => w.str(ref));
+  } catch {
+    throw new RpcError(NOT_FOUND, `no account ${ref}`);
+  }
+  const { id } = keyAt(app, AccountType, 'byName', k, height);
+  if (id === null) throw new RpcError(NOT_FOUND, `no account ${ref}`);
+  return id;
+}
+
+/** A validator by its operator's name or by id, as of a height. */
+function validatorRef(app: CoreApp, ref: unknown, height: bigint): ObjectId {
   if (typeof ref !== 'string') throw new RpcError(INVALID_PARAMS, 'validator must be an operator name or an id');
   if (/^\d+\.\d+$/.test(ref)) return parseId(ref);
-  const v = validatorByOperator(app.db, accountRef(app, ref));
-  if (!v) throw new RpcError(NOT_FOUND, `${ref} runs no validator`);
-  return v.id;
+  const { id } = keyAt(app, ValidatorType, 'byOperator', key((w) => w.id(accountRef(app, ref, height))), height);
+  if (id === null) throw new RpcError(NOT_FOUND, `${ref} runs no validator`);
+  return id;
+}
+
+/**
+ * An account's balances as of a height. A balance object is never removed, so the ones the account has now are all
+ * it ever had, and each is read as it was then; one created since reads as absent.
+ */
+function balancesAt(app: CoreApp, owner: ObjectId, height: bigint) {
+  return app.db
+    .range(BalanceType, 'byOwnerAsset', key((k) => k.id(owner)))
+    .map((live) => objectAt(app, BalanceType, live.id, height))
+    .filter((b): b is NonNullable<typeof b> => b !== null);
 }
 
 function decodeHistoryEntry(e: { kind: number; data: Uint8Array }): unknown {
@@ -182,8 +231,8 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
         const id = parseId(p.id);
         const type = CORE_TYPES.find((t) => t.id === typeOf(id));
         if (!type) throw new RpcError(INVALID_PARAMS, 'unknown object type');
-        const height = p.height === undefined ? app.lastHeight : parseBigint(p.height, 'height');
-        const obj = height === app.lastHeight ? app.db.getCommitted(type, id) : app.db.getAt(type, id, Number(height));
+        const height = stateHeight(app, p);
+        const obj = objectAt(app, type, id, height);
         const out: Record<string, unknown> = { type: type.name, height: height.toString(), object: obj ? jsonify(obj) : null };
         if (bool(p, 'prove')) out.proof = toHex(proofToBytes(app.proofAt(id, height)));
         return out;
@@ -196,10 +245,10 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
         const type = typeByName(str(p, 'type'));
         const index = str(p, 'index');
         const k = parseHex(p.key, 'key');
-        const height = p.height === undefined ? app.lastHeight : parseBigint(p.height, 'height');
-        const live = app.db.lookup(type, index, k);
-        const out: Record<string, unknown> = { height: height.toString(), id: live ? jsonify(live.id, 'id') : null };
-        if (bool(p, 'prove')) out.proof = toHex(keyProofToBytes(app.db.proveKeyAt(type, index, k, Number(height))));
+        const height = stateHeight(app, p);
+        const { id, proof } = keyAt(app, type, index, k, height);
+        const out: Record<string, unknown> = { height: height.toString(), id: id === null ? null : jsonify(id, 'id') };
+        if (bool(p, 'prove')) out.proof = toHex(keyProofToBytes(proof));
         return out;
       },
     },
@@ -208,45 +257,59 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
       async fn(p) {
         const app = coreApp(node);
         const name = str(p, 'name');
-        const a = app.accountByName(name);
-        const height = p.height === undefined ? app.lastHeight : parseBigint(p.height, 'height');
+        const height = stateHeight(app, p);
+        let k: Uint8Array | null;
+        try {
+          k = key((w) => w.str(name));
+        } catch {
+          k = null; // not a name an account can have: there is nothing to look up, and nothing to prove
+        }
+        const found = k ? keyAt(app, AccountType, 'byName', k, height) : null;
+        const a = found?.id != null ? objectAt(app, AccountType, found.id, height) : null;
         const out: Record<string, unknown> = { height: height.toString(), account: a ? jsonify(a) : null };
         if (a) {
-          out.balances = app.db
-            .range(BalanceType, 'byOwnerAsset', key((k) => k.id(a.id)))
-            .map((live) => app.db.getCommitted(BalanceType, live.id))
-            .filter((b): b is NonNullable<typeof b> => b !== null)
-            .map((b) => {
-              const asset = app.db.getCommitted(AssetType, b.asset);
-              return { asset: asset?.symbol, assetId: jsonify(b.asset, 'asset'), precision: asset?.precision ?? 0, amount: b.amount.toString() };
-            });
-          const v = validatorByOperator(app.db, a.id);
-          out.validator = v && app.db.getCommitted(ValidatorType, v.id) ? jsonify(v.id, 'id') : null;
-          out.history = app.accountHistory(a.id, 0n, 0).total.toString();
+          out.balances = balancesAt(app, a.id, height).map((b) => {
+            const asset = objectAt(app, AssetType, b.asset, height);
+            return { asset: asset?.symbol, assetId: jsonify(b.asset, 'asset'), precision: asset?.precision ?? 0, amount: b.amount.toString() };
+          });
+          const v = keyAt(app, ValidatorType, 'byOperator', key((w) => w.id(a.id)), height).id;
+          out.validator = v === null ? null : jsonify(v, 'id');
+          out.history = app.accountHistoryTotalAt(a.id, height).toString();
         }
-        if (bool(p, 'prove')) out.proof = toHex(keyProofToBytes(app.proveAccountName(name, height)));
+        if (bool(p, 'prove')) {
+          if (!found) throw new RpcError(INVALID_PARAMS, 'no proof can be made for that name');
+          out.proof = toHex(keyProofToBytes(found.proof));
+        }
         return out;
       },
     },
     validator: {
+      costly: true,
       async fn(p) {
         const app = coreApp(node);
-        const v = app.db.getCommitted(ValidatorType, validatorRef(app, p.operator ?? p.id));
+        const height = stateHeight(app, p);
+        const latest = height === app.lastHeight;
+        const v = objectAt(app, ValidatorType, validatorRef(app, p.operator ?? p.id, height), height);
         if (!v) throw new RpcError(NOT_FOUND, 'no such validator');
-        const active = app.dynamic().active.find((a) => a.validator === v.id);
-        // Every field comes from the committed view: the live indices only say where to look.
-        const self = delegationOf(app.db, v.operator, v.id);
-        const selfCommitted = self ? app.db.getCommitted(DelegationType, self.id) : null;
-        let delegators = 0;
-        for (const d of app.db.scan(DelegationType, 'byValidator', key((k) => k.id(v.id)))) if (app.db.getCommitted(DelegationType, d.id)) delegators++;
+        const active = objectAt(app, DynamicType, DYNAMIC_ID, height)?.active.find((a) => a.validator === v.id);
+        const selfId = keyAt(app, DelegationType, 'byDelegatorValidator', key((k) => k.id(v.operator).id(v.id)), height).id;
+        const self = selfId === null ? null : objectAt(app, DelegationType, selfId, height);
+        // A delegation is removed when its last share goes, so the index of today cannot count those of a past
+        // height: the count is given for the latest height only.
+        let delegators: number | null = null;
+        if (latest) {
+          delegators = 0;
+          for (const d of app.db.scan(DelegationType, 'byValidator', key((k) => k.id(v.id)))) if (app.db.getCommitted(DelegationType, d.id)) delegators++;
+        }
         return {
+          height: height.toString(),
           ...(jsonify(v) as object),
           status: STATUS_NAMES[v.status],
           active: active !== undefined,
           power: (active?.power ?? powerOf(v.tokens, precisionOf(app.db))).toString(),
-          selfBond: tokensForShares(v, selfCommitted?.shares ?? 0n).toString(),
+          selfBond: tokensForShares(v, self?.shares ?? 0n).toString(),
           delegators,
-          operatorName: app.account(v.operator)?.name,
+          operatorName: objectAt(app, AccountType, v.operator, height)?.name,
         };
       },
     },
@@ -254,39 +317,47 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
       costly: true,
       async fn(p) {
         const app = coreApp(node);
-        const delegator = accountRef(app, p.delegator);
-        const validator = validatorRef(app, p.validator);
-        const v = app.db.getCommitted(ValidatorType, validator);
+        const height = stateHeight(app, p);
+        const delegator = accountRef(app, p.delegator, height);
+        const validator = validatorRef(app, p.validator, height);
+        const v = objectAt(app, ValidatorType, validator, height);
         if (!v) throw new RpcError(NOT_FOUND, 'no such validator');
-        const live = delegationOf(app.db, delegator, validator);
-        const d = live ? app.db.getCommitted(DelegationType, live.id) : null;
-        const height = p.height === undefined ? app.lastHeight : parseBigint(p.height, 'height');
+        const { id, proof } = keyAt(app, DelegationType, 'byDelegatorValidator', key((k) => k.id(delegator).id(validator)), height);
+        const d = id === null ? null : objectAt(app, DelegationType, id, height);
         const out: Record<string, unknown> = {
           height: height.toString(),
           delegation: d ? { ...(jsonify(d) as object), tokens: tokensForShares(v, d.shares).toString() } : null,
-          unbonding: app.db
-            .range(UnbondingType, 'byDelegatorValidator', key((k) => k.id(delegator).id(validator)))
-            .map((live) => app.db.getCommitted(UnbondingType, live.id))
-            .filter((u): u is NonNullable<typeof u> => u !== null)
-            .map((u) => jsonify(u)),
+          // An unbonding entry is removed when it matures, so those of a past height cannot be listed from the
+          // index of today: they are given for the latest height only.
+          unbonding:
+            height === app.lastHeight
+              ? app.db
+                  .range(UnbondingType, 'byDelegatorValidator', key((k) => k.id(delegator).id(validator)))
+                  .map((live) => app.db.getCommitted(UnbondingType, live.id))
+                  .filter((u): u is NonNullable<typeof u> => u !== null)
+                  .map((u) => jsonify(u))
+              : null,
         };
-        if (bool(p, 'prove')) out.proof = toHex(keyProofToBytes(app.proveDelegation(delegator, validator, height)));
+        if (bool(p, 'prove')) out.proof = toHex(keyProofToBytes(proof));
         return out;
       },
     },
     balance: {
+      costly: true,
       async fn(p) {
         const app = coreApp(node);
-        const account = accountRef(app, p.account);
+        const height = stateHeight(app, p);
+        const account = accountRef(app, p.account, height);
         const asset = p.asset === undefined ? app.coreAsset : parseId(p.asset);
-        return { account: jsonify(account, 'id'), asset: jsonify(asset, 'asset'), amount: app.balance(account, asset).toString() };
+        const amount = balancesAt(app, account, height).find((b) => b.asset === asset)?.amount ?? 0n;
+        return { height: height.toString(), account: jsonify(account, 'id'), asset: jsonify(asset, 'asset'), amount: amount.toString() };
       },
     },
     accountHistory: {
       costly: true,
       async fn(p) {
         const app = coreApp(node);
-        const account = accountRef(app, p.account);
+        const account = accountRef(app, p.account, app.lastHeight);
         const from = p.from === undefined ? 0n : parseBigint(p.from, 'from');
         const limit = Math.min(num(p, 'limit', 20), 100);
         const r = app.accountHistory(account, from, limit, bool(p, 'reverse'));
@@ -320,6 +391,9 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
           decoded = null;
         }
         const out: Record<string, unknown> = { hash: toHex(hash), height: loc.height.toString(), index: loc.index, ok: loc.ok, error: loc.error, tx: toHex(raw), decoded };
+        // A transaction that failed can be included again: every block still held that carries it, oldest first.
+        const all = node.store.txLocations(hash);
+        if (all.length > 1) out.attempts = all.map((l) => ({ height: l.height.toString(), index: l.index, ok: l.ok, error: l.error }));
         if (bool(p, 'prove')) {
           const q = node.queryTx(hash);
           out.proof = q ? txQueryToJson(q) : null;
@@ -409,7 +483,7 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
     },
     peers: {
       async fn() {
-        return [...node.network.peers.values()].map((p) => ({ id: p.id, addr: p.listenAddr || p.remoteAddr, direction: p.direction, height: p.height.toString(), latencyMs: p.latencyMs }));
+        return [...node.network.peers.values()].map((p) => ({ id: p.id, addr: p.listenAddr || p.remoteAddr, direction: p.direction, height: p.height.toString(), latencyMs: p.latencyMs, clockOffsetMs: p.clockOffsetMs }));
       },
     },
     snapshots: { fn: async () => [] },
