@@ -21,7 +21,7 @@
  *
  *   CHAIN_SCHEME=secp256k1 BENCH_GENESIS_MB=56 node --expose-gc bench/run.ts paging
  */
-import { spawn } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -68,6 +68,9 @@ export async function run(): Promise<void> {
     // ---- A node under a real heap limit its load takes it past `pressure` on: a child process, so the limit is
     // V8's own and the collector works against it as it would in a node started with --heap.
     const heapMb = Number(process.env.BENCH_PAGING_HEAP ?? Math.round((1.25 * resident.heap) / 1048576));
+    // BENCH_PAGING_BEFORE_NODE is a shell command run between building the store and opening it: remounting the
+    // volume the store is on (TMPDIR chooses it) there makes the node start with none of it in the page cache.
+    if (process.env.BENCH_PAGING_BEFORE_NODE) execSync(process.env.BENCH_PAGING_BEFORE_NODE, { stdio: 'inherit' });
     {
       const child = spawn(process.execPath, [`--max-old-space-size=${heapMb}`, '--max-semi-space-size=64', '--expose-gc', join(import.meta.dirname, 'paging-node.ts'), dir, String(N), String(NODE_SECONDS)], { stdio: ['ignore', 'pipe', 'inherit'], env: process.env });
       const lines: Record<string, unknown>[] = [];

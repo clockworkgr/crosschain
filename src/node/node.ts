@@ -68,10 +68,11 @@ export interface NodeConfig {
   /** The most bytes the application's arena of encoded objects may take, the rest read from the store; unbounded by default. */
   arenaBytes?: number;
   /**
-   * Where the application's secondary indices are read from. 'memory' (the default) keeps their B+ trees in the heap
-   * while they fit, dropped under memory pressure and rebuilt after it: index reads (an account by name, a scan) are
-   * fastest. 'store' never builds them and reads LMDB: a node that mostly applies blocks commits up to a tenth more
-   * than it does while it has them (docs/benchmarks.md section 4.13), and opens with a third less in its heap.
+   * Where the application's secondary indices are read from. 'store' (the default) never builds their B+ trees and
+   * reads LMDB: the node commits about 8% more than it does while it has them and opens with a third less in its
+   * heap, a lookup by key costs the same and a page of a scan about twice as much, tens of microseconds
+   * (docs/benchmarks.md section 4.13). 'memory' keeps the trees in the heap while they fit, dropped under memory
+   * pressure and rebuilt after it, for a node that mostly serves scans.
    */
   indexTrees?: 'memory' | 'store';
   verifier?: Verifier;
@@ -259,12 +260,12 @@ export class Node {
         snapshotInterval: this.cfg.snapshotInterval,
         snapshotsKept: this.cfg.retain?.snapshots,
         arenaBytes: this.cfg.arenaBytes,
-        indexTrees: this.cfg.indexTrees === 'store' ? false : undefined,
+        indexTrees: this.indexTrees === 'store' ? false : undefined,
         // Under a heap limit, a stored state whose trees would not fit below the warn line is opened paged.
         heapRoom: heapLimitFlag() === null ? undefined : Math.max(0, Node.OPEN_FILL * memoryStats().heapLimit - heapInUse(memoryStats())),
       });
     }
-    if (this.app instanceof CoreApp && this.cfg.indexTrees === 'store') this.app.db.dropIndexTrees();
+    if (this.app instanceof CoreApp && this.indexTrees === 'store') this.app.db.dropIndexTrees();
     // A window in memory shorter than the provable one, when asked for: never longer than what the store was opened with.
     if (this.app instanceof CoreApp && this.historyInMemory < this.app.db.historyWindow) this.app.db.setHistoryWindow(this.historyInMemory);
     this.mempool = new Mempool(this.app);
@@ -541,8 +542,12 @@ export class Node {
     for (const fn of this.memoryListeners) fn(level, stats);
   }
 
-  /** The share of the heap limit a stored state's trees may fill when it is opened: the guard's warn line. */
-  static readonly OPEN_FILL = 0.7;
+  /**
+   * The share of the heap limit a stored state's trees may fill when it is opened: what a rebuild is allowed
+   * (REBUILD_FILL). Opened up to the warn line, a state the size of the heap ran just under `warn` and reached it
+   * every ten seconds (docs/benchmarks.md section 4.13).
+   */
+  static readonly OPEN_FILL = 0.5;
   /** How many past versions stay in memory from `warn` on: enough for a proof at the height a client just read. */
   static readonly HISTORY_WHEN_PAGED = 2;
   /** About the heap the window of past versions held when it was trimmed, 0 while it is whole: what letting it grow back will take. */
@@ -556,6 +561,10 @@ export class Node {
   private rebuildAfter = 0;
   /** The longest that wait gets: ten minutes at the default interval. */
   static readonly REBUILD_WAIT_MAX = 600;
+  /** The index trees are left in the store unless the config asks for them in memory. */
+  private get indexTrees(): 'memory' | 'store' {
+    return this.cfg.indexTrees ?? 'store';
+  }
   /** How many past versions the operator wants in memory (`retain.memoryVersions`); all of the window when unset. */
   private get historyInMemory(): number {
     return this.cfg.retain?.memoryVersions ?? Infinity;
@@ -574,7 +583,7 @@ export class Node {
   /** What rebuilding the dropped tiers would take; index trees kept in the store by choice are not waiting to be rebuilt. */
   private rebuildEstimate(db: CoreApp['db']): { indexTrees: number; trees: number } {
     const est = db.rebuildEstimate();
-    return this.cfg.indexTrees === 'store' ? { ...est, indexTrees: 0 } : est;
+    return this.indexTrees === 'store' ? { ...est, indexTrees: 0 } : est;
   }
 
   /**

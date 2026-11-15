@@ -145,7 +145,8 @@ describe('a node under memory pressure', () => {
     let heap = 100;
     let limit = 1000;
     const logged: string[] = [];
-    const watched = await net.makeNode(2, { memory: { stats: () => stats(heap, limit), intervalMs: 20 }, log: (_level, msg) => void logged.push(msg) });
+    // The index trees in memory, whatever the mode: this case is about dropping and rebuilding them.
+    const watched = await net.makeNode(2, { indexTrees: 'memory', memory: { stats: () => stats(heap, limit), intervalMs: 20 }, log: (_level, msg) => void logged.push(msg) });
     net.nodes.push(watched);
     const levels: MemoryLevel[] = [];
     watched.onMemory((level) => levels.push(level));

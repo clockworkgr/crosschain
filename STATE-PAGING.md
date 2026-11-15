@@ -46,7 +46,7 @@ wrong, and it moves the weight of the later phases onto tiers two and three.
 | tier two, indices | one LMDB key per index entry written at every commit; the B+ trees stay as droppable accelerators with an overlay-merged cursor scan as the fallback |
 | tier three, trees | the dense and sparse trees' changed chunks and nodes written at every commit; the live trees stay as droppable accelerators with chunk reads as the fallback |
 | eviction order | by the guard, as the heap fills: decoded cache, then the index trees and the history window (whose older versions are then read from the store), then the Merkle trees. The arena's cold slabs were to come second; as built they are released against a byte budget of the operator's, not by the guard (3.4) |
-| who turns the dials | the memory guard (`src/node/memory.ts`): `ok` evicts nothing, `warn` caps the cache, drops the index trees, trims the history window and halves the mempool's limit, `pressure` drops the Merkle trees, lowers the mempool's limit to a tenth and sheds load, `critical` stops cleanly |
+| who turns the dials | the memory guard (`src/node/memory.ts`): `ok` evicts nothing, `warn` caps the cache, drops the index trees (where the node keeps them in memory, which is not the default; 7), trims the history window and halves the mempool's limit, `pressure` drops the Merkle trees, lowers the mempool's limit to a tenth and sheds load, `critical` stops cleanly |
 | always on | the extra writes per commit are not a mode; a node that never pages pays them anyway, a few percent of warm throughput, so that the fallback exists the moment it is needed (measured: nothing for local writes, a fifth of the commit for a block spread over 192,000 accounts; 5.3) |
 | determinism | unchanged: roots are computed from the same leaves and the same bytes, wherever they are read from |
 | history | past values kept as encoded bytes, not decoded objects; the retention window costs bytes, not records; from `warn` on only the last two versions are kept in memory, the store keeping the whole window (7.2); a version the window in memory no longer holds is read from the store's history records, slower and at no cost in memory (7.3) |
@@ -310,8 +310,9 @@ a type's indices go together. Both may be called with sessions open, mid-block: 
 builds the overlay from the dirty set (4.2), the rebuild walks the merged view (store,
 unwritten roots, overlay) into fresh trees, so neither changes a lookup or a root. Dropping
 with a store behind is cheap (it touches only what is dirty); rebuilding reads the whole
-prefix. The node's guard drops every type's trees from `warn` on and rebuilds
-them at `ok` once they fit (7); `status.memory.database.indexTrees` reports `resident`, `dropped` or `partial`.
+prefix. A node with `indexTrees: 'memory'` has its guard drop every type's trees from `warn` on and rebuild
+them at `ok` once they fit (7); by default (`indexTrees: 'store'`) a node never builds them. `status.memory.database.indexTrees` reports `resident`, `dropped` or `partial`,
+and `dropped` from the start on a node with the default.
 A database can also start dropped (`indexTrees: false`), and the test setup does that for
 every database when `INDEX_TREES=0`, which is how the acceptance test of phase three runs the
 application's suites on the fallback (9).
@@ -606,7 +607,11 @@ after the index entries in the same `kv.write`, and laid over the store until
 All of it is built. The table as decided had "cold slabs may be released" at `warn`; the
 arena is bounded by a byte budget instead, which the guard does not turn (3.4). As first
 built the index trees and the history window went at `pressure` with the Merkle trees;
-they go at `warn` since the measurements of 7.1.
+they go at `warn` since the measurements of 7.1. What the table and the points below say
+of the index trees is what a node does under `indexTrees: 'memory'`, the default when the
+runs they cite were made. By default now (`indexTrees: 'store'`, below) the trees are never
+built: `warn` still caps the cache and cuts the window, and only the Merkle trees and the
+window are waited for and rebuilt.
 
 As built (`src/node/node.ts`, `onMemoryLevel`):
 
@@ -635,7 +640,7 @@ As built (`src/node/node.ts`, `onMemoryLevel`):
   dropped, and it committed about a fifth less (1,050 to 1,280 transfers a second against
   1,330 to 1,560). What is rebuilt up to the warn line leaves the load no room. The room
   is `min(REBUILD_FILL, warnAt) * heapLimit` less the highest recent sample; opening a
-  stored state is still judged against the warn line (`Node.OPEN_FILL`, 0.7; 9.1). The
+  stored state is judged against the same half (`Node.OPEN_FILL`, 0.5; 9.1). The
   estimate comes from the database (`rebuildEstimate()`): every committed object
   has one entry in each index of its type and one leaf in each authenticated index's sparse
   tree, at 210 and 1,000 bytes of heap, which is what dropping them gave back at 192,000
@@ -676,27 +681,33 @@ As built (`src/node/node.ts`, `onMemoryLevel`):
   if the operator set it. No height stops being
   provable for it: a version the window in memory no longer holds is read from the history
   records in the store (7.3).
-- **The index trees can be left in the store by choice.** `indexTrees: 'store'`
-  (`NodeConfig.indexTrees`, and `indexTrees` in the CLI's `config.json`; `'memory'` is the
-  default) makes a node that never builds them. It passes `indexTrees: false` to the
+- **The index trees are left in the store unless the config asks for them.** `indexTrees: 'store'`
+  (`NodeConfig.indexTrees`, and `indexTrees` in the CLI's `config.json`), the default,
+  makes a node that never builds them; `'memory'`, the default until the measurements
+  here, is the behaviour of the points above. With `'store'` the node passes `indexTrees: false` to the
   application it opens, drops them at start for an application it was handed, and reports
   them as needing nothing wherever it asks what waits to be rebuilt (`Node.rebuildEstimate`,
   which `onSample` and `rebuildWhatFits` read), so the Merkle trees and the history window
   are rebuilt and restored as if the index trees were resident. When a store is opened
-  (9.1) their estimate is not taken off the room either. The setting is for a validator or
-  a node that mostly applies blocks and serves few index lookups, or for a small heap.
+  (9.1) their estimate is not taken off the room either. `'store'` is the one to keep
+  unless the node mostly serves scans, which is what `'memory'` is for.
   Measured at 191,896 accounts under 1,488 MiB, 2.5 times the resident heap, for ten
-  minutes (`bench/paging-node.ts` takes `BENCH_PAGING_INDEX_TREES=store` for it): the node
-  opens with 258 MiB of heap in use against 398 MiB by default, a third less, commits
+  minutes (`bench/paging-node.ts` takes `BENCH_PAGING_INDEX_TREES=store` or `=memory` for it
+  and follows the node's default when it is unset): the node with `'store'`
+  opens with 258 MiB of heap in use against 398 MiB with `'memory'`, a third less, commits
   1,552 transfers a second against 1,485, which is within what two runs differ by (4.5%),
   and reaches `warn` once, at 40 s, from the history window and the cache, against twice,
   with nothing to rebuild but the window (docs/benchmarks.md section 4.13). What it gives
   up is index reads from memory. With 200 reads a second of each kind beside the load
-  (`BENCH_PAGING_READS=200`, 2,380 MiB of heap so that the default node keeps its trees) a
+  (`BENCH_PAGING_READS=200`, 2,380 MiB of heap so that the node with `'memory'` keeps its trees) a
   lookup by key takes 5 microseconds at the median either way, a page of twenty accounts in
   name order 33 microseconds from the store against 17 from memory (about 200 against 47 at
-  the 99th percentile), and the three runs with the setting commit 8% more than the three
-  without, 1,503 against 1,395 transfers a second. Proofs and the Merkle trees are unaffected.
+  the 99th percentile), and the three runs with `'store'` commit 8% more than the three
+  with `'memory'`, 1,503 against 1,395 transfers a second. A store none of which was in the
+  page cache when the node opened it gave the same reads from the first two seconds, the
+  open taking 3,965 ms against 3,355 to 3,545 ms: the node reads its whole store when it
+  opens (docs/benchmarks.md section 4.13); a store larger than the machine's memory was
+  not measured. Proofs and the Merkle trees are unaffected.
 - **The limit is the old generation's.** V8's `heap_size_limit` adds the young generation's
   reserve to `--max-old-space-size` (192 MiB on the machine measured), which long-lived
   objects never fill; a process aborts when the old generation is full. With the CLI's
@@ -772,7 +783,9 @@ As built (`src/node/node.ts`, `onMemoryLevel`):
 accounts. First a node, in a child process started with `--max-old-space-size=744`, 1.25
 times the heap of the resident state (595 MiB): a single validator over the store, its
 mempool kept two blocks ahead with transfers among random accounts, for 40 seconds, with
-the index trees dropped and the history window cut at `warn` (7).
+the index trees dropped and the history window cut at `warn` (7). The runs of this
+section were made with `indexTrees: 'memory'`, the default at the time, except those
+marked `store`.
 
 | seconds | what happened |
 |---|---|
@@ -860,7 +873,7 @@ ten-minute rates were 1,322 and 1,355, with two visits to `pressure` each; and w
 a run the rate fell from 1,590 to 1,050 transfers a second while the index trees were
 resident and the heap climbed towards the pressure line, and returned to 1,330 to 1,560,
 level, once they were dropped. A loaded node is faster without its index trees in memory,
-which is why they are dropped at `warn`; the window is cut there for the heap it gives
+which is why they are dropped at `warn`, and now not built at all by default; the window is cut there for the heap it gives
 back (7, 7.2). The
 store's part in the decline was small. Tested directly, LMDB's own work for the
 application's commit grew by half over 400 blocks (17.0 to 26.2 ms), most of it the
@@ -1123,9 +1136,10 @@ decision is made before anything is built (`openObjectDatabase` in `src/app/core
 `estimateTiers` in `src/db/database.ts`).
 
 - **The room.** Under a heap limit (`--max-old-space-size`, which the CLI's `start` always
-  sets) the node gives the application `heapRoom`: 0.7 of the limit (`Node.OPEN_FILL`,
-  the guard's warn line) less the heap in use at that moment (`heapInUse`, the old
-  generation's; 7). Without a heap limit it
+  sets) the node gives the application `heapRoom`: half the limit (`Node.OPEN_FILL`,
+  0.5, what a rebuild is allowed) less the heap in use at that moment (`heapInUse`, the old
+  generation's; 7). It was 0.7, the guard's warn line, at first. At the warn line a node with its index trees in the store opened its Merkle trees into a heap as large as its resident state and then ran 75 MiB under `warn`, visiting it 61 times in ten minutes; at half it opens paged and visits `warn` five times,
+  committing 1,523 transfers a second against 1,478 (docs/benchmarks.md section 4.13). Without a heap limit it
   gives none, and every tier is opened as before.
 - **The estimate.** The store keeps a counter per object type, an upper bound on how many
   objects the type holds. `estimateTiers` multiplies them by the figures
@@ -1158,7 +1172,8 @@ The objects themselves are still loaded into the arena, outside the heap, unless
 `--arena` bounds it (3.4).
 
 Measured on the 191,896-account state (595 MiB of heap resident, 400 MiB to open
-resident), a single validator under a full feed of transfers (docs/benchmarks.md 4.13):
+resident), a single validator under a full feed of transfers, with `indexTrees: 'memory'`,
+the default at the time (docs/benchmarks.md 4.13):
 
 | heap limit | of the resident heap | opened with | heap after opening | run | transfers/s | levels reached |
 |---|---:|---|---:|---:|---:|---|
@@ -1189,7 +1204,7 @@ it keeps, which the guard's first sample took for a full heap at 208 MiB (211 of
 | hotObjects | unbounded; the guard caps it at 100,000 (`warn`) and 10,000 (`pressure`) |
 | arenaBytes | unbounded; `start --arena <MiB>` sets it (at least 16); needs an object store, never releases the current slab |
 | mempool limit | 10,000 transactions; the guard admits up to all of it at `ok`, half at `warn`, a tenth at `pressure`, none at `critical` |
-| index trees | `indexTrees: 'memory'`: resident when they fit at opening, dropped from `warn` on, rebuilt at `ok` after the wait below when they fit; `indexTrees: 'store'`: never built, read from LMDB, not counted as waiting to be rebuilt |
+| index trees | `indexTrees: 'store'` (the default): never built, read from LMDB, not counted as waiting to be rebuilt; `indexTrees: 'memory'`: resident when they fit at opening, dropped from `warn` on, rebuilt at `ok` after the wait below when they fit |
 | history window in memory | the configured retention (100 versions), or `retain.memoryVersions` of it when set; 2 from `warn` on (`Node.HISTORY_WHEN_PAGED`), let grow back at `ok` once both tiers are resident and what it held fits |
 | wait before a rebuild | the guard samples since something was last rebuilt or the node started, at least 10 (`Node.REBUILD_WINDOW`) and at most 600 (`Node.REBUILD_WAIT_MAX`), all of them at `ok` in a row; then a tier is rebuilt if it fits within 0.5 of the heap limit (`Node.REBUILD_FILL`) beside the highest of the last 10 samples |
 | room for opening a store | 0.7 of the heap limit less the heap in use (the old generation's), when the process runs under a heap limit |
@@ -1210,7 +1225,7 @@ tombstones hiding removed objects until the root; history as bytes with `getAt` 
 database whose cache holds nothing as from one whose cache is unbounded.
 `test/memory.test.ts`: a core-application node whose heap is driven to the `pressure` level
 has its cache capped at 10,000 and the excess evicted, and gets it back unbounded at `ok`;
-the same node has its index trees dropped from `warn` on, keeps following the chain on the
+the same node, made with `indexTrees: 'memory'` as the test helper makes them, has its index trees dropped from `warn` on, keeps following the chain on the
 fallback, reports it in `status`, and has them rebuilt at `ok`. A guard given samples that
 carry `heapOld` takes its levels and its log fields from that figure whatever `heapUsed`
 says, and the process's own sample has `heapOld` exactly when it runs under a heap limit.

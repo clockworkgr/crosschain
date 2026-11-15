@@ -109,6 +109,9 @@ export async function makeTestnet(opts: TestnetOptions): Promise<Testnet> {
       network: FAST_NETWORK,
       lagGraceMs: 500,
       log: testLogger(`n${i}`),
+      // A node leaves its index trees in the store by default; the suites run with them in memory, so that dropping
+      // and rebuilding them is exercised, and in the store under INDEX_TREES=0.
+      indexTrees: process.env.INDEX_TREES === '0' ? 'store' : 'memory',
       ...overrides,
     });
     return node;

@@ -64,7 +64,7 @@ const node = await Node.create({
   genesis: nodeGenesis,
   dataDir: dir!,
   arenaBytes: ARENA,
-  indexTrees: process.env.BENCH_PAGING_INDEX_TREES === 'store' ? 'store' : undefined,
+  indexTrees: process.env.BENCH_PAGING_INDEX_TREES === 'memory' ? 'memory' : process.env.BENCH_PAGING_INDEX_TREES === 'store' ? 'store' : undefined,
   retain: MEMORY_VERSIONS === undefined ? undefined : { memoryVersions: MEMORY_VERSIONS },
   nodeKeySeed: seed('paging/node'),
   validatorSeed: valSeed,

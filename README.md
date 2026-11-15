@@ -176,7 +176,9 @@ its index trees and all but two versions of its history paged out for most of it
 blocks and 69,492 transfers without an abort,
 and with the cache capped and both tiers dropped the database runs on 40 to 50% of its
 resident heap at the throughput it has resident, within a tenth; a loaded node is in fact
-about a tenth faster with its index trees in the store than with them in memory, how much
+about a tenth faster with its index trees in the store than with them in memory, which is
+where a node now leaves them by default (`indexTrees`; these runs kept them in memory, the
+default at the time), how much
 of the history window it keeps in memory changes its heap and its pauses but not its rate,
 and a quarter of the resident heap was enough under that load
 (docs/benchmarks.md section 4.13).

@@ -567,7 +567,8 @@ the threshold check; its levels taken from the old generation's use when a sampl
 carries it; the scheduler's decisions with an injected collector (a minor
 collection per commit, a major one on growth measured from the last, the fraction cap,
 nothing without a collector); the observer counting real collections after garbage is
-allocated; a full node in a two-validator testnet whose guard is fed invented
+allocated; a full node in a two-validator testnet, made with `indexTrees: 'memory'` as
+the test helper makes them, whose guard is fed invented
 samples: at 75% of the limit (`warn`) it sheds nothing, drops its index trees and trims
 its history window to two versions, the Merkle trees staying resident; at 90%
 (`pressure`) it sheds (the mempool's limit lowered to a tenth, `submitTx` `full` and

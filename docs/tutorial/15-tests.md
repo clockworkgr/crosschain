@@ -31,7 +31,7 @@ below.
 
 ## The harness
 
-Everything the suites share lives in `test/helpers.ts`, 157 lines. It exports two constants,
+Everything the suites share lives in `test/helpers.ts`, 159 lines. It exports two constants,
 seven functions, two interfaces and one shared verifier.
 
 ### `FAST_TIMEOUTS`
@@ -226,12 +226,20 @@ recreate a node later with different settings:
       network: FAST_NETWORK,
       lagGraceMs: 500,
       log: testLogger(`n${i}`),
+      // A node leaves its index trees in the store by default; the suites run with them in memory, so that dropping
+      // and rebuilding them is exercised, and in the store under INDEX_TREES=0.
+      indexTrees: process.env.INDEX_TREES === '0' ? 'store' : 'memory',
       ...overrides,
     });
 ```
 
 Every node seeds from every other address, uses the shared verifier and the fast timers, and
 gives block sync a `lagGraceMs` of 500 ms (default 3,000) before it treats itself as lagging.
+The helper also names `indexTrees`, which a node defaults to `'store'` ([chapter 8](08-node.md)):
+it asks for `'memory'` in the default mode, so that the suites exercise a node that builds its
+index trees, drops them at `warn` and rebuilds them, and for `'store'` under `INDEX_TREES=0`, so
+that in that mode the node never builds them, as the databases of the run do not. A test's
+own `indexTrees` in the overrides wins over both.
 The `overrides` are a `Partial<NodeConfig>`, so `net.makeNode(4, { validatorSeed: net.validatorSeed(4) })`
 turns a full node into a validator, and `net.makeNode(0, { dataDir })` reopens a node from
 disk. All nodes are created first, then started in index order, except those in `skipStart`.
@@ -354,7 +362,10 @@ written for either mode in particular, which is the point: an application test t
 the trees resident and with them dropped shows that the fallback gives the same hashes and the
 same answers, and that is the acceptance test STATE-PAGING.md sets for phases three and four
 (section 9). Tests that need a particular mode say so in their own options (`indexTrees: true`
-for the resident twin in `test/db.test.ts`), and those win over the default.
+for the resident twin in `test/db.test.ts`), and those win over the default. A node made by
+the harness follows the same switch through its own setting: `makeNode` asks for
+`indexTrees: 'store'` under `INDEX_TREES=0` and for `'memory'` otherwise (above), a node's own
+default being `'store'`.
 
 ## The suites, file by file
 

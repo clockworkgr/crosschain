@@ -548,10 +548,17 @@ the resident state (595 MiB): a single validator over the store, its mempool kep
 ahead with transfers among random accounts, for 40 seconds (`BENCH_PAGING_HEAP` sets another
 limit in MiB, `BENCH_PAGING_SECONDS` another length, `BENCH_PAGING_ARENA` a budget for the arena
 in MiB, `BENCH_PAGING_MEMORY_VERSIONS` how many past versions the node keeps in memory, as
-`retain.memoryVersions` does, `BENCH_PAGING_INDEX_TREES=store` a node that leaves its index
-trees in the store, as `indexTrees` in its config does, `BENCH_PAGING_READS` how many index
-reads of each kind a second are made beside the load, and `BENCH_PAGING_PROFILE` a directory
-for CPU profiles of the run's first and last thirty seconds).
+`retain.memoryVersions` does, `BENCH_PAGING_INDEX_TREES=memory` or `=store` where the node's
+index trees are, as `indexTrees` in its config does (unset, the node's default, `store`),
+`BENCH_PAGING_READS` how many index
+reads of each kind a second are made beside the load, `BENCH_PAGING_BEFORE_NODE` a shell
+command run between building the store and the node opening it, which is how the volume the
+store is on (`TMPDIR` chooses it) is remounted so that none of the store is in the page cache,
+and `BENCH_PAGING_PROFILE` a directory
+for CPU profiles of the run's first and last thirty seconds). The runs of this section were
+made with `indexTrees: 'memory'`, which was the default when they were made, except those
+marked `store`: where the text says the node drops or rebuilds its index trees, that is a
+node with `memory`. By default a node now never builds them (below).
 
 | seconds | what happened |
 |---|---|
@@ -890,35 +897,37 @@ At 2.5 times the resident heap, per stretch of the run:
 
 One rebuild, where the rule of ten samples made two, at 36 and 203 s. The run commits 1,485
 transfers a second over the ten minutes with two visits to `warn`, and the stretches show what
-a rebuild costs under this load: resident index trees take about a tenth off the rate. The
-node still starts with them when they fit, and rebuilds them when the heap has stayed at `ok`
-long enough, because index reads (accounts by name, scans) are served from memory then. A
+a rebuild costs under this load: resident index trees take about a tenth off the rate. A
+node with `indexTrees: 'memory'` starts with them when they fit, and rebuilds them when the heap has stayed at `ok`
+long enough, index reads (accounts by name, scans) being served from memory then. A
 proof after the runs takes 0.07, 12 and 22 ms at the newest height, fifty back and a hundred
 back at the resident figure, and 0.04, 15 and 32 ms at 2.5 times it.
 
-Whether the index trees are in memory at all is a setting. `indexTrees: 'store'` in a node's
-config makes a node that never builds them: index reads go to LMDB from the start, and the
-guard has no index trees to drop or to rebuild. The same ten minutes at 2.5 times the resident
-heap, the mempool kept 1,000 transfers ahead, with the setting and without
-(`BENCH_PAGING_INDEX_TREES=store`):
+Whether the index trees are in memory at all is a setting, and the measurements that follow
+changed its default. `indexTrees: 'store'` in a node's
+config, the default now, makes a node that never builds them: index reads go to LMDB from the start, and the
+guard has no index trees to drop or to rebuild. `'memory'`, the default until then, is the
+node of the runs above. The same ten minutes at 2.5 times the resident
+heap, the mempool kept 1,000 transfers ahead, with each
+(`BENCH_PAGING_INDEX_TREES`):
 
 | `indexTrees` | opened with | transfers/s over ten minutes | blocks | heap during the run | visits to `warn` | longest GC pause |
 |---|---:|---:|---:|---|---:|---:|
-| `memory` (the default) | 398 MiB | 1,485 | 1,780 | 327 to 1,045 MiB | 2 | 132 ms |
-| `store` | 258 MiB | 1,552 | 1,823 | 316 to 1,045 MiB (444 to 972 at the twenty-second reports) | 1 | 155 ms |
+| `memory` (the default at the time) | 398 MiB | 1,485 | 1,780 | 327 to 1,045 MiB | 2 | 132 ms |
+| `store` (the default now) | 258 MiB | 1,552 | 1,823 | 316 to 1,045 MiB (444 to 972 at the twenty-second reports) | 1 | 155 ms |
 
-Over the whole run the two are within what two runs differ by (4.5%); the default run's own
+Over the whole run the two are within what two runs differ by (4.5%); the `memory` run's own
 stretches show the cost more clearly, 1,310 to 1,440 transfers a second while the index trees
 were resident and 1,420 to 1,600 while they were dropped. With `store` the node opens with a
 third less heap (258 against 398 MiB), reaches `warn` once, at 40 s, from the history window
 and the cache, which are then trimmed and capped, and has nothing to rebuild but the window.
 Proofs and the Merkle trees are unaffected.
 
-What it gives up is index reads from memory, and that is measured with readers beside the
+What `store` gives up is index reads from memory, and that is measured with readers beside the
 load. `BENCH_PAGING_READS=200` makes the node read its indices 200 times a second of each
 of three kinds while it commits: an account by name, a balance by owner and asset, and a
 page of twenty accounts in name order from a random name. The heap is 2,380 MiB, 4.0 times
-the resident figure, so that no run reaches `warn` and the default node keeps its index
+the resident figure, so that no run reaches `warn` and the node with `memory` keeps its index
 trees for the whole of its three minutes; each read is timed on its own, in microseconds:
 
 | `indexTrees` | readers | transfers/s | opened with | account by name: median, 99th percentile | balance: median, 99th percentile | page of twenty: median, 99th percentile, mean |
@@ -936,22 +945,75 @@ with no difference for a balance. A page of twenty takes twice as long from the 
 against 17 microseconds at the median and about 200 against 47 at the 99th percentile. The
 longest single read in any run was 11 ms (a page, from the store) and 2 to 3 ms otherwise,
 which is a read that waited behind a collection or a commit, not the index. The store here
-is in the operating system's page cache, as a node's store is once it has run; a read that
-has to reach the device would cost more. The readers themselves do not show in the rate:
+is in the operating system's page cache, as a node's store is once it has opened it (the
+cold-store run below). The readers themselves do not show in the rate:
 with and without them the rows of each setting overlap. The setting does: every `store` run
 is above every `memory` run, 1,503 against 1,395 on average, 8% more, which agrees with the
 stretches of the ten-minute run above. So under this load `store` costs a scan about 17
 microseconds a page and a lookup nothing measurable, and gives back a twelfth of the rate
-and 140 MiB of heap.
+and 140 MiB of heap. That is why `store` is the default, and `memory` the setting for a node
+that mostly serves scans.
 
-One more run put the same readers beside the node at its resident figure (595 MiB), where
+A cold store. The same readers with `store` and 4.0 times the resident heap, for 30 seconds,
+the reads reported every two seconds, on a store none of which was in the page cache: it was
+built on a disk image that was detached and attached again just before the node opened it
+(`BENCH_PAGING_BEFORE_NODE`, with `TMPDIR` on the image). The node opened in 3,965 ms, against
+3,355 to 3,545 ms warm. Microseconds, median and 99th percentile:
+
+| seconds of the run | account by name | balance | page of twenty |
+|---|---:|---:|---:|
+| 0 to 2 | 5, 78 | 5, 32 | 52, 182 |
+| from 4 on | 5, 33 to 39 | 5, 13 to 28 | 41 to 46, 83 to 106 |
+
+The node reads its whole store when it opens, the objects into the arena and the index entries
+checked against them, so the open pays for the cold cache, about half a second here, and index
+reads after it are warm from the first. Only a store larger than the machine's memory would
+send index reads to the device, and that was not measured (the machine has 48 GiB). The page
+median is 41 to 52 microseconds on the disk image against 33 on the internal volume: a
+different volume, and nothing is read into the difference.
+
+One more run, with `memory`, put the same readers beside the node at its resident figure (595 MiB), where
 the Merkle trees and the window are in the store too and the index trees go at the first
 `warn`: a name took 5 microseconds at the median and 54 at the 99th percentile, a balance 6
 and 27, a page 37 and 1,127 (one page in a hundred waits a millisecond behind the node's own
 work), the longest read 19 ms. That run committed 1,303 transfers a second over its three
 minutes, 930 to 1,270 in its first hundred seconds and 1,400 to 1,550 after; the ten-minute
 run without readers at the same limit commits 1,619, and one run does not say whether the
-readers or the run made the difference.
+readers or the run made the difference. Repeated twice
+each way, three minutes a run, it was the run: with the readers the node committed 1,633 and
+1,644 transfers a second (a name 5 microseconds at the median and 34 to 37 at the 99th
+percentile, a page 33 to 47 and 99 to 146), and without them 1,561 and 1,553.
+
+The node as it now opens. With `store` the default, a stored state was at first still opened
+against the warn line, 0.7 of the limit, and at the resident figure that went badly: with no
+index trees to make room for, the Merkle trees fitted, the node opened with 258 MiB in use and
+ran between about 340 and 420 MiB of its 595, 75 MiB under `warn`. Over ten minutes it reached
+`warn` 61 times, every ten seconds, never `pressure`, and committed 1,478 transfers a second,
+from 1,650 in its first twenty seconds to about 1,400 in its last minute, where the same heap
+with `memory` and the Merkle trees left in the store had committed 1,619 with five visits. So
+a stored state is now opened against half the limit, the share a rebuild is allowed
+(`Node.OPEN_FILL`, 0.5). The node as it now stands, `store` and that rule, 191,896 accounts:
+
+| heap limit | run | opened with | heap after opening | transfers/s | visits to `warn` | longest GC pause |
+|---|---:|---|---:|---:|---:|---:|
+| 476 MiB (0.8×) | 600 s | Merkle trees and history left in the store | 39 MiB | 1,536 | 8 | 86 ms |
+| 595 MiB (1.0×) | 600 s | Merkle trees and history left in the store | 39 MiB | 1,523 | 5 | 117 ms |
+| 744 MiB (1.25×) | 120 s | Merkle trees and history left in the store | 39 MiB | 1,605 | 1 | 98 ms |
+| 893 MiB (1.5×) | 120 s | Merkle trees and history in memory | 258 MiB | 1,557 | 2 | 72 ms |
+| 1,190 MiB (2.0×) | 120 s | Merkle trees and history in memory | 258 MiB | 1,553 | 1 | 95 ms |
+| 1,488 MiB (2.5×) | 600 s | Merkle trees and history in memory | 258 MiB | 1,400 | 1 | 443 ms |
+
+No run reached `pressure`, and each refused only the feeder's first 508 transfers. The 0.8×
+row was run before the rule changed and is unaffected by it: it opens paged either way. At
+the resident figure the visits to `warn` are five again and every window of twenty seconds
+is between 1,330 and 1,680 transfers a second with no decline; 1,523 is below the 1,619 and
+1,574 of the two `memory` runs at that limit by less than two runs of one row differ. The
+2.5× row is the low one: the same setting at the same limit committed 1,552 in the run
+further up, and this run fell from 1,590 to about 1,400 over its first four minutes, had one
+window at 839 and its longest pause of 443 ms in its last minute, with the heap between 360
+and 960 MiB and one visit to `warn`. Nothing in the node differs between the two runs (the
+opening rule does not bear on a heap this size), so the two together are the spread of a
+ten-minute run with the Merkle trees and a full heap in memory: about a tenth.
 
 The window in memory, measured directly. `retain.memoryVersions` sets how many of the provable
 versions a node keeps in memory, the store answering for the rest. The node that never reaches
@@ -1012,7 +1074,8 @@ second row could prove three heights and refused the other ninety-eight.
 
 The same state opened under heaps it used to abort under, below the 400 MiB that opening it
 resident takes (STATE-PAGING.md section 9.1): the node estimates each tier from the store's
-counters and leaves out what does not fit below the warn line, and the history window with it.
+counters and leaves out what does not fit below the warn line (half the limit now, see the node as it now
+opens, above), and the history window with it.
 
 | heap limit | of the resident heap | opened with | heap after opening | run | transfers/s | levels reached |
 |---|---:|---|---:|---:|---:|---|
@@ -1138,8 +1201,8 @@ transfers look up no index; a block's finalize even gets faster without the B+ t
   measured per account with its balance and two keys, 6.1 KB under ML-DSA-44 and 3.5 KB under
   secp256k1, with everything resident.
 - **Paging bounds memory by the working set, not the state.** Under the memory guard the
-  state is a cache over LMDB: the cache of decoded objects capped and the index trees dropped
-  at `warn`, the Merkle trees dropped at `pressure`, rebuilt once the heap has stayed at `ok`
+  state is a cache over LMDB: the cache of decoded objects capped at `warn` (and the index trees
+  dropped there, on a node with `indexTrees: 'memory'`; by default they are never built), the Merkle trees dropped at `pressure`, rebuilt once the heap has stayed at `ok`
   for as long as the node had run before the drop and they fit within half the limit. With everything dropped the database runs on 40 to 50% of its resident heap at
   the throughput it has resident, within a tenth (section 4.13). The history window is trimmed
   at `warn` and the mempool admits up to a share of its limit that follows the level, so a
@@ -1150,7 +1213,9 @@ transfers look up no index; a block's finalize even gets faster without the B+ t
   0.2 ms per version back instead of a tenth of a millisecond. The arena, outside the heap, has
   its own budget, which throughput did not notice down to 16 MiB, a quarter of what the
   unbounded arena grew to.
-- **A loaded node is faster without its index trees in memory, so it sheds early.** While the
+- **A loaded node is faster without its index trees in memory, so it sheds early, and by
+  default now never builds them.** The runs here kept them in memory (`indexTrees: 'memory'`,
+  the default at the time). While the
   index trees and the history window went only at `pressure`, the rate fell by a third over the
   first minutes of a full load, as the heap climbed towards the pressure line, and returned to
   1,330 to 1,560 transfers a second, level, once they were dropped; and at 192,000 accounts the
@@ -1285,13 +1350,14 @@ limit a store is opened under, and the arena's budget.
 
 ## 8. Further work the numbers point to
 
-1. **Index reads from the store under load.** Resident index trees cost a load of
+1. **Index reads from a store larger than memory.** Resident index trees cost a load of
    transfers about a tenth of its rate (the ten-minute run at 2.5 times the resident heap,
-   section 4.13), and `indexTrees: 'store'` in a node's config now leaves them out for good.
-   What that costs index reads (accounts by name, scans) has been measured on a database alone
-   (section 4.11) and not on a node under load. The default still starts with the trees when
-   they fit and rebuilds them when the heap has stayed at `ok` as long as it had run before
-   the drop, whatever index reads the node serves.
+   section 4.13), so `indexTrees: 'store'` is now the default and a node never builds them.
+   What that costs index reads (accounts by name, scans) is measured on a node under load,
+   with the store in the page cache and with none of it there when the node opened it
+   (section 4.13): a lookup by key the same, a page of a scan about twice as long. A store
+   larger than the machine's memory, whose index reads would reach the device, is not
+   measured.
 2. **The checks at a restart.** With the past versions read from the history records a restart
    at 192,000 accounts is 2.9 s, and 1.5 s without the check of every object against its leaf
    (section 4.12): what is left is the checks themselves, which could run after the node has
