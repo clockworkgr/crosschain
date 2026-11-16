@@ -1249,22 +1249,25 @@ end (`BENCH_PAGING_PROFILE`) and showed no decline, and its two profiles were al
 thread busy throughout, the collector 1.9 seconds of the thirty early and 2.2 late with the
 heap grown from about 700 to 980 MiB, the signature cache 0.2 and 0.4 seconds once it is full
 and every new transaction evicts an old one. The profile was not repeated in that batch. A run
-made after it, with the same limit and the two profiles, shows the cause, and it is not the
-heap. The run committed 1,590 a second over its ten minutes, 1,750 to 1,800 in its first half
-minute and 1,450 to 1,640 in its last minute. Its first half minute is the only part with the
-Merkle trees in memory: at 39 seconds the heap reached `warn` (1,046 of 1,488 MiB), the trees
-and the window were dropped, and from 76 seconds on the node stayed paged for want of room to
-rebuild, so from there it is the same node as the rows at 0.8 and 1.0 times with a larger
-heap. Between the two profiles the time the main thread spends inside the store's commit
-(lmdb-js's `finishTxn`, the native call that writes a block's pages) doubles, 2.4 seconds of
-the thirty early and 4.9 late, with `fsync` 2.3 and 2.5 beside it; the collector is 2.2 and
-2.1, and signing the feeder's transfers on the same thread 8.1 and 7.0. The store grows by
-some 950,000 transfers, their blocks and their history entries over the run, and a commit into
-the larger store costs more: about a twelfth more of the main thread's time, which is the size
-of the decline. The paged rows decline the same way over their ten minutes; they were not
-profiled, and the same growth is the likely reason. What differs at 2.5 times is the start, which is faster while the trees are resident,
-so the fall from the first window to the last is larger there. The 1,366 to 1,511 the batch's
-run read at its end and the 1,450 to 1,640 of this one are the spread between two runs.
+made after it, with the same limit and the two profiles, shows where the time goes, and it is
+not the heap. The run committed 1,590 a second over its ten minutes, 1,750 to 1,800 in its
+first half minute and 1,450 to 1,640 in its last minute. At 39 seconds the heap reached `warn`
+(1,046 of 1,488 MiB): the history window was trimmed to two versions and the cache capped, and
+from 76 seconds on the node kept them so for want of room to rebuild. The Merkle trees stayed
+in memory throughout (the run reports no block committed with them dropped), so this is not
+the node of the rows at 0.8 and 1.0 times. Between the two profiles the time the main thread
+spends inside the store's commit (lmdb-js's `finishTxn`, the native call that writes a block's
+pages) doubles, 2.4 seconds of the thirty early and 4.9 late, with `fsync` 2.3 and 2.5 beside
+it; the collector is 2.2 and 2.1, and signing the feeder's transfers on the same thread 8.1
+and 7.0. The store grows by some 950,000 transfers, their blocks and their history entries
+over the run, and a commit into the larger store costs more: about a twelfth more of the main
+thread's time, against a rate that falls by a tenth to a sixth between the first half minute
+and the last. The commit is the one cost the profiles show growing, and it accounts for most
+of the fall; the early profile also covers the half minute before `warn`, with the whole
+window in memory, and how much of the faster start is that was not measured. The paged rows
+decline over their ten minutes too; they were not profiled, and the same growth is the likely
+reason. The 1,366 to 1,511 the batch's run read at its end and the 1,450 to 1,640 of this one
+are the spread between two runs.
 
 The window in memory, measured directly. `retain.memoryVersions` sets how many of the provable
 versions a node keeps in memory, the store answering for the rest. The node that never reaches
@@ -1699,10 +1702,13 @@ a store is opened under, and the arena's budget.
 6. **Block space.** Larger blocks raise the network's ceiling and a shorter commit timeout its
    cadence, until admission (5,800/s per node under ML-DSA-44) binds; the network runs here
    filled one block of seven, so what either would do to the measured rate is not known.
-7. **The decline at 2.5 times the resident heap.** The ten-minute run with the Merkle trees and
-   a full heap in memory fell from 1,860 to 1,400 transfers a second in this batch, where the
-   paged runs fell by 4 and 9% (section 4.13); a profile of that run on the current build would
-   say where the time goes.
+7. **The store's commit as the store grows.** The ten-minute run at 2.5 times the resident heap
+   fell from 1,860 to 1,400 transfers a second in this batch, where the paged runs fell by 4
+   and 9%. A profiled run made after the batch shows the store's commit taking twice the time
+   at the end that it took at the start (section 4.13). Why a commit into the larger store
+   costs that much more (deeper trees, more pages written for a block, the account history
+   log) has not been looked at, and it is the one cost measured here that makes a node slower
+   the longer it runs.
 
 ## 9. Adding a benchmark
 

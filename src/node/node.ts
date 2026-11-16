@@ -660,37 +660,57 @@ export class Node {
 
   private stopping: Promise<void> | null = null;
 
-  /** Stopping twice is stopping once: a second caller waits for the first, and the claim is released when that one is done. */
-  stop(): Promise<void> {
-    return (this.stopping ??= this.shutDown());
+  /**
+   * Stopping twice is stopping once: a second caller waits for the first, and the claim is released when that one
+   * is done. `beforeClose` is waited for once the node has stopped working and before its store is closed: whoever
+   * still reads the store, an RPC server finishing its requests for one, is given until then. Only the first
+   * caller's is used.
+   */
+  stop(beforeClose?: () => Promise<unknown>): Promise<void> {
+    return (this.stopping ??= this.shutDown(beforeClose));
   }
 
-  private async shutDown(): Promise<void> {
+  private async shutDown(beforeClose?: () => Promise<unknown>): Promise<void> {
+    // Every step is tried whatever the ones before it did, and the first failure is the one the caller is given.
+    let failed = false;
+    let failure: unknown;
+    const step = async (fn: () => unknown): Promise<void> => {
+      try {
+        await fn();
+      } catch (e) {
+        if (!failed) failure = e;
+        failed = true;
+      }
+    };
     try {
-      if (this.started) {
-        this.started = false;
-        this.memoryGuard.stop();
-        this.gcScheduler.stop();
-        this.consensus.stop();
-        this.blockSync.stop();
-      }
-      // The network may be up from a state-sync join even if start() was never called.
-      if (this.networkStarted) {
-        this.networkStarted = false;
-        await this.network.stop();
-      }
+      await step(async () => {
+        if (this.started) {
+          this.started = false;
+          this.memoryGuard.stop();
+          this.gcScheduler.stop();
+          this.consensus.stop();
+          this.blockSync.stop();
+        }
+        // The network may be up from a state-sync join even if start() was never called.
+        if (this.networkStarted) {
+          this.networkStarted = false;
+          await this.network.stop();
+        }
+      });
       // A block being applied finishes its writes before the store goes away.
-      await this.executor?.idle();
+      await step(() => this.executor?.idle());
+      await step(() => beforeClose?.());
       // The store the node opened, and also one it was handed for a directory it holds the claim on: the claim
       // says nobody else writes there, so it cannot be given up while that store is open.
-      if (this.ownsEnv || this.releaseLock) await this.env.close();
-      await this.ownVerifier?.close();
+      await step(() => (this.ownsEnv || this.releaseLock ? this.env.close() : undefined));
+      await step(() => this.ownVerifier?.close());
     } finally {
-      // Last, and whatever failed above: until the store is closed and the writes are done, another node on the
-      // directory would be writing beside this one.
+      // Last: until the store is closed and the writes are done, another node on the directory would be writing
+      // beside this one.
       this.releaseLock?.();
       this.releaseLock = null;
     }
+    if (failed) throw failure;
   }
 
   get height(): bigint {

@@ -238,17 +238,38 @@ transactions checked at once no more are let through and applied than the pool h
   still holds this process's pid. Two nodes in one process are told apart by the directory's
   real path, however it was spelled or linked to. The claim is released last when a node
   stops, after the network has stopped, the block being applied has finished its writes
-  and the store is closed. The node closes the store it opened and also one it was
-  handed for a directory it holds the claim on, as the CLI's `start` hands one: the
-  claim says nobody else writes there, so it is not given up while that store is open.
-  `start` opens that environment before its node takes the claim, so a second `start` on
-  a directory in use opens the environment and is then refused; LMDB allows several
-  processes to open one environment, and nothing is written to the stores before the
-  refusal. Closing an LMDB environment twice is closing it once, and every caller is
-  handed the one close to wait for, so the caller closing its store again after `stop()`
-  does nothing. Stopping a node twice is stopping it once in the same way: `stop()` hands
-  every caller the one shutdown, so two callers stopping at once both wait for it, and
-  the claim is released when it is done. The verifier pool is closed before the release
+  and the store is closed. `stop` takes an optional function, which the node waits for
+  once it has stopped working and before it closes the store, so that whoever still
+  reads the store is done first: the CLI passes the RPC server's stop, and a request
+  still being served reads a store that is still open. The RPC server's stop, once its
+  connections are closed, waits one second at most for the requests it was still
+  handling, each until its method has returned and its answer is written, and answers
+  one that reaches dispatch after the stop began with code -32000, `server is stopping`:
+  a method that was waiting when its connection was cut, a broadcast waiting on the
+  mempool for one, has ended before the store is closed. Every step of the node's stop
+  (stopping consensus, block sync and the network; waiting for the block being applied;
+  the caller's function; closing the store; closing a verifier pool the node made) is
+  tried whatever the ones before it did, the claim is released last, and the first
+  failure, whatever value it is, is the one `stop` rejects with. The CLI's `start` sets
+  up its signal handlers before it makes the node. A signal that comes while the node is
+  being made is acted on once it is made, and the node is then stopped as usual; if the
+  node has not been made five seconds after such a signal the process exits as it is,
+  which leaves the claim of a process that is gone for the next
+  start to take over. A failure of the node's start or of the RPC server's (its address
+  in use, for one) is logged as `start failed` and the node is stopped like any other
+  before the process exits with status 1, so the store is closed and the claim
+  released; a failure while stopping is logged as `stopping failed` and the exit status
+  is 1 unless it was already another. The CLI's `start` passes its node the data directory alone: the node claims
+  the directory and then opens the LMDB environment, so a second `start` on a directory
+  in use is refused before it has opened anything there. The node closes the store it
+  opened and also one it was handed for a directory it holds the claim on, as a test or
+  a program that embeds a node may hand one: the claim says nobody else writes there, so
+  it is not given up while that store is open. Closing an LMDB environment twice is
+  closing it once, and every caller is handed the one close to wait for, so the caller
+  closing its store again after `stop()` does nothing. Stopping a node twice is stopping
+  it once in the same way: `stop()` hands every caller the one shutdown, so two callers
+  stopping at once both wait for it, only the first caller's function is waited for,
+  and the claim is released when it is done. The verifier pool is closed before the release
   if the node made it; one the caller passed in is the caller's to close. A node that
   fails while it is created gives back what it opened, the claim included, before the
   caller sees the error. A failure in the constructor, which cannot wait, is thrown
@@ -1120,7 +1141,7 @@ node must continue consensus with the exact proposer priorities.
 
 ## 10. Implementation status (2026-11-15)
 
-Everything above is implemented in TypeScript under `src/`. 276 tests in 29 files
+Everything above is implemented in TypeScript under `src/`. 278 tests in 29 files
 pass, and the whole suite passes under either signature scheme
 (`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there) and with
 either tier of state paging dropped from the start (`INDEX_TREES=0`, `TREES=0`, or
@@ -1154,7 +1175,7 @@ limit at `warn`, a tenth at `pressure` (a transaction beyond it refused as `full
 `retain.memoryVersions` set keeps that many past versions in memory and proves an older height from the store, and with `indexTrees: 'store'` leaves its index trees there and still finds an account by name. The history
 suite appends blocks of entries to the account history log and pages every account out
 of it in both directions against a model, counts the reads that reach the old end of a
-long history, checks that a block writes the heads of one slice of the account numbers and that a log opened after a stop has the waiting ones back, and moves a store written with the earlier layout into the log. The fourth review's suite (`test/review4.test.ts`) asks a node for a balance, an account, a key, a validator and a delegation as of past heights and checks their proofs against the next header's app hash, spends a rate limit with batches, indexes one transaction in three blocks, moves a transaction index of the earlier layout when its store is opened, refuses a snapshot without every type's section and a number too large to hold exactly, prunes and bounds the evidence pool, removes a key from the keystore, reads a peer clock seven seconds ahead from its pong and runs a node on a verifier pool of its own. Four more suites hold one case for each rule added after it. `test/review5-net.test.ts` (15 cases) counts one success for an outbound dial, leaves a refused connection open for the rejection to leave, bans and excludes a peer by the address dialed, takes an address list only in answer to a request, starts from the seeds on a peer file cut short, stops block sync cleanly, refuses a block response that does not match its request, passes over a snapshot below the trust height, drops a vote far ahead before verifying it, holds a vote for the next height once, holds for the next height only proposals a validator signed, and admits one of two transactions checked at once for the pool's last place. `test/review5-node.test.ts` (22 cases) claims a data directory by its real path and releases it last, takes a stale claim over only while holding the takeover file, closes a store it was handed for a directory it claimed before giving the claim up, reads the evidence age from the application when asked, stores nothing of a block whose application commit throws, prunes in one transaction with the set by height going with its block, answers for a past height with the set as that height had it, removes a validator set by hash once no header held names it, indexes a repeated transaction where it succeeded, undoes the writes of a memory environment transaction that throws, does not pool gossiped evidence that is too old, takes an item only from the peer asked for it, remembers no more than 2,048 fetches for a peer that announces and never answers, takes the block size from the genesis for every node alike, bounds a block by its transactions and evidence and a validator set by what a frame holds, and refuses a block with more than 16 pieces of evidence. `test/review5-app.test.ts` (17 cases) fails a store write under the application and writes the block again with a correct history, stops the application after a failure past the block's session, refuses a delegation to a validator with shares and no tokens and an authority no key leads to or that needs more signatures than a transaction carries, reads the state of the last root after writes outside a session, bounds the object types and the authenticated indices, and has the toy application refuse a validator key of another scheme than its set's. `test/review5-rpc.test.ts` (9 cases) stops a server's events with it, replays a block event with the fields of a live one, opens an account stream only for an account there is, finds a validator by its operator's account id, keeps a key under a name every object inherits, and runs the command line for an unknown command, an asset of precision 0, a light client anchor of another chain and a block whose results the node lacks. State paging (`STATE-PAGING.md`) has cases of its
+long history, checks that a block writes the heads of one slice of the account numbers and that a log opened after a stop has the waiting ones back, and moves a store written with the earlier layout into the log. The fourth review's suite (`test/review4.test.ts`) asks a node for a balance, an account, a key, a validator and a delegation as of past heights and checks their proofs against the next header's app hash, spends a rate limit with batches, indexes one transaction in three blocks, moves a transaction index of the earlier layout when its store is opened, refuses a snapshot without every type's section and a number too large to hold exactly, prunes and bounds the evidence pool, removes a key from the keystore, reads a peer clock seven seconds ahead from its pong and runs a node on a verifier pool of its own. Four more suites hold one case for each rule added after it. `test/review5-net.test.ts` (15 cases) counts one success for an outbound dial, leaves a refused connection open for the rejection to leave, bans and excludes a peer by the address dialed, takes an address list only in answer to a request, starts from the seeds on a peer file cut short, stops block sync cleanly, refuses a block response that does not match its request, passes over a snapshot below the trust height, drops a vote far ahead before verifying it, holds a vote for the next height once, holds for the next height only proposals a validator signed, and admits one of two transactions checked at once for the pool's last place. `test/review5-node.test.ts` (23 cases) claims a data directory by its real path and releases it last, takes a stale claim over only while holding the takeover file, closes a store it was handed for a directory it claimed before giving the claim up, waits for whoever still reads the store before closing it, reads the evidence age from the application when asked, stores nothing of a block whose application commit throws, prunes in one transaction with the set by height going with its block, answers for a past height with the set as that height had it, removes a validator set by hash once no header held names it, indexes a repeated transaction where it succeeded, undoes the writes of a memory environment transaction that throws, does not pool gossiped evidence that is too old, takes an item only from the peer asked for it, remembers no more than 2,048 fetches for a peer that announces and never answers, takes the block size from the genesis for every node alike, bounds a block by its transactions and evidence and a validator set by what a frame holds, and refuses a block with more than 16 pieces of evidence. `test/review5-app.test.ts` (17 cases) fails a store write under the application and writes the block again with a correct history, stops the application after a failure past the block's session, refuses a delegation to a validator with shares and no tokens and an authority no key leads to or that needs more signatures than a transaction carries, reads the state of the last root after writes outside a session, bounds the object types and the authenticated indices, and has the toy application refuse a validator key of another scheme than its set's. `test/review5-rpc.test.ts` (10 cases) stops a server's events with it, stops a server only once the methods it was running have returned, replays a block event with the fields of a live one, opens an account stream only for an account there is, finds a validator by its operator's account id, keeps a key under a name every object inherits, and runs the command line for an unknown command, an asset of precision 0, a light client anchor of another chain and a block whose results the node lacks. State paging (`STATE-PAGING.md`) has cases of its
 own: the arena suite grows slabs, counts dead bytes and compacts, and releases whole
 slabs down to a byte limit, unread ones first; the database suite
 evicts clean objects and never dirty ones, keeps history as bytes, checks that the
@@ -1216,8 +1237,10 @@ Known simplifications, all deliberate and all revisitable:
   if it is fresh (no proof of lock), its round is within 1,000, its block is of that
   height and its signature verifies with the key of the validator, in the next
   height's set, that the block names as proposer; a validator takes 2 places at most
-  and one for a round, and a bad signature costs the sender 20 points. A peer that is
-  no validator can take no place. Four validators that sign proposals for rounds that
+  and one for a round, and a bad signature costs the sender 20 points. The test is
+  on the proposal's signer, not on the peer that relays it: any peer may relay a
+  proposal a validator signed, nothing takes a place without the signature of a
+  validator of the next height's set, and the limits are counted by signer. Four validators that sign proposals for rounds that
   will not come can still fill the 8 and keep the real proposal out until gossip sends
   it again, which it does while its round lasts.
 - Non-unique indices (balances by owner, transactions by expiry, validators by power)
@@ -1287,11 +1310,7 @@ done about each finding.
   only of a later takeover. A process killed between writing
   its private `LOCK.<pid>.<8 hex>` file and unlinking it leaves that file, which is
   harmless and can be deleted, and the claim is made with a hard link, so the directory
-  must be on a filesystem that has them. The claim is taken when the node is created,
-  and the CLI's `start` opens the LMDB environment before that: a second `start` on a
-  directory in use opens the environment and is then refused. LMDB allows several
-  processes to open one environment, and nothing is written to the stores before the
-  refusal.
+  must be on a filesystem that has them.
 - When a block lengthens the unbonding period, the evidence window grows with it at
   once, but heights a pruning node deleted under the shorter window are gone: until a
   full new window has passed it refuses evidence that names them, and so a block that

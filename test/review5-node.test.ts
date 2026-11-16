@@ -169,6 +169,32 @@ describe('the data directory', () => {
     await env.close();
   });
 
+  it('waits for whoever still reads the store before closing it, and releases the claim after', async () => {
+    tmp = mkdtempSync(join(tmpdir(), 'r5-lock-'));
+    const lock = join(tmp, 'LOCK');
+    net = await makeTestnet({ validators: 1, skipStart: [0] });
+    const node = await net.makeNode(0, { dataDir: tmp });
+    await node.start();
+    await waitForHeight([node], 2n);
+    // As an RPC server finishing its requests: the store answers and the claim stands until the reader is done.
+    let read: { height: bigint; claimed: boolean } | null = null;
+    await node.stop(async () => {
+      await sleep(50);
+      read = { height: node.store.loadBlock(1n)!.block.header.height, claimed: existsSync(lock) };
+    });
+    expect(read).toEqual({ height: 1n, claimed: true });
+    expect(existsSync(lock)).toBe(false);
+    // A reader that fails does not keep the store open or the directory claimed; its error reaches the caller.
+    const again = await net.makeNode(0, { dataDir: tmp });
+    await expect(again.stop(async () => Promise.reject(new Error('reader failed')))).rejects.toThrow(/reader failed/);
+    expect(existsSync(lock)).toBe(false);
+    // Whatever it was rejected with, nothing included.
+    const third = await net.makeNode(0, { dataDir: tmp });
+    await expect(third.stop(() => Promise.reject(undefined))).rejects.toBeUndefined();
+    expect(existsSync(lock)).toBe(false);
+    await (await net.makeNode(0, { dataDir: tmp })).stop();
+  });
+
   it('is given back, with the store, by a node that fails to open', async () => {
     tmp = mkdtempSync(join(tmpdir(), 'r5-open-'));
     net = await makeTestnet({ validators: 1, skipStart: [0] });

@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-nine files, 276 cases, about 8,880 lines counting the shared harness
+`test/**/*.test.ts`: twenty-nine files, 278 cases, about 8,940 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (275 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (277 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -27,7 +27,7 @@ the external review and the later cases of the same kind, `review2` five more th
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
 by title at the end of the suites, `review4` the nine cases for the items the first review
-noted and left, and the four `review5` files 63 cases for failures and unusual callers at the
+noted and left, and the four `review5` files 65 cases for failures and unusual callers at the
 edges of every layer: `review5-net` the peer layer, sync, consensus intake and the mempool,
 `review5-node` the node, the executor and the block store, `review5-app` the application, the
 object database and the codec, and `review5-rpc` the RPC server, the keystore, the command
@@ -2612,13 +2612,13 @@ the pool holds two.
 
 ### test/review5-node.test.ts
 
-Twenty-two tests for the node, the executor and the block store. Two helpers serve several
+Twenty-three tests for the node, the executor and the block store. Two helpers serve several
 groups: `blockAfter(state, lastCommit, evidence)` builds the block that would follow a chain
 state as far as its structure goes, with a commit of no signatures, and
 `doubleSign(net, node, height, round)` signs two prevotes of validator 0 for different hashes
 and makes evidence of them.
 
-`the data directory`, six cases on a one-validator testnet whose node is not started
+`the data directory`, seven cases on a one-validator testnet whose node is not started
 (`skipStart: [0]`), with a temporary directory removed in `afterEach`.
 
 **`it('is one directory however its path is spelled or linked to')`**. A node is made on
@@ -2644,13 +2644,26 @@ transport is wrapped so that its `close` notes whether `LOCK` exists. After `sta
 `stop()` the note is true and `LOCK` is gone: the claim is given up last.
 
 **`it('closes a store it was handed for a directory it claimed before giving the claim up')`**.
-As the command line does, the test opens an `LmdbEnv` under `<tmp>/lmdb` itself and hands it to
+As a program that embeds a node may, the test opens an `LmdbEnv` under `<tmp>/lmdb` itself and hands it to
 a node made with `dataDir: tmp`. The environment's `close` is wrapped so that its first call
 notes whether `LOCK` exists. After `start()` the node is stopped twice at once
 (`await Promise.all([node.stop(), node.stop()])`): two callers wait for the one shutdown, and
 neither returns with the store still open. The note is then true and `LOCK` is gone:
 the node closed the store it was handed while it still held the claim. The test then closes
-the environment again, as the command line does after `stop()`, and nothing throws.
+the environment again, as its owner may after `stop()`, and nothing throws.
+
+**`it('waits for whoever still reads the store before closing it, and releases the claim after')`**.
+A node made with `dataDir: tmp` is started and reaches height 2. It is stopped with a
+`beforeClose` function that stands for an RPC server finishing its requests: it sleeps 50 ms,
+then loads block 1 from the node's store and notes whether `LOCK` exists. The note is height 1
+with the file there, so the store answered and the claim stood until the reader was done, and
+`LOCK` is gone once `stop` has returned. A second node on the directory, not started, is then
+stopped with a function that rejects with `reader failed`: `stop` rejects with
+`/reader failed/` and `LOCK` is gone all the same, so a reader that fails keeps neither the
+store open nor the directory claimed. A third node is stopped with a function that rejects
+with `undefined`: `stop` rejects with `undefined` (`rejects.toBeUndefined()`) and `LOCK` is
+gone, so the failure reaches the caller whatever value it is, nothing included. A fourth node
+is then made on the directory and stopped.
 
 **`it('is given back, with the store, by a node that fails to open')`**. A `KvStoreApp` whose
 `initChain` throws makes `makeNode` reject with `/no genesis for you/`. No `LOCK` is left, and
@@ -2936,11 +2949,11 @@ kept would be, and opening a `KvStoreApp` on it throws
 
 ### test/review5-rpc.test.ts
 
-Nine tests for the RPC server, the keystore, the command line and the light client.
+Ten tests for the RPC server, the keystore, the command line and the light client.
 `readEvents(res, enough)` reads the records of an event stream until `enough` says so and then
 closes it.
 
-`the rpc server`, five cases. `up()` starts four validators of the core application with
+`the rpc server`, six cases. `up()` starts four validators of the core application with
 `engineValidators: false` and a staking genesis whose operators `op0` to `op3` are the accounts
 `3.1` to `3.4` and run the validators `7.0` to `7.3`, an `RpcServer` on node 0 with limits out
 of the way, and waits for height 3. Servers and the network are stopped in `afterEach`.
@@ -2951,6 +2964,15 @@ commit has reached it, a waiter is registered through its events for a hash of z
 timeout of a minute, and `waiting` is 1. `stop()` is called: the waiter's promise resolves to
 `null`, `waiting` is 0, and a further `waitForTx` returns `null`. The node commits two more
 blocks and the count of `push` calls does not move.
+
+**`it('is stopped only once the methods it was running have returned')`**. The `status` entry
+of the server's method table is replaced with a function that sleeps 300 ms, sets a flag and
+returns an empty object: a method that is waiting when the server stops, as a broadcast waits
+on the mempool. The client calls `status`, and 50 ms later the server is stopped with
+`stop(0)`, which cuts the connection at once. When `stop` has returned the flag is set: the
+method ran to its end before the server counted as stopped, so whoever closes the node's
+stores next does not close them under it. The client's call was rejected, its connection
+having been cut, and the test reads that as `null`.
 
 **`it('replays a block event as it was pushed, failed count and all, and says when it holds no results to count')`**.
 A stream of `block` events is read for three records while a transfer is broadcast in commit

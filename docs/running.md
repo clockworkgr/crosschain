@@ -17,7 +17,7 @@ the subject of the [tutorial](tutorial/00-overview.md); design decisions are in
 ```sh
 git clone <this repository> crosschain && cd crosschain
 npm install
-npm test                 # 276 tests, about two minutes
+npm test                 # 278 tests, about two minutes
 CHAIN_SCHEME=secp256k1 npm test   # the same suite on secp256k1 keys (one ML-DSA-only case is skipped)
 INDEX_TREES=0 npm test   # the same suite with every index B+ tree dropped from the start: lookups and scans through the store
 TREES=0 npm test         # and with every Merkle tree dropped: roots and proofs from the stored chunks and nodes; the two combine
@@ -121,7 +121,24 @@ collection V8 ran since start). `SIGINT` or `SIGTERM` shuts down cleanly; so doe
 `critical` level, with exit code 3, so a supervisor can restart the node with a larger `--heap`,
 including when the heap is already that full at the guard's first sample. Shutting down stops
 consensus and block sync at once and lets the block being applied finish its writes; RPC
-requests still open get a second (none at `critical`) before their connections are closed.
+requests still open get a second (none at `critical`) before their connections are closed,
+and the store is closed only after that, so a request that finishes in time reads a store
+that is still open. A request whose connection was cut may still be running inside the node
+(a `broadcastTx` waiting on the mempool, for one): the RPC server waits up to one second more
+for those to end, and a request that arrives once the server is stopping is answered `-32000`,
+`server is stopping`. The claim on the data directory is given up last (section 5). If
+something fails while the node stops, the line `stopping failed` is logged with the error,
+the remaining steps are still carried out, the claim included, and the exit code is 1 unless
+it was already another (3 stays 3).
+
+A signal that comes before the node is ready, while it reads a large genesis or joins by state
+sync, is acted on as soon as the node has been made: the store is closed and the claim given
+up as on any stop. If the node has not been made five seconds after the signal the process exits
+as it is, which is safe for the store and leaves a `LOCK` naming a process that is gone; the
+next start takes it over (section 5). If the node cannot start, or its RPC server cannot,
+most often because another process is listening on the RPC address, the line `start failed`
+is logged with the error, the node is stopped like any other, so the store is closed and the
+claim given up, and the process exits with code 1.
 Logs go to stderr; `LOG=debug` shows every proposal, vote and timeout, `LOG=warn` only problems.
 
 Blocks are produced as soon as more than two thirds of the voting power is connected: with four
@@ -267,10 +284,10 @@ holds the pid of the process using the directory. A second node started on the s
 while that process runs is refused, until the first has stopped: the node removes the
 file as the last step of its own shutdown, after it has closed the network, let the block
 being applied finish its writes and closed the LMDB environment, and also when it fails while
-starting. That holds under `start` too, which opens the environment and hands it to its node:
-a node closes the store of a directory it holds the claim on, whoever opened it, so the file
-never goes while the store is open, and `start` closing it once more as the process exits
-does nothing. The file appears with the pid already
+starting. `start` hands its node the directory alone: the node claims it and then opens the
+environment, so a second `start` on a directory in use is refused before it has opened
+anything there. The RPC server is stopped before the environment is closed, so the file never
+goes while the store is open or a request is still being answered from it. The file appears with the pid already
 in it: the node writes the pid to a file of its own, `LOCK.<pid>.<8 hex digits>`, links it to
 `LOCK` with a hard link, which fails when a `LOCK` is there, and removes its own file. So
 of two nodes started at the same moment one gets the directory and the other is refused, and
@@ -475,7 +492,7 @@ Errors carry JSON-RPC codes: `-32700` unparsable body, `-32600` malformed reques
 outside 1 to 20 requests; a malformed request is answered with its own id when that is a string, a number or null, and with `id: null` otherwise), `-32601` unknown method (a name every JavaScript object inherits, such as `toString`, included), `-32602` bad parameters, `-32001` not found (including a `height`
 whose state the node does not hold), `-32002` the mempool refused
 the transaction (the message says why), `-32003` not included before the timeout, `-32004` rate
-limited.
+limited, `-32000` with `server is stopping` when the request reached a node that is shutting down.
 
 While the node sheds load under memory pressure (section 12), every costly method but
 `broadcastTx` answers `-32004` with `node under memory pressure` before the extra tokens of a
@@ -944,6 +961,9 @@ node's answer, unproven.
 | `block H carries evidence for height h, whose validator set this node does not hold; its history does not reach that far` | the node halted rather than apply the block differently from the rest of the network: its headers do not reach back to h (a data directory written before header records existed, an embedded node given a shorter evidence age than the chain's unbonding period, or an unbonding period lengthened by proposal since the join); stop it, delete `data/lmdb` only (keep `priv_validator_state.bin`) and join again |
 | `keystore.json is locked by another process` | another command held the keystore's lock (`keystore.json.lock` beside it) for the 5 seconds a write waits; run the command again. A lock left by a process that died is cleared after 30 seconds |
 | `data directory ... is in use by process N` (or `by this process`) | another node has the directory open (its pid is in `data/LOCK`), or is still stopping: the file goes once its network is closed, the block being applied has finished its writes and the store is closed, just before the process exits; stop it first and wait for it to exit. A `LOCK` whose process is gone is taken over by the next start; if N is not a node (the pid of a node that crashed, given since to another process), remove `data/LOCK` |
+| `start failed` in the log with `err=listen EADDRINUSE: address already in use ...`, then exit code 1 | another process is listening on the node's RPC address (`rpcListen`, by default the p2p port plus one), often a node already running with the same `config.json` ports. The node was up by then, so it is stopped like any other before the process exits: the store is closed and `data/LOCK` removed, and nothing has to be cleaned up. Free the address or change `rpcListen` (section 5) and start again. `start failed` with another error is a failure of the node's own start, handled the same way |
+| `stopping failed` in the log, then exit code 1 | a step of the shutdown failed (the error is in the line). The other steps were still carried out and the claim on the data directory given up; the exit code is 1 unless the node was stopping with another, such as 3 |
+| `server is stopping` (`-32000`) | the request reached a node that is shutting down; send it to another node, or again once this one is back |
 | `data directory ...: could not claim it in 50 attempts; <path>/LOCK.takeover may have been left by a process that stopped while taking over a stale claim: check that no node runs on the directory, then remove it` | most likely a node was killed in the few file operations for which it held `LOCK.takeover` while taking over a stale `LOCK`, and the file is never removed automatically; make sure no node runs on the directory, delete `data/LOCK.takeover` if it is there and start again. If it is not there, other processes kept claiming and releasing the directory during the attempts: start again |
 | `<path>/light.json holds a trusted header of chain X, and this node is on chain Y` | the keystore directory's light client anchor belongs to another chain; use that chain's keystore directory (`--keystore`), or anchor afresh with `light <target> trust <height> <hash>` |
 | `included at height H; this node does not hold the results of that block` from `verify-tx` | the node fetched the block after a state sync and never executed it; the inclusion is proven, and a node that executed the block proves the result |

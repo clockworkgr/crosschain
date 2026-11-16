@@ -266,21 +266,21 @@ The heap limit is three quarters of physical memory (`os.totalmem`) unless `--he
 
 `--arena <MiB>` bounds the object database's arena, the slabs of encoded objects ([chapter 9](09-database.md)). It is a flag and not something the memory guard decides because the slabs are `ArrayBuffer`s outside the V8 heap, which is all the guard measures: `--heap` bounds the heap, `--arena` the largest thing beside it. Sixteen MiB is the least because the slab being filled, 16 MiB at most, is never released. The check comes before the wrapper, so a bad figure is refused in the parent, and the flag reaches the child with the rest of the arguments. Without it the arena holds every object, as before.
 
-`start` then returns at once in the parent (`if (startUnderHeapLimit()) return`) and otherwise assembles a node: the config and the genesis one directory up, a `WorkerVerifier` (chapter 2's thread pool), a logger at `LOG` level, an `LmdbEnv` under `data/lmdb`, then `Node.create` with the TCP transport, seeds, state-sync anchor, retention and `indexTrees` from the config, and `arenaBytes` (the flag times 2^20, or undefined). The shutdown function and the memory listener (below) are registered before `node.start()`, so a heap already critical at the guard's first sample is acted on too. Because the child always runs under `--max-old-space-size`, the node also tells the application how much heap there is to open the stored state into, and a state whose trees do not fit is opened paged ([chapter 8](08-node.md), [chapter 11](11-application.md)); the line `loaded application state` then ends with `paged=` and what was left in the store. After `node.start()`, unless the node is already stopping, it opens an `RpcServer` on `rpcListen` and logs a status line every five seconds:
+`start` then returns at once in the parent (`if (startUnderHeapLimit()) return`) and otherwise assembles a node: the config and the genesis one directory up, a `WorkerVerifier` (chapter 2's thread pool), a logger at `LOG` level, then `Node.create` with the data directory (the node claims it and then opens its `LmdbEnv` under `data/lmdb`, so a second `start` on a directory in use is refused before it has opened anything there; [chapter 8](08-node.md)), the TCP transport, seeds, state-sync anchor, retention and `indexTrees` from the config, and `arenaBytes` (the flag times 2^20, or undefined). The signal handlers and the shutdown function (below) are set up before `Node.create`, so a signal that comes while the node is being made is acted on once it is made, and the memory listener is registered before the node is started, so a heap already critical at the guard's first sample is acted on too. Because the child always runs under `--max-old-space-size`, the node also tells the application how much heap there is to open the stored state into, and a state whose trees do not fit is opened paged ([chapter 8](08-node.md), [chapter 11](11-application.md)); the line `loaded application state` then ends with `paged=` and what was left in the store. After the node's `start()`, unless the node is already stopping, it opens an `RpcServer` on `rpcListen` and logs a status line every five seconds (`made` is the node `Node.create` returned):
 
 ```ts
   setInterval(() => {
-    const m = node.memoryGuard.stats;
-    const gc = node.gcScheduler.stats();
+    const m = made.memoryGuard.stats;
+    const gc = made.gcScheduler.stats();
     log('info', 'status', {
-      height: node.height,
-      peers: node.network.peers.size,
-      mempool: node.mempool.size,
-      round: node.consensus.round,
+      height: made.height,
+      peers: made.network.peers.size,
+      mempool: made.mempool.size,
+      round: made.consensus.round,
       validators: app.dynamic().active.length,
       pool: app.dynamic().communityPool,
       heap: `${Math.round(heapInUse(m) / 2 ** 20)}/${Math.round(m.heapLimit / 2 ** 20)} MiB`,
-      memory: node.memoryLevel,
+      memory: made.memoryLevel,
       gc: `${gc.collections} pauses, ${gc.totalMs.toFixed(0)} ms, longest ${gc.maxMs.toFixed(1)} ms`,
     });
   }, 5000).unref();
@@ -289,30 +289,76 @@ The heap limit is three quarters of physical memory (`os.totalmem`) unless `--he
 Height, peers, mempool size, round, active validators and the community pool as before, then the guard's last sample as `heap=<used>/<limit> MiB`, the guard's level as `memory=`, and the collections V8 has run since start with their total and longest pause as `gc=`. Both heap figures are the old generation's, the ones the guard takes its levels from ([chapter 8](08-node.md)): the limit is the `--max-old-space-size` the child runs under, so `--heap 512` shows as 512 and not as the 704 V8's own `heap_size_limit` would say with the young generation's reserve added, and the use is `heapInUse(m)`, the sample's `heapOld`, which leaves out the garbage the young generation holds between two minor collections. On a one-node testnet under `--heap 512` the line read `heap=17/512 MiB memory=ok gc=5 pauses, 1 ms, longest 0.2 ms` after five blocks: one scheduled minor collection per commit. Shutdown is one function with an exit code:
 
 ```ts
+  // A signal that comes while the node is being made (a large genesis read, a state-sync join) is acted on once
+  // it is made, so the store is closed and the claim released as on any stop. If making it takes more than five
+  // seconds longer the process ends as it is: the store is safe against that, and the claim it leaves is one of
+  // a process that is gone, which the next start takes over.
+  let node: Node | null = null;
   let rpc: RpcServer | null = null;
   let stopping = false;
+  let giveUp: NodeJS.Timeout | undefined;
   // Consensus and block sync stop at once, and the block being applied finishes its writes, while the RPC server
   // stops beside them; a request still running then has a second (none at `critical`) before its connection is cut,
   // so no client can keep a node that must stop running.
   const shutdown = async (code = 0) => {
     if (stopping) return;
     stopping = true;
-    await Promise.all([node.stop(), rpc?.stop(code === 3 ? 0 : 1000)]);
-    await env.close();
-    await verifier.close();
+    if (!node) {
+      giveUp = setTimeout(() => process.exit(code), 5000).unref();
+      return; // start() goes on to stop the node when it has one
+    }
+    try {
+      // The store is closed by the node, once the RPC server has let go of it, and the claim released after.
+      const rpcStopped = rpc?.stop(code === 3 ? 0 : 1000);
+      await node.stop(async () => void (await rpcStopped));
+      await verifier.close();
+    } catch (e) {
+      log('error', 'stopping failed', { err: e instanceof Error ? e.message : String(e) });
+      code ||= 1;
+    }
     process.exit(code);
   };
   process.on('SIGINT', () => void shutdown());
   process.on('SIGTERM', () => void shutdown());
+```
+
+`SIGINT` and `SIGTERM` start the RPC server's stop at once (the server gives a request still running one second before it cuts the connection, and none at `critical`, so a slow client cannot keep a node that must stop running; `rpc` is null until the server exists, and `rpcStopped` is then undefined) and pass its promise to `node.stop` as `beforeClose`. The node stops consensus, block sync and the network and lets the block being applied finish its writes while the server stops beside it; it then waits for the server, and only after that closes LMDB and gives up its claim on the data directory ([chapter 8](08-node.md)). The server's stop does not return until the methods it was running have returned ([chapter 12](12-rpc.md)), so a request still being served reads a store that is still open, and one whose connection was cut is not left running over a store that is being closed. The environment is the node's own, so nothing here closes it. Then the verifier is closed and the process exits 0; the `stopping` flag makes a second signal harmless, and two do arrive under the wrapper, the terminal's and the one the parent passes on. If the node's stop or the verifier's close fails, the error is logged as `stopping failed` and the exit status is 1, unless it was already another: a node stopped at `critical` whose stop fails still exits 3. The node tries every step of its shutdown whatever the earlier ones did and releases the claim last, so a failure reported here has not left the store open where it could be closed, nor the directory claimed ([chapter 8](08-node.md)).
+
+The handlers and `shutdown` are set up before `Node.create`, because making a node can take a while (a large genesis to read, a state-sync join) and a signal may come meanwhile. `node` is still null then, and `shutdown` does not stop anything: it sets `stopping`, arms an unreferenced timer of five seconds and returns. What follows `Node.create` does the rest:
+
+```ts
+  node = made;
+  const app = made.app as CoreApp;
+  if (stopping) {
+    // Asked to stop while the node was being made: it is made now, and is stopped in its own time.
+    clearTimeout(giveUp);
+    stopping = false;
+    return shutdown();
+  }
   // Past the critical level the next step is V8 aborting the process; stopping cleanly first keeps the stores
   // consistent and tells the supervisor, through the exit code, that the node needs a larger heap. Registered before
   // the node starts, so a heap already critical at the first sample is acted on too.
-  node.onMemory((level) => {
+  made.onMemory((level) => {
     if (level === 'critical') void shutdown(3);
   });
+  try {
+    await made.start();
+    if (stopping) return;
+    const [host, port] = (cfg.rpcListen ?? `127.0.0.1:${Number(cfg.listenAddr.split(':')[1]) + 1}`).split(':');
+    rpc = new RpcServer(made, { host, port: Number(port), log });
+    await rpc.start();
+  } catch (e) {
+    // A node that is up and cannot go on (its RPC address is taken, for one) is stopped like any other, so the
+    // store is closed and the claim released before the error ends the process.
+    log('error', 'start failed', { err: e instanceof Error ? e.message : String(e) });
+    rpc = null;
+    return shutdown(1);
+  }
 ```
 
-`SIGINT` and `SIGTERM` stop the node and the RPC server side by side (the server gives a request still running one second before it cuts the connection, and none at `critical`, so a slow client cannot keep a node that must stop running; `rpc` is null until the server exists), then close LMDB and the verifier, and exit 0. The node has closed the environment by then, before it gave up its claim on the data directory ([chapter 8](08-node.md)), and closing an `LmdbEnv` a second time returns the promise of the first close, so the `env.close()` here finds it closed; the `stopping` flag makes a second signal harmless, and two do arrive under the wrapper, the terminal's and the one the parent passes on. The guard's `critical` level, 95% of the heap limit, takes the same path with exit code 3: the alternative is V8 aborting the process at the limit with the stores wherever the last write left them, and a distinct code lets a supervisor tell "restart me with a larger `--heap`" from a crash. The guard has already logged the reason and the remedy by then (`memory: heap at the limit; stopping before the process aborts (raise --max-old-space-size or --heap)`), and the node has already shed what it could at the `pressure` level; what remains is a state that does not fit, which no amount of shedding changes.
+When `Node.create` returns and `stopping` is set, the timer is cancelled, the flag is cleared and `shutdown()` is called again, this time with a node to stop: the node, which was never started, closes its store and releases the claim as on any stop, in its own time, and the process exits 0. The timer bounds only the making: if the node has not been made five seconds after the signal, the process exits as it is. The store is safe against a process that ends in the middle of its work, and the `LOCK` such an exit leaves names a process that is gone, which the next start takes over ([chapter 8](08-node.md)). A failure of `Node.create` itself is not caught here: the node has given back what it opened, the claim included, before `create` rejects, and the error goes to `main`, which prints it and exits 1.
+
+`made.start()` and the RPC server's start are inside a `try`. If either fails, the usual case being an RPC address another process is listening on, the node is up and holds its directory, so the error may not simply end the process: it is logged as `start failed` with its message, `rpc` is set back to null (a server that did not start is not to be stopped) and `shutdown(1)` stops the node like any other, so the store is closed and the claim released before the process exits with status 1. `if (stopping) return` after `made.start()` is for a shutdown that began while the node was starting, a heap already `critical` at the first sample or a signal: no RPC server is opened for a node that is stopping. The guard's `critical` level, 95% of the heap limit, takes the same path with exit code 3: the alternative is V8 aborting the process at the limit with the stores wherever the last write left them, and a distinct code lets a supervisor tell "restart me with a larger `--heap`" from a crash. The guard has already logged the reason and the remedy by then (`memory: heap at the limit; stopping before the process aborts (raise --max-old-space-size or --heap)`), and the node has already shed what it could at the `pressure` level; what remains is a state that does not fit, which no amount of shedding changes.
 
 **Client helpers.**
 

@@ -69,7 +69,6 @@ import { RpcClient } from './rpc/client.ts';
 import { commitFromJson, headerFromJson, txQueryFromJson } from './rpc/json.ts';
 import { encode } from './codec/writer.ts';
 import { RpcServer } from './rpc/server.ts';
-import { LmdbEnv } from './store/lmdb.ts';
 import { headerHash, txHash } from './types/block.ts';
 import { genesisToJson, loadGenesisFile, type Genesis } from './types/genesis.ts';
 import { makeLogger, type LogLevel } from './util/log.ts';
@@ -214,8 +213,40 @@ async function start(nodeDir: string): Promise<void> {
   const genesis = loadGenesisFile(join(nodeDir, '..', 'genesis.json'));
   const verifier = new WorkerVerifier();
   const log = makeLogger(cfg.name, (process.env.LOG as LogLevel | undefined) ?? 'info');
-  const env = new LmdbEnv(join(nodeDir, 'data', 'lmdb'));
-  const node = await Node.create({
+  // A signal that comes while the node is being made (a large genesis read, a state-sync join) is acted on once
+  // it is made, so the store is closed and the claim released as on any stop. If making it takes more than five
+  // seconds longer the process ends as it is: the store is safe against that, and the claim it leaves is one of
+  // a process that is gone, which the next start takes over.
+  let node: Node | null = null;
+  let rpc: RpcServer | null = null;
+  let stopping = false;
+  let giveUp: NodeJS.Timeout | undefined;
+  // Consensus and block sync stop at once, and the block being applied finishes its writes, while the RPC server
+  // stops beside them; a request still running then has a second (none at `critical`) before its connection is cut,
+  // so no client can keep a node that must stop running.
+  const shutdown = async (code = 0) => {
+    if (stopping) return;
+    stopping = true;
+    if (!node) {
+      giveUp = setTimeout(() => process.exit(code), 5000).unref();
+      return; // start() goes on to stop the node when it has one
+    }
+    try {
+      // The store is closed by the node, once the RPC server has let go of it, and the claim released after.
+      const rpcStopped = rpc?.stop(code === 3 ? 0 : 1000);
+      await node.stop(async () => void (await rpcStopped));
+      await verifier.close();
+    } catch (e) {
+      log('error', 'stopping failed', { err: e instanceof Error ? e.message : String(e) });
+      code ||= 1;
+    }
+    process.exit(code);
+  };
+  process.on('SIGINT', () => void shutdown());
+  process.on('SIGTERM', () => void shutdown());
+  // The node opens the store itself, after it has claimed the directory: a second start on a directory in use
+  // is refused before it has opened anything there.
+  const made = await Node.create({
     name: cfg.name,
     genesis,
     dataDir: join(nodeDir, 'data'),
@@ -224,7 +255,6 @@ async function start(nodeDir: string): Promise<void> {
     transport: new TcpTransport(),
     listenAddr: cfg.listenAddr,
     seeds: cfg.seeds,
-    env,
     verifier,
     log,
     stateSync: cfg.stateSync ? { trustHeight: BigInt(cfg.stateSync.trustHeight), trustHash: fromHex(cfg.stateSync.trustHash), backfill: cfg.stateSync.backfill } : undefined,
@@ -233,46 +263,46 @@ async function start(nodeDir: string): Promise<void> {
     arenaBytes: arenaMb === null ? undefined : arenaMb * 1048576,
     indexTrees: cfg.indexTrees,
   });
-  const app = node.app as CoreApp;
-  let rpc: RpcServer | null = null;
-  let stopping = false;
-  // Consensus and block sync stop at once, and the block being applied finishes its writes, while the RPC server
-  // stops beside them; a request still running then has a second (none at `critical`) before its connection is cut,
-  // so no client can keep a node that must stop running.
-  const shutdown = async (code = 0) => {
-    if (stopping) return;
-    stopping = true;
-    await Promise.all([node.stop(), rpc?.stop(code === 3 ? 0 : 1000)]);
-    await env.close();
-    await verifier.close();
-    process.exit(code);
-  };
-  process.on('SIGINT', () => void shutdown());
-  process.on('SIGTERM', () => void shutdown());
+  node = made;
+  const app = made.app as CoreApp;
+  if (stopping) {
+    // Asked to stop while the node was being made: it is made now, and is stopped in its own time.
+    clearTimeout(giveUp);
+    stopping = false;
+    return shutdown();
+  }
   // Past the critical level the next step is V8 aborting the process; stopping cleanly first keeps the stores
   // consistent and tells the supervisor, through the exit code, that the node needs a larger heap. Registered before
   // the node starts, so a heap already critical at the first sample is acted on too.
-  node.onMemory((level) => {
+  made.onMemory((level) => {
     if (level === 'critical') void shutdown(3);
   });
-  await node.start();
-  if (stopping) return;
-  const [host, port] = (cfg.rpcListen ?? `127.0.0.1:${Number(cfg.listenAddr.split(':')[1]) + 1}`).split(':');
-  rpc = new RpcServer(node, { host, port: Number(port), log });
-  await rpc.start();
+  try {
+    await made.start();
+    if (stopping) return;
+    const [host, port] = (cfg.rpcListen ?? `127.0.0.1:${Number(cfg.listenAddr.split(':')[1]) + 1}`).split(':');
+    rpc = new RpcServer(made, { host, port: Number(port), log });
+    await rpc.start();
+  } catch (e) {
+    // A node that is up and cannot go on (its RPC address is taken, for one) is stopped like any other, so the
+    // store is closed and the claim released before the error ends the process.
+    log('error', 'start failed', { err: e instanceof Error ? e.message : String(e) });
+    rpc = null;
+    return shutdown(1);
+  }
 
   setInterval(() => {
-    const m = node.memoryGuard.stats;
-    const gc = node.gcScheduler.stats();
+    const m = made.memoryGuard.stats;
+    const gc = made.gcScheduler.stats();
     log('info', 'status', {
-      height: node.height,
-      peers: node.network.peers.size,
-      mempool: node.mempool.size,
-      round: node.consensus.round,
+      height: made.height,
+      peers: made.network.peers.size,
+      mempool: made.mempool.size,
+      round: made.consensus.round,
       validators: app.dynamic().active.length,
       pool: app.dynamic().communityPool,
       heap: `${Math.round(heapInUse(m) / 2 ** 20)}/${Math.round(m.heapLimit / 2 ** 20)} MiB`,
-      memory: node.memoryLevel,
+      memory: made.memoryLevel,
       gc: `${gc.collections} pauses, ${gc.totalMs.toFixed(0)} ms, longest ${gc.maxMs.toFixed(1)} ms`,
     });
   }, 5000).unref();

@@ -90,11 +90,14 @@ export class RpcServer {
     this.methods = makeMethods(node, this.events);
     this.server = createServer((req, res) => {
       req.on('error', () => res.destroy());
-      this.handle(req, res).catch((e) => {
-        this.log('warn', 'rpc request failed', { err: (e as Error).message });
-        if (!res.headersSent) res.writeHead(500, CORS);
-        res.end();
-      });
+      const done: Promise<void> = this.handle(req, res)
+        .catch((e) => {
+          this.log('warn', 'rpc request failed', { err: (e as Error).message });
+          if (!res.headersSent) res.writeHead(500, CORS);
+          res.end();
+        })
+        .finally(() => this.inFlight.delete(done));
+      this.inFlight.add(done);
     });
     this.unsubscribe = this.events.onCommitted((e) => this.push(e));
   }
@@ -121,6 +124,7 @@ export class RpcServer {
    * transaction are answered: a node whose server is replaced does not keep the old one alive or at work.
    */
   async stop(graceMs = 1000): Promise<void> {
+    this.stopped = true;
     this.unsubscribe();
     this.events.close();
     for (const s of this.streams) s.res.end();
@@ -130,7 +134,17 @@ export class RpcServer {
     const cut = setTimeout(() => this.server.closeAllConnections(), graceMs);
     await closed;
     clearTimeout(cut);
+    // A connection that is closed does not end the method it called: one waiting on the mempool or the verifier
+    // would go on to read the node's stores when it resumes. Those are waited for, a second at most, so whoever
+    // closes the stores after this does not close them under a request; none is begun once the server is stopping.
+    let giveUp!: NodeJS.Timeout;
+    await Promise.race([Promise.allSettled([...this.inFlight]), new Promise<void>((resolve) => (giveUp = setTimeout(resolve, 1000)))]);
+    clearTimeout(giveUp);
   }
+
+  private stopped = false;
+  /** Requests being handled, each until its method has returned and its answer is written. */
+  private readonly inFlight = new Set<Promise<void>>();
 
   private allow(remote: string, cost: number): boolean {
     const now = Date.now();
@@ -236,6 +250,7 @@ export class RpcServer {
     if (params !== undefined && (typeof params !== 'object' || params === null || Array.isArray(params))) return answer({ code: INVALID_PARAMS, message: 'params must be an object' });
     if (m.costly && !m.whileShedding && this.node.isShedding) return answer({ code: RATE_LIMITED, message: 'node under memory pressure' });
     if (m.costly && !this.allow(remote, this.limits.costlyCost - 1)) return answer({ code: RATE_LIMITED, message: 'rate limited' });
+    if (this.stopped) return answer({ code: -32000, message: 'server is stopping' });
     try {
       return answer(null, await m.fn((params as Record<string, unknown>) ?? {}));
     } catch (e) {

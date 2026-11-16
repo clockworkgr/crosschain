@@ -23,7 +23,7 @@ import { RpcClient } from '../src/rpc/client.ts';
 import { RpcServer } from '../src/rpc/server.ts';
 import { headerHash, txHash } from '../src/types/block.ts';
 import { Keystore } from '../src/wallet/keystore.ts';
-import { makeTestnet, seedFor, verifier, waitFor, waitForHeight, type Testnet } from './helpers.ts';
+import { makeTestnet, sleep, seedFor, verifier, waitFor, waitForHeight, type Testnet } from './helpers.ts';
 
 const faucet = keyPairFromSeed(seedFor('r5/faucet'));
 const operators = [0, 1, 2, 3].map((i) => keyPairFromSeed(seedFor(`r5/op/${i}`)));
@@ -115,6 +115,23 @@ describe('the rpc server', () => {
     const seen = pushed;
     await waitForHeight([node], node.height + 2n);
     expect(pushed).toBe(seen);
+  });
+
+  it('is stopped only once the methods it was running have returned', async () => {
+    const { server, rpc } = await up();
+    // A method that is waiting when the server stops, as a broadcast waits on the mempool: its connection is cut
+    // at once, and it still runs to its end before stop() returns, so the stores are not closed under it.
+    let finished = false;
+    (server as unknown as { methods: Record<string, { fn: (p: unknown) => Promise<unknown> }> }).methods.status!.fn = async () => {
+      await sleep(300);
+      finished = true;
+      return {};
+    };
+    const call = rpc.status().catch(() => null);
+    await sleep(50);
+    await server.stop(0);
+    expect(finished).toBe(true);
+    expect(await call).toBeNull();
   });
 
   it('replays a block event as it was pushed, failed count and all, and says when it holds no results to count', async () => {

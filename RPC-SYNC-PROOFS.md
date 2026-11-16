@@ -221,7 +221,8 @@ mempool's lowered limit being its throttle then.
   inherits, such as `toString` or `constructor`, is unknown like any other: the method
   table is asked only for names of its own), `-32602` for bad parameters, `-32001`
   not found, including a state query for a height the application does not hold, `-32002` check failed (with the application's message), `-32003`
-  timeout, `-32004` rate limited.
+  timeout, `-32004` rate limited, `-32000` with `server is stopping` for a request that
+  reaches dispatch once the server has begun to stop.
 
 ### 3.3 Methods
 
@@ -310,6 +311,15 @@ client should broadcast in `sync` mode and poll `tx`. When the server is stopped
 every wait outstanding is answered at once as a timeout is, and the server's
 listener is taken back from the executor (`BlockExecutor.onCommitted` returns the function
 that removes it), so a node whose server is replaced keeps nothing of the old one.
+Stopping closes idle connections at once and cuts one in the middle of a request after
+a grace of one second (the caller may give another; the CLI gives none when it stops
+for want of heap). A connection that is cut does not end the method its request
+called, so the stop then waits, one second at most, for the requests still being
+handled, each until its method has returned and its answer is written: a broadcast
+that was waiting on the mempool has ended before the stop returns, and whoever closes
+the node's stores afterwards does not close them under it. A request that reaches
+dispatch once the server is stopping is answered `-32000` with `server is stopping`
+and its method is not called.
 
 ### 3.4 Events
 
@@ -586,7 +596,9 @@ its block is of that height and its signature verifies with the key of the valid
 in the next height's set, that the block names as proposer; a bad signature costs the
 sender its 20 points, and one there is no place for is dropped before its signature is
 verified. There are 8 places, 2 for one validator and one for a validator and round,
-so a peer that is no validator takes none; four validators together can still fill
+counted by the proposal's signer and not by the peer that relays it: any peer may relay
+a proposal a validator signed, and nothing takes a place without the signature of a
+validator of the next height's set; four validators together can still fill
 them, and a proposal not held is sent again while its round lasts. A vote more than 1,000 rounds ahead of the
 node's round is dropped before its signature is verified. A response to a request the node
 awaits (blocks, headers, validator sets, snapshots, manifests, chunks) that matches no
@@ -701,8 +713,9 @@ bound; the codec's `u53` and `i53`; `Keystore.remove`; a peer clock read from it
 pong; and a node that makes and closes its own verifier pool. Two tests run the
 CLI as a process: `start` against a directory that does not exist, for the heap limit
 it keeps (`test/review3.test.ts`), and `keys add` and `keys remove`
-(`test/review4.test.ts`). `test/review5-rpc.test.ts` (nine cases) stops a server and
-finds its listener gone from the executor and a commit wait answered; replays a block
+(`test/review4.test.ts`). `test/review5-rpc.test.ts` (ten cases) stops a server and
+finds its listener gone from the executor and a commit wait answered; stops one with a
+method still running and finds the method ended when the stop returns; replays a block
 event with the fields of the pushed one, and with `failed: null` when the results
 are not held; opens an account stream only for an account there is, by name or by
 id; answers `-32601` for `toString` and a malformed request under the id it carries;
@@ -740,8 +753,8 @@ vote for the next height held once however often it is sent, a proposal for the 
 validator, block requests forgotten with the height), an empty
 validator set decoded only with proposer index -1, and the mempool (one of two
 concurrent checks admitted to the last place, a place given back, a pooled
-transaction never forgotten). `test/review5-node.test.ts` (22 cases) covers the data
-directory's claim and the takeover of a stale one, a store handed in closed before the claim is given up, the evidence age read when asked, a block of which nothing is
+transaction never forgotten). `test/review5-node.test.ts` (23 cases) covers the data
+directory's claim and the takeover of a stale one, a store handed in closed before the claim is given up, a store closed only once whoever still reads it is done, the evidence age read when asked, a block of which nothing is
 stored when the application's commit throws, pruning in one transaction with the
 set by height, a past height answered with the set as it had it, proposer included, a set by hash removed once no header held names it, a repeated transaction indexed where it succeeded, the memory store's
 write order, a memory environment's transaction undone in every store when it throws, a heap flag of zero, gossiped evidence too old to pool, an item taken
