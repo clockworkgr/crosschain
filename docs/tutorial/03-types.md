@@ -80,7 +80,7 @@ The *chain state* is what the engine needs to remember between blocks: the last 
 
 The private constant `PRIORITY_WINDOW = 2n` is Tendermint's `PriorityWindowSizeFactor`, and the private comparator `byPowerThenAddress` defines the canonical order of a set: power descending, then address ascending by `compareBytes`.
 
-**`class ValidatorSet`** holds `validators` (sorted; "Index = position here"), `totalPower`, and a private `proposerIndex`. The constructor is private; sets are made by `create`, `applyUpdates`, `copy` and `decode`. It sums the powers and throws if the sum exceeds `MAX_TOTAL_POWER`, 2^60: priorities swing by a few multiples of the total and are stored as `i64`, so a larger total could overflow them, and the bound is the same one Tendermint applies. Because every way of building a set passes through the constructor, an application update that would push the total past the limit throws instead of corrupting proposer selection.
+**`class ValidatorSet`** holds `validators` (sorted; "Index = position here"), `totalPower`, and a private `proposerIndex`. The constructor is private; sets are made by `create`, `applyUpdates`, `copy` and `decode`. It refuses more than `MAX_VALIDATORS`, 2,000, members (`N validators exceed the limit 2000`). A commit carries one signature for each validator, and a block travels with two commits, the one inside it and its own (in a block-sync response): with 2,000 ML-DSA-44 signatures in each, about 9.2 MiB for the two, and the 16 MiB of transactions and evidence the largest genesis setting allows, a block still fits the 32 MiB network frame ([chapter 6](06-p2p.md)). The core application allows itself half as many (`maxValidators`, at most 1,000). The constructor then sums the powers and throws if the sum exceeds `MAX_TOTAL_POWER`, 2^60: priorities swing by a few multiples of the total and are stored as `i64`, so a larger total could overflow them, and the bound is the same one Tendermint applies. Because every way of building a set passes through the constructor, an application update that would make the set larger than 2,000 or push the total past the limit throws instead of making a block no frame can carry or corrupting proposer selection.
 
 **`static create(entries)`** builds the genesis set. It checks each public key with `isPublicKey` from [chapter 2](02-crypto.md) (a known scheme tag followed by exactly that scheme's key, which for secp256k1 must also be a point on the curve) and each power positive, derives addresses, rejects duplicates through the private `assertUnique` (keyed by hex address), sorts, and then performs one increment so the set has a proposer:
 
@@ -99,7 +99,7 @@ The private constant `PRIORITY_WINDOW = 2n` is Tendermint's `PriorityWindowSizeF
   }
 ```
 
-An empty set is allowed here (nothing is incremented), but `genesisState` refuses one and `applyUpdates` refuses to produce one.
+An empty set is allowed here (nothing is incremented), but `genesisState` refuses one, and `applyUpdates` refuses a list of updates that would leave none. With no updates at all it returns a copy of the set as it is, an empty one included.
 
 **`size`**, **`byIndex(i)`**, **`indexOf(address)`** and **`byAddress(address)`** are the lookups; the last two are linear scans with `bytesEqual`, fine for sets of tens of validators. **`proposer()`** returns the validator at `proposerIndex` or throws `'validator set has no proposer'`, which happens on a set fresh from `applyUpdates` before its first increment.
 
@@ -117,7 +117,7 @@ An empty set is allowed here (nothing is incremented), but `genesisState` refuse
   }
 ```
 
-**`copy()`** deep-copies the validators (priorities are mutated in place by the increment, so a copy is needed before computing a hypothetical proposer) and keeps the proposer index.
+**`copy()`** copies each validator record (priorities are mutated in place by the increment, so a copy is needed before computing a hypothetical proposer) and keeps the proposer index. The copy is one level deep: the records are new, so a priority changed in one set is not changed in the other, while the `address` and `publicKey` byte arrays, which nothing mutates, are shared.
 
 **`hash()`** is the value the header's `validatorsHash` and `nextValidatorsHash` carry:
 
@@ -205,7 +205,7 @@ The private **`rescalePriorities(diffMax)`** finds the spread between the highes
       if (!isPublicKey(publicKey)) throw new Error('bad public key');
       if (power <= 0n) throw new Error('validator power must be positive');
       return { address: addressOf(publicKey), publicKey, power, priority };
-    }, 10_000);
+    }, MAX_VALIDATORS);
     ValidatorSet.assertUnique(vals);
     for (let i = 1; i < vals.length; i++) if (byPowerThenAddress(vals[i - 1]!, vals[i]!) >= 0) throw new Error('validator set out of order');
     const proposerIndex = r.i53();
@@ -256,7 +256,7 @@ export function voteSignBytes(chainId: string, v: UnsignedVote): Uint8Array {
 
 The chain id appears both here and in the signing context from [chapter 2](02-crypto.md); the comment acknowledges the redundancy. `src/consensus/privval.ts` signs these bytes with the `vote` context, and `src/consensus/consensus.ts` and `src/consensus/evidence.ts` rebuild them to verify.
 
-**`encodeVote(w, v)`** writes type, height, round, optional hash, `u32(validatorIndex)` and the signature with `fixed`, tag included. **`decodeVote(r)`** reads the same, taking the signature through `decodeSignature` so that its length comes from the tag, and rejects a type other than 1 or 2 with `'bad vote type'`; it does not bound `round` or `validatorIndex`, leaving that to consensus (which ignores votes more than 1000 rounds ahead and checks the index against the set in its vote set).
+**`encodeVote(w, v)`** writes type, height, round, optional hash, `u32(validatorIndex)` and the signature with `fixed`, tag included. **`decodeVote(r)`** reads the same, taking the signature through `decodeSignature` so that its length comes from the tag, and rejects a type other than 1 or 2 with `bad vote type N`, where `N` is the byte it read; it does not bound `round` or `validatorIndex`, leaving that to consensus (which ignores votes more than 1000 rounds ahead and checks the index against the set in its vote set).
 
 **`blockHashKey(h)`** turns a nullable hash into a `Map` key, `'nil'` or hex. The vote set in `src/consensus/votes.ts` tallies power per block with it.
 
@@ -279,7 +279,7 @@ Each field is checked by `validateBlockStructure` in `src/consensus/validate.ts`
 | `lastResultsHash` | `state.lastResultsHash` |
 | `evidenceHash` | `evidenceHash(block.evidence)` |
 | `lastCommitHash` | `commitHash(block.lastCommit)` |
-| `time` | after `state.lastBlockTime`, within `maxClockDriftMs` of local time |
+| `time` | after `state.lastBlockTime`; for a fresh proposal also within `maxClockDriftMs` of local time (a re-proposal, a fetched block and a synced block are not held to the clock, [chapter 4](04-consensus.md)) |
 | `proposerAddress` | present in `state.validators` |
 
 `version` was added in the proofs round (`RPC-SYNC-PROOFS.md` section 2.1): "validation rejects a header whose version differs from the state's. The first version with this header is 1."
@@ -314,9 +314,9 @@ export function blockHash(b: Block): Uint8Array {
 
 **`txHash(tx)`** is `sha256(tx)` over the raw transaction bytes, the id the mempool, the transaction index and the RPC all use (`RPC-SYNC-PROOFS.md` section 2.2).
 
-**`encodeCommit`**/**`decodeCommit`** write height, round, block hash and an array of optional signatures, each read back with `decodeSignature`, at most 10,000. **`commitHash(c)`** is `ZERO_HASH` for `null` (height 1) and otherwise the hash of the encoding. **`evidenceHash(evs)`** is `ZERO_HASH` for an empty list and otherwise the hash of the encoded array; it is the header field. The hash of *one* piece of evidence, used to announce it to peers by inventory, is a different function, `evidenceId(ev)` in `src/consensus/evidence.ts`. It was also called `evidenceHash` until review finding 48 renamed it, because two exported functions with one name and two meanings were a trap for readers even though no file imported both.
+**`encodeCommit`**/**`decodeCommit`** write height, round, block hash and an array of optional signatures, each read back with `decodeSignature`, at most `MAX_VALIDATORS` (2,000), one for each validator a set may hold. **`commitHash(c)`** is `ZERO_HASH` for `null` (height 1) and otherwise the hash of the encoding. **`evidenceHash(evs)`** is `ZERO_HASH` for an empty list and otherwise the hash of the encoded array; it is the header field. The hash of *one* piece of evidence, used to announce it to peers by inventory, is a different function, `evidenceId(ev)` in `src/consensus/evidence.ts`. It was also called `evidenceHash` until review finding 48 renamed it, because two exported functions with one name and two meanings were a trap for readers even though no file imported both.
 
-**`encodeBlock`**/**`decodeBlock`** compose the parts: header, transactions as length-prefixed `bytes`, the optional commit, and at most 1,000 evidence entries. The decoder's own limits are loose; the enforced bound is `limits.maxBlockBytes` on **`blockBytes(b)`**, the full encoding, which validation measures and which the proposer uses to budget transactions (review finding 15 made the proposer measure the block without transactions first and cap evidence at 16 per block).
+**`encodeBlock`**/**`decodeBlock`** compose the parts: header, transactions as length-prefixed `bytes`, the optional commit, and at most 1,000 evidence entries. The decoder's own limits are loose; the enforced bound is `limits.maxBlockBytes`, the chain's figure from the genesis (`consensus.maxBlockBytes`, below), on **`blockDataBytes(b)`**, the encoded size of the transactions array plus the evidence array: what the proposer chooses to put in the block. The header is of a fixed shape and the last commit has one signature for each validator, so neither is the proposer's to make smaller, and a limit that counted them could be one a large validator set cannot build an empty block under. Validation measures `blockDataBytes` and the proposer budgets its transactions with it (review finding 15 made the proposer measure before it reaps and cap evidence at 16 per block). **`blockBytes(b)`** is the full encoding, at most `maxBlockBytes` plus the header and the commit.
 
 ### src/types/evidence.ts
 
@@ -431,7 +431,7 @@ export function genesisState(genesis: Genesis, appHash: Uint8Array, validatorsOv
 ```ts
 export function nextState(state: ChainState, block: Block, updates: ValidatorUpdate[], appHash: Uint8Array, resultsHash: Uint8Array): ChainState {
   if (block.header.height !== state.lastHeight + 1n) throw new Error('nextState: height mismatch');
-  // The application refuses such a key in checkTx; a set that still carried one would halt here rather than sign with it.
+  // The applications refuse such a key themselves; an update that still carried one halts here rather than sign with it.
   for (const u of updates) if (schemeOf(u.publicKey) !== state.scheme) throw new Error(`validator update key is not a ${schemeName(state.scheme)} key`);
   const nextNext = state.nextValidators.applyUpdates(updates);
   nextNext.incrementProposerPriority(1);
@@ -451,7 +451,7 @@ export function nextState(state: ChainState, block: Block, updates: ValidatorUpd
 }
 ```
 
-The sets shift down one slot and the updates returned by executing block H are applied to the set that will sign H+2, which is the two-height delay from the Concepts section. An update whose key is of the other scheme throws first: the application already refuses such a consensus key at admission ([chapter 11](11-application.md)), so one reaching here is a bug, and halting is better than carrying a key of the wrong scheme into a set that every node on the chain takes to be of one scheme. `src/node/executor.ts` calls it as `nextState(this.state, block, res.validatorUpdates, res.appHash, resultsRoot(res.txResults))`.
+The sets shift down one slot and the updates returned by executing block H are applied to the set that will sign H+2, which is the two-height delay from the Concepts section. An update whose key is of the other scheme throws first: both applications already refuse such a key themselves (the core application at admission, [chapter 11](11-application.md), and the toy one in its `parse`, [chapter 5](05-mempool-executor.md)), so one reaching here is a bug, and halting is better than carrying a key of the wrong scheme into a set that every node on the chain takes to be of one scheme. `src/node/executor.ts` calls it as `nextState(this.state, block, res.validatorUpdates, res.appHash, resultsRoot(res.txResults))`.
 
 **`encodeState`**/**`decodeState`** persist the record. The field order is not the interface order: `chainId`, `lastHeight`, `lastBlockHash`, `lastBlockTime`, `appHash`, the three sets, only then `version` and `lastResultsHash`, the two fields the proofs round added, and last the scheme as a single `u8`, which `decodeState` reads back through the private `readScheme`:
 
@@ -480,8 +480,13 @@ export interface Genesis {
   genesisTime: bigint;
   /** The initial validator set, unless the application supplies one from initChain. */
   validators?: GenesisValidator[];
-  /** Engine settings: the protocol version and limits that must agree with the application's rules. */
-  consensus?: { maxEvidenceAgeMs?: bigint; version?: number };
+  /**
+   * Engine settings every node of the chain must hold alike: the protocol version, the evidence age (which must
+   * agree with the application's rules) and the most bytes the transactions and evidence of a block may encode to,
+   * 4 MiB when absent. A block over
+   * that size is invalid for everyone, so it is read from here and from nowhere else.
+   */
+  consensus?: { maxEvidenceAgeMs?: bigint; version?: number; maxBlockBytes?: number };
   /** Opaque to consensus; handed to the application's initChain. Empty when `appStateFile` is set. */
   appState: Uint8Array;
   /** The application genesis in its own file. Relative to the genesis file as written; absolute once loaded. */
@@ -489,9 +494,9 @@ export interface Genesis {
 }
 ```
 
-`signatureScheme` is the JSON field `"signatureScheme": "ml-dsa-44"` or `"secp256k1"`; absent means ML-DSA-44, so every genesis file written before there were two schemes keeps its meaning. `appStateFile` is the resolution of review finding 35: an application genesis of a few hundred thousand accounts, each with two 1,313-byte ML-DSA-44 keys, exceeds the 512 MB string limit V8 imposes on `JSON.parse`, so the application state can live in its own file that the application reads as a token stream.
+`signatureScheme` is the JSON field `"signatureScheme": "ml-dsa-44"` or `"secp256k1"`; absent means ML-DSA-44, so every genesis file written before there were two schemes keeps its meaning. `consensus.maxBlockBytes` is the most bytes the transactions and evidence of a block may encode to (the header and the last commit are not counted), and it is in the genesis because it is a rule of validity: `validateBlockStructure` ([chapter 4](04-consensus.md)) applies it to proposals, to blocks being committed and to synced blocks, so two nodes holding different figures would disagree about which blocks are valid. The node reads it from here and from nowhere else ([chapter 8](08-node.md)). **`MIN_BLOCK_BYTES`** (64 KiB, room for a transaction of some size), **`MAX_BLOCK_BYTES`** (16 MiB, inside one network frame with two commits of the largest validator set beside it) and **`DEFAULT_MAX_BLOCK_BYTES`** (4 MiB, used when the field is absent) bound it, and **`checkMaxBlockBytes(n)`** returns a whole number within those bounds or throws `genesis: consensus.maxBlockBytes must be a whole number from 65536 to 16777216`; a number written as a string is refused too. `appStateFile` is the resolution of review finding 35: an application genesis of a few hundred thousand accounts, each with two 1,313-byte ML-DSA-44 keys, exceeds the 512 MB string limit V8 imposes on `JSON.parse`, so the application state can live in its own file that the application reads as a token stream.
 
-**`genesisToJson(g)`** serializes with `bigint`s as decimal strings and keys as hex, writes `signatureScheme` when the genesis names one, omits `appState` when `appStateFile` is set, and otherwise emits `appState` decoded as a UTF-8 string. **`genesisFromJson(s, baseDir = '.')`** parses it back:
+**`genesisToJson(g)`** serializes with `bigint`s as decimal strings and keys as hex, writes `signatureScheme` when the genesis names one and `consensus.maxBlockBytes`, a plain number, when it sets one, omits `appState` when `appStateFile` is set, and otherwise emits `appState` decoded as a UTF-8 string. **`genesisFromJson(s, baseDir = '.')`** parses it back:
 
 ```ts
 export function genesisFromJson(s: string, baseDir = '.'): Genesis {
@@ -505,7 +510,7 @@ export function genesisFromJson(s: string, baseDir = '.'): Genesis {
     genesisTime: BigInt(j.genesisTime),
     validators: Array.isArray(j.validators) ? (j.validators as any[]).map((v) => ({ publicKey: fromHex(v.publicKey), power: BigInt(v.power), name: v.name })) : undefined,
     consensus: j.consensus
-      ? { maxEvidenceAgeMs: j.consensus.maxEvidenceAgeMs !== undefined ? BigInt(j.consensus.maxEvidenceAgeMs) : undefined, version: j.consensus.version }
+      ? { maxEvidenceAgeMs: j.consensus.maxEvidenceAgeMs !== undefined ? BigInt(j.consensus.maxEvidenceAgeMs) : undefined, version: j.consensus.version, ...(j.consensus.maxBlockBytes !== undefined ? { maxBlockBytes: checkMaxBlockBytes(j.consensus.maxBlockBytes) } : {}) }
       : undefined,
     appState: appStateFile ? new Uint8Array() : new TextEncoder().encode(typeof j.appState === 'string' ? j.appState : JSON.stringify(j.appState ?? {})),
     ...(appStateFile ? { appStateFile } : {}),
@@ -513,7 +518,7 @@ export function genesisFromJson(s: string, baseDir = '.'): Genesis {
 }
 ```
 
-`appState` may be written as a JSON string or as an inline object; either becomes bytes for the application. Validation is minimal: the chain id must be a non-empty string, `signatureScheme`, when present, must be a name the code knows (`schemeTag` throws `unknown signature scheme "x"; one of ml-dsa-44, secp256k1`), `fromHex` rejects malformed keys, and everything else is caught later by `ValidatorSet.create` (a tagged key of a known scheme, positive power), by `genesisState` (every key of the named scheme) or by the application. A bad `genesisTime` makes `BigInt()` throw a `SyntaxError` rather than a descriptive error. **`loadGenesisFile(path)`** reads the file and resolves `appStateFile` against its directory.
+`appState` may be written as a JSON string or as an inline object; either becomes bytes for the application. Validation is minimal: the chain id must be a non-empty string, `signatureScheme`, when present, must be a name the code knows (`schemeTag` throws `unknown signature scheme "x"; one of ml-dsa-44, secp256k1`), `consensus.maxBlockBytes`, when present, must pass `checkMaxBlockBytes`, `fromHex` rejects malformed keys, and everything else is caught later by `ValidatorSet.create` (a tagged key of a known scheme, positive power), by `genesisState` (every key of the named scheme) or by the application. A bad `genesisTime` makes `BigInt()` throw a `SyntaxError` rather than a descriptive error. **`loadGenesisFile(path)`** reads the file and resolves `appStateFile` against its directory.
 
 The CLI writes `genesis.json` with `genesisToJson` at `init` and loads it at `start`; the RPC's `genesis` method returns the same JSON without `appStateFile`, which is a path on the node's own disk.
 
@@ -577,7 +582,7 @@ A hash prints as its first six bytes, a `bigint` height as a number, a nil block
 
 **`test/units.test.ts`, `describe('validator set')`.** `picks proposers in proportion to voting power` creates a set with powers 1, 2 and 3, advances a copy one step 600 times and asserts the proposer counts are exactly 100, 200 and 300: the round-robin is fair and deterministic. `applies updates, hashes independently of priorities, and survives a codec round-trip` adds a third validator with `applyUpdates` and asserts its priority is negative, removes one with power 0, asserts removing it again throws `/unknown/`, advances a set three rounds and asserts `hash()` is unchanged, then encodes and decodes the advanced set and asserts the proposer and every priority survive.
 
-**`test/review.test.ts`, `rejects decoded validator sets with duplicate members, wrong order or a bad proposer index`** hand-encodes three malformed sets with the codec and asserts `ValidatorSet.decode` throws `/duplicate/`, `/out of order/` and `/proposer index/`. It is the regression for review finding 1. `test/review5-net.test.ts`, `has no proposer when it is empty, and says so in the one way create() does`, decodes the encoding of `ValidatorSet.create([])` and a hand-encoded empty set with index −1, and asserts that the same empty set with index 0, 5 or −2 throws `/proposer index out of range/`. `refuses validator powers whose total a priority could not track` calls `create` with two validators of 2^63 each and expects `/total power/`: the sum is above `MAX_TOTAL_POWER`. The same file's `keeps per-block results so a repeated transaction proves its real outcome at each position` builds a block whose `dataHash` is `txsRoot([raw, raw])`, stores it with results `[ok, duplicate failure]`, and asserts a result proof for position 1 verifies and says `ok: false` (review finding 18).
+**`test/review.test.ts`, `rejects decoded validator sets with duplicate members, wrong order or a bad proposer index`** hand-encodes three malformed sets with the codec and asserts `ValidatorSet.decode` throws `/duplicate/`, `/out of order/` and `/proposer index/`. It is the regression for review finding 1. `test/review5-net.test.ts`, `has no proposer when it is empty, and says so in the one way create() does`, decodes the encoding of `ValidatorSet.create([])` and a hand-encoded empty set with index −1, and asserts that the same empty set with index 0, 5 or −2 throws `/proposer index out of range/`. `refuses validator powers whose total a priority could not track` calls `create` with two validators of 2^63 each and expects `/total power/`: the sum is above `MAX_TOTAL_POWER`. `test/review5-node.test.ts`, `bounds a block by what its proposer chose, and a validator set by what a frame holds`, creates a set of `MAX_VALIDATORS` members, expects one more to throw `/2001 validators exceed the limit 2000/`, and checks that `MAX_BLOCK_BYTES` with two commits of 2,000 ML-DSA-44 signatures is less than `MAX_FRAME`; its first half, on `blockDataBytes`, is in [chapter 4](04-consensus.md). `test/review.test.ts`, `keeps per-block results so a repeated transaction proves its real outcome at each position`, builds a block whose `dataHash` is `txsRoot([raw, raw])`, stores it with results `[ok, duplicate failure]`, and asserts a result proof for position 1 verifies and says `ok: false` (review finding 18).
 
 **`test/txproof.test.ts`.** `proves inclusion against the data hash and rejects tampering` uses seven small transactions: the empty root is `EMPTY`; every position's proof verifies, survives a byte round-trip, and fails with a different transaction, a different index, a path one sibling longer or one shorter, an index eight too high (one the path's length cannot address), an index of −1 and a root over six transactions; reversing the list changes the root. `proves results, including failures, against the results hash` does the same for results with every third one failing, and asserts flipping `ok` or appending to `error` breaks the proof.
 
@@ -602,10 +607,10 @@ Known simplifications:
 - `ValidatorSet.hash()` excludes priorities and the proposer index (`DESIGN.md` section 10). A state-syncing node checks that the sets it receives pick the proposers the chain actually used, and nothing more; review finding 8 records the residual risk.
 - Only duplicate-vote evidence exists. Amnesia evidence is deferred (`DESIGN.md` section 10).
 - Votes carry no timestamp, so there is no BFT time; block time is the proposer's word, bounded by validation's clock-drift window.
-- Proposals carry whole blocks; there are no block parts, so a block must fit in one p2p frame.
+- Proposals carry whole blocks; there are no block parts, so a block must fit in one p2p frame. The bounds on a block's transactions and evidence (16 MiB) and on a validator set (2,000) are what make it fit.
 - `decodeVote` and `decodeProposal` do not range-check `round`, `validatorIndex` or `polRound`, beyond refusing a `polRound` too large to hold exactly; consensus does, after decoding.
 - A `TxProof` does not say how many transactions its block has; the root commits to the tree's height and not to the count.
-- `genesisFromJson` validates little beyond the chain id and the scheme name; bad keys and powers surface later with less helpful messages.
+- `genesisFromJson` validates little beyond the chain id, the scheme name and the block size; bad keys and powers surface later with less helpful messages.
 - `src/types/state.ts` imports `EMPTY` from the database and `src/types/txproof.ts` imports `TxResult` from the application interface, so the types layer is not quite the bottom of the dependency graph.
 
 Exercises:

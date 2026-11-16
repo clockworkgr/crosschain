@@ -21,7 +21,7 @@ import { KvStoreApp } from '../src/app/kvstore.ts';
 import { Reader } from '../src/codec/reader.ts';
 import { Writer } from '../src/codec/writer.ts';
 import { toHex } from '../src/crypto/hash.ts';
-import { DEFAULT_SCHEME, keyPairFromSeed, schemeName, type KeyPair } from '../src/crypto/keys.ts';
+import { DEFAULT_SCHEME, keyPairFromSeed, Scheme, schemeName, type KeyPair } from '../src/crypto/keys.ts';
 import { InlineVerifier } from '../src/crypto/verifier.ts';
 import { ObjectDatabase } from '../src/db/database.ts';
 import { objectId, type ObjectId } from '../src/db/id.ts';
@@ -425,6 +425,16 @@ describe('the toy application and its validator set', () => {
     r = await run(app, 3n, [val(alice, 0), val(bob, 0)]);
     expect(r.txResults.map((t) => t.ok)).toEqual([true, false]);
     expect(r.validatorUpdates).toEqual([{ publicKey: alice.publicKey, power: 0n }]);
+  });
+
+  it('refuses a validator key of another scheme than the set\'s', async () => {
+    const app = new KvStoreApp();
+    await app.initChain(genesis);
+    const other = keyPairFromSeed(seedFor('r5a/kv/other'), DEFAULT_SCHEME === Scheme.mlDsa44 ? Scheme.secp256k1 : Scheme.mlDsa44);
+    expect((await app.checkTx(val(other, 5))).error).toMatch(/key must be a .* key/);
+    const r = await run(app, 1n, [val(other, 5), val(bob, 5)]);
+    expect(r.txResults.map((t) => t.ok)).toEqual([false, true]);
+    expect(r.validatorUpdates).toEqual([{ publicKey: bob.publicKey, power: 5n }]);
   });
 
   it('has its validator set back from its file', async () => {

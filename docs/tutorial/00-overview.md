@@ -14,10 +14,11 @@ made, with [STAKING.md](../../STAKING.md), [FEES.md](../../FEES.md),
 [RPC-SYNC-PROOFS.md](../../RPC-SYNC-PROOFS.md) and [STATE-PAGING.md](../../STATE-PAGING.md) as
 the detailed specifications it points to.
 [REVIEW-2026-10-28.md](../../REVIEW-2026-10-28.md) records an external review and what each
-finding changed; the tutorial refers to findings by number. The test suite is 29 files and 268
+finding changed; the tutorial refers to findings by number. The test suite is 29 files and 276
 tests; `npm test` runs it under ML-DSA-44 and `CHAIN_SCHEME=secp256k1 npm test` runs it again
-under secp256k1, the other signature scheme a genesis may choose; `INDEX_TREES=0` and `TREES=0`
-run it with the object database's index trees or Merkle trees dropped from the start, the
+under secp256k1, the other signature scheme a genesis may choose, where 275 run and one is
+skipped; `INDEX_TREES=0` and `TREES=0` run it with the object database's index trees or Merkle
+trees dropped from the start, the
 fallbacks STATE-PAGING.md describes.
 
 ## What a node is made of
@@ -93,11 +94,15 @@ it and chapter 11 the one real application behind it.
 6. Validators prevote and precommit; at more than two thirds of precommits the block is decided
    and the commit (the precommit signatures) is attached ([04](04-consensus.md)).
 7. The executor calls `finalizeBlock` first: the application undoes the pending session, prunes
-   expired transactions, runs begin-block staking steps, verifies any uncached signatures in one
-   batch, evaluates each transaction in order inside its own session, runs end-block (proposals,
-   the active set), writes the dynamic properties, and computes the root; all of it inside one
-   block session committed just before the root is taken, so a failure half way leaves the
-   database as the previous block left it. Only then does the executor save the block, commit,
+   expired transactions, runs begin-block staking steps, verifies in one batch the uncached
+   signatures whose keys the state before the block already holds, evaluates each transaction in order
+   inside its own session (checking there any signature whose key an earlier transaction of the
+   block introduced), runs end-block (proposals, the active set), writes the dynamic properties,
+   and computes the root; all of it inside one block session committed just before the root is
+   taken, so a failure while that session is open is undone and leaves the database as the
+   previous block left it. A failure while the root is taken can no longer be undone in memory:
+   the application refuses further checks and blocks until the node is restarted, and the store
+   still holds the state of the previous block. Only then does the executor save the block, commit,
    results and validator sets in one store batch and call `commit`, which writes the
    application's changes to LMDB ([05](05-mempool-executor.md), [11](11-application.md),
    [09](09-database.md), [10](10-store.md)).
@@ -172,7 +177,7 @@ the concepts of the ones before it.
 12. [RPC](12-rpc.md): JSON-RPC methods, event streams, limits, the client.
 13. [Light client](13-light-client.md): verifying headers and queries with proofs.
 14. [Wallet and CLI](14-wallet-cli.md): the keystore and the command line.
-15. [Tests](15-tests.md): the harness, every suite (29 files, 268 tests, run under either
+15. [Tests](15-tests.md): the harness, every suite (29 files, 276 tests, run under either
     signature scheme and with the database's trees resident or dropped), and how to write a new
     test.
 

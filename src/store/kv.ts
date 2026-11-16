@@ -32,7 +32,8 @@ export interface KvEnv {
   /**
    * Run writes to several stores of this environment as one transaction: on
    * disk they all land or none does, whatever happens in between. In memory
-   * each store's write lands on its own; there is no crash to recover from.
+   * there is no crash to recover from, but a throw out of `fn` still undoes
+   * what the stores took inside it.
    */
   transaction(fn: () => void): void;
   close(): Promise<void>;
@@ -70,9 +71,41 @@ export class MemoryKv implements KvStore {
     const ops: [Uint8Array, Uint8Array | null][] = [];
     fn({ put: (k, v) => void ops.push([k.slice(), v.slice()]), del: (k) => void ops.push([k.slice(), null]) });
     for (const [k, v] of ops) {
+      // Inside an environment's transaction, what each key held before is kept so the transaction can be undone.
+      this.undo?.push([k, this.tree.get(k) ?? null]);
       if (v) this.tree.set(k, v);
       else this.tree.delete(k);
     }
+  }
+
+  private undo: [Uint8Array, Uint8Array | null][] | null = null;
+
+  /** Start keeping what writes replace. */
+  begin(): void {
+    this.undo = [];
+  }
+
+  /** How much has been kept so far: a place a transaction inside this one can go back to. */
+  mark(): number {
+    return this.undo?.length ?? 0;
+  }
+
+  /** Put back everything written since `mark`, newest first. */
+  rollbackTo(mark: number): void {
+    const undo = this.undo;
+    if (!undo) return;
+    for (let i = undo.length - 1; i >= mark; i--) {
+      const [k, v] = undo[i]!;
+      if (v) this.tree.set(k, v);
+      else this.tree.delete(k);
+    }
+    undo.length = mark;
+  }
+
+  /** Stop keeping it; with `rollback`, first put everything back. */
+  end(rollback: boolean): void {
+    if (rollback) this.rollbackTo(0);
+    this.undo = null;
   }
 
   get size(): number {
@@ -85,12 +118,45 @@ export class MemoryEnv implements KvEnv {
 
   store(name: string): KvStore {
     let s = this.stores.get(name);
-    if (!s) this.stores.set(name, (s = new MemoryKv()));
+    if (!s) {
+      this.stores.set(name, (s = new MemoryKv()));
+      if (this.depth > 0) s.begin(); // first asked for inside a transaction: part of it
+    }
     return s;
   }
 
+  private depth = 0;
+
+  /**
+   * All the stores' writes inside `fn`, or none of them if it throws: the same promise the disk environment makes.
+   * A transaction inside another is part of it, and if it throws, its own writes are undone there and then, so an
+   * outer one that catches the error and goes on keeps only what it wrote itself.
+   */
   transaction(fn: () => void): void {
-    fn();
+    if (this.depth > 0) {
+      const marks = new Map([...this.stores.values()].map((s) => [s, s.mark()]));
+      this.depth++;
+      try {
+        fn();
+      } catch (e) {
+        // A store first asked for inside has no mark: all it holds of this transaction goes.
+        for (const s of this.stores.values()) s.rollbackTo(marks.get(s) ?? 0);
+        throw e;
+      } finally {
+        this.depth--;
+      }
+      return;
+    }
+    this.depth++;
+    for (const s of this.stores.values()) s.begin();
+    let failed = true;
+    try {
+      fn();
+      failed = false;
+    } finally {
+      this.depth--;
+      for (const s of this.stores.values()) s.end(failed);
+    }
   }
 
   async close(): Promise<void> {}

@@ -115,6 +115,12 @@ and cached, because signing is the slow part of setting up.
   then 1,246 and 1,348 for the two window settings at 514,008 accounts. One pair agreed to a
   part in a thousand (1,689 and 1,687). So a difference of less than a tenth between two node
   runs is not read as a difference here. The suites were run once under each scheme.
+- **A short benchmark can measure the compiler.** The empty-block row of section 4.5 read 175
+  microseconds in some runs and 450 in others while it timed twenty blocks after the full
+  ones: the engine was running code compiled for the full blocks, or had just discarded it and
+  not yet compiled it again. It now runs 1,000 untimed blocks first, and its figure is from a
+  run made after the batch (section 4.5). A row measured over few iterations straight after
+  different work is open to the same effect.
 - **The tables are copied from one run's output.** The runner prints the machine, the date and
   its tables and saves nothing itself, so a figure here is an observation on that day, not a
   constant: rerun and compare before relying on one.
@@ -167,11 +173,15 @@ Hashing 2.5 KB is two to three orders of magnitude cheaper than signing or verif
 
 A signed transfer is 2,510 bytes under ML-DSA-44: a 41-byte operation, 48 bytes of framing and
 signer address, and a 2,421-byte signature, tag included; under secp256k1 the signature is 65
-bytes and the transfer 154. The suite's estimate of how many fit a 4 MiB block, 1,667,
-subtracts a 2 KiB shell; the proposer measures the real shell (header, previous commit,
-evidence; about 10 KiB with four signatures) and keeps 1 KiB spare, so the count depends on the
-validator set and the evidence, and the four-validator network in section 4.6 filled a block
-with 1,663. Encoding and decoding are about a microsecond each and never matter.
+bytes and the transfer 154. The suite's line `transfers per block at the
+default limit, less the 1 KiB the builder leaves` reads 1,667 (26,539 under secp256k1): 4.00 MiB
+of transactions and evidence; the header and the commit are not counted. That is the builder's
+own sum, since the limit is on what the proposer chooses and the builder gives the transactions
+the limit less the evidence and 1 KiB, so the count no longer depends on the validator set, only
+on the evidence. In a network run made after that change the largest block held 1,667 transfers,
+the codec's figure exactly, and encoded to 4.01 MiB with its header and commit. The batch's run
+in section 4.6 was made under the earlier rule, which counted the header and the commit (about
+10 KiB with four signatures) against the limit, and filled a block with 1,663. Encoding and decoding are about a microsecond each and never matter.
 
 ### 4.3 db
 
@@ -266,7 +276,7 @@ memory and to LMDB. The genesis has 1,001 accounts; transfers are pre-signed.
 | finalizeBlock 500 transfers, cold, worker pool | 5,768 | 87 ms |
 | finalizeBlock 500 transfers, warm (signatures cached by checkTx) | 25,000 | 20 ms |
 | finalizeBlock 1,500 transfers, warm (about 3.6 MiB with a block shell) | 23,600 | 64 ms |
-| finalizeBlock, empty block | 5,590 | 0.18 ms |
+| finalizeBlock, empty block (after 1,000 untimed ones) | 3,501 | 0.29 ms (median 0.27 ms, p99 0.58 ms) |
 | commit to memory (after a 500-transfer block) | 293 | 3.4 ms |
 | commit to LMDB (after a 500-transfer block) | 102 | 9.9 ms |
 
@@ -289,7 +299,17 @@ transfer leaves a recent transaction id, which has two indices; the balances cha
 and at 1,001 accounts its chunks cost nothing measurable. Commit to memory carries the same
 bookkeeping: 2.6 ms in that earlier build, 3.1 to 3.9 ms when the change was measured, 3.4 ms
 in this batch. An empty block took 32 microseconds when an earlier build was measured and takes
-0.18 ms here, over twenty iterations.
+0.29 ms here (286 microseconds at the mean, 273 at the median, 576 at the 99th percentile), over
+500 iterations that follow 1,000 untimed ones. That row is from a run made after the batch, with
+the benchmark changed, because the one it replaces did not measure one thing. It timed twenty
+empty blocks straight after the full blocks, and from run to run it read about 175 microseconds
+(5,590 a second, the figure this table carried) or about 450 (2,200 a second). The cause is the
+state of the JavaScript engine's compiler, not the chain. The functions an empty block runs
+were compiled while the full blocks ran, for what those blocks did. The first twenty or so
+empty blocks run that code; then the engine discards it and they run unoptimised, until about
+600 blocks later the functions are compiled again for what an empty block does. With the
+optimising compilers switched off the time is flat. Twenty iterations caught the first state or
+the second, by chance; the benchmark now measures the third.
 
 ### 4.6 network
 
@@ -298,14 +318,16 @@ Whole nodes: four validators on the in-memory transport, then a fifth node catch
 | measurement | value |
 |---|---|
 | engine only, empty blocks, commit timeout 50 ms | 8.9 blocks/s, 113 ms per block |
-| core app, 6,000 transfers submitted to one node, until all committed | 5.9 s: 1,014 tx/s, 7 blocks, 857 txs per block on average, largest 1,663 txs (4.00 MiB) |
+| core app, 6,000 transfers submitted to one node, until all committed | 5.9 s: 1,014 tx/s, 7 blocks, 857 txs per block on average, largest 1,663 txs (4.00 MiB; the limit then counted the header and the commit, and a full block now holds 1,667 and encodes to 4.01 MiB) |
 | submitted / rejected / failed / left queued | 6,000 / 0 / 0 / 0 |
 | block sync, 9 blocks holding 6,000 transfers | 1.8 s: 5.1 blocks/s, 3,419 tx/s; app hash not compared in this run, the two nodes being at heights 9 and 13 when the benchmark looked. As it stands the benchmark always compares: it stops the synced node, waits up to 30 s for a validator to hold the block after the synced node's height, and holds the synced app hash against the app hash in that block's header, failing on a disagreement |
 
 Analysis. With the test timeouts a height takes 113 ms: the commit timeout of 50 ms plus three
 message rounds with signing at each. Under load the network committed 1,014 transfers a second,
 seven blocks at 1.18 a second; the largest was full at 1,663 transfers and the average held
-857. A full block is the limit block space sets: each node admits the transfers at pool speed
+857. (The limit then counted the header and the commit. It is now on the transactions and the
+evidence alone, and in a run made after that change a full block held 1,667 transfers, the
+codec's figure exactly, and encoded to 4.01 MiB with its header and commit.) A full block is the limit block space sets: each node admits the transfers at pool speed
 and the proposer fills the 4 MiB. Only one of the seven blocks was full, so the run's rate is
 below that ceiling, and the run does not separate what held the other blocks short of it.
 Raising the block size raises the ceiling and lowering the commit timeout the cadence; neither
@@ -400,13 +422,14 @@ machine, same batch, same method; the crypto rows are in section 4.1. What chang
 | benchmark | ML-DSA-44 | secp256k1 |
 |---|---:|---:|
 | signed transfer | 2,510 B | 154 B |
-| transfers per 4 MiB block, estimate | 1,667 | 26,533 |
+| transfers per block at the default limit, less the 1 KiB the builder leaves | 1,667 | 26,539 |
 | checkTx on the worker pool, 32 in flight | 5,799/s | 8,709/s |
 | finalizeBlock 500 transfers, cold, worker pool | 5,768/s | 7,330/s |
 | finalizeBlock 500 transfers, warm | 25,029/s, 20.0 ms a block | 17,239/s, 29.0 ms a block (median 20.1 ms) |
 | finalizeBlock 1,500 transfers, warm | 23,564/s | 29,678/s |
+| finalizeBlock, empty block (after 1,000 untimed ones; run after the batch, section 4.5) | 3,501/s, 286 microseconds (median 273, p99 576) | 3,443/s, 290 microseconds (median 277, p99 554) |
 | saveBlock, 500 transfers with results and index | 9.2 ms (1.2 MiB) | 8.1 ms (75 KiB) |
-| network: 6,000 transfers submitted to one node | 5.9 s, 1,014 tx/s, 7 blocks, the largest full at 1,663 | 4.1 s, 1,450 tx/s, 6 blocks, the largest 2,830 transfers (437 KiB) |
+| network: 6,000 transfers submitted to one node | 5.9 s, 1,014 tx/s, 7 blocks, the largest full at 1,663 (1,667 under the present rule) | 4.1 s, 1,450 tx/s, 6 blocks, the largest 2,830 transfers (437 KiB) |
 | block sync of those blocks | 3,419 tx/s | 5,647 tx/s |
 | genesis of 192,000 accounts: parse | 6.5 s at 154 MiB/s | 2.2 s at 25 MiB/s |
 | genesis: build (apply, root, persist) | 11.4 s | 7.9 s |
@@ -1225,11 +1248,23 @@ a slow run: the third of them had CPU profiles of thirty seconds near its start 
 end (`BENCH_PAGING_PROFILE`) and showed no decline, and its two profiles were alike, the main
 thread busy throughout, the collector 1.9 seconds of the thirty early and 2.2 late with the
 heap grown from about 700 to 980 MiB, the signature cache 0.2 and 0.4 seconds once it is full
-and every new transaction evicts an old one. The profile was not repeated in this batch, so the
-batch shows a decline at this limit and does not show its cause. What it does record beside the
-rate is the collector, 1.0 to 1.3 seconds of every twenty in the first two minutes and 1.2 to
-1.4 in the last two, with the heap grown from 404 to 990 MiB: about a hundredth more of the
-time, against a rate a quarter lower.
+and every new transaction evicts an old one. The profile was not repeated in that batch. A run
+made after it, with the same limit and the two profiles, shows the cause, and it is not the
+heap. The run committed 1,590 a second over its ten minutes, 1,750 to 1,800 in its first half
+minute and 1,450 to 1,640 in its last minute. Its first half minute is the only part with the
+Merkle trees in memory: at 39 seconds the heap reached `warn` (1,046 of 1,488 MiB), the trees
+and the window were dropped, and from 76 seconds on the node stayed paged for want of room to
+rebuild, so from there it is the same node as the rows at 0.8 and 1.0 times with a larger
+heap. Between the two profiles the time the main thread spends inside the store's commit
+(lmdb-js's `finishTxn`, the native call that writes a block's pages) doubles, 2.4 seconds of
+the thirty early and 4.9 late, with `fsync` 2.3 and 2.5 beside it; the collector is 2.2 and
+2.1, and signing the feeder's transfers on the same thread 8.1 and 7.0. The store grows by
+some 950,000 transfers, their blocks and their history entries over the run, and a commit into
+the larger store costs more: about a twelfth more of the main thread's time, which is the size
+of the decline. The paged rows decline the same way over their ten minutes; they were not
+profiled, and the same growth is the likely reason. What differs at 2.5 times is the start, which is faster while the trees are resident,
+so the fall from the first window to the last is larger there. The 1,366 to 1,511 the batch's
+run read at its end and the 1,450 to 1,640 of this one are the spread between two runs.
 
 The window in memory, measured directly. `retain.memoryVersions` sets how many of the provable
 versions a node keeps in memory, the store answering for the rest. The node that never reaches
@@ -1427,9 +1462,10 @@ block's finalize even gets faster without the B+ tree updates, 39.6 ms against 4
   key an earlier transaction of the same block introduces is verified in the per-transaction
   pass). A node admits 5,800 ML-DSA-44 or 8,700 secp256k1 transfers a second on eleven threads;
   a network of such nodes cannot commit more than its block space allows.
-- **Block space is the ceiling of the live network, and the runs were below it.** About 1,660
-  transfers per 4 MiB block (1,663 with four validators' commit in the shell) at about one
-  block a second with these timeouts. The run of section 4.6 committed 1,014 a second in seven
+- **Block space is the ceiling of the live network, and the runs were below it.** A full block
+  holds 1,667 transfers, the codec's figure exactly, and encodes to 4.01 MiB with its header and
+  commit (1,663 in the batch's run, when the 4 MiB limit counted the header and the commit), at
+  about one block a second with these timeouts. The run of section 4.6 committed 1,014 a second in seven
   blocks that held 857 transfers on average, one of them full, and the secp256k1 run 1,450 a
   second with its largest block at 437 KiB of the 4 MiB (section 4.9). So block space is a
   limit these runs reached in one block, not what set their rates, and what did set them end

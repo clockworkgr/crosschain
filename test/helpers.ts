@@ -41,6 +41,8 @@ export interface TestnetOptions {
   dataDirFor?: (i: number) => string | null;
   timeouts?: Partial<typeof FAST_TIMEOUTS>;
   limits?: Partial<ValidationLimits>;
+  /** The chain's engine settings, written to the genesis. */
+  consensus?: Genesis['consensus'];
   /** Indices to create but not start. */
   skipStart?: number[];
   /** The chain's signature scheme; CHAIN_SCHEME from the environment, else ML-DSA-44. */
@@ -85,6 +87,7 @@ export async function makeTestnet(opts: TestnetOptions): Promise<Testnet> {
       opts.engineValidators === false
         ? undefined
         : validatorKeys.map((publicKey, i) => ({ publicKey, power: opts.powers?.[i] ?? 10n, name: `val${i}` })),
+    ...(opts.consensus ? { consensus: opts.consensus } : {}),
     appState: new TextEncoder().encode(appState),
   };
 

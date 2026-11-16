@@ -56,6 +56,8 @@ export interface BlockStore {
   saveState(state: ChainState): void;
   loadValidatorSet(hash: Uint8Array): ValidatorSet | null;
   saveValidatorSet(set: ValidatorSet): void;
+  /** Remove a set by hash; the caller has found that no header still held and no state names it. */
+  deleteValidatorSet(hash: Uint8Array): void;
   /** The exact set, priorities included, that signs a height. */
   loadValidatorsAt(height: bigint): ValidatorSet | null;
   saveValidatorsAt(height: bigint, set: ValidatorSet): void;
@@ -267,7 +269,8 @@ export class KvBlockStore implements BlockStore {
       w.del(hashKey(blockHash(stored.block)));
       w.del(resultsKey(height));
       // The set by height serves a state-sync join at a snapshot height, which needs the block of that height too:
-      // without the block the record answers nothing. Sets by hash stay; headers still held name them.
+      // without the block the record answers nothing. Sets by hash are the executor's to remove, once no header
+      // still held names them.
       w.del(valsetAtKey(height));
       for (const tx of stored.block.txs) w.del(txKey(txHash(tx), height));
     });
@@ -280,6 +283,10 @@ export class KvBlockStore implements BlockStore {
 
   saveValidatorSet(set: ValidatorSet): void {
     this.write((w) => w.put(valsetKey(set.hash()), encode((wr) => set.encode(wr))));
+  }
+
+  deleteValidatorSet(hash: Uint8Array): void {
+    this.write((w) => w.del(valsetKey(hash)));
   }
 
   loadValidatorsAt(height: bigint): ValidatorSet | null {

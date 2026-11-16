@@ -63,7 +63,7 @@ export function genesisState(genesis: Genesis, appHash: Uint8Array, validatorsOv
 /** The state after committing `block`, given the app's response to executing it. */
 export function nextState(state: ChainState, block: Block, updates: ValidatorUpdate[], appHash: Uint8Array, resultsHash: Uint8Array): ChainState {
   if (block.header.height !== state.lastHeight + 1n) throw new Error('nextState: height mismatch');
-  // The application refuses such a key in checkTx; a set that still carried one would halt here rather than sign with it.
+  // The applications refuse such a key themselves; an update that still carried one halts here rather than sign with it.
   for (const u of updates) if (schemeOf(u.publicKey) !== state.scheme) throw new Error(`validator update key is not a ${schemeName(state.scheme)} key`);
   const nextNext = state.nextValidators.applyUpdates(updates);
   nextNext.incrementProposerPriority(1);

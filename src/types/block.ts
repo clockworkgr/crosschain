@@ -3,6 +3,7 @@ import { Writer, encode } from '../codec/writer.ts';
 import { HASH_SIZE, ZERO_HASH, sha256 } from '../crypto/hash.ts';
 import { ADDRESS_SIZE, decodeSignature } from '../crypto/keys.ts';
 import { decodeEvidence, encodeEvidence, type DuplicateVoteEvidence } from './evidence.ts';
+import { MAX_VALIDATORS } from './validator.ts';
 
 /**
  * Block header. Execution is deferred by one block: `appHash` and
@@ -114,7 +115,7 @@ export function decodeCommit(r: Reader): Commit {
     height: r.u64(),
     round: r.u32(),
     blockHash: r.fixed(HASH_SIZE),
-    signatures: r.array((r) => r.option(decodeSignature), 10_000),
+    signatures: r.array((r) => r.option(decodeSignature), MAX_VALIDATORS),
   };
 }
 
@@ -142,6 +143,19 @@ export function decodeBlock(r: Reader): Block {
     lastCommit: r.option(decodeCommit),
     evidence: r.array(decodeEvidence, 1000),
   };
+}
+
+/**
+ * The bytes of what a proposer chooses to put in a block: its transactions and its evidence, as the block encodes
+ * them. The chain's block size limit is on this. The header is of a fixed shape and the last commit has one
+ * signature for each validator, so neither is the proposer's to make smaller, and a limit that counted them
+ * could be one a large validator set cannot build an empty block under.
+ */
+export function blockDataBytes(b: Pick<Block, 'txs' | 'evidence'>): number {
+  return encode((w) => {
+    w.array(b.txs, (w, tx) => w.bytes(tx));
+    w.array(b.evidence, encodeEvidence);
+  }).length;
 }
 
 export function blockBytes(b: Block): Uint8Array {

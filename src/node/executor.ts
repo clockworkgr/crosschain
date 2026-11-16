@@ -119,12 +119,27 @@ export class BlockExecutor {
     return this.d.store.loadBlock(h)?.block.header ?? this.d.store.loadHeader(h);
   }
 
+  /**
+   * Whether validatorSetAtHeight(h) is the set with the proposer that height had: the three sets the state holds,
+   * or a record kept by height. A block that was backfilled, or a header kept alone, has only the record by hash.
+   */
+  hasProposerAt(h: bigint): boolean {
+    const last = this.state.lastHeight;
+    return (h >= last && h <= last + 2n) || this.d.store.loadValidatorsAt(h) !== null;
+  }
+
   /** The set that signs (or signed) height h. */
   validatorSetAtHeight(h: bigint): ValidatorSet | null {
     const s = this.state;
     if (h === s.lastHeight + 1n) return s.validators;
     if (h === s.lastHeight + 2n) return s.nextValidators;
     if (h === s.lastHeight) return s.lastValidators;
+    // The record kept by height is the set as that height had it, proposer and priorities included. The record by
+    // hash names the same members and powers (the hash covers no more) and is rewritten as later heights save it,
+    // so its proposer is a later one: it answers for a height whose own record is gone, which is enough to check
+    // signatures with.
+    const at = this.d.store.loadValidatorsAt(h);
+    if (at) return at;
     const header = this.headerAt(h);
     if (!header) return null;
     return this.d.store.loadValidatorSet(header.validatorsHash);
@@ -251,12 +266,52 @@ export class BlockExecutor {
     const age = this.d.evidenceAgeMs?.();
     // The time before which evidence can no longer name a height, as of the latest block.
     const oldest = age === undefined ? null : this.state.lastBlockTime - age;
-    this.pruneBlocks(oldest);
-    this.pruneHeaders(oldest);
+    // The validator sets the removed heights were signed by; one that nothing left names goes with them.
+    const sets = new Map<string, Uint8Array>();
+    this.pruneBlocks(oldest, sets);
+    this.pruneHeaders(oldest, sets);
+    this.pruneValidatorSets(sets);
+  }
+
+  /** Where a set was last found named by a header still held, so the search is not made again while that header stays. */
+  private readonly setNamedAt = new Map<string, bigint>();
+
+  /**
+   * Remove the sets, stored by hash, that no header still held and no state names. A set usually outlives the
+   * heights removed (the height above them has the same one), which the first header looked at shows; only a set
+   * that changed at the boundary costs a walk over the headers held, and what the walk finds is remembered.
+   */
+  private pruneValidatorSets(sets: Map<string, Uint8Array>): void {
+    if (sets.size === 0) return;
+    const st = this.state;
+    const bottom = this.d.store.lowestHeaderHeight() ?? this.d.store.lowestHeight();
+    const gone: Uint8Array[] = [];
+    for (const [k, hash] of sets) {
+      if ([st.validators, st.nextValidators, st.lastValidators].some((v) => bytesEqual(v.hash(), hash))) continue;
+      const known = this.setNamedAt.get(k);
+      if (known !== undefined && known >= bottom) continue;
+      let namedAt: bigint | null = null;
+      for (let h = bottom; h <= st.lastHeight; h++) {
+        const header = this.d.store.loadHeader(h) ?? this.d.store.loadBlock(h)?.block.header;
+        if (header && (bytesEqual(header.validatorsHash, hash) || bytesEqual(header.nextValidatorsHash, hash))) {
+          namedAt = h;
+          break;
+        }
+      }
+      if (namedAt === null) {
+        this.setNamedAt.delete(k);
+        gone.push(hash);
+      } else this.setNamedAt.set(k, namedAt);
+    }
+    if (gone.length === 0) return;
+    this.d.store.batch(() => {
+      for (const hash of gone) this.d.store.deleteValidatorSet(hash);
+    });
+    this.d.log('debug', 'pruned validator sets', { count: gone.length });
   }
 
   /** Drop blocks older than the retention window, never past the newest snapshot nor into the evidence window. */
-  private pruneBlocks(oldest: bigint | null): void {
+  private pruneBlocks(oldest: bigint | null, sets: Map<string, Uint8Array>): void {
     const keep = this.d.retainBlocks;
     if (keep === undefined) return;
     let floor = this.state.lastHeight - BigInt(keep);
@@ -271,14 +326,18 @@ export class BlockExecutor {
     }
     // One transaction for the pass: the blocks go with the marker that says they are gone, or none of it does.
     this.d.store.batch(() => {
-      for (let h = lowest; h < floor; h++) this.d.store.deleteBlock(h);
+      for (let h = lowest; h < floor; h++) {
+        const hash = this.d.store.loadBlock(h)?.block.header.validatorsHash;
+        if (hash) sets.set(toHex(hash), hash);
+        this.d.store.deleteBlock(h);
+      }
       this.d.store.setLowestHeight(floor);
     });
     this.d.log('debug', 'pruned blocks', { below: floor });
   }
 
   /** Headers kept alone below the lowest block serve evidence checks; once older than evidence may be, they go too. */
-  private pruneHeaders(oldest: bigint | null): void {
+  private pruneHeaders(oldest: bigint | null, sets: Map<string, Uint8Array>): void {
     if (oldest === null) return;
     const lowest = this.d.store.lowestHeaderHeight();
     if (lowest === null) return;
@@ -289,7 +348,11 @@ export class BlockExecutor {
     if (h === lowest) return;
     // One transaction for the pass, as for blocks.
     this.d.store.batch(() => {
-      for (let d = lowest; d < h; d++) this.d.store.deleteHeader(d);
+      for (let d = lowest; d < h; d++) {
+        const hash = this.d.store.loadHeader(d)?.validatorsHash;
+        if (hash) sets.set(toHex(hash), hash);
+        this.d.store.deleteHeader(d);
+      }
       this.d.store.setLowestHeaderHeight(h < top ? h : null);
     });
     this.d.log('debug', 'pruned headers', { below: h });

@@ -232,7 +232,7 @@ mempool's lowered limit being its throttle then.
 | header | height? | header; below the lowest retained block, a header the node keeps alone (section 4.2), where `block` and `commit` answer `-32001` |
 | block | height? | header, transactions (hex), lastCommit, evidence, and the block's own commit |
 | commit | height? | the commit for that height |
-| validators | height? | the set that signs that height: hash, total power, proposer address, members with address, public key and power (no priorities) |
+| validators | height? | the set that signs that height: hash, total power, proposer address (`null` for a height whose set the node holds only by hash, a backfilled block or a header kept alone), members with address, public key and power (no priorities) |
 | validatorSet | hash | a set by hash, same shape |
 | object | id, height?, prove? | type, height, the object as of that height or null, with `proof` hex when asked |
 | key | type, index, key (hex), height?, prove? | `{ height, id, proof? }`: the object id the key mapped to at `height` (`"type.n"`) or null, read from the key proof at `height`, which is returned when asked |
@@ -279,7 +279,9 @@ when it matures). Both are answered for any height the node holds: to the ids th
 index gives now are added, at a past height, those of the type that a later height
 created, changed or removed (`ObjectDatabase.changedSince`), and each is read as of
 the height and kept if it existed then and belongs to the validator, or to the
-delegator and the validator. At the latest height that is the index scan alone; at a
+delegator and the validator. At the latest height that is the index scan and the
+objects of the type that an open session (the block in progress) has removed, which
+the committed answer still holds; at a
 past height it costs one read as of the height for each object of the type changed
 since, and for a height older than the window in memory one history record, read
 once and decoded, for each height between the one asked for and the window.
@@ -556,7 +558,10 @@ or until the item arrives or every peer asked has said it lacks it), in
 batches of 256. A fetch is remembered by kind and hash for one minute from the first
 time it is sent, whatever is asked after; a node remembers 20,000 at most and 2,048
 for one peer, and asks a peer at its limit nothing more until answers or expiry free
-places. An `item` is processed only when its hash was fetched from the peer
+places. When the 20,000 are in use only the hash there is no place for is passed over,
+not the rest of the announcement, and a peer that disconnects is taken out of every
+fetch still outstanding, so what it announces after it reconnects is asked for again.
+An `item` is processed only when its hash was fetched from the peer
 that sends it, as that kind, within that minute; any other is dropped
 unread and without a charge, so a peer cannot push transactions or evidence past the
 announce-and-fetch round. A newly
@@ -575,10 +580,14 @@ Points per offence: bad vote or proposal signature 20, proposal body not matchin
 its header 20, malformed message 20, malformed or invalid evidence 20, bad manifest,
 chunk, commit or batch of headers during state sync 50, bad block during sync or
 backfill 50, a block sync response that does not match its request 50, an
-oversized or repetitive fetch 5. A proposal for the next height is held unverified
-until that height starts (8 in all, 2 from any one peer) and replayed with its
-sender, so a bad signature found then costs that peer its 20 points; four peers
-together can still fill the 8 places. A vote more than 1,000 rounds ahead of the
+oversized or repetitive fetch 5. A proposal for the next height is held until that
+height starts only if it is fresh (no proof of lock), its round is no more than 1,000,
+its block is of that height and its signature verifies with the key of the validator,
+in the next height's set, that the block names as proposer; a bad signature costs the
+sender its 20 points, and one there is no place for is dropped before its signature is
+verified. There are 8 places, 2 for one validator and one for a validator and round,
+so a peer that is no validator takes none; four validators together can still fill
+them, and a proposal not held is sent again while its round lasts. A vote more than 1,000 rounds ahead of the
 node's round is dropped before its signature is verified. A response to a request the node
 awaits (blocks, headers, validator sets, snapshots, manifests, chunks) that matches no
 outstanding request is ignored without charge. Nothing is taken unasked: one
@@ -617,8 +626,10 @@ each time the executor asks, so a block that lengthens the unbonding period is p
 behind with the new age; heights deleted under the shorter one are gone, and until a
 full new window has passed a pruning node refuses evidence that names them.
 A validator set stored by height is deleted with the block of its height (records
-below the lowest block in a store pruned by an earlier build stay). Validator sets
-by hash, one per distinct set, and account history are not pruned.
+below the lowest block in a store pruned by an earlier build stay). A validator set
+stored by hash is deleted after a pass once the heights removed carried its hash, no
+header still held names it (as `validatorsHash` or `nextValidatorsHash`) and the
+current state does not use it. Account history is not pruned.
 `versions` is the provable window (default 100 heights, whose history is held in
 memory and in the store); `memoryVersions` is how many of those heights are kept in
 memory (all of them when left out), the store answering for the rest; `snapshots` the
@@ -653,10 +664,13 @@ node `{ versions: 10000, snapshots: 2 }`, archive: no `blocks` and as many
 | headers per response | 1000, downward from the height asked |
 | ban threshold | 100 points, 1 hour, doubling per repeat for an address the node dialed |
 | evidence per block | at most 16 pieces |
-| next-height proposals held | 8, at most 2 from one peer |
+| next-height proposals held | 8, at most 2 signed by one validator |
+| block size | `consensus.maxBlockBytes` in the genesis, 65,536 to 16,777,216 bytes; 4 MiB when absent. It bounds the encoded transactions and evidence; the header and the last commit are not counted. A proposer gives evidence at most half of it |
+| validators in a set | at most 2,000, so that a block of the largest size with two commits fits the 32 MiB frame |
+| transaction size (mempool) | 1 MiB, or four bytes under half the block size if that is less, so that an admitted transaction always fits the half of a block left to transactions |
 | memory guard | sampled every second; `warn` at 70% of the heap limit, `pressure` at 85%, `critical` at 95%, each left 5 points below its threshold |
 | scheduled major collection | once the heap has grown 256 MiB, or a tenth of the limit, since the last one |
-| heap limit (`start`) | three quarters of physical memory, `--heap <MiB>` otherwise, at least 256; a 64 MiB semi-space |
+| heap limit (`start`) | three quarters of physical memory, `--heap <MiB>` otherwise, at least 256; a 64 MiB semi-space. An old-space limit already set on Node's command line or in `NODE_OPTIONS` is kept in place of both |
 
 ## 6. Tests
 
@@ -721,16 +735,20 @@ taken only in answer to a request, a peer file cut short), block sync (nothing
 applied after a stop, the buffer dropped once no peer is ahead, a response with more
 blocks than asked for, a block of another height and a commit naming another block),
 state sync (a snapshot from before the trusted height passed over, a manifest that
-does not decode charged), consensus intake (a vote far ahead dropped unverified, two
-unchecked proposals a peer, block requests forgotten with the height), an empty
+does not decode charged), consensus intake (a vote far ahead dropped unverified, a
+vote for the next height held once however often it is sent, a proposal for the next height held only when a validator signed it and two to a
+validator, block requests forgotten with the height), an empty
 validator set decoded only with proposer index -1, and the mempool (one of two
 concurrent checks admitted to the last place, a place given back, a pooled
-transaction never forgotten). `test/review5-node.test.ts` (15 cases) covers the data
-directory's claim and the takeover of a stale one, the evidence age read when asked, a block of which nothing is
+transaction never forgotten). `test/review5-node.test.ts` (22 cases) covers the data
+directory's claim and the takeover of a stale one, a store handed in closed before the claim is given up, the evidence age read when asked, a block of which nothing is
 stored when the application's commit throws, pruning in one transaction with the
-set by height, a repeated transaction indexed where it succeeded, the memory store's
-write order, a heap flag of zero, gossiped evidence too old to pool, an item taken
+set by height, a past height answered with the set as it had it, proposer included, a set by hash removed once no header held names it, a repeated transaction indexed where it succeeded, the memory store's
+write order, a memory environment's transaction undone in every store when it throws, a heap flag of zero, gossiped evidence too old to pool, an item taken
 only from the peer asked, the fetches remembered for a peer that never answers bounded,
+the block size taken from the genesis by every node alike, evidence given half a block at
+most so that the largest transaction admitted still fits, a block bounded by its
+transactions and evidence and a validator set by what a frame holds,
 and a block with more than 16 pieces of evidence refused.
 
 Schemes (`test/schemes.test.ts`, five cases): signing, verifying, tagging and codec

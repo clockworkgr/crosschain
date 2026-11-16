@@ -146,7 +146,7 @@ The app hash:
 
 Sorted entries through the deterministic codec, then `sha256`: every node that applied the same blocks reports the same hash, whatever order the keys were inserted in. The initial hash is `sha256` of nothing.
 
-`parse(tx)` decodes with `TextDecoder('utf-8', { fatal: true })` so invalid UTF-8 is an error rather than replacement characters, then recognises the two forms and validates the public key with `isPublicKey` (a known scheme tag followed by exactly that scheme's key, which for secp256k1 must also be a point on the curve, [chapter 2](02-crypto.md)) and that the power is decimal digits. `checkTx` is `parse` and nothing more: it is stateless, so the post-commit recheck can never evict anything for this application. `initChain` loads `genesis.appState` as a JSON object of string keys into `committed`, persists, and returns the app hash with no validators (the engine uses the genesis list). `finalizeBlock`:
+`parse(tx)` decodes with `TextDecoder('utf-8', { fatal: true })` so invalid UTF-8 is an error rather than replacement characters, then recognises the two forms and validates the public key with `isPublicKey` (a known scheme tag followed by exactly that scheme's key, which for secp256k1 must also be a point on the curve, [chapter 2](02-crypto.md)), that the key is of the scheme the validator set's keys are of, and that the power is decimal digits. The scheme is read from the first key of the application's `validators` map, "which the set's own keys show", and a key of the other one is refused as `key must be a <scheme> key`; an application whose map is empty has nothing to compare with and takes either. `checkTx` is `parse` and nothing more. The one thing `parse` reads from the state is that scheme, which no block changes (every member is of it and the last member cannot be removed), so the post-commit recheck can never evict anything for this application. `initChain` loads `genesis.appState` as a JSON object of string keys into `committed`, persists, and returns the app hash with no validators (the engine uses the genesis list). `finalizeBlock`:
 
 ```ts
   async finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult> {
@@ -171,6 +171,7 @@ Sorted entries through the deterministic codec, then `sha256`: every node that a
       if (power === 0n && !set.has(k)) return { ok: false, error: 'unknown validator' };
       if (power === 0n && set.size === 1) return { ok: false, error: 'the last validator cannot be removed' };
       const next = total - (set.get(k) ?? 0n) + power;
+      if (power > 0n && !set.has(k) && set.size >= MAX_VALIDATORS) return { ok: false, error: `the set already holds the limit of ${MAX_VALIDATORS} validators` };
       if (next > MAX_TOTAL_POWER) return { ok: false, error: `total power ${next} would exceed the limit ${MAX_TOTAL_POWER}` };
       total = next;
       if (power === 0n) set.delete(k);
@@ -187,7 +188,7 @@ Sorted entries through the deterministic codec, then `sha256`: every node that a
   }
 ```
 
-Even a toy application has to respect what the engine demands of the update list (`applyUpdates` and the `ValidatorSet` constructor in chapter 3), or the executor throws while applying a decided block and consensus halts. So each `val:` transaction is tried against `set`, a working copy of the application's `validators` map as the block's earlier transactions have left it, with `total` its total power, and the transaction fails if the engine would refuse the set that results. A removal (`power 0`) of a validator the working set does not hold fails as `'unknown validator'`, where the engine would say `'cannot remove unknown validator'`. A removal of the only validator left fails as `'the last validator cannot be removed'`, where the engine would say `'updates would empty the validator set'`. An update that would take the total power past `MAX_TOTAL_POWER` fails with `total power ... would exceed the limit ...`, where the `ValidatorSet` constructor would refuse the set. A transaction is the right place for these refusals: each is the sender's mistake, and a failed result is what a mistake costs.
+Even a toy application has to respect what the engine demands of the update list (`applyUpdates` and the `ValidatorSet` constructor in chapter 3), or the executor throws while applying a decided block and consensus halts. So each `val:` transaction is tried against `set`, a working copy of the application's `validators` map as the block's earlier transactions have left it, with `total` its total power, and the transaction fails if the engine would refuse the set that results. A removal (`power 0`) of a validator the working set does not hold fails as `'unknown validator'`, where the engine would say `'cannot remove unknown validator'`. A removal of the only validator left fails as `'the last validator cannot be removed'`, where the engine would say `'updates would empty the validator set'`. An addition to a set that already holds `MAX_VALIDATORS` members fails with `the set already holds the limit of 2000 validators`, where the `ValidatorSet` constructor would say `2001 validators exceed the limit 2000`. An update that would take the total power past `MAX_TOTAL_POWER` fails with `total power ... would exceed the limit ...`, where the `ValidatorSet` constructor would refuse the set. The last of the engine's refusals is met earlier, in `parse`: `nextState` throws on an update whose key is not of the chain's scheme ([chapter 3](03-types.md)), so a `val:` transaction with such a key is refused as `key must be a <scheme> key`, in `checkTx` and, since `finalizeBlock` parses each transaction again, in a block, where it fails and adds no update. `test/review5-app.test.ts`, `refuses a validator key of another scheme than the set's`, sends one such transaction through `checkTx` and then in a block ahead of a good one: the first fails, the second succeeds, and the block's updates hold the second key alone. A transaction is the right place for these refusals: each is the sender's mistake, and a failed result is what a mistake costs.
 
 The update list is kept apart from the working set because the engine wants one entry per key and only for validators it knows. Two `val:` transactions for one key in a block would be a duplicate address in the updates, so they are coalesced in the `updates` map and the last one wins. A key the committed set does not hold that is added and then removed within the block gets no entry at all: both transactions succeed, and the engine, which never held that validator, is told nothing.
 
@@ -195,7 +196,7 @@ The working copy starts as a copy of the committed map, so a block's effects are
 
 ### src/mempool.ts
 
-**`MempoolOptions`**: `maxTxs` (10 000), `maxTxBytes` (1 MiB), `cacheSize` (100 000 hashes). **`AddTxStatus`** is `'added' | 'seen' | 'invalid' | 'full' | 'too-large' | 'paused'` and **`AddTxResult`** carries the status, the hash, and the application's error for `invalid`, for `paused` the reason the pool is not admitting, or for `full` whether the pool is simply full or full at a limit that was lowered. `Node.submitTx` returns this result, and the RPC's `broadcastTx` method answers from it.
+**`MempoolOptions`**: `maxTxs` (10 000), `maxTxBytes` (1 MiB; the node passes the smaller of that and four bytes under half the chain's block size, so that an admitted transaction always fits the half of a block the builder keeps for transactions, [chapter 8](08-node.md)), `cacheSize` (100 000 hashes). **`AddTxStatus`** is `'added' | 'seen' | 'invalid' | 'full' | 'too-large' | 'paused'` and **`AddTxResult`** carries the status, the hash (for `too-large` a getter that works it out only when it is read), and the application's error for `invalid`, for `paused` the reason the pool is not admitting, or for `full` whether the pool is simply full or full at a limit that was lowered. `Node.submitTx` returns this result, and the RPC's `broadcastTx` method answers from it.
 
 **`Mempool`** extends `EventEmitter` with one typed event, `tx: [hash, tx, source]`, emitted on every admission; `Node.init` listens and broadcasts an inventory announcement to every peer except `source`, the peer the transaction came from. State: `txs`, a `Map` from hex hash to bytes whose insertion order is the FIFO order; `cache`, a `Map` from the hex hashes seen lately to the place in the ring that stands for each; `cacheOrder` and `cacheHead`, the ring itself, the hashes in the order they came and the position of the oldest, which let the cache evict its oldest entry; `reserved`, the number of checks the application has admitted that are not in the pool yet, each holding a place; `pausedReason`, null while the pool admits and otherwise the reason it does not; `limit`, how many transactions the pool admits up to just now, `maxTxs` unless the node has lowered it.
 
@@ -290,10 +291,19 @@ Admission can also be suspended as a whole. The node pauses the pool only at the
 
 ```ts
   async addTx(tx: Uint8Array, source: string | null = null): Promise<AddTxResult> {
+    // Before the hash: a transaction refused for its size costs nothing in proportion to it. Its hash is worked
+    // out only if the caller reads it.
+    if (tx.length > this.opts.maxTxBytes) {
+      return {
+        status: 'too-large',
+        get hash() {
+          return txHash(tx);
+        },
+      };
+    }
     const hash = txHash(tx);
     const key = toHex(hash);
     if (this.pausedReason !== null) return { status: 'paused', hash, error: this.pausedReason };
-    if (tx.length > this.opts.maxTxBytes) return { status: 'too-large', hash };
     if (this.known(key)) return { status: 'seen', hash };
     if (this.txs.size + this.reserved >= this.limit) return { status: 'full', hash, error: this.fullReason };
     // Mark before the await so a concurrent duplicate is not checked twice.
@@ -353,7 +363,7 @@ Admission can also be suspended as a whole. The node pauses the pool only at the
   }
 ```
 
-Order of the checks: the transaction is hashed first, whatever its size and whatever the pool's condition, because every result carries the hash; then paused, so a pool that is not admitting does nothing beyond that hash and leaves no trace in the cache, and the reason travels back in `error` (the RPC turns it into `-32004`, [chapter 12](12-rpc.md)); then size (a comparison, and an oversized transaction is refused before its hash enters the cache), seen (in the cache or in the pool), full (the pool's size and the places held by checks in flight against `limit`, which is `maxTxs` unless the node lowered it), then the application. The hash is cached *before* the await so that a second copy arriving while `checkTx` runs is answered `seen` rather than checked again; that also means an `invalid` transaction stays in the cache and is not re-checked when a peer announces it again. A `checkTx` that *throws* (the verifier pool closed underneath it, say) decided nothing, so the `catch` has `forget` remove the hash from the cache before rethrowing; otherwise the transaction would be `seen` on this node for as long as the cache remembered it without ever having been judged, and a client resubmitting a perfectly good transaction would be told it was already known. The second `full` check, after the await, covers the pool filling, or its limit being lowered, while this transaction was being checked; because the hash was already cached, that refusal forgets it again, so a resubmission hears `full` (and `added` once there is room) rather than `seen` (review finding 38). The check before it does the same for a pause that began during the await. Both come before the application's verdict is looked at, so a transaction the pool would not take is refused as `paused` or `full`, which a sender may retry, whatever the application said.
+Order of the checks: size first, a comparison, so a transaction refused for its size costs nothing in proportion to it. Every result carries the hash, and the `too-large` one carries it as a getter, so the bytes are hashed only if the caller reads it. Then the transaction is hashed, whatever the pool's condition; then paused, so a pool that is not admitting does nothing beyond that hash and leaves no trace in the cache, and the reason travels back in `error` (the RPC turns it into `-32004`, [chapter 12](12-rpc.md)); then seen (in the cache or in the pool), full (the pool's size and the places held by checks in flight against `limit`, which is `maxTxs` unless the node lowered it), then the application. The hash is cached *before* the await so that a second copy arriving while `checkTx` runs is answered `seen` rather than checked again; that also means an `invalid` transaction stays in the cache and is not re-checked when a peer announces it again. A `checkTx` that *throws* (the verifier pool closed underneath it, say) decided nothing, so the `catch` has `forget` remove the hash from the cache before rethrowing; otherwise the transaction would be `seen` on this node for as long as the cache remembered it without ever having been judged, and a client resubmitting a perfectly good transaction would be told it was already known. The second `full` check, after the await, covers the pool filling, or its limit being lowered, while this transaction was being checked; because the hash was already cached, that refusal forgets it again, so a resubmission hears `full` (and `added` once there is room) rather than `seen` (review finding 38). The check before it does the same for a pause that began during the await. Both come before the application's verdict is looked at, so a transaction the pool would not take is refused as `paused` or `full`, which a sender may retry, whatever the application said.
 
 The `admit` function handed to `checkTx` asks the same two questions from inside the application, after its last wait and just before the transaction would be applied to the pending state (`CoreApp.checkTx` in `src/app/core/app.ts`; the key-value test app ignores the option): a transaction the pool no longer takes must not leave its writes there for later checks to run against. A transaction enters `txs` only when `addTx` resumes after `checkTx` has returned, so the pool's size alone would let two transactions checked at the same time both be admitted to the last place and both be applied to the pending state. That is what `reserved` prevents. An `admit` that finds room takes a place (`holdsPlace`, `reserved++`), and every comparison with the limit, in `admit`, in `addTx` and in `accepting`, counts `txs.size + reserved`. The second of the two is therefore refused by its own `admit`, before the application applies it; `admit` notes the refusal in `refused`, and `addTx` answers `paused` or `full` from it and forgets the hash, whatever result the application made of the refusal. A check that holds a place has room whatever came since and is not measured again; one that holds none, because the application never asked or refused the transaction before asking, is measured against the pool and the places others hold. A place is given back on every way out: `release()` runs just before the transaction is pooled, when the place it held becomes its place in the pool, and again in the `finally`, where it does nothing unless the place is still held, which covers a transaction the application admitted and then found invalid, a `checkTx` that threw after admitting, and a pause that began after the place was taken.
 
@@ -372,7 +382,7 @@ The `admit` function handed to `checkTx` asks the same two questions from inside
   }
 ```
 
-`Consensus.createBlock` calls this with the byte budget left after the block's fixed parts. The `+ 4` is the codec's length prefix per `bytes` element; the array's own count prefix fits in the 1 KiB slack consensus subtracts. Reaping does not remove: the proposal may fail, and the transactions must still be there for the next proposer. The loop breaks at the first transaction that does not fit rather than skipping it, which keeps strict FIFO at the cost of a partially filled block when a large transaction is at the head.
+`Consensus.createBlock` calls this with `maxBlockBytes` less `blockDataBytes({ txs: [], evidence })`, the size of the block's data before any transaction is in it, and less 1 KiB of slack; the header and the last commit do not count against the limit ([chapter 4](04-consensus.md)). The `+ 4` is the codec's length prefix per `bytes` element; the count prefixes of the two arrays are already in that measurement. Reaping does not remove: the proposal may fail, and the transactions must still be there for the next proposer. The loop breaks at the first transaction that does not fit rather than skipping it, which keeps strict FIFO at the cost of a partially filled block when a large transaction is at the head.
 
 ```ts
   /** Called after a block commits: drop what was included, re-check what remains. */
@@ -435,12 +445,22 @@ A fresh data directory runs `initChain` and builds genesis state (chapter 3's `g
 - `onCommitted(fn)`: register a listener for `(block, commit, results, updates)`, and return a function that takes the listener back, which the RPC's event streams call when they close; the node (`src/node/node.ts`) and the RPC event streams (`src/rpc/events.ts`) hang off this.
 - `getLastCommit()`: the stored commit of `lastHeight`, or null at genesis. Consensus builds the next block's `lastCommit` from it; because `updateCommit` rewrites the stored commit, this is where late precommits reach the next block.
 - `headerAt(h)`: the header of a height, from the stored block, or from the header record a state-synced node keeps below its lowest block (`loadHeader`, [chapter 10](10-store.md)). Null when the node holds neither.
-- `validatorSetAtHeight(h)`: "The set that signs (or signed) height h": `validators` for `lastHeight + 1`, `nextValidators` for `lastHeight + 2`, `lastValidators` for `lastHeight`, and for anything older the `validatorsHash` of `headerAt(h)` resolved through the store. Returns null for a height whose header is gone. Consensus uses it for evidence; the node for gossiped evidence; the tests to find a validator's index at a past height.
+- `validatorSetAtHeight(h)`: "The set that signs (or signed) height h": `validators` for `lastHeight + 1`, `nextValidators` for `lastHeight + 2`, `lastValidators` for `lastHeight`, and for anything older the record the store keeps by height (`loadValidatorsAt(h)`), or, when that is gone, the `validatorsHash` of `headerAt(h)` resolved through the store. Returns null for a height that has neither a record nor a header. Consensus uses it for evidence; the node for gossiped evidence; the RPC for its `validators` method ([chapter 12](12-rpc.md)); the tests to find a validator's index at a past height.
+- `hasProposerAt(h)`: whether `validatorSetAtHeight(h)` is "the set with the proposer that height had": true for the three heights whose sets the state holds and for any height whose record by height exists, false where only the copy by hash answers.
 
 ```ts
   /** The header of a height: from the stored block, or kept alone below the lowest block a state-synced node holds. */
   headerAt(h: bigint): Header | null {
     return this.d.store.loadBlock(h)?.block.header ?? this.d.store.loadHeader(h);
+  }
+
+  /**
+   * Whether validatorSetAtHeight(h) is the set with the proposer that height had: the three sets the state holds,
+   * or a record kept by height. A block that was backfilled, or a header kept alone, has only the record by hash.
+   */
+  hasProposerAt(h: bigint): boolean {
+    const last = this.state.lastHeight;
+    return (h >= last && h <= last + 2n) || this.d.store.loadValidatorsAt(h) !== null;
   }
 
   /** The set that signs (or signed) height h. */
@@ -449,13 +469,19 @@ A fresh data directory runs `initChain` and builds genesis state (chapter 3's `g
     if (h === s.lastHeight + 1n) return s.validators;
     if (h === s.lastHeight + 2n) return s.nextValidators;
     if (h === s.lastHeight) return s.lastValidators;
+    // The record kept by height is the set as that height had it, proposer and priorities included. The record by
+    // hash names the same members and powers (the hash covers no more) and is rewritten as later heights save it,
+    // so its proposer is a later one: it answers for a height whose own record is gone, which is enough to check
+    // signatures with.
+    const at = this.d.store.loadValidatorsAt(h);
+    if (at) return at;
     const header = this.headerAt(h);
     if (!header) return null;
     return this.d.store.loadValidatorSet(header.validatorsHash);
   }
 ```
 
-Both lookups go through `headerAt`, so a node that joined from a snapshot answers for the heights below its join for as long as it holds their headers, which is what lets it apply a block carrying evidence of a double sign from before the join.
+The two records of a past height's set are not the same thing. The one by height is the set as that height had it, with its proposer and priorities: the executor saves it once, two heights ahead, and nothing writes it again. The one by hash is shared by every height that has those members and powers, since the hash covers no more, and it is saved again each time a later height has the same set, so its proposer is that later height's. The record by height is therefore asked first, and a caller that reads the proposer, as the RPC's `validators` method does, gets the proposer of the height's first round. The record by height goes with its block when the block is pruned ([chapter 10](10-store.md)), and a block backfilled below a state-sync join never had one, nor has a header kept alone; for those heights the set comes by hash, "which is enough to check signatures with". Its proposer is not that height's, and `hasProposerAt(h)` lets a caller tell the two apart: `(h >= last && h <= last + 2n) || this.d.store.loadValidatorsAt(h) !== null`, with `last` the state's `lastHeight`. The RPC's `validators` method asks it and returns `proposer: null` where it is false, so a later height's proposer is not passed off as that height's ([chapter 12](12-rpc.md)). That lookup goes through `headerAt`, so a node that joined from a snapshot answers for the heights below its join for as long as it holds their headers, which is what lets it apply a block carrying evidence of a double sign from before the join. `test/review5-node.test.ts`, `answers for a past height with the set as that height had it, proposer included`, runs four validators to height 8 and checks, for every height below the latest, that the set's hash is the header's `validatorsHash`, that `hasProposerAt` is true and, for each block decided in round 0 (more than four of them), that the set's proposer is the block's `proposerAddress`.
 
 ```ts
   applyBlock(block: Block, commit: Commit): Promise<void> {
@@ -602,7 +628,7 @@ interface SyncCommit {
 }
 ```
 
-Otherwise `commit()` is called in the callback, and one that throws where it is called, instead of returning a promise that rejects, aborts the transaction in the same way. `CoreApp.commit` is written for this: it is not an `async` function, it does all of its writing to the store before it returns its promise, and a store write that fails throws out of the call ([chapter 11](11-application.md)). In either case nothing of the block is stored, neither the block and its commit nor the set for `h + 2` nor the chain state; `doApply` rejects before `this.state` is replaced, and consensus halts on the rejection (chapter 4). The application's memory is then one block ahead of the store, so the node needs a restart, which finds chain and application at the same height, the one before the block.
+Otherwise `commit()` is called in the callback, and one that throws where it is called, instead of returning a promise that rejects, aborts the transaction in the same way. `CoreApp.commit` is written for this: it is not an `async` function, it does all of its writing to the store before it returns its promise, and a store write that fails throws out of the call ([chapter 11](11-application.md)). In either case nothing of the block is stored, neither the block and its commit nor the set for `h + 2` nor the chain state; `doApply` rejects before `this.state` is replaced, and consensus halts on the rejection (chapter 4). The application's memory is then one block ahead of the store, so the node needs a restart, which finds chain and application at the same height, the one before the block. That is so on both backends. LMDB's transaction aborts every write made inside it, and `MemoryEnv.transaction` undoes, in every store of the environment, the writes made inside a callback that throws ([chapter 10](10-store.md)), so on a node without a data directory too the chain's batch, written first, is gone when the application's commit throws.
 
 A failure that comes after the write is a rejected promise. `CoreApp.commit` rejects when the snapshot it takes after writing the block fails: the block, the chain state and the application's state are all stored by then, `doApply` rejects with `this.state` unchanged, and a restart finds both at the new height. An application that awaits before it writes loses the saving: its writes land in a transaction of their own after the chain's, which is the two-transaction order again, a failure there leaves the chain's writes in place, and the next start finds the application one block behind and replays it.
 
@@ -611,12 +637,52 @@ A failure that comes after the write is a rejected promise. `CoreApp.commit` rej
     const age = this.d.evidenceAgeMs?.();
     // The time before which evidence can no longer name a height, as of the latest block.
     const oldest = age === undefined ? null : this.state.lastBlockTime - age;
-    this.pruneBlocks(oldest);
-    this.pruneHeaders(oldest);
+    // The validator sets the removed heights were signed by; one that nothing left names goes with them.
+    const sets = new Map<string, Uint8Array>();
+    this.pruneBlocks(oldest, sets);
+    this.pruneHeaders(oldest, sets);
+    this.pruneValidatorSets(sets);
+  }
+
+  /** Where a set was last found named by a header still held, so the search is not made again while that header stays. */
+  private readonly setNamedAt = new Map<string, bigint>();
+
+  /**
+   * Remove the sets, stored by hash, that no header still held and no state names. A set usually outlives the
+   * heights removed (the height above them has the same one), which the first header looked at shows; only a set
+   * that changed at the boundary costs a walk over the headers held, and what the walk finds is remembered.
+   */
+  private pruneValidatorSets(sets: Map<string, Uint8Array>): void {
+    if (sets.size === 0) return;
+    const st = this.state;
+    const bottom = this.d.store.lowestHeaderHeight() ?? this.d.store.lowestHeight();
+    const gone: Uint8Array[] = [];
+    for (const [k, hash] of sets) {
+      if ([st.validators, st.nextValidators, st.lastValidators].some((v) => bytesEqual(v.hash(), hash))) continue;
+      const known = this.setNamedAt.get(k);
+      if (known !== undefined && known >= bottom) continue;
+      let namedAt: bigint | null = null;
+      for (let h = bottom; h <= st.lastHeight; h++) {
+        const header = this.d.store.loadHeader(h) ?? this.d.store.loadBlock(h)?.block.header;
+        if (header && (bytesEqual(header.validatorsHash, hash) || bytesEqual(header.nextValidatorsHash, hash))) {
+          namedAt = h;
+          break;
+        }
+      }
+      if (namedAt === null) {
+        this.setNamedAt.delete(k);
+        gone.push(hash);
+      } else this.setNamedAt.set(k, namedAt);
+    }
+    if (gone.length === 0) return;
+    this.d.store.batch(() => {
+      for (const hash of gone) this.d.store.deleteValidatorSet(hash);
+    });
+    this.d.log('debug', 'pruned validator sets', { count: gone.length });
   }
 
   /** Drop blocks older than the retention window, never past the newest snapshot nor into the evidence window. */
-  private pruneBlocks(oldest: bigint | null): void {
+  private pruneBlocks(oldest: bigint | null, sets: Map<string, Uint8Array>): void {
     const keep = this.d.retainBlocks;
     if (keep === undefined) return;
     let floor = this.state.lastHeight - BigInt(keep);
@@ -631,14 +697,18 @@ A failure that comes after the write is a rejected promise. `CoreApp.commit` rej
     }
     // One transaction for the pass: the blocks go with the marker that says they are gone, or none of it does.
     this.d.store.batch(() => {
-      for (let h = lowest; h < floor; h++) this.d.store.deleteBlock(h);
+      for (let h = lowest; h < floor; h++) {
+        const hash = this.d.store.loadBlock(h)?.block.header.validatorsHash;
+        if (hash) sets.set(toHex(hash), hash);
+        this.d.store.deleteBlock(h);
+      }
       this.d.store.setLowestHeight(floor);
     });
     this.d.log('debug', 'pruned blocks', { below: floor });
   }
 
   /** Headers kept alone below the lowest block serve evidence checks; once older than evidence may be, they go too. */
-  private pruneHeaders(oldest: bigint | null): void {
+  private pruneHeaders(oldest: bigint | null, sets: Map<string, Uint8Array>): void {
     if (oldest === null) return;
     const lowest = this.d.store.lowestHeaderHeight();
     if (lowest === null) return;
@@ -649,14 +719,20 @@ A failure that comes after the write is a rejected promise. `CoreApp.commit` rej
     if (h === lowest) return;
     // One transaction for the pass, as for blocks.
     this.d.store.batch(() => {
-      for (let d = lowest; d < h; d++) this.d.store.deleteHeader(d);
+      for (let d = lowest; d < h; d++) {
+        const hash = this.d.store.loadHeader(d)?.validatorsHash;
+        if (hash) sets.set(toHex(hash), hash);
+        this.d.store.deleteHeader(d);
+      }
       this.d.store.setLowestHeaderHeight(h < top ? h : null);
     });
     this.d.log('debug', 'pruned headers', { below: h });
   }
 ```
 
-`prune` computes `oldest`, the block time before which evidence can no longer name a height (`lastBlockTime - evidenceAgeMs`, or null when no age is configured), and hands it to the two halves. In `pruneBlocks` the floor is `lastHeight - retainBlocks`, lowered to the newest snapshot height if that is older, and then lowered again, one block at a time, while the block just below it is younger than `oldest`. `deleteBlock` removes the block, its commit, its results, its transaction index entries (`RPC-SYNC-PROOFS.md` section 4.7) and the validator set stored under its height, the record `doApply` writes at every block with `saveValidatorsAt`: that record serves a state-sync join at a snapshot height, which needs the block of that height too, so without the block it answers nothing. The records by hash are never pruned; headers still held name them. The deletions of a pass and the new lowest-height marker go into one `store.batch`, one store transaction, so a crash leaves the blocks with the old marker or neither. `pruneHeaders` is guarded by the age alone, not by `retainBlocks`: it walks up from the lowest header record towards the lowest block past each record older than `oldest`, passing over a record that is already missing (block sync's backfill deletes the record of every height it fills in), and then, in one batch as for blocks, deletes the records it passed and moves the marker to the first record it kept, or clears it when none is left below the lowest block. A pruned height makes `validatorSetAtHeight` and `blockTimeAt` return null, so evidence for it is rejected as "evidence for an unknown height" (chapter 4). That is exactly why the evidence window is kept: evidence is accepted for as long as `maxEvidenceAgeMs` (the unbonding period, once the application has set it) says it may be, and checking it needs the validator set and the block time of the height it names, both of which come from the stored block or header. A node that pruned inside the window would refuse valid evidence that every other node accepts, and would then reject the block that carries it. So `retain.blocks` is a floor only outside the evidence window; with the default seven-day age a short test chain never prunes at all, which is why `test/sync.test.ts`'s pruning node passes `limits: { maxEvidenceAgeMs: 0n }`, and why `test/review2.test.ts`, "keeps blocks the evidence window may still name, whatever the retention setting", gives a node `retain: { blocks: 2 }` and expects `lowestHeight()` to stay at 1. The guard is the age in force when `prune` runs, and the age can grow: governance can lengthen the unbonding period ([chapter 11](11-application.md)). `prune` asks for the age through `evidenceAgeMs()`, which the node answers from the application as it stands after the block just applied, so the block that adopts a longer period is already pruned behind with the longer age. Heights a pruning node deleted under the shorter age are inside the longer window all the same and are not fetched back. Until a full new window has passed, evidence that names such a height is refused by that node as "evidence for an unknown height", along with the block that carries it, while a node that kept the height accepts both.
+`prune` computes `oldest`, the block time before which evidence can no longer name a height (`lastBlockTime - evidenceAgeMs`, or null when no age is configured), and hands it to `pruneBlocks` and `pruneHeaders`, each of which also notes in `sets` the `validatorsHash` of every height it removes; `pruneValidatorSets` then deals with those. In `pruneBlocks` the floor is `lastHeight - retainBlocks`, lowered to the newest snapshot height if that is older, and then lowered again, one block at a time, while the block just below it is younger than `oldest`. `deleteBlock` removes the block, its commit, its results, its transaction index entries (`RPC-SYNC-PROOFS.md` section 4.7) and the validator set stored under its height, the record `doApply` writes at every block with `saveValidatorsAt`: that record serves a state-sync join at a snapshot height, which needs the block of that height too, so without the block it answers nothing. The records by hash are not `deleteBlock`'s to remove, since headers still held name them; `pruneValidatorSets`, described after the two passes, removes them. The deletions of a pass and the new lowest-height marker go into one `store.batch`, one store transaction, so a crash leaves the blocks with the old marker or neither. `pruneHeaders` is guarded by the age alone, not by `retainBlocks`: it walks up from the lowest header record towards the lowest block past each record older than `oldest`, passing over a record that is already missing (block sync's backfill deletes the record of every height it fills in), and then, in one batch as for blocks, deletes the records it passed and moves the marker to the first record it kept, or clears it when none is left below the lowest block. A pruned height makes `validatorSetAtHeight` and `blockTimeAt` return null, so evidence for it is rejected as "evidence for an unknown height" (chapter 4). That is exactly why the evidence window is kept: evidence is accepted for as long as `maxEvidenceAgeMs` (the unbonding period, once the application has set it) says it may be, and checking it needs the validator set and the block time of the height it names, both of which come from the stored block or header. A node that pruned inside the window would refuse valid evidence that every other node accepts, and would then reject the block that carries it. So `retain.blocks` is a floor only outside the evidence window; with the default seven-day age a short test chain never prunes at all, which is why `test/sync.test.ts`'s pruning node passes `limits: { maxEvidenceAgeMs: 0n }`, and why `test/review2.test.ts`, "keeps blocks the evidence window may still name, whatever the retention setting", gives a node `retain: { blocks: 2 }` and expects `lowestHeight()` to stay at 1. The guard is the age in force when `prune` runs, and the age can grow: governance can lengthen the unbonding period ([chapter 11](11-application.md)). `prune` asks for the age through `evidenceAgeMs()`, which the node answers from the application as it stands after the block just applied, so the block that adopts a longer period is already pruned behind with the longer age. Heights a pruning node deleted under the shorter age are inside the longer window all the same and are not fetched back. Until a full new window has passed, evidence that names such a height is refused by that node as "evidence for an unknown height", along with the block that carries it, while a node that kept the height accepts both.
+
+`pruneValidatorSets` removes the sets stored by hash that nothing left names. Its candidates are the hashes the two passes collected, the `validatorsHash` of each block and header record they deleted. A candidate stays if the current state uses it (`validators`, `nextValidators` or `lastValidators`), or if a header still held, from the lowest header record or the lowest block up to the last height, names it as `validatorsHash` or `nextValidatorsHash`. A set usually outlives the heights removed, because the height above them was signed by the same one, and then the first header looked at settles it; `setNamedAt` remembers the height where a set was found named, so the search is not made again while that header is still held. Only a set that changed at the boundary costs a walk over every header held, and one that is found nowhere is deleted, with the others of the pass, in one batch (`BlockStore.deleteValidatorSet`, [chapter 10](10-store.md)). The condition is what keeps evidence checkable: `validatorSetAtHeight` goes from a held header's `validatorsHash` to the set, so a set is removed only when no held height can lead to it.
 
 ```ts
   /** Crash recovery: the app may be behind the chain state. */
@@ -713,9 +789,9 @@ Three cases. The application ahead of the chain is impossible under the persiste
 
 `test/review5-net.test.ts`, `describe('the mempool')`, uses an application that waits on a gate, then asks `admit` as the core application does and records what it applied. "admits one of two transactions checked at once for the last place, and applies only that one": with `maxTxs: 1`, two transactions checked together end as `added` and `full`, the application applied only the first, `accepting` is false until `update` removes the first, and the second is then `added`. "gives back the place of a transaction that was admitted and then refused": a transaction the application admits and then answers as invalid leaves `accepting` true and the next one is `added`. "keeps a transaction it forgot and saw again for as long as any other, and never forgets one that is pooled": with `cacheSize: 3`, X's first check throws, X is then added and committed, and A and B follow; X is still `seen` after B, which took the place X's first coming left behind, and is gone after C. With `cacheSize: 1`, A and then B are added, A is still seen and answered `seen` when given again, and the `tx` event has fired twice, not three times.
 
-`test/review5-node.test.ts`, `describe('the executor')`. "reads the evidence age from the application when asked, not at the commit before": on a node of the core application, the function the executor was given answers the application's unbonding period, and three times that as soon as the application's staking parameters say so, with no commit in between. "stores nothing of a block whose application commit throws inside the shared transaction": an executor over LMDB with a key-value application whose `commitSync` throws `disk full` rejects `applyBlock`, its state stays at height 0, and the store holds no block 1, a chain state at height 0 and no validator set for height 3. "prunes blocks and headers in one transaction each, the set by height going with its block": a store that records the key prefixes of every write shows that each write deleting a block also moves the lowest-height marker and deletes as many sets by height as blocks, that the sets of the heights still held and the genesis set by hash remain, and that two aged header records planted below the lowest block go in a single write with their marker. In `describe('the stores')`, "indexes a transaction repeated in one block where it succeeded" is the `saveBlock` rule above.
+`test/review5-node.test.ts`, `describe('the executor')`. "reads the evidence age from the application when asked, not at the commit before": on a node of the core application, the function the executor was given answers the application's unbonding period, and three times that as soon as the application's staking parameters say so, with no commit in between. "stores nothing of a block whose application commit throws inside the shared transaction": an executor over LMDB with a key-value application whose `commitSync` throws `disk full` rejects `applyBlock`, its state stays at height 0, and the store holds no block 1, a chain state at height 0 and no validator set for height 3. "prunes blocks and headers in one transaction each, the set by height going with its block": a store that records the key prefixes of every write shows that each write deleting a block also moves the lowest-height marker and deletes as many sets by height as blocks, that the sets of the heights still held and the genesis set by hash remain, and that two aged header records planted below the lowest block go in a single write with their marker. "answers for a past height with the set as that height had it, proposer included" is described with `validatorSetAtHeight` above. "removes a validator set by hash once no header held names it": a one-validator node with `retain: { blocks: 2 }` and an evidence age of 1 ms takes a `val:` transaction that adds a second validator of power 1, so the set changes while the first validator goes on signing alone; the first set is still stored when the new one takes effect, is gone once every block that names it has been pruned, and every block still held finds both of the sets its header names. In `describe('the stores')`, "indexes a transaction repeated in one block where it succeeded" is the `saveBlock` rule above, and "undoes the writes of a memory environment transaction that throws, in every store" is the memory environment's side of the shared transaction ([chapter 10](10-store.md)).
 
-`test/review5-app.test.ts`, `describe('the toy application and its validator set')`. "fails a transaction whose update the engine could not apply to the set": a validator added and removed in one block gives two successes and no update; removing the only validator and raising the total past `MAX_TOTAL_POWER` fail while an update within the limit passes; with two validators the first may be removed and the second is then the last. "has its validator set back from its file": an application reopened from its JSON file removes a validator added before the restart and refuses to remove the last one, and a file with no `validators` in it makes the constructor throw `written before the validator set was kept`.
+`test/review5-app.test.ts`, `describe('the toy application and its validator set')`. "fails a transaction whose update the engine could not apply to the set": a validator added and removed in one block gives two successes and no update; removing the only validator and raising the total past `MAX_TOTAL_POWER` fail while an update within the limit passes; with two validators the first may be removed and the second is then the last. "refuses a validator key of another scheme than the set's" is described with `finalizeBlock` above. "has its validator set back from its file": an application reopened from its JSON file removes a validator added before the restart and refuses to remove the last one, and a file with no `validators` in it makes the constructor throw `written before the validator set was kept`.
 
 `test/memory.test.ts`, "sheds load, keeps following the chain, and resumes when the heap eases": a node whose memory guard is fed a heap at 90% of its limit has `mempool.paused` false and `mempool.currentLimit` a tenth of `maxTxs`; with the limit set to zero by the test, `submitTx` answers `full`. Back at `ok` the limit is `maxTxs` again and a transaction is no longer refused as `full`. The limit is the node's doing (chapter 8); the pool only honours it.
 
@@ -723,21 +799,21 @@ Three cases. The application ahead of the chain is impossible under the persiste
 
 - FIFO only: no fee priority, no per-sender ordering, no replacement of a pending transaction by a better-paid one. A large transaction at the head of the queue that does not fit the remaining budget stops the reap.
 - No expiry in the mempool itself; eviction depends on the application's `checkTx` saying no after a commit.
-- `addTx` hashes a transaction before it looks at the pause or at the size limit.
+- `addTx` checks the size before it hashes a transaction, but hashes it before it looks at the pause, so a paused pool still hashes what it refuses.
 - A hash that `addTx` forgot after a failed or refused check leaves its old place in the cache's ring unused until the ring comes round to it, so the cache can hold fewer than `cacheSize` hashes for a while.
 - After an application commit that threw inside the shared transaction, nothing of the block is stored but the application's memory holds it; the node has to be restarted.
 - The post-commit recheck is sequential and runs inside `doApply`, so a 10 000-transaction pool adds 10 000 `checkTx` calls to the commit path before the listeners (and the `status` broadcast) run.
 - No `PrepareProposal` or `ProcessProposal`: the application cannot reorder, drop or veto transactions in a proposal; it sees them when decided and can only mark them failed.
-- Validator sets by hash are kept forever, one record per distinct set. The record by height, a whole set written at every block, goes with its block when the block is pruned, so on a node that keeps every block that part of the store grows with the chain even when the membership does not change; records below the lowest block of a store pruned before the two were deleted together stay.
+- The validator set by height, a whole set written at every block, goes with its block when the block is pruned, so on a node that keeps every block that part of the store grows with the chain even when the membership does not change; records below the lowest block of a store pruned before the two were deleted together stay. `pruneValidatorSets` looks only at the sets of the heights a pass removes, so sets by hash that only heights pruned by an earlier build carried stay as well.
 - Lengthening the unbonding period does not bring back what a pruning node deleted under the shorter evidence window. Until a full new window has passed, such a node refuses evidence for those heights, and the block that carries it.
-- The pool is bounded by count, not bytes: 10 000 transactions of up to 1 MiB each is the ceiling, and under memory pressure the node lowers the count it admits up to rather than trimming what is pooled.
+- The pool is bounded by count, not bytes: 10 000 transactions of up to 1 MiB each (or four bytes under half the block size, where that is less) is the ceiling, and under memory pressure the node lowers the count it admits up to rather than trimming what is pooled.
 
 Exercises:
 
 1. Add a `maxAge` in blocks to `Mempool`: record the height at admission, and in `update` drop transactions older than the limit before rechecking. Write a unit test with a stateless application that proves age alone evicts.
 2. Make `reap` skip, rather than stop at, a transaction that does not fit, and measure block fill on the four-validator benchmark with mixed transaction sizes.
 3. Move the recheck off the commit path: run `update`'s recheck after the listeners, or in batches between blocks, and show with a timer that `applyBlock` resolves sooner.
-4. Make `prune` also drop validator sets stored by hash that no retained header names, and prove with a test that `validatorSetAtHeight` still answers for every retained height and that evidence for a pruned one is refused.
+4. `pruneValidatorSets` considers only the sets of the heights a pass removed. Write a sweep, run once when a store is opened, that removes every set by hash that no retained header and no state names (the sets a store pruned by an earlier build still holds), and prove with a test that `validatorSetAtHeight` still answers for every retained height and that evidence for a pruned one is refused.
 5. Write a crash test: an `Application` wrapper whose `commit()` throws once; restart the executor on the same store and assert that `replayToApp` replays exactly one block and that the app hash check passes. Then corrupt the stored block and assert it refuses.
 6. Implement a `ProcessProposal`-style hook: add an optional `checkBlock(req)` to `Application`, call it from `Consensus.handleProposal` before marking a proposal valid, and have the key-value application reject blocks containing a transaction it would fail.
 

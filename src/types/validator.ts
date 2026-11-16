@@ -43,6 +43,13 @@ function byPowerThenAddress(a: Validator, b: Validator): number {
 /** The most voting power a set may hold in all, so priorities (which swing by a few totals) stay within an i64, as in Tendermint. */
 export const MAX_TOTAL_POWER = 2n ** 60n;
 
+/**
+ * The most validators a set may hold. A commit carries one signature for each, and a block travels with two
+ * commits (the one inside it and its own): at this size, with the largest signatures and the largest block a
+ * genesis may allow, a block still fits one network frame. The core application allows itself half as many.
+ */
+export const MAX_VALIDATORS = 2000;
+
 export class ValidatorSet {
   /** Sorted by power descending, then address ascending. Index = position here. */
   readonly validators: Validator[];
@@ -50,6 +57,7 @@ export class ValidatorSet {
   private proposerIndex: number;
 
   private constructor(validators: Validator[], proposerIndex: number) {
+    if (validators.length > MAX_VALIDATORS) throw new Error(`${validators.length} validators exceed the limit ${MAX_VALIDATORS}`);
     this.validators = validators;
     this.totalPower = validators.reduce((s, v) => s + v.power, 0n);
     if (this.totalPower > MAX_TOTAL_POWER) throw new Error(`total power ${this.totalPower} exceeds the limit ${MAX_TOTAL_POWER}`);
@@ -250,7 +258,7 @@ export class ValidatorSet {
       if (!isPublicKey(publicKey)) throw new Error('bad public key');
       if (power <= 0n) throw new Error('validator power must be positive');
       return { address: addressOf(publicKey), publicKey, power, priority };
-    }, 10_000);
+    }, MAX_VALIDATORS);
     ValidatorSet.assertUnique(vals);
     for (let i = 1; i < vals.length; i++) if (byPowerThenAddress(vals[i - 1]!, vals[i]!) >= 0) throw new Error('validator set out of order');
     const proposerIndex = r.i53();

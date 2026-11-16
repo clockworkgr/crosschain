@@ -17,7 +17,7 @@ the subject of the [tutorial](tutorial/00-overview.md); design decisions are in
 ```sh
 git clone <this repository> crosschain && cd crosschain
 npm install
-npm test                 # 268 tests, about two minutes
+npm test                 # 276 tests, about two minutes
 CHAIN_SCHEME=secp256k1 npm test   # the same suite on secp256k1 keys (one ML-DSA-only case is skipped)
 INDEX_TREES=0 npm test   # the same suite with every index B+ tree dropped from the start: lookups and scans through the store
 TREES=0 npm test         # and with every Merkle tree dropped: roots and proofs from the stored chunks and nodes; the two combine
@@ -235,14 +235,21 @@ exit with status 1. Transactions expire 60 seconds after they are built, or half
 Consensus timeouts and limits are not in `config.json`: a node started by the CLI runs with the
 defaults (propose 3 s plus 500 ms per round, prevote and precommit 1 s plus 500 ms per round, a
 1 s pause after each commit, votes re-sent every 500 ms while a round is open, 15 s of tolerated
-clock drift on a fresh proposal, 4 MiB blocks, at most 16 pieces of evidence in a block,
-rounds more than 1,000 ahead ignored). The timeouts, the clock drift, the block size
+clock drift on a fresh proposal, at most 16 pieces of evidence in a block,
+rounds more than 1,000 ahead ignored). The timeouts, the clock drift
 and the evidence age are `timeouts` and `limits` options of `Node` for a program that embeds
 one. The 16 pieces of evidence and the 1,000 rounds are constants of the engine. The 16 is a
 rule of the chain: a proposer takes no more from its pool, and every node refuses a block that
-carries more (`too much evidence`). The block size and the clock drift are limits of each node
-that block validation uses, so nodes embedded with different values would disagree about a
-block: keep them the same on every node of a chain.
+carries more (`too much evidence`). The block size is a rule of the chain too, and it is in
+`genesis.json` (`consensus.maxBlockBytes`, below; 4 MiB when the file names none): a node takes
+it from there and from nowhere else, so every node of a chain holds the same figure. It bounds
+what a proposer chooses, the transactions and the evidence of a block; the header and the last
+commit are not counted, so an empty block is within it whatever the validator set. A validator
+set holds at most 2,000 members, a constant of the engine: a block with the largest size a
+genesis may set and two commits of that many signatures still fits one network frame. The
+clock drift is each node's own: it is applied only to a fresh proposal when the node decides
+its prevote, never to a block being committed or synced, so nodes that differ in it still
+agree on every block.
 
 Environment: `LOG` sets the log level (`debug`, `info`, `warn`, `error`); `CHAIN_PASSPHRASE`
 the keystore passphrase. `CHAIN_SCHEME` is read only by the local network script, the tests and
@@ -257,9 +264,13 @@ alone) and `app` (objects, counters, every secondary index entry, the Merkle tre
 nodes, version history, account history, snapshots; section 12); next to it are `priv_validator_state.bin`, the consensus
 sign state that guards against double signing, `peers.json`, the address book, and `LOCK`, which
 holds the pid of the process using the directory. A second node started on the same directory
-while that process runs is refused, until the first has stopped altogether: it removes the
-file last, after it has closed the network, let the block being applied finish its writes and
-closed the store, and also when it fails while starting. The file appears with the pid already
+while that process runs is refused, until the first has stopped: the node removes the
+file as the last step of its own shutdown, after it has closed the network, let the block
+being applied finish its writes and closed the LMDB environment, and also when it fails while
+starting. That holds under `start` too, which opens the environment and hands it to its node:
+a node closes the store of a directory it holds the claim on, whoever opened it, so the file
+never goes while the store is open, and `start` closing it once more as the process exits
+does nothing. The file appears with the pid already
 in it: the node writes the pid to a file of its own, `LOCK.<pid>.<8 hex digits>`, links it to
 `LOCK` with a hard link, which fails when a `LOCK` is there, and removes its own file. So
 of two nodes started at the same moment one gets the directory and the other is refused, and
@@ -302,6 +313,7 @@ a fresh one. Back a node up by copying `data` while the node is stopped.
 | `validators` | the engine's initial set, used only when the application supplies none. `init` leaves it out and declares validators in the application genesis instead |
 | `consensus.maxEvidenceAgeMs` | how old evidence of double signing may be; `init` sets the unbonding period. A node running the core application follows the staking unbonding period in force instead, so the two never drift apart |
 | `consensus.version` | the protocol version every header must carry |
+| `consensus.maxBlockBytes` | the most bytes the transactions and evidence of a block may encode to (its header and last commit are not counted, so a whole block is that much larger): a whole number from 65,536 to 16,777,216, written as a JSON number; 4 MiB (4,194,304) when absent, and `init` writes none. Any other value is refused when the file is read (`genesis: consensus.maxBlockBytes must be a whole number from 65536 to 16777216`). Every node holds a block over it invalid (`block too large`), whether proposed, committed or synced, so set it before the chain starts and keep the file the same on every node. The mempool's limit on one transaction follows it: 1 MiB, or four bytes under half the block size where that is less. A proposer gives evidence at most half the limit, so an admitted transaction always fits the next block it is first in line for |
 | `appState` | the application genesis, inline |
 | `appStateFile` | instead of `appState`: a path (relative to `genesis.json`) to a file holding the application genesis. Use it for large states; the node streams the file at first start and never reads it again |
 
@@ -374,9 +386,11 @@ the RPC, the mempool and account history name a transaction, and which the CLI p
 hash of the signed bytes.
 
 A transaction holds at most 64 operations and 16 signatures; a node's mempool refuses one over
-1 MiB, queues 10,000 of them and remembers the last 100,000 hashes it has seen. The 1 MiB is the
+1 MiB (or over four bytes under half the chain's block size, where `consensus.maxBlockBytes` in the
+genesis makes that less), queues 10,000 of them and remembers the last 100,000 hashes it has seen. That limit is the
 mempool's admission rule, not a rule of block validation: a larger transaction in a block that a
-proposer built some other way is executed like any other, within the block size. Over the RPC,
+proposer built some other way is executed like any other, within the block size, which every
+node holds alike. Over the RPC,
 where a transaction travels as hex inside a request body of at most 1 MiB, it can be a little
 under 512 KiB.
 
@@ -414,7 +428,7 @@ mixes them with requests is answered for the requests alone. `GET /health` answe
 | `header` | `height?` | the header; below the lowest block, one the node keeps alone when it has it (section 9) | |
 | `block` | `height?` | header, transactions (hex), last commit, evidence, commit | yes |
 | `commit` | `height?` | the commit (precommit signatures) for a height | |
-| `validators` | `height?` | the validator set that signs that height: its hash, total power, members with their powers, and the proposer of its first round (proposer priorities are not included) | |
+| `validators` | `height?` | the validator set that signs that height: its hash, total power, members with their powers, and a proposer (proposer priorities are not included). That is the proposer of the height's first round, for the latest height, the two after it and every older height whose set the node still holds by height: the heights it applied itself, and the one whose snapshot it joined at, while their blocks are not pruned. For a block backfilled below a state-sync join, or a header kept alone, the set is read by its hash: the members and powers are that height's, and `proposer` is `null`, because the copy stored under the hash carries a later height's proposer | |
 | `validatorSet` | `hash` | a set by its hash, for light clients following set changes | |
 | `object` | `id`, `height?`, `prove?` | any object by id as JSON, with an object proof on request | yes |
 | `key` | `type`, `index`, `key`, `height?`, `prove?` | a lookup in an authenticated unique index (`account`/`byName`, `asset`/`bySymbol`, ...) as of the height, with a key proof; the id is the one the proof proves | yes |
@@ -464,8 +478,9 @@ the transaction (the message says why), `-32003` not included before the timeout
 limited.
 
 While the node sheds load under memory pressure (section 12), every costly method but
-`broadcastTx` answers `-32004` with `node under memory pressure` before the rate limiter is
-consulted, and `GET /events` answers HTTP 503; the cheap methods, `/health` and the streams
+`broadcastTx` answers `-32004` with `node under memory pressure` before the extra tokens of a
+costly call are taken (the one token of the request, or of a further call in a batch, is taken
+first), and `GET /events` answers HTTP 503; the cheap methods, `/health` and the streams
 already open keep working, and everything resumes once the heap eases. `broadcastTx` is still
 served, because the mempool's limit is what throttles it then: from the guard's `warn` level
 the mempool admits up to a lowered limit (section 12), and a `broadcastTx` that
@@ -501,9 +516,9 @@ refused with HTTP 400, and an `account` that does not exist, by name or by id, w
 A client that reconnects sends `Last-Event-ID: <height>` and receives the blocks after it, from
 within the last 1,000; the replay costs as much as a costly call and is refused with 429 when the
 client cannot afford it, rather than opening a stream with a gap. Only `block` events are replayed,
-with the fields of a live one, and the replay stops at a block the node has pruned. The count of
-failures (`failed`) is `null` in the replay of a block whose results the node does not hold, one
-it fetched by backfill after a state sync. A stream whose client has stopped reading is closed once a megabyte of events is
+with the fields of a live one, and the replay stops at a block the node has pruned. In the replay of
+a block whose results the node does not hold, one it fetched by backfill after a state sync,
+the count of failures (`failed`) is `null` if the block has transactions and 0 if it has none. A stream whose client has stopped reading is closed once a megabyte of events is
 queued for it; the client resumes with `Last-Event-ID`. No stream is opened while the node
 sheds load under memory pressure: the request gets HTTP 503, and the client tries again later.
 
@@ -578,8 +593,9 @@ among the top `maxValidators`; the engine applies set changes two heights later.
 4. A validator that misses too many blocks in the downtime window is jailed, slashed lightly, and
    leaves the set; after the jail time its operator runs `unjail`. Double signing, proven by
    evidence any node can gossip, slashes 5% and tombstones the validator for good. A node that
-   restarts never signs twice for a height and round, because the sign state file remembers
-   the last signature.
+   restarts never signs two different proposals or votes for one height, round and step, nor
+   anything for a step behind the last it signed, because the sign state file remembers the
+   last signature; asked for the same one again, it gives the signature it made.
 
 5. Validators change the chain's parameters by proposal: `propose` with the changes, `signal`
    from the others; more than two thirds of active stake adopts at the end of the block. Fees and
@@ -626,16 +642,19 @@ node's answer, unproven.
 
 ## 12. Operating notes
 
-- **Disk.** A full block of transfers is 4 MiB, a transfer in it 2.5 KiB under ML-DSA-44 or 154
-  bytes under secp256k1; the state, with its index entries, chunks and nodes stored beside the
+- **Disk.** A full block holds 4 MiB of transactions and evidence by default
+  (`consensus.maxBlockBytes`, section 6), with its header and last commit beside them, a
+  transfer in it 2.5 KiB under ML-DSA-44 or 154 bytes under secp256k1; the state, with its index entries, chunks and nodes stored beside the
   objects, is about the size of an ML-DSA-44 genesis (a gigabyte becomes 958 MiB of LMDB) and
   about four times a secp256k1 one (213 MiB for the 56 MB genesis of the same accounts); a
   snapshot adds the objects again while it is kept (506 MiB and 34 MiB). `retain.blocks` prunes
   blocks outside the evidence window, and the headers a state-synced node keeps alone go as the
   window moves on; snapshots are kept to `retain.snapshots`. A validator set stored by height
   goes with the block of its height (in a store pruned by an earlier build the ones below the
-  lowest block stay). Account history and validator sets by hash, one record per distinct set,
-  are never pruned and grow with use. The application store holds, beside the objects,
+  lowest block stay). A validator set stored by hash goes once the heights that carried its
+  hash are pruned and neither a header still held nor the chain state (the sets of the last,
+  the current and the next height) names it. Account history is never pruned and grows
+  with use. The application store holds, beside the objects,
   every secondary index entry and the Merkle trees' chunks and nodes, written in the same
   transaction as the objects they belong to, which is what lets the node page them (below):
   at 192,000 secp256k1 accounts the genesis store is 213 MiB where the objects alone were
@@ -886,7 +905,7 @@ node's answer, unproven.
 
 | symptom | cause and fix |
 |---|---|
-| `missing <argument>` | the command's arguments are positional; see section 4 |
+| `missing <argument>` | the command's arguments are positional, and one given as an empty string counts as missing; see section 4 |
 | `usage: see the comment at the top of src/cli.ts`, exit code 1 | no command, or one the CLI does not know, whatever follows it; a known command without its target says `missing target` |
 | the keystore refuses to open | wrong passphrase; `CHAIN_PASSPHRASE` or `--passphrase-file` must match the one `init` printed |
 | `dial failed` in the log under `LOG=debug`, with `err=connect ECONNREFUSED ...` | a seed is not running yet; the node keeps dialling and starts once it has peers |
@@ -915,6 +934,8 @@ node's answer, unproven.
 | `signature of another scheme than the chain uses` | a transaction signed with a key of the other scheme (one added with the wrong `--scheme`); sign with a key of the chain's scheme |
 | `genesis validator key is not a secp256k1 key` (or `ml-dsa-44`) | the engine's `validators` list in `genesis.json` holds keys of another scheme than `signatureScheme` names |
 | `unknown signature scheme "x"; one of ml-dsa-44, secp256k1` | `signatureScheme` in `genesis.json`, or a `--scheme` flag, is not one of the two names |
+| `genesis: consensus.maxBlockBytes must be a whole number from 65536 to 16777216` | `consensus.maxBlockBytes` in `genesis.json` is out of range, not a whole number, or written as a string; leave the field out for 4 MiB |
+| `N validators exceed the limit 2000` | a validator set of more than 2,000 members: the engine's `validators` list in `genesis.json` names too many, or an embedded application returned updates that make such a set, and the node halted rather than apply them. The core application cannot: its `maxValidators` is at most 1,000 |
 | `state sync: a validator key is not a secp256k1 key; this is not the chain genesis describes` | the peers serve a chain of another scheme than the local `genesis.json` names: the wrong genesis file, or seeds on another chain |
 | `catchingUp: true` for long | the node is far behind and fetching blocks; verification runs at a few thousand transfers a second |
 | `state sync: no peers; replaying from genesis` | no peer connected within 30 seconds of starting; check the seeds and that they are running |
@@ -922,7 +943,7 @@ node's answer, unproven.
 | `state sync: no peer serves the headers below H that evidence may still name` | the peers offering the snapshot do not hold the headers from H back to the evidence window (they joined by state sync themselves and have let theirs go, or run a shorter evidence age); start the node again once a peer that keeps its blocks is connected, and it reuses the headers it already stored |
 | `block H carries evidence for height h, whose validator set this node does not hold; its history does not reach that far` | the node halted rather than apply the block differently from the rest of the network: its headers do not reach back to h (a data directory written before header records existed, an embedded node given a shorter evidence age than the chain's unbonding period, or an unbonding period lengthened by proposal since the join); stop it, delete `data/lmdb` only (keep `priv_validator_state.bin`) and join again |
 | `keystore.json is locked by another process` | another command held the keystore's lock (`keystore.json.lock` beside it) for the 5 seconds a write waits; run the command again. A lock left by a process that died is cleared after 30 seconds |
-| `data directory ... is in use by process N` (or `by this process`) | another node has the directory open (its pid is in `data/LOCK`), or is still stopping: the file goes last, once its store is closed; stop it first and wait for it to exit. A `LOCK` whose process is gone is taken over by the next start; if N is not a node (the pid of a node that crashed, given since to another process), remove `data/LOCK` |
+| `data directory ... is in use by process N` (or `by this process`) | another node has the directory open (its pid is in `data/LOCK`), or is still stopping: the file goes once its network is closed, the block being applied has finished its writes and the store is closed, just before the process exits; stop it first and wait for it to exit. A `LOCK` whose process is gone is taken over by the next start; if N is not a node (the pid of a node that crashed, given since to another process), remove `data/LOCK` |
 | `data directory ...: could not claim it in 50 attempts; <path>/LOCK.takeover may have been left by a process that stopped while taking over a stale claim: check that no node runs on the directory, then remove it` | most likely a node was killed in the few file operations for which it held `LOCK.takeover` while taking over a stale `LOCK`, and the file is never removed automatically; make sure no node runs on the directory, delete `data/LOCK.takeover` if it is there and start again. If it is not there, other processes kept claiming and releasing the directory during the attempts: start again |
 | `<path>/light.json holds a trusted header of chain X, and this node is on chain Y` | the keystore directory's light client anchor belongs to another chain; use that chain's keystore directory (`--keystore`), or anchor afresh with `light <target> trust <height> <hash>` |
 | `included at height H; this node does not hold the results of that block` from `verify-tx` | the node fetched the block after a state sync and never executed it; the inclusion is proven, and a node that executed the block proves the result |

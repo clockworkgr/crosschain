@@ -19,7 +19,7 @@ Requires Node 24 (it runs TypeScript directly; there is no build step).
 
 ```sh
 npm install
-npm test                      # 268 tests, about two minutes; CHAIN_SCHEME=secp256k1 runs them on secp256k1 keys, INDEX_TREES=0 or TREES=0 with the database's index or Merkle trees dropped
+npm test                      # 276 tests, about two minutes; CHAIN_SCHEME=secp256k1 runs them on secp256k1 keys, INDEX_TREES=0 or TREES=0 with the database's index or Merkle trees dropped
 node scripts/localnet.ts 4 30 # 4 validators in one process for 30 seconds, driving the app from a faucet, RPC on :26657
 ```
 
@@ -52,7 +52,9 @@ own file named by `"appStateFile"` in `genesis.json`; the node streams it with
 `stream-json` at first start and never reads it again.
 
 `start` runs the node in a child process under a heap limit, three quarters of memory
-unless `--heap <MiB>` says otherwise, with a memory guard that pages the state as the heap
+unless `--heap <MiB>` says otherwise (an old-space limit already set on Node's command
+line or in `NODE_OPTIONS` is kept instead: no child is started and `--heap` is not
+read), with a memory guard that pages the state as the heap
 fills. At 70% of the limit it caps the object database's cache of decoded objects, drops the
 secondary indices' B+ trees (on a node set to keep them in memory; by default they are never
 built and index reads go to the store), cuts the window of past versions kept in memory to the
@@ -89,7 +91,7 @@ engine and the application, not the wire.
 | ML-DSA-44 sign | 2.85 ms (a rejection loop; earlier runs read between 2 and 9 ms) |
 | secp256k1 verify | 1,400/s on one thread, 9,200/s on the worker pool |
 | secp256k1 sign | 0.23 ms |
-| signed transfer | 2,510 bytes under ML-DSA-44, 154 under secp256k1; 1,663 ML-DSA-44 transfers filled a 4 MiB block in the four-validator run (the codec's estimate with a 2 KiB shell is 1,667) |
+| signed transfer | 2,510 bytes under ML-DSA-44, 154 under secp256k1; a full block holds 1,667 ML-DSA-44 transfers, the codec's figure exactly (the 4 MiB limit is on the transactions and the evidence, less the 1 KiB the builder leaves), and encodes to 4.01 MiB with its header and commit |
 | checkTx (admission to the mempool) | 5,800 transfers/s through the pool |
 | finalizeBlock, signatures verified at admission | 25,000 transfers/s; 1,500 transfers (about 3.6 MiB with a block shell) in 64 ms |
 | finalizeBlock, cold (block sync, or a node that missed the gossip) | 5,800 transfers/s |
@@ -108,8 +110,8 @@ at admission or in the block, and
 reuses the result while its cache entry lasts (the cache holds 20,000 transaction
 bodies); a signer whose key an earlier transaction of the same block introduces is
 verified in the per-transaction pass instead of the batch. Block space bounds the live
-network: a 4 MiB block holds about 1,660 ML-DSA-44 transfers once the previous commit and the
-header are in it, at about a block a second. The object database and the store are
+network: the 4 MiB a block may give its transactions and evidence hold 1,667 ML-DSA-44
+transfers (the header and the previous commit are not counted), at about a block a second. The object database and the store are
 nowhere near their limits at this scale.
 
 ### A large genesis

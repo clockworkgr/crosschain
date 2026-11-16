@@ -74,7 +74,11 @@ export async function run(): Promise<void> {
     const r = await blockOf(app, block1500);
     if (r.txResults.some((t) => !t.ok)) throw new Error('a transaction failed');
   });
-  await bench('finalizeBlock, empty block', { iterations: 20 }, () => blockOf(app, []));
+  // Measured once the engine has settled. The functions an empty block runs were compiled while the full blocks
+  // above ran, for what those blocks did; the first empty blocks run that code (about 190 µs), then it is thrown
+  // away and they run unoptimised (about 470 µs) until, some 600 blocks on, it is compiled again for what an empty
+  // block does. Twenty blocks after the full ones measured one of the first two, by chance; this is the third.
+  await bench('finalizeBlock, empty block', { warmup: 1000, iterations: 500 }, () => blockOf(app, []));
 
   await bench('commit to memory (after a 500-transfer block)', { iterations: 5, before: async () => void (await blockOf((app = makeApp(pool)), block500)) }, () => app.commit());
   const dir = mkdtempSync(join(tmpdir(), 'crosschain-bench-'));

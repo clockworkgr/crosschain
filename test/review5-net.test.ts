@@ -15,7 +15,7 @@ import type { Application, CheckTxOptions } from '../src/app/types.ts';
 import { Reader } from '../src/codec/reader.ts';
 import { encode } from '../src/codec/writer.ts';
 import { DEFAULT_LIMITS, MAX_ROUND_AHEAD } from '../src/consensus/consensus.ts';
-import { DEFAULT_SCHEME, keyPairFromSeed } from '../src/crypto/keys.ts';
+import { DEFAULT_SCHEME, keyPairFromSeed, sign, signContext } from '../src/crypto/keys.ts';
 import { InlineVerifier } from '../src/crypto/verifier.ts';
 import { Mempool } from '../src/mempool.ts';
 import { MemoryHub } from '../src/p2p/memory.ts';
@@ -29,10 +29,10 @@ import { MemoryKv } from '../src/store/kv.ts';
 import { BlockSync } from '../src/sync/blocksync.ts';
 import { stateSync } from '../src/sync/statesync.ts';
 import { blockHash, headerHash, txHash, type Block, type Commit } from '../src/types/block.ts';
-import type { Proposal } from '../src/types/proposal.ts';
+import { proposalSignBytes, type Proposal } from '../src/types/proposal.ts';
 import type { ChainState } from '../src/types/state.ts';
 import { ValidatorSet } from '../src/types/validator.ts';
-import { VoteType, type Vote } from '../src/types/vote.ts';
+import { VoteType, voteSignBytes, type Vote } from '../src/types/vote.ts';
 import { makeTestnet, seedFor, sleep, tx, verifier, waitFor, waitForHeight, type Testnet } from './helpers.ts';
 
 describe('the peer layer', () => {
@@ -341,7 +341,7 @@ describe('consensus intake', () => {
     net = null;
   });
 
-  it('drops a vote for a round far ahead before verifying it, holds few unchecked proposals from one peer, and forgets block requests with the height', async () => {
+  it('drops a vote for a round far ahead before verifying it, holds for the next height only proposals a validator signed, and forgets block requests with the height', async () => {
     // Two of four validators: the height stays where it is until the others start.
     net = await makeTestnet({ validators: 4, skipStart: [2, 3] });
     const node = net.nodes[0]!;
@@ -355,14 +355,45 @@ describe('consensus intake', () => {
     await consensus.handleVote(vote(consensus.round + 1), 'near');
     expect(node.network.scoreOf('near')).toBeGreaterThan(19);
 
-    // Proposals for the next height wait unchecked. One peer fills two places and no more; another still gets in.
+    // A valid vote for the next height is held once however often it is sent; a conflicting one is held beside it.
+    const heldVotes = () => (consensus as unknown as { nextHeightVotes: unknown[] }).nextHeightVotes;
+    const key0 = keyPairFromSeed(net.validatorSeed(0));
+    const index = node.executor.validatorSetAtHeight(2n)!.indexOf(key0.address);
+    const signedVote = (fill: number): Vote => {
+      const unsigned = { type: VoteType.Prevote, height: 2n, round: 0, blockHash: new Uint8Array(32).fill(fill), validatorIndex: index };
+      return { ...unsigned, signature: sign(voteSignBytes(net!.genesis.chainId, unsigned), key0.secretKey, signContext(net!.genesis.chainId, 'vote')) };
+    };
+    for (let i = 0; i < 5; i++) await consensus.handleVote(signedVote(1), 'repeater');
+    expect(heldVotes().length).toBe(1);
+    await consensus.handleVote(signedVote(2), 'repeater');
+    expect(heldVotes().length).toBe(2);
+
+    // A proposal for the next height waits only if the validator its block names signed it, two to a validator.
     const held = () => (consensus as unknown as { nextHeightProposals: { from: string | null }[] }).nextHeightProposals;
-    // The block is of another height than the proposal, so each is dropped at a glance when the height starts.
-    const junk = (round: number) => ({ height: 2n, round, polRound: -1, block: { header: { height: 0n } }, signature: new Uint8Array(64) }) as unknown as Proposal;
-    for (let r = 0; r < 10; r++) void consensus.handleProposal(junk(r), 'junk');
-    expect(held().filter((e) => e.from === 'junk').length).toBe(2);
-    void consensus.handleProposal(junk(0), 'other');
-    expect(held().filter((e) => e.from === 'other').length).toBe(1);
+    const zero = new Uint8Array(32);
+    const keys = [0, 1, 2, 3].map((i) => keyPairFromSeed(net!.validatorSeed(i)));
+    // The block is not one height 2 would accept, so each is dropped once that height starts; the rounds are late
+    // ones, so none stands where a real proposal will.
+    const proposal = (round: number, proposer: number, signer = proposer): Proposal => {
+      const header = { chainId: net!.genesis.chainId, version: 1, height: 2n, time: 1n, lastBlockHash: zero, lastCommitHash: zero, dataHash: zero, lastResultsHash: zero, validatorsHash: zero, nextValidatorsHash: zero, appHash: zero, evidenceHash: zero, proposerAddress: keys[proposer]!.address };
+      const unsigned = { height: 2n, round, polRound: -1, block: { header, txs: [], lastCommit: null, evidence: [] } as Block };
+      return { ...unsigned, signature: sign(proposalSignBytes(net!.genesis.chainId, unsigned), keys[signer]!.secretKey, signContext(net!.genesis.chainId, 'proposal')) };
+    };
+    // Signed by another key than the proposer's it names: not held, and its sender pays for the verification.
+    await consensus.handleProposal(proposal(5, 0, 1), 'forger');
+    expect(held().length).toBe(0);
+    expect(node.network.scoreOf('forger')).toBeGreaterThan(19);
+    // With a proof of lock, or a block of another height: dropped unverified.
+    await consensus.handleProposal({ ...proposal(5, 0), polRound: 0 }, 'junk');
+    await consensus.handleProposal({ ...proposal(5, 0), height: 2n, block: { header: { height: 0n } } } as unknown as Proposal, 'junk');
+    expect(held().length).toBe(0);
+    expect(node.network.scoreOf('junk')).toBe(0);
+    // One validator takes two places and no more, whichever peer relays; a round it already holds is not held twice.
+    for (let r = 5; r < 10; r++) await consensus.handleProposal(proposal(r, 0), 'junk');
+    await consensus.handleProposal(proposal(5, 0), 'other');
+    expect(held().length).toBe(2);
+    for (const i of [1, 2, 3]) for (let r = 5; r < 8; r++) await consensus.handleProposal(proposal(r, i), 'other');
+    expect(held().length).toBe(8);
 
     // The hashes of blocks asked for are kept for the height they belong to and no longer.
     const fetchRequested = (consensus as unknown as { fetchRequested: Set<string> }).fetchRequested;
@@ -371,7 +402,7 @@ describe('consensus intake', () => {
     await net.nodes[3]!.start();
     await waitForHeight(net.nodes, 2n);
     expect(fetchRequested.has('a-hash-of-height-1')).toBe(false);
-    expect(held().filter((e) => e.from === 'junk').length).toBe(0);
+    expect(held().length).toBe(0);
   });
 });
 

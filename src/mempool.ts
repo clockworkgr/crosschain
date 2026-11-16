@@ -148,10 +148,19 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
   }
 
   async addTx(tx: Uint8Array, source: string | null = null): Promise<AddTxResult> {
+    // Before the hash: a transaction refused for its size costs nothing in proportion to it. Its hash is worked
+    // out only if the caller reads it.
+    if (tx.length > this.opts.maxTxBytes) {
+      return {
+        status: 'too-large',
+        get hash() {
+          return txHash(tx);
+        },
+      };
+    }
     const hash = txHash(tx);
     const key = toHex(hash);
     if (this.pausedReason !== null) return { status: 'paused', hash, error: this.pausedReason };
-    if (tx.length > this.opts.maxTxBytes) return { status: 'too-large', hash };
     if (this.known(key)) return { status: 'seen', hash };
     if (this.txs.size + this.reserved >= this.limit) return { status: 'full', hash, error: this.fullReason };
     // Mark before the await so a concurrent duplicate is not checked twice.

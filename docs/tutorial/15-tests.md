@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-nine files, 268 cases, about 8,670 lines counting the shared harness
+`test/**/*.test.ts`: twenty-nine files, 276 cases, about 8,880 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (267 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (275 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -27,7 +27,7 @@ the external review and the later cases of the same kind, `review2` five more th
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
 by title at the end of the suites, `review4` the nine cases for the items the first review
-noted and left, and the four `review5` files 55 cases for failures and unusual callers at the
+noted and left, and the four `review5` files 63 cases for failures and unusual callers at the
 edges of every layer: `review5-net` the peer layer, sync, consensus intake and the mempool,
 `review5-node` the node, the executor and the block store, `review5-app` the application, the
 object database and the codec, and `review5-rpc` the RPC server, the keystore, the command
@@ -36,7 +36,7 @@ below.
 
 ## The harness
 
-Everything the suites share lives in `test/helpers.ts`, 159 lines. It exports two constants,
+Everything the suites share lives in `test/helpers.ts`, 162 lines. It exports two constants,
 seven functions, two interfaces and one shared verifier.
 
 ### `FAST_TIMEOUTS`
@@ -136,6 +136,8 @@ export interface TestnetOptions {
   dataDirFor?: (i: number) => string | null;
   timeouts?: Partial<typeof FAST_TIMEOUTS>;
   limits?: Partial<ValidationLimits>;
+  /** The chain's engine settings, written to the genesis. */
+  consensus?: Genesis['consensus'];
   /** Indices to create but not start. */
   skipStart?: number[];
   /** The chain's signature scheme; CHAIN_SCHEME from the environment, else ML-DSA-44. */
@@ -152,7 +154,9 @@ export interface TestnetOptions {
 `validators` nodes get a validator key; `fullNodes` more are created without one, so they
 follow but do not vote. `powers` sets voting power per validator (default 10 each).
 `dataDirFor` returns a directory for a node that should persist to LMDB, or `null` to keep
-it in memory (the default). `skipStart` creates nodes without starting them, for "node down"
+it in memory (the default). `limits` goes into every node's configuration, and `consensus`
+into the genesis: the chain's engine settings, which is where a block size has to be set, since
+a node takes none from its own configuration ([chapter 8](08-node.md)). `skipStart` creates nodes without starting them, for "node down"
 and "late joiner" scenarios. `scheme` is the signature scheme the validator and node keys are
 derived with and the genesis names; it defaults to `DEFAULT_SCHEME`, which is `CHAIN_SCHEME`
 from the environment or ML-DSA-44, and only `test/schemes.test.ts` passes one explicitly
@@ -196,6 +200,7 @@ The genesis is built once and shared:
       opts.engineValidators === false
         ? undefined
         : validatorKeys.map((publicKey, i) => ({ publicKey, power: opts.powers?.[i] ?? 10n, name: `val${i}` })),
+    ...(opts.consensus ? { consensus: opts.consensus } : {}),
     appState: new TextEncoder().encode(appState),
   };
 ```
@@ -2243,9 +2248,10 @@ and the new node stopped: the lock is released with the node, not left behind.
 accepted until the first verification step, and a set that had since unbonded could have signed
 it. Two validators; with header 2's hash as the anchor, `trust` with `trustingPeriodMs: 1n`
 rejects with `/trusting period/`, while with the default period the same anchor is accepted and
-`trusted.header.height` is 2. `test/light.test.ts` makes the same check at the anchor on a larger network. No case advances
-the clock after anchoring, so the trusting-period rule of `timeProblem`, applied at each
-verification step, is not exercised by a test.
+`trusted.header.height` is 2. `test/light.test.ts` makes the same check at the anchor on a larger network. The
+trusting-period rule of `timeProblem`, applied at each verification step once the clock has
+moved on from the anchor, has its case in `test/review5-rpc.test.ts`, below: "verifies no
+header from a trusted one that has reached the trusting period, the next one or a later one".
 
 Findings fixed with tests elsewhere: 33 in `test/network.test.ts` (a message sent the instant a
 peer connects), 25 and 31 in `test/rpc.test.ts` (event streams and replay), 36 in
@@ -2471,8 +2477,8 @@ verifier rejects with `/closed/`.
 
 ### test/review5-net.test.ts
 
-Fifteen tests for the peer layer, block sync, state sync, what consensus takes in before it has
-checked it, and the mempool, each at an edge: a failure, a peer that misbehaves, or two things
+Fifteen tests for the peer layer, block sync, state sync, what consensus takes in ahead of
+its round or its height, and the mempool, each at an edge: a failure, a peer that misbehaves, or two things
 happening at once. They are listed by group and title with what each sets up and asserts.
 
 `the peer layer`, five cases. `makeNet(name, transport, cfg)` makes a bare `Network` on chain
@@ -2551,15 +2557,27 @@ charge of 50 for a manifest that does not decode, less a moment's decay.
 
 `consensus intake`, one case.
 
-**`it('drops a vote for a round far ahead before verifying it, holds few unchecked proposals from one peer, and forgets block requests with the height')`**.
+**`it('drops a vote for a round far ahead before verifying it, holds for the next height only proposals a validator signed, and forgets block requests with the height')`**.
 Two of four validators are started, so node 0 stays at height 1. A prevote with a signature of
 zeros for round `round + MAX_ROUND_AHEAD + 1`, handed to `handleVote` as from the peer `far`,
 leaves `far`'s score at 0, while the same vote for `round + 1` from `near` leaves `near` above
 19: a bad signature costs its sender 20 points when it is verified, and a vote dropped for its
-round is never verified. Ten proposals for height 2 from the peer `junk` leave two of its
-entries in `nextHeightProposals`, and one from `other` is still taken. A made-up hash is put
-into `fetchRequested`; the other two validators are started, the network reaches height 2, and
-the hash is gone and so are `junk`'s entries.
+round is never verified. `signedVote(fill)` makes a prevote of validator 0 for height 2, round
+0, for a block hash of 32 bytes of `fill`, signed with that validator's key. The vote for hash
+1 is handed to `handleVote` five times from the peer `repeater` and `nextHeightVotes` holds one
+entry: a vote for the next height is held once however often it is sent. The vote for hash 2
+makes it two, a conflicting vote being held beside the first. `proposal(round, proposer, signer)` then makes a fresh proposal for
+height 2 whose block names validator `proposer` and which validator `signer` signs, the
+proposer itself unless said otherwise; the block is not one height 2 would accept and the
+rounds are 5 and later, so each is dropped when that height starts and none stands where a
+real proposal will. One naming validator 0 and signed by validator 1, from the peer `forger`,
+is not held and leaves `forger` above 19. One with `polRound: 0` and one whose block is of
+height 0, from `junk`, are not held and leave `junk` at 0: neither was verified. Rounds 5 to 9
+signed by validator 0 from `junk`, and round 5 again from `other`, leave two entries in
+`nextHeightProposals`: a validator takes two places whichever peer relays, and a round held is
+not held twice. Rounds 5 to 7 from each of validators 1, 2 and 3 bring it to 8, the most it
+holds. A made-up hash is put into `fetchRequested`; the other two validators are started, the
+network reaches height 2, and the hash is gone and the buffer is empty.
 
 `a validator set from bytes`, one case.
 
@@ -2594,13 +2612,13 @@ the pool holds two.
 
 ### test/review5-node.test.ts
 
-Fifteen tests for the node, the executor and the block store. Two helpers serve several
+Twenty-two tests for the node, the executor and the block store. Two helpers serve several
 groups: `blockAfter(state, lastCommit, evidence)` builds the block that would follow a chain
 state as far as its structure goes, with a commit of no signatures, and
 `doubleSign(net, node, height, round)` signs two prevotes of validator 0 for different hashes
 and makes evidence of them.
 
-`the data directory`, five cases on a one-validator testnet whose node is not started
+`the data directory`, six cases on a one-validator testnet whose node is not started
 (`skipStart: [0]`), with a temporary directory removed in `afterEach`.
 
 **`it('is one directory however its path is spelled or linked to')`**. A node is made on
@@ -2625,12 +2643,21 @@ process's id and there is no `LOCK.takeover`.
 transport is wrapped so that its `close` notes whether `LOCK` exists. After `start()` and
 `stop()` the note is true and `LOCK` is gone: the claim is given up last.
 
+**`it('closes a store it was handed for a directory it claimed before giving the claim up')`**.
+As the command line does, the test opens an `LmdbEnv` under `<tmp>/lmdb` itself and hands it to
+a node made with `dataDir: tmp`. The environment's `close` is wrapped so that its first call
+notes whether `LOCK` exists. After `start()` the node is stopped twice at once
+(`await Promise.all([node.stop(), node.stop()])`): two callers wait for the one shutdown, and
+neither returns with the store still open. The note is then true and `LOCK` is gone:
+the node closed the store it was handed while it still held the claim. The test then closes
+the environment again, as the command line does after `stop()`, and nothing throws.
+
 **`it('is given back, with the store, by a node that fails to open')`**. A `KvStoreApp` whose
 `initChain` throws makes `makeNode` reject with `/no genesis for you/`. No `LOCK` is left, and
 the same process makes a node on the directory again, at height 0: neither the claim nor the
 store environment stayed held.
 
-`the executor`, three cases.
+`the executor`, five cases.
 
 **`it('reads the evidence age from the application when asked, not at the commit before')`**.
 One validator of the core application with an unbonding period of 2 s, not started. The
@@ -2658,7 +2685,26 @@ alone below the lowest block with times of 1 and 2 and the lowest-header marker 
 lower: the next commits delete them in exactly one write, which deletes at least two header
 records (`'H'`) and the marker (`'L'`).
 
-`the stores`, three cases.
+**`it('answers for a past height with the set as that height had it, proposer included')`**.
+Four validators run to height 8. For every height from 1 to the one before node 0's latest,
+the hash of `validatorSetAtHeight(h)` is the `validatorsHash` of the stored block's header
+and `hasProposerAt(h)` is true.
+Where the block's commit is of round 0, the address of the set's `proposer()` is the header's
+`proposerAddress`: a block decided in its first round was proposed by the set's proposer of
+that height, which the record by height has and the record by hash, rewritten by later
+heights, has not. More than four heights are checked that way.
+
+**`it('removes a validator set by hash once no header held names it')`**. One validator with
+`maxEvidenceAgeMs: 1n` and `retain: { blocks: 2 }`; the hash of its set is noted before it
+starts. At height 2 a `val:` transaction adds a second validator with power 1, so the set
+changes and the first validator, alone, still decides every block. When the state's set has
+two members the first set is still in the store. The test then waits for
+`loadValidatorSet(first)` to be null, which happens once every block that names the first set
+is pruned. Every block from the lowest held to the one before the latest has a
+`validatorsHash` other than the first set's, and both sets its header names are found by
+hash; the set in use is found too.
+
+`the stores`, four cases.
 
 **`it('indexes a transaction repeated in one block where it succeeded')`**. On a
 `MemoryBlockStore`: block 3 holds a transaction at positions 0 and 2, failed at 0 and
@@ -2672,12 +2718,26 @@ On a `MemoryKv`, a write that puts a key and then deletes it leaves no value; on
 deletes and puts again leaves the last value; and a write that deletes and then throws leaves
 the value as it was.
 
+**`it('undoes the writes of a memory environment transaction that throws, in every store')`**.
+A `MemoryEnv` whose `chain` store holds key 1 with value 1. Inside one `transaction` the store
+is written twice, key 1 put with value 2 and key 2 added, then key 1 deleted; a transaction
+inside it writes key 1 to the `app` store, which is asked for there for the first time; and the
+callback throws `commit failed`, which `transaction` throws on. Afterwards key 1 holds value 1
+again, key 2 is absent and the `app` store has nothing under key 1. A transaction that returns
+keeps its write of key 2, a write of key 1 made outside any transaction follows, and a
+transaction that only throws leaves both as they were: writes after a failed transaction are
+not undone by a later one. The last part is a failure inside: an outer transaction puts key 1
+with value 5, then runs an inner one that puts key 1 with value 6, writes key 1 to a `late`
+store first asked for there and throws `inner`; the outer one catches the error and puts key 2
+with value 5. Afterwards key 1 and key 2 both hold value 5 and the `late` store has nothing
+under key 1: the inner transaction was undone by itself, and the outer one kept its own writes.
+
 **`it('reads a heap flag of zero as no flag')`**. `heapLimitFlag` is null for
 `--max-old-space-size=0` on the command line and for `--max_old_space_size=0` in the options
 string; null when a 0 follows a 512 on the command line, and when the command line says 0 and
 the options string 512; and 512 when the command line says 512 and the options string 0.
 
-`gossip and block validation`, four cases.
+`gossip and block validation`, seven cases.
 
 **`it('does not pool gossiped evidence that is already too old for a block')`**. One validator
 with `maxEvidenceAgeMs` of 1,500 runs until the latest block's time is more than 1,700 ms past
@@ -2699,6 +2759,43 @@ asks for as many as it remembers for one peer and no more: the set reaches 2,048
 (`MAX_OUTSTANDING_PER_PEER`) within ten seconds and still holds exactly 2,048 after another
 300 ms.
 
+**`it('takes the block size from the genesis, for every node alike')`**. Two validators on a
+genesis with `consensus: { maxBlockBytes: 65536 }`, and a third node, no validator, made with
+`limits: { maxBlockBytes: 1024 }` forced past the type. 200 transactions of about 1 KiB each
+are `added` on the first node, and one of half a block and a little more is `too-large`: the
+pool's limit is four bytes under half the block size here. Every one of the 200 reaches the third node's
+transaction index, so the node configured with another size followed the chain. They lie in
+more than three blocks, and the transactions and evidence of the largest of those blocks
+(`blockDataBytes`) encode to more than half of 65,536 bytes and not more than it. The genesis written with `genesisToJson` and read with
+`genesisFromJson` has the figure, and the same text with 1,024, 64 MiB, 70,000.5 or the string
+`"65536"` in its place throws `/maxBlockBytes must be a whole number/`.
+
+**`it('gives evidence half a block at most, so the largest transaction admitted still fits')`**.
+One validator on a genesis with `consensus: { maxBlockBytes: MIN_BLOCK_BYTES }`, past height 2.
+`MAX_EVIDENCE_PER_BLOCK` pieces of evidence, double signs of validator 0 at height 1 in sixteen
+rounds, are added to the node's evidence pool: under ML-DSA-44 the sixteen encode to more than
+the whole of 65,536 bytes. A transaction of `MIN_BLOCK_BYTES / 2 - 4` bytes, 32,764, the
+largest the pool takes on this chain, is then submitted and is `added`. It is committed within
+twenty seconds. In the block that holds it the transactions and evidence (`blockDataBytes`)
+encode to no more than 65,536 bytes and the evidence alone to no more than 32,768: the builder
+left out the records that did not fit in half the limit and gave the transaction the other
+half. The records left out follow in later blocks: the pool's pending count comes down to 0,
+and the evidence in the blocks from height 2 to the node's height adds up to 16, so none was
+lost.
+
+**`it('bounds a block by what its proposer chose, and a validator set by what a frame holds')`**.
+One validator, not started, on a genesis with `consensus: { maxBlockBytes: MIN_BLOCK_BYTES }`.
+The block `blockAfter` builds on the node's state, empty, passes `validateBlockStructure` under
+that limit. `room` is the limit less what `blockDataBytes` gives for one empty transaction and
+no evidence, so a block whose one transaction is `room` bytes long encodes its transactions and
+evidence to exactly 65,536 bytes: it passes, and with `room + 1` bytes the answer is
+`block too large`, whatever the header and the commit weigh. Then the set: `ValidatorSet.create`
+with `MAX_VALIDATORS` entries of power 1 gives a set of 2,000, and with one more throws
+`/2001 validators exceed the limit 2000/`. Last, a sum: `MAX_BLOCK_BYTES`, two commits of
+`MAX_VALIDATORS` signatures of 2,421 bytes with 16 bytes allowed beside each, and 64 KiB more
+are less than `MAX_FRAME`, so the largest block a genesis may allow fits one frame with the two
+commits it travels with.
+
 **`it('refuses a block with more evidence than a block may carry')`**. One validator, stopped
 at height 2 or later. `validateBlockStructure` on the next block carrying
 `MAX_EVIDENCE_PER_BLOCK + 1` pieces of evidence, double signs of validator 0 in as many rounds,
@@ -2706,7 +2803,7 @@ answers `too much evidence`, and with `MAX_EVIDENCE_PER_BLOCK` of them `null`.
 
 ### test/review5-app.test.ts
 
-Sixteen tests for the application, the object database, the codec and the toy application. The
+Seventeen tests for the application, the object database, the codec and the toy application. The
 application cases run a `CoreApp` over a genesis with a faucet, three operator accounts and two
 validators (self-bonds 200 and 100), a downtime window of four blocks and no block reward,
 driven a block at a time by `block(app, txs, signers)`. `FlakyKv` is a store over a `MemoryKv`
@@ -2814,7 +2911,7 @@ still hold what was read; the `fixed` result is a plain `Uint8Array` on a buffer
 **`it('grows a writer that was made with no capacity')`**. `new Writer(0)` writes a `u8` and a
 `u64`, and 100 fixed bytes, and `new Writer(1)` a `u32`, each finishing with the right bytes.
 
-`the toy application and its validator set`, two cases on `KvStoreApp` with `val:<key>:<power>`
+`the toy application and its validator set`, three cases on `KvStoreApp` with `val:<key>:<power>`
 transactions and a genesis set of alice at power 10.
 
 **`it('fails a transaction whose update the engine could not apply to the set')`**. Block 1 adds
@@ -2823,6 +2920,12 @@ removes alice (refused, `/last validator/`), adds bob at `MAX_TOTAL_POWER` (refu
 `/exceed the limit/`), adds bob at `MAX_TOTAL_POWER - 10` (accepted) and raises alice to 11
 (refused); the one update is bob's. Block 3 removes alice and then bob: the first succeeds,
 the second fails, bob then being the last, and the one update is alice at power 0.
+
+**`it('refuses a validator key of another scheme than the set\'s')`**. A key pair is derived
+under the scheme the suite is not running on, secp256k1 under the default and ML-DSA-44 under
+`CHAIN_SCHEME=secp256k1`. `checkTx` of a `val:` transaction with that key at power 5 fails with
+`/key must be a .* key/`. A block of that transaction followed by one adding bob at power 5
+has results failed and succeeded, and its one update is bob's.
 
 **`it('has its validator set back from its file')`**. A `KvStoreApp` on a file adds bob and
 commits. A second one opened on the file removes bob and then alice: the first succeeds and the

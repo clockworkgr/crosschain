@@ -237,7 +237,11 @@ export function bootstrapValidators(db: ObjectDatabase, list: { operator: Object
     if (v.selfBond < g.staking.minSelfBond) throw new Error(`genesis validator ${name}: self-bond below the minimum`);
     if (validatorByOperator(db, v.operator)) throw new Error(`genesis validator ${name}: account already operates a validator`);
     if (keyEverUsed(db, addressOf(v.consensusKey))) throw new Error(`genesis validator ${name}: consensus key already used`);
-    adjustBalance(db, v.operator, g.coreAsset, -v.selfBond);
+    try {
+      adjustBalance(db, v.operator, g.coreAsset, -v.selfBond);
+    } catch (e) {
+      throw new Error(`genesis validator ${name}: ${(e as Error).message}`);
+    }
     createValidator(db, v.operator, v.consensusKey, v.selfBond, 0n);
   }
   const active = computeActiveSet(db, g.staking, precisionOf(db));

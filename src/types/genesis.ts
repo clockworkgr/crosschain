@@ -26,12 +26,30 @@ export interface Genesis {
   genesisTime: bigint;
   /** The initial validator set, unless the application supplies one from initChain. */
   validators?: GenesisValidator[];
-  /** Engine settings: the protocol version and limits that must agree with the application's rules. */
-  consensus?: { maxEvidenceAgeMs?: bigint; version?: number };
+  /**
+   * Engine settings every node of the chain must hold alike: the protocol version, the evidence age (which must
+   * agree with the application's rules) and the most bytes the transactions and evidence of a block may encode to,
+   * 4 MiB when absent. A block over
+   * that size is invalid for everyone, so it is read from here and from nowhere else.
+   */
+  consensus?: { maxEvidenceAgeMs?: bigint; version?: number; maxBlockBytes?: number };
   /** Opaque to consensus; handed to the application's initChain. Empty when `appStateFile` is set. */
   appState: Uint8Array;
   /** The application genesis in its own file. Relative to the genesis file as written; absolute once loaded. */
   appStateFile?: string;
+}
+
+/**
+ * The sizes a chain may set for the transactions and evidence of a block: room for a transaction of some size, and,
+ * with two commits of the largest validator set beside it, inside one network frame.
+ */
+export const MIN_BLOCK_BYTES = 64 * 1024;
+export const MAX_BLOCK_BYTES = 16 * 1024 * 1024;
+export const DEFAULT_MAX_BLOCK_BYTES = 4 * 1024 * 1024;
+
+export function checkMaxBlockBytes(n: unknown): number {
+  if (typeof n !== 'number' || !Number.isInteger(n) || n < MIN_BLOCK_BYTES || n > MAX_BLOCK_BYTES) throw new Error(`genesis: consensus.maxBlockBytes must be a whole number from ${MIN_BLOCK_BYTES} to ${MAX_BLOCK_BYTES}`);
+  return n;
 }
 
 export function genesisToJson(g: Genesis): string {
@@ -41,7 +59,7 @@ export function genesisToJson(g: Genesis): string {
       signatureScheme: g.signatureScheme,
       genesisTime: g.genesisTime.toString(),
       validators: g.validators?.map((v) => ({ publicKey: toHex(v.publicKey), power: v.power.toString(), name: v.name })),
-      consensus: g.consensus ? { maxEvidenceAgeMs: g.consensus.maxEvidenceAgeMs?.toString(), version: g.consensus.version } : undefined,
+      consensus: g.consensus ? { maxEvidenceAgeMs: g.consensus.maxEvidenceAgeMs?.toString(), version: g.consensus.version, maxBlockBytes: g.consensus.maxBlockBytes } : undefined,
       appState: g.appStateFile ? undefined : new TextDecoder().decode(g.appState),
       appStateFile: g.appStateFile,
     },
@@ -62,7 +80,7 @@ export function genesisFromJson(s: string, baseDir = '.'): Genesis {
     genesisTime: BigInt(j.genesisTime),
     validators: Array.isArray(j.validators) ? (j.validators as any[]).map((v) => ({ publicKey: fromHex(v.publicKey), power: BigInt(v.power), name: v.name })) : undefined,
     consensus: j.consensus
-      ? { maxEvidenceAgeMs: j.consensus.maxEvidenceAgeMs !== undefined ? BigInt(j.consensus.maxEvidenceAgeMs) : undefined, version: j.consensus.version }
+      ? { maxEvidenceAgeMs: j.consensus.maxEvidenceAgeMs !== undefined ? BigInt(j.consensus.maxEvidenceAgeMs) : undefined, version: j.consensus.version, ...(j.consensus.maxBlockBytes !== undefined ? { maxBlockBytes: checkMaxBlockBytes(j.consensus.maxBlockBytes) } : {}) }
       : undefined,
     appState: appStateFile ? new Uint8Array() : new TextEncoder().encode(typeof j.appState === 'string' ? j.appState : JSON.stringify(j.appState ?? {})),
     ...(appStateFile ? { appStateFile } : {}),

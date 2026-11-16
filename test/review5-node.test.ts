@@ -25,9 +25,12 @@ import { heapLimitFlag } from '../src/node/memory.ts';
 import type { Node } from '../src/node/node.ts';
 import { InvKind } from '../src/p2p/messages.ts';
 import { KvBlockStore, MemoryBlockStore } from '../src/store/blockstore.ts';
-import { MemoryKv, type KvEnv, type KvWriter } from '../src/store/kv.ts';
+import { MemoryEnv, MemoryKv, type KvEnv, type KvWriter } from '../src/store/kv.ts';
 import { LmdbEnv } from '../src/store/lmdb.ts';
-import { blockHash, commitHash, evidenceHash, txHash, type Block, type Commit, type Header } from '../src/types/block.ts';
+import { blockDataBytes, blockHash, commitHash, evidenceHash, txHash, type Block, type Commit, type Header } from '../src/types/block.ts';
+import { genesisFromJson, genesisToJson, MAX_BLOCK_BYTES, MIN_BLOCK_BYTES } from '../src/types/genesis.ts';
+import { MAX_FRAME } from '../src/p2p/tcp.ts';
+import { MAX_VALIDATORS, ValidatorSet } from '../src/types/validator.ts';
 import { encodeEvidence, makeDuplicateVoteEvidence, type DuplicateVoteEvidence } from '../src/types/evidence.ts';
 import type { ChainState } from '../src/types/state.ts';
 import { txsRoot } from '../src/types/txproof.ts';
@@ -142,6 +145,28 @@ describe('the data directory', () => {
     await node.stop();
     expect(claimedAtClose).toBe(true);
     expect(existsSync(lock)).toBe(false);
+  });
+
+  it('closes a store it was handed for a directory it claimed before giving the claim up', async () => {
+    tmp = mkdtempSync(join(tmpdir(), 'r5-lock-'));
+    const lock = join(tmp, 'LOCK');
+    net = await makeTestnet({ validators: 1, skipStart: [0] });
+    // As the command line does: the caller opens the store in the directory and hands it over.
+    const env = new LmdbEnv(join(tmp, 'lmdb'));
+    const close = env.close.bind(env);
+    let claimedAtClose: boolean | null = null;
+    env.close = async () => {
+      claimedAtClose ??= existsSync(lock);
+      await close();
+    };
+    const node = await net.makeNode(0, { dataDir: tmp, env });
+    await node.start();
+    // Two callers stopping at once wait for the one shutdown: neither returns with the store still open.
+    await Promise.all([node.stop(), node.stop()]);
+    expect(claimedAtClose).toBe(true);
+    expect(existsSync(lock)).toBe(false);
+    // The caller closing it again afterwards, as the command line does, is harmless.
+    await env.close();
   });
 
   it('is given back, with the store, by a node that fails to open', async () => {
@@ -288,6 +313,48 @@ describe('the executor', () => {
       await node.stop();
     }
   });
+
+  it('answers for a past height with the set as that height had it, proposer included', async () => {
+    net = await makeTestnet({ validators: 4 });
+    await waitForHeight(net.nodes, 8n);
+    const node = net.nodes[0]!;
+    let checked = 0;
+    for (let h = 1n; h <= node.height - 1n; h++) {
+      const { block, commit } = node.store.loadBlock(h)!;
+      const set = node.executor.validatorSetAtHeight(h)!;
+      expect(toHex(set.hash())).toBe(toHex(block.header.validatorsHash));
+      expect(node.executor.hasProposerAt(h)).toBe(true);
+      // A block decided in its first round was proposed by the set's proposer of that height.
+      if (commit.round !== 0) continue;
+      expect(toHex(set.proposer().address)).toBe(toHex(block.header.proposerAddress));
+      checked++;
+    }
+    expect(checked).toBeGreaterThan(4);
+  });
+
+  it('removes a validator set by hash once no header held names it', async () => {
+    net = await makeTestnet({ validators: 1, skipStart: [0], limits: { maxEvidenceAgeMs: 1n } });
+    const node = await net.makeNode(0, { retain: { blocks: 2 } });
+    const first = node.executor.state.validators.hash();
+    await node.start();
+    await waitForHeight([node], 2n);
+    // A second validator of little power joins: the set changes, and the chain goes on with the first alone signing.
+    const added = keyPairFromSeed(seedFor('r5/added-validator'));
+    expect((await node.submitTx(tx(`val:${toHex(added.publicKey)}:1`))).status).toBe('added');
+    await waitFor(() => node.executor.state.validators.size === 2, 20_000, 'the new set to take effect');
+    const second = node.executor.state.validators.hash();
+    expect(node.store.loadValidatorSet(first)).not.toBeNull();
+    // Once every block the first set signed or was named in is pruned, the set goes; the one in use stays.
+    await waitFor(() => node.store.loadValidatorSet(first) === null, 30_000, 'the first set to be removed');
+    for (let h = node.store.lowestHeight(); h <= node.height - 1n; h++) {
+      const header = node.store.loadBlock(h)!.block.header;
+      expect(toHex(header.validatorsHash)).not.toBe(toHex(first));
+      expect(node.store.loadValidatorSet(header.validatorsHash)).not.toBeNull();
+      expect(node.store.loadValidatorSet(header.nextValidatorsHash)).not.toBeNull();
+    }
+    expect(node.store.loadValidatorSet(second)).not.toBeNull();
+    await node.stop();
+  });
 });
 
 describe('the stores', () => {
@@ -342,6 +409,50 @@ describe('the stores', () => {
       }),
     ).toThrow(/stop/);
     expect(kv.get(k)).toEqual(Uint8Array.of(8));
+  });
+
+  it('undoes the writes of a memory environment transaction that throws, in every store', () => {
+    const env = new MemoryEnv();
+    const chain = env.store('chain');
+    const k = Uint8Array.of(1);
+    const j = Uint8Array.of(2);
+    chain.write((w) => w.put(k, Uint8Array.of(1)));
+    expect(() =>
+      env.transaction(() => {
+        chain.write((w) => {
+          w.put(k, Uint8Array.of(2));
+          w.put(j, Uint8Array.of(2));
+        });
+        chain.write((w) => w.del(k));
+        // A store first asked for inside the transaction is part of it, and so is a transaction inside it.
+        env.transaction(() => env.store('app').write((w) => w.put(k, Uint8Array.of(9))));
+        throw new Error('commit failed');
+      }),
+    ).toThrow(/commit failed/);
+    expect(chain.get(k)).toEqual(Uint8Array.of(1));
+    expect(chain.get(j)).toBeUndefined();
+    expect(env.store('app').get(k)).toBeUndefined();
+    // One that returns keeps its writes, and writes after a failed one are not undone later.
+    env.transaction(() => chain.write((w) => w.put(j, Uint8Array.of(3))));
+    chain.write((w) => w.put(k, Uint8Array.of(4)));
+    expect(() => env.transaction(() => { throw new Error('again'); })).toThrow(/again/);
+    expect(chain.get(j)).toEqual(Uint8Array.of(3));
+    expect(chain.get(k)).toEqual(Uint8Array.of(4));
+    // An inner transaction that throws is undone by itself; the outer one catches the error and keeps its own writes.
+    env.transaction(() => {
+      chain.write((w) => w.put(k, Uint8Array.of(5)));
+      expect(() =>
+        env.transaction(() => {
+          chain.write((w) => w.put(k, Uint8Array.of(6)));
+          env.store('late').write((w) => w.put(k, Uint8Array.of(6)));
+          throw new Error('inner');
+        }),
+      ).toThrow(/inner/);
+      chain.write((w) => w.put(j, Uint8Array.of(5)));
+    });
+    expect(chain.get(k)).toEqual(Uint8Array.of(5));
+    expect(chain.get(j)).toEqual(Uint8Array.of(5));
+    expect(env.store('late').get(k)).toBeUndefined();
   });
 
   it('reads a heap flag of zero as no flag', () => {
@@ -419,6 +530,81 @@ describe('gossip and block validation', () => {
     await waitFor(() => fetched.size >= 2048, 10_000, 'the announcement to be fetched');
     await sleep(300);
     expect(fetched.size).toBe(2048);
+  });
+
+  it('takes the block size from the genesis, for every node alike', async () => {
+    const maxBlockBytes = 64 * 1024;
+    net = await makeTestnet({ validators: 2, consensus: { maxBlockBytes } });
+    const [a] = net.nodes as [Node, Node];
+    // A node configured with another size holds the chain's all the same.
+    const odd = await net.makeNode(2, { validatorSeed: null, limits: { maxBlockBytes: 1024 } as never });
+    await odd.start();
+    // 200 transactions of about 1 KiB are three blocks' worth and more; a transaction over half a block is refused.
+    const txs = Array.from({ length: 200 }, (_, i) => tx(`big${i}=${'x'.repeat(1000)}`));
+    for (const t of txs) expect((await a.submitTx(t)).status).toBe('added');
+    expect((await a.submitTx(tx(`huge=${'x'.repeat(maxBlockBytes / 2)}`))).status).toBe('too-large');
+    await waitFor(() => txs.every((t) => odd.store.txLocation(txHash(t)) !== null), 30_000, 'the transactions to be committed and reach the third node');
+    let most = 0;
+    const heights = new Set<bigint>();
+    for (const t of txs) heights.add(odd.store.txLocation(txHash(t))!.height);
+    for (const h of heights) most = Math.max(most, blockDataBytes(odd.store.loadBlock(h)!.block));
+    expect(heights.size).toBeGreaterThan(3);
+    expect(most).toBeLessThanOrEqual(maxBlockBytes);
+    expect(most).toBeGreaterThan(maxBlockBytes / 2);
+    await odd.stop();
+
+    // The figure is part of the genesis file, within bounds.
+    expect(genesisFromJson(genesisToJson(net.genesis)).consensus?.maxBlockBytes).toBe(maxBlockBytes);
+    const withSize = (n: unknown) => genesisToJson(net!.genesis).replace(`"maxBlockBytes": ${maxBlockBytes}`, `"maxBlockBytes": ${JSON.stringify(n)}`);
+    for (const bad of [1024, 64 * 1024 * 1024, 70000.5, '65536']) expect(() => genesisFromJson(withSize(bad))).toThrow(/maxBlockBytes must be a whole number/);
+  });
+
+  it('gives evidence half a block at most, so the largest transaction admitted still fits', async () => {
+    net = await makeTestnet({ validators: 1, consensus: { maxBlockBytes: MIN_BLOCK_BYTES } });
+    const node = net.nodes[0]!;
+    await waitForHeight([node], 2n);
+    // Sixteen records are more than half of 64 KiB under ML-DSA-44; the transaction is the largest the pool takes.
+    const evidence = Array.from({ length: MAX_EVIDENCE_PER_BLOCK }, (_, round) => doubleSign(net!, node, 1n, round));
+    for (const ev of evidence) expect(node.evidencePool.add(ev)).toBe(true);
+    const big = tx(`big=${'x'.repeat(MIN_BLOCK_BYTES / 2 - 4 - 'big='.length)}`);
+    expect(big.length).toBe(MIN_BLOCK_BYTES / 2 - 4);
+    expect((await node.submitTx(big)).status).toBe('added');
+    await waitFor(() => node.store.txLocation(txHash(big)) !== null, 20_000, 'the transaction to be committed');
+    const at = node.store.txLocation(txHash(big))!.height;
+    const block = node.store.loadBlock(at)!.block;
+    expect(blockDataBytes(block)).toBeLessThanOrEqual(MIN_BLOCK_BYTES);
+    expect(blockDataBytes({ txs: [], evidence: block.evidence })).toBeLessThanOrEqual(MIN_BLOCK_BYTES / 2);
+    // Evidence left out of that block follows; none is lost.
+    await waitFor(() => node.evidencePool.size === 0, 20_000, 'all the evidence to be committed');
+    let committed = 0;
+    for (let h = 2n; h <= node.height; h++) committed += node.store.loadBlock(h)?.block.evidence.length ?? 0;
+    expect(committed).toBe(MAX_EVIDENCE_PER_BLOCK);
+  });
+
+  it('bounds a block by what its proposer chose, and a validator set by what a frame holds', async () => {
+    net = await makeTestnet({ validators: 1, skipStart: [0], consensus: { maxBlockBytes: MIN_BLOCK_BYTES } });
+    const node = await net.makeNode(0);
+    const state = node.executor.state;
+    const check = (block: Block) => validateBlockStructure(state, block, { ...DEFAULT_LIMITS, maxBlockBytes: MIN_BLOCK_BYTES }, null, () => null);
+    const { block } = blockAfter(state, null);
+    expect(check(block)).toBeNull();
+    // Transactions up to the limit pass and one byte more does not, whatever the header and the commit weigh.
+    const withTxs = (bytes: number): Block => {
+      const txs = [new Uint8Array(bytes)];
+      return { ...block, txs, header: { ...block.header, dataHash: txsRoot(txs) } };
+    };
+    const room = MIN_BLOCK_BYTES - blockDataBytes({ txs: [new Uint8Array(0)], evidence: [] });
+    expect(check(withTxs(room))).toBeNull();
+    expect(check(withTxs(room + 1))).toBe('block too large');
+    await node.stop();
+
+    // A set of the largest size is accepted and one more is not; two commits of that size, with the largest
+    // signatures, and the largest block data a genesis may set fit one frame with room to spare.
+    const entries = Array.from({ length: MAX_VALIDATORS + 1 }, (_, i) => ({ publicKey: keyPairFromSeed(seedFor(`r5/many/${i}`)).publicKey, power: 1n }));
+    expect(ValidatorSet.create(entries.slice(0, MAX_VALIDATORS)).size).toBe(MAX_VALIDATORS);
+    expect(() => ValidatorSet.create(entries)).toThrow(/2001 validators exceed the limit 2000/);
+    const mlDsaSignature = 2421;
+    expect(MAX_BLOCK_BYTES + 2 * MAX_VALIDATORS * (mlDsaSignature + 16) + 64 * 1024).toBeLessThan(MAX_FRAME);
   });
 
   it('refuses a block with more evidence than a block may carry', async () => {

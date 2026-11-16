@@ -33,7 +33,7 @@
 import { bytesEqual, toHex } from '../crypto/hash.ts';
 import { signContext } from '../crypto/keys.ts';
 import type { Verifier } from '../crypto/verifier.ts';
-import { blockBytes, blockHash, commitHash, evidenceHash, type Block, type Commit, type Header } from '../types/block.ts';
+import { blockDataBytes, blockHash, commitHash, evidenceHash, type Block, type Commit, type Header } from '../types/block.ts';
 import { txsRoot } from '../types/txproof.ts';
 import { makeDuplicateVoteEvidence } from '../types/evidence.ts';
 import { zeroSignature } from '../crypto/keys.ts';
@@ -44,6 +44,7 @@ import { VoteType, voteSignBytes, voteTypeName, type Vote } from '../types/vote.
 import type { Logger } from '../util/log.ts';
 import { EvidencePool } from './evidence.ts';
 import { DoubleSignError, type PrivValidator } from './privval.ts';
+import { DEFAULT_MAX_BLOCK_BYTES } from '../types/genesis.ts';
 import { MAX_EVIDENCE_PER_BLOCK, bodyMatchesHeader, evidenceAgeOk, validateBlockStructure, verifyBlockSignatures, type BlockTimeLookup, type ValidationLimits } from './validate.ts';
 import { HeightVoteSet } from './votes.ts';
 
@@ -72,7 +73,7 @@ export const DEFAULT_TIMEOUTS: ConsensusTimeouts = {
 };
 
 export const DEFAULT_LIMITS: ValidationLimits = {
-  maxBlockBytes: 4 * 1024 * 1024,
+  maxBlockBytes: DEFAULT_MAX_BLOCK_BYTES,
   maxClockDriftMs: 15_000,
   maxEvidenceAgeMs: 7n * 24n * 3_600_000n,
 };
@@ -82,24 +83,12 @@ const STEP_ORDER: Record<Step, number> = { propose: 0, prevote: 1, precommit: 2,
 
 /** Rounds beyond this many ahead of ours are ignored; a round number is otherwise a free CPU budget for a peer. */
 export const MAX_ROUND_AHEAD = 1000;
-/** Proposals for the next height held until it starts, in all and from any one peer. */
+/** Proposals for the next height held until it starts, in all and signed by any one validator. */
 const MAX_NEXT_HEIGHT_PROPOSALS = 8;
-const MAX_NEXT_HEIGHT_PROPOSALS_PER_PEER = 2;
-const EMPTY_HEADER: Header = {
-  chainId: '',
-  version: 0,
-  height: 0n,
-  time: 0n,
-  lastBlockHash: new Uint8Array(32),
-  lastCommitHash: new Uint8Array(32),
-  dataHash: new Uint8Array(32),
-  lastResultsHash: new Uint8Array(32),
-  validatorsHash: new Uint8Array(32),
-  nextValidatorsHash: new Uint8Array(32),
-  appHash: new Uint8Array(32),
-  evidenceHash: new Uint8Array(32),
-  proposerAddress: new Uint8Array(32),
-};
+const MAX_NEXT_HEIGHT_PROPOSALS_PER_VALIDATOR = 2;
+
+/** What tells one held vote for the next height from another: a conflicting vote differs in its block hash and is held too. */
+const nextHeightVoteKey = (v: Vote): string => `${v.round}:${v.type}:${v.validatorIndex}:${v.blockHash ? toHex(v.blockHash) : ''}`;
 
 export class StaleHeightError extends Error {
   constructor(msg: string) {
@@ -175,8 +164,9 @@ export class Consensus {
   private timers = new Map<string, NodeJS.Timeout>();
   /** Votes for the next height with the key each was verified against, replayed once that height starts. */
   private nextHeightVotes: { vote: Vote; publicKey: Uint8Array }[] = [];
-  /** Proposals for the next height with the peer each came from, replayed once that height starts; nothing in them is checked yet. */
-  private nextHeightProposals: { proposal: Proposal; from: string | null }[] = [];
+  private readonly nextHeightVoteKeys = new Set<string>();
+  /** Proposals for the next height, each signed by the validator of the next set its block names, replayed once that height starts. */
+  private nextHeightProposals: { proposal: Proposal; from: string | null; signer: Uint8Array }[] = [];
   private decided = false;
   private decidedRound = -1;
   private decidedHash: Uint8Array | null = null;
@@ -258,6 +248,7 @@ export class Consensus {
     const votes = this.nextHeightVotes.filter((e) => e.vote.height === this.height && bytesEqual(this.validators.byIndex(e.vote.validatorIndex)?.publicKey ?? null, e.publicKey)).map((e) => e.vote);
     const proposals = this.nextHeightProposals.filter((e) => e.proposal.height === this.height);
     this.nextHeightVotes = [];
+    this.nextHeightVoteKeys.clear();
     this.nextHeightProposals = [];
 
     this.startRound(resumeRound);
@@ -333,14 +324,13 @@ export class Consensus {
     // Evidence a validator would reject as too old must not go into the block, and is dropped for good.
     this.d.evidencePool.pruneIf((ev) => evidenceAgeOk(ev.voteA.height, st.lastHeight + 1n, time, st, this.limits, this.d.blockTimeAt) !== null);
     let evidence = this.d.evidencePool.list(MAX_EVIDENCE_PER_BLOCK);
-    // Everything but the transactions is fixed now; measure it and give the transactions what is left.
-    let shell: Block = { header: { ...EMPTY_HEADER, chainId: this.d.chainId }, txs: [], lastCommit, evidence };
-    // Evidence is picked by count; by bytes it may not fit a small limit. Leave some for the next block.
-    while (evidence.length > 0 && blockBytes(shell).length + 1024 > this.limits.maxBlockBytes) {
-      evidence = evidence.slice(0, -1);
-      shell = { ...shell, evidence };
-    }
-    const budget = this.limits.maxBlockBytes - blockBytes(shell).length - 1024;
+    // The limit is on the transactions and the evidence. Evidence is picked by count and may have half the limit:
+    // by bytes it may be more under a small one, and the last record is left for the next block until it fits.
+    // The transactions get what is left, never less than half, which is the most one transaction may be
+    // (the mempool admits none larger), so evidence arriving block after block cannot keep a transaction out.
+    const SLACK = 1024;
+    while (evidence.length > 0 && blockDataBytes({ txs: [], evidence }) + SLACK > Math.floor(this.limits.maxBlockBytes / 2)) evidence = evidence.slice(0, -1);
+    const budget = this.limits.maxBlockBytes - blockDataBytes({ txs: [], evidence }) - SLACK;
     const txs = budget > 0 ? this.d.reapTxs(budget) : [];
     return {
       header: {
@@ -366,13 +356,37 @@ export class Consensus {
 
   // ------------------------------------------------------- incoming proposals
 
+  /**
+   * A proposal for the height after this one waits for that height to start. Only a fresh one (no proof of lock)
+   * is held, since its signer is then the proposer its block names, and only once that signature verifies with
+   * the key the validator of that address holds in the next height's set: nothing takes a place without a
+   * validator's signature, whichever peer relays it, and one validator's proposals may take two. Whether the signer is the proposer of its round is decided when
+   * the height starts. A proposal not held is not lost; the round's proposer sends it again while the round lasts.
+   */
+  private async holdNextHeightProposal(p: Proposal, fromPeer: string | null): Promise<void> {
+    if (p.polRound !== -1 || p.round > MAX_ROUND_AHEAD || p.block.header.height !== p.height) return;
+    const signer = this.d.validatorSetAtHeight(p.height)?.byAddress(p.block.header.proposerAddress);
+    if (!signer) return;
+    const room = () =>
+      this.nextHeightProposals.length < MAX_NEXT_HEIGHT_PROPOSALS &&
+      this.nextHeightProposals.filter((e) => bytesEqual(e.signer, signer.address)).length < MAX_NEXT_HEIGHT_PROPOSALS_PER_VALIDATOR &&
+      !this.nextHeightProposals.some((e) => e.proposal.round === p.round && bytesEqual(e.signer, signer.address));
+    // Before the signature is verified: a proposal there is no place for must not cost a verification.
+    if (!room()) return;
+    const ok = await this.d.verifier.verifyOne({ sig: p.signature, msg: proposalSignBytes(this.d.chainId, p), publicKey: signer.publicKey, context: this.proposalCtx });
+    if (!ok) {
+      if (fromPeer) this.d.scorePeer?.(fromPeer, 20, 'bad proposal signature');
+      return;
+    }
+    // Again: others were verified meanwhile, and the height may have moved on.
+    if (!this.running || p.height !== this.height + 1n || !room()) return;
+    this.nextHeightProposals.push({ proposal: p, from: fromPeer, signer: signer.address });
+  }
+
   async handleProposal(p: Proposal, fromPeer: string | null): Promise<void> {
     if (!this.running) return;
     if (p.height === this.height + 1n) {
-      // Unverified, so the places are few, and one peer may fill only some of them: a peer sending junk cannot
-      // alone keep the real proposal out.
-      const fromSame = this.nextHeightProposals.filter((e) => e.from === fromPeer).length;
-      if (this.nextHeightProposals.length < MAX_NEXT_HEIGHT_PROPOSALS && fromSame < MAX_NEXT_HEIGHT_PROPOSALS_PER_PEER) this.nextHeightProposals.push({ proposal: p, from: fromPeer });
+      await this.holdNextHeightProposal(p, fromPeer);
       return;
     }
     if (p.height !== this.height) return;
@@ -433,6 +447,9 @@ export class Consensus {
       if (this.hvs.has(v)) return;
       set = this.validators;
     } else if (v.height === this.height + 1n) {
+      // One already held is not verified and held again: a peer repeating a valid vote would otherwise have it
+      // checked each time and fill the places with copies.
+      if (this.nextHeightVoteKeys.has(nextHeightVoteKey(v))) return;
       // By the vote's own height: the executor may have applied this height already, and then the
       // state's "next" set is the one after, whose index positions mean other keys.
       set = this.d.validatorSetAtHeight(v.height);
@@ -458,7 +475,10 @@ export class Consensus {
     if (!this.running) return;
     if (v.round > this.round + MAX_ROUND_AHEAD) return; // again: the height may have moved on, and the round with it
     if (v.height === this.height) this.addVote(v, fromPeer);
-    else if (v.height === this.height + 1n && this.nextHeightVotes.length < 4096) this.nextHeightVotes.push({ vote: v, publicKey: val.publicKey });
+    else if (v.height === this.height + 1n && this.nextHeightVotes.length < 4096 && !this.nextHeightVoteKeys.has(nextHeightVoteKey(v))) {
+      this.nextHeightVoteKeys.add(nextHeightVoteKey(v));
+      this.nextHeightVotes.push({ vote: v, publicKey: val.publicKey });
+    }
   }
 
   /** Add an already-verified vote for the current height. */

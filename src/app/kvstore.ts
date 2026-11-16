@@ -13,9 +13,9 @@ import { readFileSync, existsSync } from 'node:fs';
 import { writeAtomic } from '../store/files.ts';
 import { encode } from '../codec/writer.ts';
 import { fromHex, sha256 , toHex } from '../crypto/hash.ts';
-import { isPublicKey } from '../crypto/keys.ts';
+import { isPublicKey, schemeName, schemeOf } from '../crypto/keys.ts';
 import type { Genesis } from '../types/genesis.ts';
-import { MAX_TOTAL_POWER, type ValidatorUpdate } from '../types/validator.ts';
+import { MAX_TOTAL_POWER, MAX_VALIDATORS, type ValidatorUpdate } from '../types/validator.ts';
 import type { Application, CheckTxResult, FinalizeBlockRequest, FinalizeBlockResult, InitChainResult } from './types.ts';
 
 interface Snapshot {
@@ -80,6 +80,9 @@ export class KvStoreApp implements Application {
         return { kind: 'bad', error: 'bad public key hex' };
       }
       if (!isPublicKey(publicKey)) return { kind: 'bad', error: 'bad public key' };
+      // The engine halts on an update whose key is of another scheme than the chain's, which the set's own keys show.
+      const [member] = this.validators.keys();
+      if (member !== undefined && schemeOf(publicKey) !== schemeOf(fromHex(member))) return { kind: 'bad', error: `key must be a ${schemeName(schemeOf(fromHex(member))!)} key` };
       if (!/^\d+$/.test(parts[2]!)) return { kind: 'bad', error: 'bad power' };
       return { kind: 'val', update: { publicKey, power: BigInt(parts[2]!) } };
     }
@@ -127,6 +130,7 @@ export class KvStoreApp implements Application {
       if (power === 0n && !set.has(k)) return { ok: false, error: 'unknown validator' };
       if (power === 0n && set.size === 1) return { ok: false, error: 'the last validator cannot be removed' };
       const next = total - (set.get(k) ?? 0n) + power;
+      if (power > 0n && !set.has(k) && set.size >= MAX_VALIDATORS) return { ok: false, error: `the set already holds the limit of ${MAX_VALIDATORS} validators` };
       if (next > MAX_TOTAL_POWER) return { ok: false, error: `total power ${next} would exceed the limit ${MAX_TOTAL_POWER}` };
       total = next;
       if (power === 0n) set.delete(k);

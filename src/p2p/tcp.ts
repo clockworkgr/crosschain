@@ -8,7 +8,7 @@ import { BaseConn, type Conn, type Transport } from './transport.ts';
 
 /** Bytes queued for one peer before we give up on it. */
 const MAX_BUFFERED = 32 * 1024 * 1024;
-const MAX_FRAME = 32 * 1024 * 1024;
+export const MAX_FRAME = 32 * 1024 * 1024;
 
 function parseAddr(addr: string): { host: string; port: number } {
   const i = addr.lastIndexOf(':');

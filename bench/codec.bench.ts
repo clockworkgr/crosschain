@@ -13,7 +13,7 @@ export async function run(): Promise<void> {
   const bytes = txs[0]!;
   const tx = decodeTransaction(bytes);
   fact('signed transfer', `${fmtBytes(bytes.length)} (one ${schemeName(DEFAULT_SCHEME)} signature)`);
-  fact('transfers per block at the default limit, less a 2 KiB shell estimate', `${Math.floor((DEFAULT_LIMITS.maxBlockBytes - 2048) / (bytes.length + 4))} (${fmtBytes(DEFAULT_LIMITS.maxBlockBytes)} block; the proposer measures the real shell, about 10 KiB with four signatures, and keeps 1 KiB spare)`);
+  fact('transfers per block at the default limit, less the 1 KiB the builder leaves', `${Math.floor((DEFAULT_LIMITS.maxBlockBytes - 1024) / (bytes.length + 4))} (${fmtBytes(DEFAULT_LIMITS.maxBlockBytes)} of transactions and evidence; the header and the commit are not counted)`);
   await bench('encodeTransaction', { batch: 100 }, () => {
     for (let i = 0; i < 100; i++) encodeTransaction(tx);
   });

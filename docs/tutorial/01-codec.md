@@ -1,6 +1,6 @@
 # 1. The codec
 
-Everything in this chain that is hashed, signed, stored, or sent to a peer first becomes bytes through `src/codec/writer.ts`, and comes back through `src/codec/reader.ts`. The two files are the floor the rest of the node stands on: [the crypto layer](02-crypto.md) hashes and signs the bytes the writer produces, [the chain types](03-types.md) define one `encode`/`decode` pair per object on top of these primitives, the p2p messages ([chapter 6](06-p2p.md)), the block store ([chapter 10](10-store.md)), the object database ([chapter 9](09-database.md)) and the proofs carried over RPC ([chapter 12](12-rpc.md)) all go through the same two classes. Nothing feeds the codec; it depends only on the JavaScript standard library.
+Everything in this chain that is hashed, signed, stored, or sent to a peer first becomes bytes through `src/codec/writer.ts`, and comes back through `src/codec/reader.ts`. The two files are the floor the rest of the node stands on: [the crypto layer](02-crypto.md) hashes and signs the bytes the writer produces, [the chain types](03-types.md) define one `encode`/`decode` pair per object on top of these primitives, the p2p messages ([chapter 6](06-p2p.md)), the block store ([chapter 10](10-store.md)), the object database ([chapter 9](09-database.md)) and the proofs carried over RPC ([chapter 12](12-rpc.md)) all go through the same two classes. The exceptions are a few files kept as JSON beside the stores: the genesis and the node's configuration, the peer database (`peers.json`, [chapter 6](06-p2p.md)) and the snapshot of the toy application ([chapter 5](05-mempool-executor.md)). Nothing feeds the codec; it depends only on the JavaScript standard library.
 
 ## Concepts
 
@@ -152,7 +152,7 @@ Failure modes: every writer method throws on out-of-range input, and nothing cat
 
 The reader walks a buffer from a position and refuses to go past the end. It exports an error class, the reader, and a helper.
 
-**`class CodecError extends Error`.** Every decoding failure the reader itself detects in the input is a `CodecError` with `name = 'CodecError'`; the one exception is malformed UTF-8 in `string`, which is the `TypeError` that `TextDecoder` throws (below). So a log line or a test can tell a structural failure from anything else. Nothing in `src/` dispatches on the class today: the network's frame handler in `src/p2p/network.ts` wraps `decodeMessage` in a `try/catch`, treats any error as a malformed message, logs it as `'undecodable message'` with the error text and scores the peer 20 points. That is the right policy, because the type-level decoders in `src/types/` throw plain `Error`s for semantic problems ("bad vote type", "validator set out of order"), and both kinds of failure mean the same thing about the peer.
+**`class CodecError extends Error`.** Every decoding failure the reader itself detects in the input is a `CodecError` with `name = 'CodecError'`; the one exception is malformed UTF-8 in `string`, which is the `TypeError` that `TextDecoder` throws (below). So a log line or a test can tell a structural failure from anything else. Nothing in `src/` dispatches on the class today: the network's frame handler in `src/p2p/network.ts` wraps `decodeMessage` in a `try/catch`, treats any error as a malformed message, logs it as `'undecodable message'` with the error text and scores the peer 20 points. That is the right policy, because the type-level decoders in `src/types/` throw plain `Error`s for semantic problems ("bad vote type 3", "validator set out of order"), and both kinds of failure mean the same thing about the peer.
 
 **`class Reader`.** The constructor takes the buffer and an optional starting position:
 
@@ -251,7 +251,7 @@ Both options matter. `fatal: true` makes invalid UTF-8 a thrown `TypeError` rath
   }
 ```
 
-Two checks, for two reasons. `maxCount` is the semantic limit a caller chooses: `ValidatorSet.decode` passes `10_000`, `decodeBlock` passes `1000` for evidence, `decodeTxProof` passes `32` for siblings. The second check is the structural one: even under the semantic limit, a count larger than the remaining bytes cannot be honest, so the `new Array(n)` allocation is bounded by the size of the input the peer actually sent. The comment states the invariant that makes this sound: every element type in this codebase consumes at least one byte (an absent `option` is one flag byte; an empty `bytes` is a four-byte prefix).
+Two checks, for two reasons. `maxCount` is the semantic limit a caller chooses: `ValidatorSet.decode` passes `MAX_VALIDATORS`, 2,000, `decodeBlock` passes `1000` for evidence, `decodeTxProof` passes `32` for siblings. The second check is the structural one: even under the semantic limit, a count larger than the remaining bytes cannot be honest, so the `new Array(n)` allocation is bounded by the size of the input the peer actually sent. The comment states the invariant that makes this sound: every element type in this codebase consumes at least one byte (an absent `option` is one flag byte; an empty `bytes` is a four-byte prefix).
 
 **`finish()`** throws `CodecError('N trailing bytes')` unless the whole buffer was consumed. **`decode(buf, f)`** runs a decoder and then `finish()`:
 
@@ -276,10 +276,10 @@ The defaults on `bytes`, `string` and `array` are the outer fence. The real fenc
 | decoder | field | limit |
 |---|---|---|
 | `src/types/block.ts` `decodeHeader` | `chainId` | `string(256)` |
-| `src/types/block.ts` `decodeCommit` | `signatures` | `array(..., 10_000)` |
+| `src/types/block.ts` `decodeCommit` | `signatures` | `array(..., MAX_VALIDATORS)`, 2,000 |
 | `src/types/block.ts` `decodeBlock` | `evidence` | `array(decodeEvidence, 1000)` |
 | `src/types/block.ts` `decodeBlock` | each transaction | `bytes()` (64 MiB default) |
-| `src/types/validator.ts` `decode` | validators | `array(..., 10_000)` |
+| `src/types/validator.ts` `decode` | validators | `array(..., MAX_VALIDATORS)`, 2,000 |
 | `src/crypto/keys.ts` `decodePublicKey`, `decodeSignature` | every key and signature | one tag byte, then that scheme's size: 1,312 or 33 for a key, 2,420 or 64 for a signature |
 | `src/types/txproof.ts` `decodeTxProof`, `decodeResultProof` | `siblings` | `array(..., 32)` |
 | `src/types/state.ts` `decodeState` | `chainId` | `string(256)` |
@@ -291,7 +291,7 @@ The defaults on `bytes`, `string` and `array` are the outer fence. The real fenc
 | `src/p2p/messages.ts` | snapshot heights offered | `array(..., 64)` |
 | `src/p2p/messages.ts` | the reason in a reject | `string(1024)` |
 
-Two things bound what these can add up to. A TCP frame is refused above `MAX_FRAME = 32 * 1024 * 1024` in `src/p2p/tcp.ts` before any decoding starts, and a block is rejected above `maxBlockBytes` (default 4 MiB, `DEFAULT_LIMITS` in `src/consensus/consensus.ts`) by validation after decoding. So a transaction's 64 MiB `bytes()` default is never the binding limit; the frame is. The database proofs in `src/db/proof.ts` and the snapshot chunks in `src/app/core/snapshot.ts` carry their own, tighter numbers (sibling lists of 16, 64, 128 or 256; keys of at most 4,096 bytes).
+Two things bound what these can add up to. A TCP frame is refused above `MAX_FRAME = 32 * 1024 * 1024` in `src/p2p/tcp.ts` before any decoding starts, and a block whose transactions and evidence encode to more than `maxBlockBytes` (the chain's figure from the genesis, at most 16 MiB and 4 MiB when the genesis names none, `src/types/genesis.ts`) is rejected by validation after decoding. The header and the last commit are not counted in that figure, and a validator set holds at most 2,000 members (`MAX_VALIDATORS`, [chapter 3](03-types.md)), so that the largest block with its two commits still fits a frame. So a transaction's 64 MiB `bytes()` default is never the binding limit; the frame is. The database proofs in `src/db/proof.ts` and the snapshot chunks in `src/app/core/snapshot.ts` carry their own, tighter numbers (sibling lists of 64, 128 or 256 hashes; at most 16 authenticated index roots; keys of at most 4,096 bytes).
 
 ### A worked example: the bytes of a vote
 
@@ -346,7 +346,7 @@ Two bytes where four are needed; one byte left over; a `bytes` length of 4,294,9
 
 Beyond that, the codec is exercised indirectly by every other suite, because every block, vote, validator set, state record and proof goes through it. One test uses it to build *malformed* input on purpose: `test/review.test.ts`, `rejects decoded validator sets with duplicate members, wrong order or a bad proposer index`, hand-encodes validator sets with `encode((w) => w.array(...).i64(...))` to feed `ValidatorSet.decode` a duplicate member, a reversed order and an out-of-range proposer index. That is the pattern to copy when writing a test for any decoder: `encode` lets you write bytes the honest encoder would never produce.
 
-`bench/codec.bench.ts` measures `encodeTransaction`, `decodeTransaction`, `txHash` and `txsRoot` over 500 signed transfers; under ML-DSA-44 a signed transfer is about 2.5 KiB and `README.md` reports that the codec suite estimates 1,667 fit in the default 4 MiB block and that 1,663 filled one in the four-validator run, while under secp256k1 the same transfer is about 150 bytes.
+`bench/codec.bench.ts` measures `encodeTransaction`, `decodeTransaction`, `txHash` and `txsRoot` over 500 signed transfers; under ML-DSA-44 a signed transfer is about 2.5 KiB and `README.md` reports that 1,667 fit in the 4 MiB a block has for its transactions by default, the codec suite's figure and what a full block held in a four-validator run, while under secp256k1 the same transfer is about 150 bytes.
 
 ## Limitations and ideas
 

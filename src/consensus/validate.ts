@@ -6,7 +6,7 @@
 import { bytesEqual } from '../crypto/hash.ts';
 import { signContext } from '../crypto/keys.ts';
 import type { Verifier } from '../crypto/verifier.ts';
-import { blockBytes, blockHash, commitHash, evidenceHash, type Block, type Commit } from '../types/block.ts';
+import { blockDataBytes, blockHash, commitHash, evidenceHash, type Block, type Commit } from '../types/block.ts';
 import { txsRoot } from '../types/txproof.ts';
 import type { ChainState } from '../types/state.ts';
 import type { ValidatorSet } from '../types/validator.ts';
@@ -14,8 +14,12 @@ import { VoteType, voteSignBytes } from '../types/vote.ts';
 import { verifyDuplicateVoteEvidence } from './evidence.ts';
 
 export interface ValidationLimits {
+  /** The most bytes a block's transactions and evidence may encode to. A rule of the chain, read from the genesis: every node must hold the same figure. */
   maxBlockBytes: number;
-  /** How far a proposed block time may be from local time, in ms. */
+  /**
+   * How far a freshly proposed block's time may be from local time, in ms. A node's own rule for what it votes
+   * for, like its clock: it is not applied to a block being committed or synced, so nodes may differ in it.
+   */
   maxClockDriftMs: number;
   /** Evidence for an infraction older than this, by block time, is rejected. Equal to the staking unbonding period. */
   maxEvidenceAgeMs: bigint;
@@ -78,7 +82,7 @@ export function validateBlockStructure(state: ChainState, block: Block, limits: 
     const age = evidenceAgeOk(ev.voteA.height, h.height, h.time, state, limits, blockTimeAt);
     if (age) return age;
   }
-  if (blockBytes(block).length > limits.maxBlockBytes) return 'block too large';
+  if (blockDataBytes(block) > limits.maxBlockBytes) return 'block too large';
   return null;
 }
 

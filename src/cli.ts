@@ -106,7 +106,7 @@ const [cmd, ...args] = positional;
 
 function need(i: number, what: string): string {
   const v = args[i];
-  if (v === undefined) throw new Error(`missing ${what}`);
+  if (v === undefined || v === '') throw new Error(`missing ${what}`);
   return v;
 }
 

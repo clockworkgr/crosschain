@@ -65,7 +65,13 @@ export class LmdbEnv implements KvEnv {
     this.root.transactionSync(fn);
   }
 
-  async close(): Promise<void> {
-    await this.root.close();
+  private closing: Promise<void> | null = null;
+
+  /**
+   * Closing twice is closing once: a node closes the store of a directory it claimed, and its owner may close it
+   * again. Every caller waits for the one close, so none goes on as if the store were shut while it still is not.
+   */
+  close(): Promise<void> {
+    return (this.closing ??= this.root.close());
   }
 }

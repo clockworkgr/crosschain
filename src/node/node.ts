@@ -36,7 +36,7 @@ import type { KeyProof, ObjectProof } from '../db/proof.ts';
 import type { KeyQueryResult, StateQueryResult, TxQueryResult } from '../light/verify.ts';
 import { resultProofFor, txProofFor } from '../types/txproof.ts';
 import { BlockSync } from '../sync/blocksync.ts';
-import type { Genesis } from '../types/genesis.ts';
+import { checkMaxBlockBytes, type Genesis } from '../types/genesis.ts';
 import { makeLogger, type Logger, type LogLevel } from '../util/log.ts';
 import { BlockExecutor } from './executor.ts';
 import { GcScheduler, heapInUse, heapLimitFlag, MemoryGuard, memoryStats, type GcSchedulerOptions, type MemoryGuardOptions, type MemoryLevel, type MemoryStats } from './memory.ts';
@@ -83,7 +83,8 @@ export interface NodeConfig {
    */
   verifier?: Verifier;
   timeouts?: Partial<ConsensusTimeouts>;
-  limits?: Partial<ValidationLimits>;
+  /** The clock drift this node votes within, and for tests the evidence age. The block size is the chain's and comes from the genesis. */
+  limits?: Partial<Omit<ValidationLimits, 'maxBlockBytes'>>;
   network?: Partial<Pick<NetworkConfig, 'desiredOutbound' | 'maxInbound' | 'connectIntervalMs' | 'pingIntervalMs' | 'idleTimeoutMs'>>;
   lagGraceMs?: number;
   log?: Logger;
@@ -187,6 +188,17 @@ function lockDataDir(dir: string): () => void {
   };
 }
 
+/** A constructor's failure, with what releases the resources it had taken by then. */
+class ConstructionFailure extends Error {
+  override readonly cause: unknown;
+  readonly cleanup: () => Promise<void>;
+  constructor(cause: unknown, cleanup: () => Promise<void>) {
+    super('node construction failed');
+    this.cause = cause;
+    this.cleanup = cleanup;
+  }
+}
+
 export class Node {
   readonly name: string;
   private releaseLock: (() => void) | null = null;
@@ -222,11 +234,12 @@ export class Node {
     this.name = cfg.name;
     this.chainId = cfg.genesis.chainId;
     this.log = cfg.log ?? makeLogger(cfg.name, cfg.logLevel ?? 'info');
-    this.ownVerifier = cfg.verifier ? null : new WorkerVerifier();
-    this.verifier = cfg.verifier ?? this.ownVerifier!;
-    // One scheme per chain, genesis's, for the node identity and the validator key alike.
+    // One scheme per chain, genesis's, for the node identity and the validator key alike. Before anything is
+    // opened: a genesis naming a scheme the code does not know throws here with nothing to give back.
     const scheme = schemeTag(cfg.genesis.signatureScheme ?? 'ml-dsa-44');
     this.nodeKey = keyPairFromSeed(cfg.nodeKeySeed, scheme);
+    this.ownVerifier = cfg.verifier ? null : new WorkerVerifier();
+    this.verifier = cfg.verifier ?? this.ownVerifier!;
     let env: KvEnv | null = null;
     try {
       if (cfg.dataDir) mkdirSync(cfg.dataDir, { recursive: true });
@@ -244,16 +257,40 @@ export class Node {
           )
         : null;
     } catch (e) {
-      // Nothing is handed back to stop: what was opened so far is let go here, the claim on the directory last.
-      if (env && !cfg.env) void env.close().catch(() => {});
-      void this.ownVerifier?.close();
-      this.releaseLock?.();
-      throw e;
+      // Nothing is handed back to stop, and a constructor cannot wait: the error goes out with what gives back
+      // what was opened so far, for create() to wait on. The store is closed under the rule stop() follows (the
+      // node's own, or any in a directory it claimed), and the claim on the directory goes last, once it is.
+      const ownVerifier = this.ownVerifier;
+      const releaseLock = this.releaseLock;
+      throw new ConstructionFailure(e, async () => {
+        try {
+          // Each step on its own: one that throws, even before it returns a promise, does not stop the next.
+          try {
+            if (env && (!cfg.env || releaseLock)) await env.close();
+          } catch {
+            // The error the caller is given is the one that failed the construction.
+          }
+          try {
+            await ownVerifier?.close();
+          } catch {
+            // As above.
+          }
+        } finally {
+          releaseLock?.();
+        }
+      });
     }
   }
 
   static async create(cfg: NodeConfig): Promise<Node> {
-    const node = new Node(cfg);
+    let node: Node;
+    try {
+      node = new Node(cfg);
+    } catch (e) {
+      if (!(e instanceof ConstructionFailure)) throw e;
+      await e.cleanup();
+      throw e.cause;
+    }
     try {
       await node.init();
     } catch (e) {
@@ -276,7 +313,14 @@ export class Node {
   }
 
   private async init(): Promise<void> {
-    const limits = (this.limits = { ...DEFAULT_LIMITS, ...(this.cfg.genesis.consensus?.maxEvidenceAgeMs !== undefined ? { maxEvidenceAgeMs: this.cfg.genesis.consensus.maxEvidenceAgeMs } : {}), ...this.cfg.limits });
+    const chain = this.cfg.genesis.consensus;
+    const limits = (this.limits = {
+      ...DEFAULT_LIMITS,
+      ...(chain?.maxEvidenceAgeMs !== undefined ? { maxEvidenceAgeMs: chain.maxEvidenceAgeMs } : {}),
+      ...this.cfg.limits,
+      // Last, so nothing a node is configured with changes what blocks it holds valid.
+      maxBlockBytes: chain?.maxBlockBytes !== undefined ? checkMaxBlockBytes(chain.maxBlockBytes) : DEFAULT_LIMITS.maxBlockBytes,
+    });
 
     this.network = new Network({
       chainId: this.chainId,
@@ -359,7 +403,9 @@ export class Node {
     if (this.app instanceof CoreApp && this.indexTrees === 'store') this.app.db.dropIndexTrees();
     // A window in memory shorter than the provable one, when asked for: never longer than what the store was opened with.
     if (this.app instanceof CoreApp && this.historyInMemory < this.app.db.historyWindow) this.app.db.setHistoryWindow(this.historyInMemory);
-    this.mempool = new Mempool(this.app);
+    // Half the block at most, with the four bytes of its length: the block builder gives evidence no more than
+    // the other half, so a transaction admitted here fits the next block it is first in line for.
+    this.mempool = new Mempool(this.app, { maxTxBytes: Math.min(1024 * 1024, Math.floor(this.limits.maxBlockBytes / 2) - 4) });
     this.executor = await BlockExecutor.open(
       {
         app: this.app,
@@ -612,7 +658,14 @@ export class Node {
     });
   }
 
-  async stop(): Promise<void> {
+  private stopping: Promise<void> | null = null;
+
+  /** Stopping twice is stopping once: a second caller waits for the first, and the claim is released when that one is done. */
+  stop(): Promise<void> {
+    return (this.stopping ??= this.shutDown());
+  }
+
+  private async shutDown(): Promise<void> {
     try {
       if (this.started) {
         this.started = false;
@@ -628,7 +681,9 @@ export class Node {
       }
       // A block being applied finishes its writes before the store goes away.
       await this.executor?.idle();
-      if (this.ownsEnv) await this.env.close();
+      // The store the node opened, and also one it was handed for a directory it holds the claim on: the claim
+      // says nobody else writes there, so it cannot be given up while that store is open.
+      if (this.ownsEnv || this.releaseLock) await this.env.close();
       await this.ownVerifier?.close();
     } finally {
       // Last, and whatever failed above: until the store is closed and the writes are done, another node on the
@@ -835,7 +890,8 @@ export class Node {
 
   /**
    * A transaction with its inclusion proof against its block's header and, once
-   * the next block exists, its result proof against that header. Null if unknown.
+   * the next block exists and this node holds the block's results (a backfilled
+   * block has none), its result proof against that header. Null if unknown.
    */
   queryTx(hash: Uint8Array): TxQueryResult | null {
     const loc = this.store.txLocation(hash);

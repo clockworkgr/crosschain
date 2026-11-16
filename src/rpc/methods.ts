@@ -233,7 +233,11 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
         const h = heightParam(node, p);
         const set = node.executor.validatorSetAtHeight(h);
         if (!set) throw new RpcError(NOT_FOUND, `no validator set for height ${h}`);
-        return { height: h.toString(), ...(validatorSetToJson(set) as object) };
+        const json = validatorSetToJson(set) as { proposer: string | null };
+        // Without the record of that height the set is the one stored by hash: the members and powers are right,
+        // the proposer is a later height's, and is not passed off as this one's.
+        if (!node.executor.hasProposerAt(h)) json.proposer = null;
+        return { height: h.toString(), ...json };
       },
     },
     validatorSet: {

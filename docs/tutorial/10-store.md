@@ -43,7 +43,7 @@ README.md puts numbers on the disk side: a 500-transfer block commits in 9.9 ms 
 
 Blocks and their commits by height, so the chain can be replayed and served; a hash-to-height index, so a block can be found by hash; chain state (the current height, hashes and validator sets around it); validator sets by hash and by the height they sign; the lowest height held; a transaction index by hash with the outcome; the execution results of each block; and, on a node that joined by state sync, headers kept without their block for the heights below its lowest block, as far back as evidence may reach, with the lowest such height.
 
-Validator sets are stored by hash rather than only by height because they rarely change and each one can be large: 1,313 bytes of tagged public key per validator on an ML-DSA-44 chain, which the header of `src/store/blockstore.ts` rounds to 1.3 KB (34 bytes on a secp256k1 chain, where the sets are small but the reasoning is the same). A header names its set by hash, so the set that signed any past height is two lookups away, which is what evidence verification needs. Sets are also stored by the height they sign, with proposer priorities, because a node that joins by state sync must continue consensus with the exact priorities the chain had (RPC-SYNC-PROOFS.md, sections 1 and 4.2); the hash excludes priorities, so the by-hash copy cannot supply them.
+Validator sets are stored by hash rather than only by height because they rarely change and each one can be large: 1,313 bytes of tagged public key per validator on an ML-DSA-44 chain, which the header of `src/store/blockstore.ts` rounds to 1.3 KB (34 bytes on a secp256k1 chain, where the sets are small but the reasoning is the same). A header names its set by hash, so the set that signed any past height is two lookups away, which is what evidence verification needs. A set by hash is removed once pruning has left no header that names it and the chain state does not hold it either ([chapter 5](05-mempool-executor.md)). Sets are also stored by the height they sign, with proposer priorities, because a node that joins by state sync must continue consensus with the exact priorities the chain had (RPC-SYNC-PROOFS.md, sections 1 and 4.2); the hash excludes priorities, so the by-hash copy cannot supply them. The same record answers the executor's `validatorSetAtHeight` for a past height ([chapter 5](05-mempool-executor.md)), which asks by height first and by hash only when that record is gone: the copy by hash is written again whenever a later height has the same set, so its proposer is a later height's. The executor's `hasProposerAt(h)` says whether the record of the height answers, and where only the copy by hash does the RPC's `validators` method gives `proposer: null` ([chapter 12](12-rpc.md)).
 
 The transaction index and the per-block results are derived data outside the state root (RPC-SYNC-PROOFS.md section 2.3): replay or backfill rebuilds them. The lowest height is what retention moves: after each commit the executor deletes blocks below `lastHeight - blocks`, never below the newest snapshot nor into the evidence window (a block whose time is within the evidence age of the latest block stays), and records where the contiguous range now starts.
 
@@ -63,7 +63,7 @@ Exports:
 
 - `interface KvWriter { put(key, value); del(key) }`: what a `write` callback receives.
 - `interface KvStore { get(key); range(start, end); write(fn) }`: one named store. `range` yields `[key, value]` pairs with `start <= key < end`, ascending.
-- `interface KvEnv { store(name); transaction(fn); close() }`: a set of named stores sharing one environment. `transaction(fn)` runs writes to several stores of the environment as one transaction: on disk they all land or none does, whatever happens in between; in memory each store's write lands on its own, since there is no crash to recover from. `close` is the only asynchronous method, because closing LMDB is.
+- `interface KvEnv { store(name); transaction(fn); close() }`: a set of named stores sharing one environment. `transaction(fn)` runs writes to several stores of the environment as one transaction: on disk they all land or none does, whatever happens in between; in memory "there is no crash to recover from, but a throw out of `fn` still undoes what the stores took inside it". `close` is the only asynchronous method, because closing LMDB is.
 - `prefixEnd(prefix)`: the exclusive upper bound of a prefix scan.
 - `class MemoryKv implements KvStore` and `class MemoryEnv implements KvEnv`.
 
@@ -110,6 +110,8 @@ The copies are what make the memory store a faithful stand-in for LMDB. The tree
     const ops: [Uint8Array, Uint8Array | null][] = [];
     fn({ put: (k, v) => void ops.push([k.slice(), v.slice()]), del: (k) => void ops.push([k.slice(), null]) });
     for (const [k, v] of ops) {
+      // Inside an environment's transaction, what each key held before is kept so the transaction can be undone.
+      this.undo?.push([k, this.tree.get(k) ?? null]);
       if (v) this.tree.set(k, v);
       else this.tree.delete(k);
     }
@@ -118,7 +120,79 @@ The copies are what make the memory store a faithful stand-in for LMDB. The tree
 
 Keys and values are copied on the way in as well as on the way out, so a caller that reuses a buffer after `put` cannot corrupt the store, and the B+ tree, which stores keys by reference, is safe. The atomicity test in `test/store.test.ts` relies on the buffering: a callback that puts `d` and then throws leaves `d` absent, because nothing is applied until the callback returns. The puts and deletes go into one list and are applied in the order the callback made them, which is the order LMDB applies them in: a `put(k)` followed by `del(k)` in one `write` leaves `k` absent on both backends, and a `del(k)` followed by `put(k)` leaves it present. The application's commit relies on the second for an index key that changed hands within the block, its change list putting the removal first.
 
-`size` is the entry count, which `test/app.test.ts` uses as a cheap "something was persisted" check. `MemoryEnv.store(name)` creates a store on first use and returns the same one afterwards; `transaction(fn)` just calls `fn()`, so each store's `write` inside it lands on its own; `close` does nothing. The in-memory store is what most engine and application tests run on (the recovery and restart cases use LMDB in a temporary directory), and what `Node` uses when no data directory is configured.
+`size` is the entry count, which `test/app.test.ts` uses as a cheap "something was persisted" check. `MemoryEnv.store(name)` creates a store on first use and returns the same one afterwards, and `close` does nothing. `transaction(fn)` keeps the promise the disk environment makes, all the stores' writes inside `fn` or none of them if it throws:
+
+```ts
+  private undo: [Uint8Array, Uint8Array | null][] | null = null;
+
+  /** Start keeping what writes replace. */
+  begin(): void {
+    this.undo = [];
+  }
+
+  /** How much has been kept so far: a place a transaction inside this one can go back to. */
+  mark(): number {
+    return this.undo?.length ?? 0;
+  }
+
+  /** Put back everything written since `mark`, newest first. */
+  rollbackTo(mark: number): void {
+    const undo = this.undo;
+    if (!undo) return;
+    for (let i = undo.length - 1; i >= mark; i--) {
+      const [k, v] = undo[i]!;
+      if (v) this.tree.set(k, v);
+      else this.tree.delete(k);
+    }
+    undo.length = mark;
+  }
+
+  /** Stop keeping it; with `rollback`, first put everything back. */
+  end(rollback: boolean): void {
+    if (rollback) this.rollbackTo(0);
+    this.undo = null;
+  }
+```
+
+```ts
+  private depth = 0;
+
+  /**
+   * All the stores' writes inside `fn`, or none of them if it throws: the same promise the disk environment makes.
+   * A transaction inside another is part of it, and if it throws, its own writes are undone there and then, so an
+   * outer one that catches the error and goes on keeps only what it wrote itself.
+   */
+  transaction(fn: () => void): void {
+    if (this.depth > 0) {
+      const marks = new Map([...this.stores.values()].map((s) => [s, s.mark()]));
+      this.depth++;
+      try {
+        fn();
+      } catch (e) {
+        // A store first asked for inside has no mark: all it holds of this transaction goes.
+        for (const s of this.stores.values()) s.rollbackTo(marks.get(s) ?? 0);
+        throw e;
+      } finally {
+        this.depth--;
+      }
+      return;
+    }
+    this.depth++;
+    for (const s of this.stores.values()) s.begin();
+    let failed = true;
+    try {
+      fn();
+      failed = false;
+    } finally {
+      this.depth--;
+      for (const s of this.stores.values()) s.end(failed);
+    }
+  }
+```
+
+The first block is `MemoryKv`'s, the second `MemoryEnv`'s. While a transaction is open each store has an undo list, and the line in `write` above, `this.undo?.push([k, this.tree.get(k) ?? null])`, notes what each key held just before it is changed, `null` for a key that was absent. `rollbackTo(mark)` walks the list from its newest entry down to entry `mark`, puts each value back or deletes the key, and cuts the list to `mark`, so a key written several times ends with what it held before the first of the writes undone. `mark()` is the length of the list at that moment, "a place a transaction inside this one can go back to". `end(true)` is `rollbackTo(0)`, everything since `begin`, and then drops the list; `end(false)` only drops it. The environment begins every store it has when the outermost transaction starts and ends them all in a `finally`, with `failed` still true if `fn` threw. Two cases are covered beside the plain one. A store first asked for inside the transaction is begun as it is created (`if (this.depth > 0) s.begin()` in `store`), so its writes are undone with the rest. A transaction inside a transaction is part of the one already open: its writes go onto the same undo lists, and a throw out of the outer one undoes them too, as LMDB's child transactions are aborted with their parent. If the inner one itself throws, "its own writes are undone there and then": before it calls `fn` it takes a mark in every store the environment has, and its `catch` rolls each store back to its mark and throws the error on. A store first asked for inside the inner transaction has no mark and is rolled back to 0, which is everything it holds, since it was begun when it was created. An outer transaction that catches the error and goes on therefore keeps only what it wrote itself, before the inner one and after it, which is what an LMDB child transaction that aborts leaves its parent. A `MemoryKv` used on its own, outside any environment, has no undo list and its `write` is as before; its `mark()` is 0 and its `rollbackTo` returns at once. This is what makes a failed application commit leave nothing of the block on the memory backend as it does on LMDB ([chapter 5](05-mempool-executor.md)).
+
+The in-memory store is what most engine and application tests run on (the recovery and restart cases use LMDB in a temporary directory), and what `Node` uses when no data directory is configured.
 
 ### src/store/lmdb.ts
 
@@ -190,7 +264,21 @@ Results are copied into fresh `Uint8Array`s (`new Uint8Array(v)`), which is the 
   }
 ```
 
-Binary key encoding is what makes LMDB's order the bytewise order the keys were designed for; with a key encoding that transforms keys before comparison, the ranges would not line up with `prefixEnd`. `close` awaits the root's close; `Node` calls it only for an environment it created itself (`ownsEnv`).
+Binary key encoding is what makes LMDB's order the bytewise order the keys were designed for; with a key encoding that transforms keys before comparison, the ranges would not line up with `prefixEnd`. `close` closes the root once and returns that one close to every caller:
+
+```ts
+  private closing: Promise<void> | null = null;
+
+  /**
+   * Closing twice is closing once: a node closes the store of a directory it claimed, and its owner may close it
+   * again. Every caller waits for the one close, so none goes on as if the store were shut while it still is not.
+   */
+  close(): Promise<void> {
+    return (this.closing ??= this.root.close());
+  }
+```
+
+The first call keeps the promise of the root's close in `closing`, and a later call is handed the same promise, so a second caller waits for the close instead of returning at once while the store is still open. `Node` calls it for an environment it created itself (`ownsEnv`) and for one it was handed for a data directory it holds the claim on ([chapter 8](08-node.md)).
 
 `transaction` is a write transaction on the root database:
 
@@ -202,7 +290,7 @@ Binary key encoding is what makes LMDB's order the bytewise order the keys were 
   }
 ```
 
-lmdb-js nests transactions: a `transactionSync` opened on a sub-database while one is open on the root becomes a child of it, so every `write` the callback makes, on whichever named store, joins the environment-wide transaction, and a throw out of `fn` aborts them together (this was probed before it was relied on: nothing lands). There are two callers. State sync's install writes the application store, the validator sets, block H, the lowest heights and the chain state inside `env.transaction`, so a crash leaves either a complete join or nothing, and a restart simply joins again (chapter 7). And the executor of a node that created its own application saves each block and has the application commit inside one ([chapter 5](05-mempool-executor.md)): when the commit succeeds, the block and the state it produced land together, a crash leaves both or neither, and LMDB flushes to the device once for the block where two transactions flushed twice. A commit whose store write fails aborts the transaction. `CoreApp.commit` is not an `async` function and does its write before it returns, so the failure is thrown inside the callback and takes the block, the validator set and the chain state with it: the store is where it was before the block, and `applyBlock` rejects with the chain state unchanged. The executor calls `commitSync()` in place of `commit()` on an application that has one, for the same effect. The application's memory is by then one block ahead of its store, so the node needs a restart, which finds the chain and the application at the same height. Only what a commit does after its write, the snapshot export in `CoreApp`, fails as a rejected promise once the transaction has ended: the block and the state are stored by then. The flush, not the writing, is most of what a commit costs: at 192,000 accounts the application's commit of a 500-transfer block measured 17 to 26 ms of LMDB's own work (15 to 19 ms since the account history became a log) and 40 to 120 ms with the flush (`F_FULLFSYNC` on macOS). The `MemoryEnv` version just runs the callback, which is the right stand-in: in memory there is no crash to recover from, and the store the tests see is the same whether the writes were one transaction or several.
+lmdb-js nests transactions: a `transactionSync` opened on a sub-database while one is open on the root becomes a child of it, so every `write` the callback makes, on whichever named store, joins the environment-wide transaction, and a throw out of `fn` aborts them together (this was probed before it was relied on: nothing lands). There are two callers. State sync's install writes the application store, the validator sets, block H, the lowest heights and the chain state inside `env.transaction`, so a crash leaves either a complete join or nothing, and a restart simply joins again (chapter 7). And the executor of a node that created its own application saves each block and has the application commit inside one ([chapter 5](05-mempool-executor.md)): when the commit succeeds, the block and the state it produced land together, a crash leaves both or neither, and LMDB flushes to the device once for the block where two transactions flushed twice. A commit whose store write fails aborts the transaction. `CoreApp.commit` is not an `async` function and does its write before it returns, so the failure is thrown inside the callback and takes the block, the validator set and the chain state with it: the store is where it was before the block, and `applyBlock` rejects with the chain state unchanged. The executor calls `commitSync()` in place of `commit()` on an application that has one, for the same effect. The application's memory is by then one block ahead of its store, so the node needs a restart, which finds the chain and the application at the same height. Only what a commit does after its write, the snapshot export in `CoreApp`, fails as a rejected promise once the transaction has ended: the block and the state are stored by then. The flush, not the writing, is most of what a commit costs: at 192,000 accounts the application's commit of a 500-transfer block measured 17 to 26 ms of LMDB's own work (15 to 19 ms since the account history became a log) and 40 to 120 ms with the flush (`F_FULLFSYNC` on macOS). The `MemoryEnv` version has no crash to recover from and keeps the other half of the promise: a throw out of the callback undoes the writes made inside it, in every store, and a throw out of a transaction inside another undoes that one's writes alone (`src/store/kv.ts` above).
 
 Two behaviours of lmdb-js to know. `openDB` builds a new database object on every call, so two calls to `store('app')` give two wrappers over the same named database; nothing in `LmdbEnv` caches them, and the node calls `store` once per name in the normal path. And in a read-only environment, `openDB` of a name that does not exist returns `undefined` rather than throwing, so a wrapper built over it would fail on first use with a type error; `store` checks for that and throws `the store has no database named X, and a read-only environment cannot create it` where the database is asked for. The test opens a name that exists and one that does not.
 
@@ -213,7 +301,7 @@ Purpose: the chain's persistent records on a `KvStore`.
 Exports:
 
 - `interface TxLocation { height; index; ok: boolean | null; error }`: where a transaction landed. `ok` is null for a block stored without executing it here (a backfilled block).
-- `interface BlockStore`: `loadBlock`, `saveBlock`, `heightOf`, `txLocation` and `txLocations`, `loadResults`, `loadState`, `saveState`, `loadValidatorSet`, `saveValidatorSet`, `loadValidatorsAt`, `saveValidatorsAt`, `lowestHeight`, `setLowestHeight`, the header records `loadHeader`, `saveHeader`, `deleteHeader`, `lowestHeaderHeight` and `setLowestHeaderHeight`, `deleteBlock`, and `batch(fn)`, which runs several saves as one store transaction "so a crash leaves all or none of them".
+- `interface BlockStore`: `loadBlock`, `saveBlock`, `heightOf`, `txLocation` and `txLocations`, `loadResults`, `loadState`, `saveState`, `loadValidatorSet`, `saveValidatorSet`, `deleteValidatorSet`, `loadValidatorsAt`, `saveValidatorsAt`, `lowestHeight`, `setLowestHeight`, the header records `loadHeader`, `saveHeader`, `deleteHeader`, `lowestHeaderHeight` and `setLowestHeaderHeight`, `deleteBlock`, and `batch(fn)`, which runs several saves as one store transaction "so a crash leaves all or none of them".
 - `class KvBlockStore implements BlockStore` over any `KvStore`.
 - `class MemoryBlockStore extends KvBlockStore`: the same on a fresh `MemoryKv`.
 
@@ -399,14 +487,15 @@ Setting the marker to `null` deletes the key, which is what header pruning does 
       w.del(hashKey(blockHash(stored.block)));
       w.del(resultsKey(height));
       // The set by height serves a state-sync join at a snapshot height, which needs the block of that height too:
-      // without the block the record answers nothing. Sets by hash stay; headers still held name them.
+      // without the block the record answers nothing. Sets by hash are the executor's to remove, once no header
+      // still held names them.
       w.del(valsetAtKey(height));
       for (const tx of stored.block.txs) w.del(txKey(txHash(tx), height));
     });
   }
 ```
 
-Deleting a block removes that block's index entries only: a transaction that is also in another block still held keeps its entry there. The validator set stored by height (`'V'`) goes with the block of that height: it is what a peer joining at a snapshot of that height is served, and such a join needs the block too, so the record answers nothing once the block is gone. The sets of the heights still held stay, as do the two the executor has stored ahead of the latest block. Sets by hash (`'v'`) are never deleted; there is one per distinct set, and headers still held name them, which is what evidence at any retained height needs. A store pruned by an earlier build keeps the by-height records of the blocks that build deleted, below its lowest block, since `deleteBlock` returns at once for a height whose block is already gone.
+Deleting a block removes that block's index entries only: a transaction that is also in another block still held keeps its entry there. The validator set stored by height (`'V'`) goes with the block of that height: it is what a peer joining at a snapshot of that height is served, and such a join needs the block too, so the record answers nothing once the block is gone. The sets of the heights still held stay, as do the two the executor has stored ahead of the latest block. Sets by hash (`'v'`), one per distinct set, are not deleted here: headers still held name them, which is what evidence at any retained height needs. They are the executor's to remove. After a pruning pass it looks for each set the removed heights carried among the headers still held and in the current state, and calls **`deleteValidatorSet(hash)`**, a single `del` of the `'v'` key, for one that nothing names (`pruneValidatorSets`, [chapter 5](05-mempool-executor.md)). The store does not check the condition itself; the interface says so: "the caller has found that no header still held and no state names it". A store pruned by an earlier build keeps the by-height records of the blocks that build deleted, below its lowest block, since `deleteBlock` returns at once for a height whose block is already gone.
 
 ### src/store/files.ts
 
@@ -458,7 +547,7 @@ The file is either the old content or the new content, never a mix: the data goe
 
 `test/review4.test.ts` has two cases on the transaction index. "keeps every block a transaction is in, answers with the one it succeeded in, and loses only the pruned one" saves one transaction in blocks 5 (failed), 8 (succeeded, at position 1) and 9 (failed): `txLocations` lists the three in height order, `txLocation` answers block 8, after `deleteBlock(8n)` the list is 5 and 9 and the answer block 9, and after the other two are deleted it is null. "moves an index of the old layout, one entry per hash, when the store is opened, and reads it before that" writes 12,000 entries under the hash alone and opens a `KvBlockStore` on them: no 33-byte key is left, the first and the last entry read back with their heights, positions and results, a transaction given an entry at height 5 by hand that lands again at height 9 has both and keeps the first when block 9 is deleted, a second store opened on the same data makes no range read, and a store whose `write` throws answers from an entry of the old layout.
 
-`test/review5-node.test.ts` has three cases on this chapter's code. "indexes a transaction repeated in one block where it succeeded": on a `MemoryBlockStore`, a block `[T, U, T]` with results failure, success, success is indexed at position 2 with `ok: true`; a block `[T, T]` with success then failure at position 0; one where both fail at the first of the two with its error; one saved with `null` results at position 0 with `ok: null`; and `txLocations` has one entry per block, which goes when the block is deleted. "applies the operations of one write to the memory store in the order they were made": a put followed by a delete of one key in a single `write` leaves the key absent, put, delete, put leaves the last value, and a callback that deletes and then throws leaves the store as it was. "prunes blocks and headers in one transaction each, the set by height going with its block": a one-validator node retaining two blocks runs on a `MemoryKv` that records the first byte of every key each `write` puts and deletes. Every write that deletes a block also puts the lowest-height marker, no write moves the marker alone, and each deletes as many `'V'` records as blocks; `loadValidatorsAt` is null below the lowest block and answers at it and two heights above the latest, and the genesis set is still found by hash. Two header records written below the lowest block with times older than the evidence age are then deleted, with their marker, in a single write after the next commit.
+`test/review5-node.test.ts` has five cases on this chapter's code. "indexes a transaction repeated in one block where it succeeded": on a `MemoryBlockStore`, a block `[T, U, T]` with results failure, success, success is indexed at position 2 with `ok: true`; a block `[T, T]` with success then failure at position 0; one where both fail at the first of the two with its error; one saved with `null` results at position 0 with `ok: null`; and `txLocations` has one entry per block, which goes when the block is deleted. "applies the operations of one write to the memory store in the order they were made": a put followed by a delete of one key in a single `write` leaves the key absent, put, delete, put leaves the last value, and a callback that deletes and then throws leaves the store as it was. "prunes blocks and headers in one transaction each, the set by height going with its block": a one-validator node retaining two blocks runs on a `MemoryKv` that records the first byte of every key each `write` puts and deletes. Every write that deletes a block also puts the lowest-height marker, no write moves the marker alone, and each deletes as many `'V'` records as blocks; `loadValidatorsAt` is null below the lowest block and answers at it and two heights above the latest, and the genesis set is still found by hash, the chain's one validator never having changed. Two header records written below the lowest block with times older than the evidence age are then deleted, with their marker, in a single write after the next commit. The fourth, "removes a validator set by hash once no header held names it" ([chapter 5](05-mempool-executor.md)), exercises `deleteValidatorSet`: a set replaced by a `val:` transaction is gone from the store once every block that names it has been pruned, and each block still held finds both sets its header names. The fifth, "undoes the writes of a memory environment transaction that throws, in every store", puts a key in the `chain` store of a `MemoryEnv`, then in a transaction overwrites it, adds a second key, deletes the first, writes to an `app` store first asked for inside a nested transaction, and throws: the first key holds its old value, the second key and the `app` store's key are absent. A transaction that returns keeps its write, and a write made after it is not undone by a later transaction that throws. Last, an outer transaction puts the first key, runs an inner one that overwrites it, writes to a `late` store first asked for there and throws, catches the error and puts the second key: afterwards the first key holds the outer transaction's value, the second key its new one, and the `late` store has nothing.
 
 `test/app.test.ts`, "restarts from the store with the same app hash and keeps producing the same hashes": the application on a `MemoryKv` is reopened from it, serves the same app hash and the same proofs, and after the window slides the history keys under prefix `0x68` are exactly versions 4 to 7, showing that commit deletes the record that left the window. `test/genesis.test.ts` reopens an application from a `MemoryKv` and checks the app hash matches an inline genesis.
 
@@ -471,7 +560,7 @@ The remaining block store methods (state, validator sets by hash and by height, 
 - `LmdbEnv.store(name)` returns a new wrapper on every call and does not cache.
 - `batch` is per `KvBlockStore` and therefore per named store. What makes a block and the application's commit one transaction is `KvEnv.transaction` around both, which the executor uses only when the node created the application on its own environment's `app` store. An application handed to the node commits in a separate transaction, or outside LMDB altogether, so a crash between the block store's batch and `app.commit` is still possible there and is still repaired by replay, as DESIGN.md section 4 describes.
 - A transaction that encloses an asynchronous `commit()` holds only what the application wrote before its first `await`; nothing checks that an application in the environment's store keeps to that, and one that does not silently pays the second flush. A `commit()` that fails after an `await` rejects its promise and does not abort the transaction, so the block is stored without the application's writes and the node relies on the replay at restart. After a commit that did abort the transaction the application still holds the block in memory while the store does not, and the node has to be restarted.
-- Validator sets by hash are kept for ever, one per distinct set. The by-height records of blocks deleted before those records went with their blocks stay in a store pruned by an earlier build.
+- The by-height records of blocks deleted before those records went with their blocks stay in a store pruned by an earlier build, and so do the sets by hash that only those blocks named: the executor considers a set by hash only when a pass removes a height that carried it.
 - There is no compaction or map-size management beyond lmdb-js's defaults.
 
 Exercises:

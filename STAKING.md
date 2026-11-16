@@ -380,7 +380,7 @@ registers an account, pays one, or delegates 500 tokens to a validator in turn.
 ## 11. Invariants to test
 
 - Supply: `currentSupply = sum(balances) + sum(validator.tokens) + sum(unbonding.tokens) + communityPool` at every height; the mint is the only increase and nothing is burned.
-- Per validator: `shares > 0` iff `tokens > 0`, delegation shares sum to `shares`, the operator's delegation exists unless tombstoned.
+- Per validator: `shares > 0` iff `tokens > 0`, except after a slash of the whole stake, which leaves shares over no tokens (section 5); delegation shares sum to `shares`, the operator's delegation exists unless tombstoned.
 - `dynamic.bonded = sum(validator.tokens over candidates and jailed)`.
 - Active set: at most maxValidators, all candidates with power >= 1 and self-bond met, no higher-power candidate excluded.
 - Pending entries per pair never exceed maxEntries except forced tombstone conversions.

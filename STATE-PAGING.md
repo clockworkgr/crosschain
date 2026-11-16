@@ -919,9 +919,9 @@ whose trees have 1,100, a block of 500 transfers took 271 ms to finalize against
 with every chunk cached and 45 to 73 resident. The cache now holds 4,096 chunks, 128 MiB
 at most and outside the heap (5.2), so the dense trees of up to two million leaves are
 read once after a drop and the cache bounds only larger ones. The index trees dropped
-cost nothing a block of transfers notices (the transfers
-look up no index; a block's finalize even gets faster without the B+ tree updates, 39.6 ms
-against 49.0).
+cost nothing a block of transfers notices (a transfer looks its two balances up by
+`byOwnerAsset`, which the store and the overlays answer once the tree is dropped; a
+block's finalize even gets faster without the B+ tree updates, 39.6 ms against 49.0).
 
 The node over longer runs and other heaps (docs/benchmarks.md 4.13 has the tables). Over
 three states (34,000, 192,000 and 514,000 accounts) and five limits (0.8 to 2.0 times the
