@@ -134,6 +134,15 @@ describe('the rpc server', () => {
     expect(await call).toBeNull();
   });
 
+  it('is not listening after a stop that overtook its start', async () => {
+    const { node } = await up();
+    const late = new RpcServer(node, { port: 0 });
+    const starting = late.start();
+    await late.stop();
+    await starting;
+    expect((late as unknown as { server: { listening: boolean } }).server.listening).toBe(false);
+  });
+
   it('replays a block event as it was pushed, failed count and all, and says when it holds no results to count', async () => {
     const { node, server, rpc, chainId } = await up();
     const live = fetch(server.url + '/events?types=block').then((res) => readEvents(res, (ev) => ev.length >= 3));

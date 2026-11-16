@@ -79,15 +79,22 @@ class TcpConn extends BaseConn {
 
 export class TcpTransport implements Transport {
   private server: Server | null = null;
+  /** Sockets still connecting, each with what ends its dial: close() must not leave them to connect later. */
+  private readonly dialing = new Map<Socket, (err: Error) => void>();
 
   dial(addr: string): Promise<Conn> {
     const { host, port } = parseAddr(addr);
     return new Promise((resolve, reject) => {
       const socket = connect({ host, port });
-      const onError = (err: Error) => reject(err);
+      const onError = (err: Error) => {
+        this.dialing.delete(socket);
+        reject(err);
+      };
+      this.dialing.set(socket, onError);
       socket.once('error', onError);
       socket.once('connect', () => {
         socket.off('error', onError);
+        this.dialing.delete(socket);
         resolve(new TcpConn(socket));
       });
     });
@@ -106,6 +113,11 @@ export class TcpTransport implements Transport {
   }
 
   async close(): Promise<void> {
+    for (const [socket, fail] of [...this.dialing]) {
+      socket.removeAllListeners('connect');
+      socket.destroy();
+      fail(new Error('transport closed'));
+    }
     const s = this.server;
     this.server = null;
     if (s) await new Promise<void>((resolve) => s.close(() => resolve()));

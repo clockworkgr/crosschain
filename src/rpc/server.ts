@@ -107,15 +107,18 @@ export class RpcServer {
   }
 
   start(): Promise<number> {
-    return new Promise((resolve, reject) => {
+    return (this.starting ??= new Promise((resolve, reject) => {
       this.server.once('error', reject);
       this.server.listen(this.port, this.host, () => {
         this.boundPort = (this.server.address() as AddressInfo).port;
         this.log('info', 'rpc listening', { url: this.url });
         resolve(this.boundPort);
       });
-    });
+    }));
   }
+
+  /** A start on its way: a stop waits for it, since a server closed before it listens would listen afterwards. */
+  private starting: Promise<number> | null = null;
 
   /**
    * Stop listening and close every connection. One in the middle of a request is given `graceMs` to finish and is
@@ -129,6 +132,7 @@ export class RpcServer {
     this.events.close();
     for (const s of this.streams) s.res.end();
     this.streams.clear();
+    await this.starting?.catch(() => {}); // one that failed is not listening, and closing it is harmless
     const closed = new Promise<void>((resolve) => this.server.close(() => resolve()));
     this.server.closeIdleConnections();
     const cut = setTimeout(() => this.server.closeAllConnections(), graceMs);

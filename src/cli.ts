@@ -221,12 +221,14 @@ async function start(nodeDir: string): Promise<void> {
   let rpc: RpcServer | null = null;
   let stopping = false;
   let giveUp: NodeJS.Timeout | undefined;
+  let status: NodeJS.Timeout | undefined;
   // Consensus and block sync stop at once, and the block being applied finishes its writes, while the RPC server
   // stops beside them; a request still running then has a second (none at `critical`) before its connection is cut,
   // so no client can keep a node that must stop running.
   const shutdown = async (code = 0) => {
     if (stopping) return;
     stopping = true;
+    clearInterval(status); // it reads the application, whose store is about to close
     if (!node) {
       giveUp = setTimeout(() => process.exit(code), 5000).unref();
       return; // start() goes on to stop the node when it has one
@@ -283,6 +285,7 @@ async function start(nodeDir: string): Promise<void> {
     const [host, port] = (cfg.rpcListen ?? `127.0.0.1:${Number(cfg.listenAddr.split(':')[1]) + 1}`).split(':');
     rpc = new RpcServer(made, { host, port: Number(port), log });
     await rpc.start();
+    if (stopping) return; // the shutdown that began meanwhile has the server to stop, and no status line follows it
   } catch (e) {
     // A node that is up and cannot go on (its RPC address is taken, for one) is stopped like any other, so the
     // store is closed and the claim released before the error ends the process.
@@ -291,7 +294,7 @@ async function start(nodeDir: string): Promise<void> {
     return shutdown(1);
   }
 
-  setInterval(() => {
+  status = setInterval(() => {
     const m = made.memoryGuard.stats;
     const gc = made.gcScheduler.stats();
     log('info', 'status', {
@@ -305,7 +308,8 @@ async function start(nodeDir: string): Promise<void> {
       memory: made.memoryLevel,
       gc: `${gc.collections} pauses, ${gc.totalMs.toFixed(0)} ms, longest ${gc.maxMs.toFixed(1)} ms`,
     });
-  }, 5000).unref();
+  }, 5000);
+  status.unref();
 }
 
 // ---- client helpers ----

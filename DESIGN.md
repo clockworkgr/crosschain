@@ -266,7 +266,32 @@ transactions checked at once no more are let through and applied than the pool h
   block, a transaction or evidence item) is handed to one place, `detached`, which takes
   whatever it ends with and logs `handling a <what> failed`, at `warn` while the node
   runs and at `debug` once it is stopping: such work that resumes to a closed store or a
-  closed verifier pool ends there. A
+  closed verifier pool ends there. A validator's own proposal and the proposals consensus
+  held for a height are handled without being waited for as well, and no handler of the
+  node stands behind them, so consensus catches their failure itself and logs it with
+  the same words, at `debug` once it is stopped and at `error` while it runs: one whose
+  signature was being verified when the node closed its verifier pool ends there and not
+  as a rejection nobody handles, which would end the process. No timer or immediate
+  of the network or of block sync, and no collection the node queued, is left to fire
+  after the stop; what can still happen is the suspended work above, which ends when it
+  resumes. A dial still connecting when the
+  network stops is ended by the transport, which destroys the socket and fails the dial
+  with `transport closed`, and one that resolves all the same is closed with nothing
+  sent on it. A connection that was sent a rejection, which is closed 50 ms later so
+  that the frame can leave, is closed at the stop and its timer cleared, and a
+  rejection due after the stop closes its connection at once. Block sync looks at
+  whether it still runs at every pass of the loop that applies blocks, so one stopped
+  while a block was being applied reads nothing more and sets no timer. A handshake
+  step that is given a connection already closed fails at once with `closed during
+  handshake`: a connection tells of its close once, so one that closed between two
+  steps would otherwise hold the next step until the handshake timeout, on a timer
+  the stop could not reach. The collection the node queues for the moment after a
+  commit and the next step of a backfill are immediates that are kept, one of each:
+  the node queues no collection once it is stopping and clears the one queued as its
+  stop begins, and block sync's stop clears its own. The in-memory transport of the
+  tests and the local network keeps, for each of its transports, the connections and
+  the latency timers of what is on its way to them, and closing the transport clears
+  the timers and closes the connections. A
   stop also waits for a start still on its way: `start()` is one promise, it marks the
   network as started before it waits for it, and after each of its waits (the network,
   the collection, the memory guard's first sample) it goes no further if a stop has
@@ -284,7 +309,10 @@ transactions checked at once no more are let through and applied than the pool h
   in use, for one) is logged as `start failed` and the node is stopped like any other
   before the process exits with status 1, so the store is closed and the claim
   released; a failure while stopping is logged as `stopping failed` and the exit status
-  is 1 unless it was already another. The CLI's `start` passes its node the data directory alone: the node claims
+  is 1 unless it was already another. The status line the CLI logs every five seconds
+  reads the application, so its interval is cleared as the shutdown begins: a tick after
+  the store was closed would throw `the store is closed` inside a timer, where nothing
+  handles it. The CLI's `start` passes its node the data directory alone: the node claims
   the directory and then opens the LMDB environment, so a second `start` on a directory
   in use is refused before it has opened anything there. The node closes the store it
   opened and also one it was handed for a directory it holds the claim on, as a test or
@@ -1092,7 +1120,8 @@ The first real application on the object database, BitShares style.
   megabytes of public keys, beyond what V8 holds as one string) is named by
   `appStateFile` and read as a token stream with `stream-json`, one account at a
   time (`loadAppGenesis`), only at first start, since afterwards the store has the
-  state. The encoded change list of a version is dropped once the store has written
+  state. `loadAppGenesis` closes the file it opened however the reading ended, so a
+  file that does not parse leaves no descriptor open. The encoded change list of a version is dropped once the store has written
   it, so genesis does not keep a second copy of every object in memory.
 
 ## 8. Staking
@@ -1166,7 +1195,7 @@ node must continue consensus with the exact proposer priorities.
 
 ## 10. Implementation status (2026-11-15)
 
-Everything above is implemented in TypeScript under `src/`. 280 tests in 29 files
+Everything above is implemented in TypeScript under `src/`. 287 tests in 29 files
 pass, and the whole suite passes under either signature scheme
 (`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there) and with
 either tier of state paging dropped from the start (`INDEX_TREES=0`, `TREES=0`, or
@@ -1200,7 +1229,7 @@ limit at `warn`, a tenth at `pressure` (a transaction beyond it refused as `full
 `retain.memoryVersions` set keeps that many past versions in memory and proves an older height from the store, and with `indexTrees: 'store'` leaves its index trees there and still finds an account by name. The history
 suite appends blocks of entries to the account history log and pages every account out
 of it in both directions against a model, counts the reads that reach the old end of a
-long history, checks that a block writes the heads of one slice of the account numbers and that a log opened after a stop has the waiting ones back, and moves a store written with the earlier layout into the log. The fourth review's suite (`test/review4.test.ts`) asks a node for a balance, an account, a key, a validator and a delegation as of past heights and checks their proofs against the next header's app hash, spends a rate limit with batches, indexes one transaction in three blocks, moves a transaction index of the earlier layout when its store is opened, refuses a snapshot without every type's section and a number too large to hold exactly, prunes and bounds the evidence pool, removes a key from the keystore, reads a peer clock seven seconds ahead from its pong and runs a node on a verifier pool of its own. Four more suites hold one case for each rule added after it. `test/review5-net.test.ts` (15 cases) counts one success for an outbound dial, leaves a refused connection open for the rejection to leave, bans and excludes a peer by the address dialed, takes an address list only in answer to a request, starts from the seeds on a peer file cut short, stops block sync cleanly, refuses a block response that does not match its request, passes over a snapshot below the trust height, drops a vote far ahead before verifying it, holds a vote for the next height once, holds for the next height only proposals a validator signed, and admits one of two transactions checked at once for the pool's last place. `test/review5-node.test.ts` (25 cases) claims a data directory by its real path and releases it last, takes a stale claim over only while holding the takeover file, closes a store it was handed for a directory it claimed before giving the claim up, waits for whoever still reads the store before closing it, does not go on starting once it is being stopped and answers a closed store with an error, refuses every step of an iteration and every use of a writer once the disk environment is closed, reads the evidence age from the application when asked, stores nothing of a block whose application commit throws, prunes in one transaction with the set by height going with its block, answers for a past height with the set as that height had it, removes a validator set by hash once no header held names it, indexes a repeated transaction where it succeeded, undoes the writes of a memory environment transaction that throws, does not pool gossiped evidence that is too old, takes an item only from the peer asked for it, remembers no more than 2,048 fetches for a peer that announces and never answers, takes the block size from the genesis for every node alike, bounds a block by its transactions and evidence and a validator set by what a frame holds, and refuses a block with more than 16 pieces of evidence. `test/review5-app.test.ts` (17 cases) fails a store write under the application and writes the block again with a correct history, stops the application after a failure past the block's session, refuses a delegation to a validator with shares and no tokens and an authority no key leads to or that needs more signatures than a transaction carries, reads the state of the last root after writes outside a session, bounds the object types and the authenticated indices, and has the toy application refuse a validator key of another scheme than its set's. `test/review5-rpc.test.ts` (10 cases) stops a server's events with it, stops a server only once a method it was running has returned (the method ends within the server's one-second wait), replays a block event with the fields of a live one, opens an account stream only for an account there is, finds a validator by its operator's account id, keeps a key under a name every object inherits, and runs the command line for an unknown command, an asset of precision 0, a light client anchor of another chain and a block whose results the node lacks. State paging (`STATE-PAGING.md`) has cases of its
+long history, checks that a block writes the heads of one slice of the account numbers and that a log opened after a stop has the waiting ones back, and moves a store written with the earlier layout into the log. The fourth review's suite (`test/review4.test.ts`) asks a node for a balance, an account, a key, a validator and a delegation as of past heights and checks their proofs against the next header's app hash, spends a rate limit with batches, indexes one transaction in three blocks, moves a transaction index of the earlier layout when its store is opened, refuses a snapshot without every type's section and a number too large to hold exactly, prunes and bounds the evidence pool, removes a key from the keystore, reads a peer clock seven seconds ahead from its pong and runs a node on a verifier pool of its own. Four more suites hold one case for each rule added after it. `test/review5-net.test.ts` (20 cases) counts one success for an outbound dial, leaves a refused connection open for the rejection to leave, sends nothing on a connection that opened after the network was stopped and leaves no refused connection or timer behind, does not wait on a connection that closed between two steps of its handshake and leaves no timer of the in-memory wire behind, ends a dial still connecting when the transport is closed, bans and excludes a peer by the address dialed, takes an address list only in answer to a request, starts from the seeds on a peer file cut short, stops block sync cleanly, sets no timer when block sync was stopped while a block was being applied, catches the failure of a proposal nobody waits for, refuses a block response that does not match its request, passes over a snapshot below the trust height, drops a vote far ahead before verifying it, holds a vote for the next height once, holds for the next height only proposals a validator signed, and admits one of two transactions checked at once for the pool's last place. `test/review5-node.test.ts` (26 cases) claims a data directory by its real path and releases it last, takes a stale claim over only while holding the takeover file, closes a store it was handed for a directory it claimed before giving the claim up, waits for whoever still reads the store before closing it, does not go on starting once it is being stopped and answers a closed store with an error, leaves nothing queued behind a stop made from a commit and no file open behind a genesis that does not parse, refuses every step of an iteration and every use of a writer once the disk environment is closed, reads the evidence age from the application when asked, stores nothing of a block whose application commit throws, prunes in one transaction with the set by height going with its block, answers for a past height with the set as that height had it, removes a validator set by hash once no header held names it, indexes a repeated transaction where it succeeded, undoes the writes of a memory environment transaction that throws, does not pool gossiped evidence that is too old, takes an item only from the peer asked for it, remembers no more than 2,048 fetches for a peer that announces and never answers, takes the block size from the genesis for every node alike, bounds a block by its transactions and evidence and a validator set by what a frame holds, and refuses a block with more than 16 pieces of evidence. `test/review5-app.test.ts` (17 cases) fails a store write under the application and writes the block again with a correct history, stops the application after a failure past the block's session, refuses a delegation to a validator with shares and no tokens and an authority no key leads to or that needs more signatures than a transaction carries, reads the state of the last root after writes outside a session, bounds the object types and the authenticated indices, and has the toy application refuse a validator key of another scheme than its set's. `test/review5-rpc.test.ts` (11 cases) stops a server's events with it, stops a server only once a method it was running has returned (the method ends within the server's one-second wait), replays a block event with the fields of a live one, opens an account stream only for an account there is, finds a validator by its operator's account id, keeps a key under a name every object inherits, and runs the command line for an unknown command, an asset of precision 0, a light client anchor of another chain and a block whose results the node lacks. State paging (`STATE-PAGING.md`) has cases of its
 own: the arena suite grows slabs, counts dead bytes and compacts, and releases whole
 slabs down to a byte limit, unread ones first; the database suite
 evicts clean objects and never dirty ones, keeps history as bytes, checks that the

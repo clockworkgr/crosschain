@@ -22,6 +22,7 @@ import { MemoryHub } from '../src/p2p/memory.ts';
 import { decodeMessage, type Message } from '../src/p2p/messages.ts';
 import { Network, type NetworkConfig } from '../src/p2p/network.ts';
 import { PeerDb } from '../src/p2p/peerdb.ts';
+import { TcpTransport } from '../src/p2p/tcp.ts';
 import { Requester } from '../src/p2p/request.ts';
 import type { Conn, Transport } from '../src/p2p/transport.ts';
 import { MemoryBlockStore } from '../src/store/blockstore.ts';
@@ -96,6 +97,122 @@ describe('the peer layer', () => {
     await waitFor(() => times.close !== undefined, 2000, 'the refused connection to close');
     expect(times.reject).toBeDefined();
     expect(times.close! - times.reject!).toBeGreaterThanOrEqual(40);
+  });
+
+  it('sends nothing on a connection that opened after it was stopped, and leaves no refused connection or timer behind', async () => {
+    const hub = new MemoryHub();
+    const inner = hub.transport('b:1');
+    let open: () => void = () => {};
+    const gate = new Promise<void>((r) => (open = r));
+    let dialed: Conn | null = null;
+    const sent: string[] = [];
+    // A dial that is held until the test lets it finish, on a connection whose frames are recorded.
+    const slow: Transport = {
+      listen: (addr, onConn) => inner.listen(addr, onConn),
+      close: () => inner.close(),
+      dial: async (addr) => {
+        const conn = await inner.dial(addr);
+        await gate;
+        dialed = {
+          get remoteAddr() {
+            return conn.remoteAddr;
+          },
+          get closed() {
+            return conn.closed;
+          },
+          send(frame) {
+            sent.push(decodeMessage(frame).type);
+            conn.send(frame);
+          },
+          onFrame: (cb) => conn.onFrame(cb),
+          onClose: (cb) => conn.onClose(cb),
+          close: () => conn.close(),
+        };
+        return dialed;
+      },
+    };
+    const a = makeNet('a', hub.transport('a:1'));
+    const b = makeNet('b', slow, { listenAddr: null });
+    await a.start();
+    await b.start();
+    const dialing = b.connect('a:1');
+    const failed = expect(dialing).rejects.toThrow(/network stopped/);
+    await b.stop();
+    open();
+    await failed;
+    expect(sent).toEqual([]);
+    expect(dialed!.closed).toBe(true);
+
+    // A connection that was refused waits a moment before it is closed; a stop inside that moment closes it.
+    const c = makeNet('c', hub.transport('c:1'), { chainId: 'another-chain', listenAddr: null });
+    await c.start();
+    await expect(c.connect('a:1')).rejects.toThrow(/rejected: wrong chain id/);
+    const rejected = (a as unknown as { rejected: Map<Conn, unknown> }).rejected;
+    expect(rejected.size).toBe(1);
+    const [refused] = [...rejected.keys()];
+    await a.stop();
+    expect(rejected.size).toBe(0);
+    expect(refused!.closed).toBe(true);
+  });
+
+  it('does not wait on a connection that closed between two steps of its handshake, and leaves no timer of the wire behind', async () => {
+    const hub = new MemoryHub();
+    const inner = hub.transport('a:1');
+    // The accepting side's connection closes as soon as the hello has been handed over: before the handshake goes on.
+    let closedAfterHello = false;
+    const closing: Transport = {
+      dial: (addr) => inner.dial(addr),
+      close: () => inner.close(),
+      listen: (addr, onConn) =>
+        inner.listen(addr, (conn) => {
+          conn.onFrame = ((real) => (cb: (frame: Uint8Array) => void) =>
+            real((frame) => {
+              cb(frame);
+              if (decodeMessage(frame).type === 'hello') {
+                conn.close();
+                closedAfterHello = true;
+              }
+            }))(conn.onFrame.bind(conn));
+          onConn(conn);
+        }),
+    };
+    const a = makeNet('a', closing, { handshakeTimeoutMs: 60_000 });
+    const b = makeNet('b', hub.transport('b:1'), { listenAddr: null, handshakeTimeoutMs: 60_000 });
+    await a.start();
+    await b.start();
+    b.connect('a:1').catch(() => {});
+    const inside = a as unknown as { handshaking: Set<Conn>; pendingInbound: number };
+    await waitFor(() => closedAfterHello, 2000, 'the hello to arrive');
+    await waitFor(() => inside.pendingInbound === 0 && inside.handshaking.size === 0, 2000, 'the handshake to end without its timeout');
+
+    // Frames and connections still crossing the hub when both ends stop are taken back with them.
+    const timers = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
+    await a.stop();
+    await b.stop();
+    const c = makeNet('c', hub.transport('c:1'));
+    const d = makeNet('d', hub.transport('d:1'), { listenAddr: null });
+    const before = timers();
+    hub.latencyMs = 5000;
+    await c.start();
+    await d.start();
+    d.connect('c:1').catch(() => {});
+    await sleep(10);
+    expect(timers()).toBeGreaterThan(before);
+    await c.stop();
+    await d.stop();
+    expect(timers()).toBe(before);
+  });
+
+  it('ends a dial that is still connecting when the transport is closed', async () => {
+    const t = new TcpTransport();
+    // An address nothing answers from: the dial stays connecting, or fails at once where there is no route.
+    const dial = t.dial('10.255.255.1:9');
+    const failed = expect(dial).rejects.toThrow();
+    const before = performance.now();
+    await t.close();
+    await failed;
+    expect(performance.now() - before).toBeLessThan(1000);
+    expect((t as unknown as { dialing: Map<unknown, unknown> }).dialing.size).toBe(0);
   });
 
   it('excludes and bans a peer by the address it dialed, whatever that resolved to', async () => {
@@ -232,6 +349,33 @@ describe('block sync', () => {
     expect(t.h.applied).toEqual([]);
   });
 
+  it('sets no timer when it was stopped while a block was being applied', async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    const t = harness({ respond: (from, count) => Array.from({ length: count }, (_, i) => blockAt(from + BigInt(i))), deciding: false });
+    const inner = t.sync as unknown as { verify: () => Promise<string | null>; d: { applyBlock: (b: Block) => Promise<void>; isConsensusDeciding: () => boolean }; graceTimer: unknown };
+    inner.verify = async () => null;
+    let applying = false;
+    let deciding = false;
+    inner.d.isConsensusDeciding = () => deciding;
+    inner.d.applyBlock = async (block) => {
+      applying = true;
+      await gate;
+      t.h.applied.push(block.header.height);
+      t.h.ours = block.header.height;
+    };
+    t.sync.start();
+    t.status(3n);
+    await waitFor(() => applying, 2000, 'the first block to reach the application');
+    // Another block is held and consensus is deciding: a running sync would wait and look again.
+    deciding = true;
+    t.sync.stop();
+    release();
+    await sleep(20);
+    expect(t.h.applied).toEqual([1n]);
+    expect(inner.graceTimer).toBeNull();
+  });
+
   it('lets go of the blocks it held once no peer is ahead', async () => {
     // Consensus is deciding, so what arrives is held and not applied.
     const t = harness({ respond: (from, count) => Array.from({ length: count }, (_, i) => blockAt(from + BigInt(i))), deciding: true });
@@ -339,6 +483,17 @@ describe('consensus intake', () => {
   afterEach(async () => {
     await net?.stop();
     net = null;
+  });
+
+  it('catches the failure of a proposal nobody waits for', async () => {
+    net = await makeTestnet({ validators: 4, skipStart: [2, 3] });
+    const consensus = net.nodes[0]!.consensus as unknown as { handleProposal: () => Promise<void>; proposalUnawaited: (p: Proposal, from: string | null) => void };
+    const real = consensus.handleProposal;
+    consensus.handleProposal = () => Promise.reject(new Error('verifier closed'));
+    // An unhandled rejection fails the run; this one is caught and logged.
+    consensus.proposalUnawaited({ height: 1n, round: 0 } as Proposal, null);
+    await sleep(20);
+    consensus.handleProposal = real;
   });
 
   it('drops a vote for a round far ahead before verifying it, holds for the next height only proposals a validator signed, and forgets block requests with the height', async () => {

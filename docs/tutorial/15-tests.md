@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-nine files, 280 cases, about 8,990 lines counting the shared harness
+`test/**/*.test.ts`: twenty-nine files, 287 cases, about 9,190 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (279 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (286 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -27,7 +27,7 @@ the external review and the later cases of the same kind, `review2` five more th
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
 by title at the end of the suites, `review4` the nine cases for the items the first review
-noted and left, and the four `review5` files 67 cases for failures and unusual callers at the
+noted and left, and the four `review5` files 74 cases for failures and unusual callers at the
 edges of every layer: `review5-net` the peer layer, sync, consensus intake and the mempool,
 `review5-node` the node, the executor and the block store, `review5-app` the application, the
 object database and the codec, and `review5-rpc` the RPC server, the keystore, the command
@@ -2477,11 +2477,11 @@ verifier rejects with `/closed/`.
 
 ### test/review5-net.test.ts
 
-Fifteen tests for the peer layer, block sync, state sync, what consensus takes in ahead of
+Twenty tests for the peer layer, block sync, state sync, what consensus takes in ahead of
 its round or its height, and the mempool, each at an edge: a failure, a peer that misbehaves, or two things
 happening at once. They are listed by group and title with what each sets up and asserts.
 
-`the peer layer`, five cases. `makeNet(name, transport, cfg)` makes a bare `Network` on chain
+`the peer layer`, eight cases. `makeNet(name, transport, cfg)` makes a bare `Network` on chain
 `r5` with its own `PeerDb`, an inline verifier, a connect interval of 50 ms and a ping interval
 of 200 ms; every network made is stopped in `afterEach`.
 
@@ -2496,6 +2496,38 @@ was sent on it and the time it was closed. `b` is on `another-chain`, and `b.con
 rejects with `/rejected: wrong chain id/`. The accepting side's connection is closed, a
 rejection was sent, and the close came at least 40 ms after it: the connection a `reject` went
 out on is left to the 50 ms timer.
+
+**`it('sends nothing on a connection that opened after it was stopped, and leaves no refused connection or timer behind')`**.
+`b`'s transport is wrapped: its `dial` makes the connection and then waits on a gate before it
+returns it, and what it returns records the type of every frame sent on it. `b.connect('a:1')`
+is begun and `b` is stopped while the dial is held; the gate is then opened. `connect` rejects
+with `/network stopped/`, no frame was sent, and the connection is closed: a dial that
+resolves on a stopped network gets no `hello`. The second half is the refused connection of
+the case before, seen from the node that refused: `c`, on `another-chain`, dials `a` and is
+rejected with `/rejected: wrong chain id/`, and `a`'s `rejected` map holds one connection,
+waiting for its 50 ms timer. `a.stop()` is called inside that moment: the map is empty and the
+connection is closed, the timer cleared with it.
+
+**`it('does not wait on a connection that closed between two steps of its handshake, and leaves no timer of the wire behind')`**.
+`a`'s transport is the hub's, with `listen` wrapped: the connection handed to `a` has its
+`onFrame` replaced by one that passes each frame on and then, when the frame was a `hello`,
+closes the connection, "as soon as the hello has been handed over: before the handshake goes
+on". Both networks are made with a handshake timeout of 60 seconds. `b` dials `a`; once the
+`hello` has arrived, `a`'s `pendingInbound` is 0 and its `handshaking` set empty within the
+two seconds the test waits: the step that would wait for `auth` found the connection closed
+and rejected, where it had waited out the timeout before ([chapter 6](06-p2p.md)). The second
+half is about the hub. `a` and `b` are stopped, and the test counts the process's active
+timers (`process.getActiveResourcesInfo()`, the entries that are `Timeout`). Two more
+networks, `c` and `d`, are made, the hub's latency is set to 5,000 ms, both are started and
+`d` dials `c`: 10 ms on there are more timers than before, the connection on its way to `c`
+and the `hello` behind it among them. After `c.stop()` and `d.stop()` the count is what it
+was: closing a hub transport takes back what was crossing the hub towards it.
+
+**`it('ends a dial that is still connecting when the transport is closed')`**. A `TcpTransport`
+dials `10.255.255.1:9`, "an address nothing answers from: the dial stays connecting, or fails
+at once where there is no route", and is closed. The dial rejects, the close and the rejection
+together take less than a second, and the transport's `dialing` map is empty: the socket was
+destroyed and not left to connect or to time out later.
 
 **`it('excludes and bans a peer by the address it dialed, whatever that resolved to')`**. `b`'s
 transport records every dial and turns `name:1` into `a:1`, as a host name resolves over TCP;
@@ -2518,7 +2550,7 @@ file parses to that one record with `failures: 1`, no `peers.json.tmp` is left b
 second `PeerDb` on the file reads the failure back. A file holding valid JSON that is an object
 and not a list opens as a database of size 0.
 
-`block sync`, four cases. `harness(opts)` builds a `BlockSync` whose network has one peer, whose
+`block sync`, five cases. `harness(opts)` builds a `BlockSync` whose network has one peer, whose
 requester answers every `blocksRequest` with what the case's `respond(from, count)` returns,
 whose `applyBlock` notes the height and whose `scorePeer` notes the charge; `blockAt(height)`
 is a block of zero hashes with a commit naming its hash, and `status(height)` delivers the
@@ -2527,6 +2559,15 @@ peer's status message. Nothing here verifies a block for real.
 **`it('applies nothing after it was stopped, though a block was being verified')`**. The sync's
 `verify` is replaced by one that waits on a gate. The peer reports height 2, the first block
 reaches verification, the sync is stopped and the gate released: `applied` stays empty.
+
+**`it('sets no timer when it was stopped while a block was being applied')`**. `verify` passes
+every block, `applyBlock` waits on a gate before it notes the height and moves the node's own
+height to it, and `isConsensusDeciding` reads a flag of the test's. The peer reports height 3,
+so three blocks are fetched, and the first reaches the application. The flag is then set,
+"another block is held and consensus is deciding: a running sync would wait and look again",
+the sync is stopped and the gate released. 20 ms on, `applied` is `[1n]` and `graceTimer` is
+null: the block that was being applied was applied, nothing after it was, and the 200 ms timer
+was not set again after `stop()` had cleared it.
 
 **`it('lets go of the blocks it held once no peer is ahead')`**. With consensus reported as
 deciding, the two blocks the peer sends are held in the buffer and `isSyncing` is true. The
@@ -2555,7 +2596,15 @@ sources' `manifestBytes` is replaced by seven bytes of `0xff`, and a join trusti
 rejects with `/no valid manifest/`, each source's score on the joiner's network above 40: one
 charge of 50 for a manifest that does not decode, less a moment's decay.
 
-`consensus intake`, one case.
+`consensus intake`, two cases, the testnet stopped in `afterEach`.
+
+**`it('catches the failure of a proposal nobody waits for')`**. Two of four validators are
+started. Node 0's `handleProposal` is replaced by a function that rejects with `verifier
+closed`, as the node's own verifier pool does once it is closed, and `proposalUnawaited` is
+called with a proposal for height 1, round 0, from no peer. The test waits 20 ms and puts the
+real method back. It asserts nothing of its own: "an unhandled rejection fails the run; this
+one is caught and logged", by the `catch` consensus attaches to its own proposal and to the
+ones it held for the height ([chapter 4](04-consensus.md)).
 
 **`it('drops a vote for a round far ahead before verifying it, holds for the next height only proposals a validator signed, and forgets block requests with the height')`**.
 Two of four validators are started, so node 0 stays at height 1. A prevote with a signature of
@@ -2612,13 +2661,13 @@ the pool holds two.
 
 ### test/review5-node.test.ts
 
-Twenty-five tests for the node, the executor and the block store. Two helpers serve several
+Twenty-six tests for the node, the executor and the block store. Two helpers serve several
 groups: `blockAfter(state, lastCommit, evidence)` builds the block that would follow a chain
 state as far as its structure goes, with a commit of no signatures, and
 `doubleSign(net, node, height, round)` signs two prevotes of validator 0 for different hashes
 and makes evidence of them.
 
-`the data directory`, eight cases on a one-validator testnet whose node is not started
+`the data directory`, nine cases on a one-validator testnet whose node is not started
 (`skipStart: [0]`), with a temporary directory removed in `afterEach`.
 
 **`it('is one directory however its path is spelled or linked to')`**. A node is made on
@@ -2681,6 +2730,21 @@ figure so that the heap figure is the one read, and an `onLevel` that calls the 
 `stop()`. `start()` takes the first sample, which is `critical` and calls the listener; the
 guard's timer is null afterwards, so a guard stopped from inside its first sample stays
 stopped ([chapter 8](08-node.md)).
+
+**`it('leaves nothing queued behind a stop made from a commit, and no file open behind a genesis that does not parse')`**.
+A one-validator testnet is made and started. The node's scheduler has its `afterCommit`
+wrapped to count the calls that come once the test's flag `stopped` is set, and the test adds
+a commit listener of its own, which sets the flag and calls `node.stop()`, once. It runs after
+the node's listener: "the node's own listener has queued the collection for after this commit
+when this one stops the node". The test waits for the stop and 20 ms more. The scheduler was
+not called after the stop, and the node's `afterCommit` and its block sync's `nextBackfill`
+are both null: the immediate that was queued was cleared, and none was queued after
+([chapter 8](08-node.md)). The second half writes `{"accounts": [1, 2`, a document cut short,
+to `state.json` in a temporary directory, counts the entries of `/dev/fd`, and calls
+`loadAppGenesis` twenty times on the testnet's genesis with that file as its `appStateFile`.
+Every call rejects, and the count of open descriptors afterwards is what it was before:
+`loadAppGenesis` closes the file it opened, however the parsing ended
+([chapter 11](11-application.md)).
 
 **`it('is given back, with the store, by a node that fails to open')`**. A `KvStoreApp` whose
 `initChain` throws makes `makeNode` reject with `/no genesis for you/`. No `LOCK` is left, and
@@ -2978,7 +3042,7 @@ kept would be, and opening a `KvStoreApp` on it throws
 
 ### test/review5-rpc.test.ts
 
-Ten tests for the RPC server, the keystore, the command line and the light client.
+Eleven tests for the RPC server, the keystore, the command line and the light client.
 `readEvents(res, enough)` reads the records of an event stream until `enough` says so and then
 closes it.
 
@@ -3007,6 +3071,12 @@ second `stop` waits. A method that took longer than the second would still be ru
 reads the store of a stopped node is the `StoreClosedError` that
 `does not go on starting once it is being stopped, and answers a closed store with an error`
 in `test/review5-node.test.ts` checks.
+
+**`it('is not listening after a stop that overtook its start')`**. A second server is made for
+the node; `start()` is called and, before it has resolved, `stop()`. The stop waits for the
+start and then closes the server, so when both have returned the HTTP server's `listening` is
+false. Before the stop waited, it closed a server that was not listening yet, and the listen
+that was on its way went through after it.
 
 **`it('replays a block event as it was pushed, failed count and all, and says when it holds no results to count')`**.
 A stream of `block` events is read for three records while a transfer is broadcast in commit

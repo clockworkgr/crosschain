@@ -257,7 +257,18 @@ export async function parseAppGenesisStream(source: Readable): Promise<AppGenesi
 export async function loadAppGenesis(genesis: Genesis): Promise<AppGenesis> {
   if (!genesis.appStateFile) return parseAppGenesis(genesis.appState);
   if (statSync(genesis.appStateFile).size === 0) return appGenesisFrom({}, []);
-  return parseAppGenesisStream(createReadStream(genesis.appStateFile));
+  const file = createReadStream(genesis.appStateFile);
+  try {
+    return await parseAppGenesisStream(file);
+  } finally {
+    // A file that did not parse is left open by the parser; it is closed here, however the reading ended.
+    if (!file.closed) {
+      await new Promise<void>((resolve) => {
+        file.once('close', () => resolve());
+        file.destroy();
+      });
+    }
+  }
 }
 
 

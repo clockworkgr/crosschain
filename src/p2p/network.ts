@@ -94,6 +94,11 @@ const MAX_HELD_FRAMES = 64;
 
 function nextMessage(conn: Conn, timeoutMs: number): Promise<Message> {
   return new Promise((resolve, reject) => {
+    // A connection tells of its close once, and an earlier step may have been told: wait for nothing on a closed one.
+    if (conn.closed) {
+      reject(new HandshakeError('closed during handshake'));
+      return;
+    }
     const timer = setTimeout(() => {
       cleanup();
       reject(new HandshakeError('handshake timeout'));
@@ -143,8 +148,8 @@ export class Network {
   private readonly peerGoneListeners: ((p: Peer) => void)[] = [];
   private readonly dialing = new Set<string>();
   private readonly handshaking = new Set<Conn>();
-  /** Connections that were sent a rejection; each closes itself a moment later, once the frame has left. */
-  private readonly rejected = new WeakSet<Conn>();
+  /** Connections sent a rejection and not yet closed, each with the timer that closes it once the frame has left. */
+  private readonly rejected = new Map<Conn, NodeJS.Timeout>();
   /** Peers whose answer to an address request is still awaited. */
   private readonly addrAsked = new WeakSet<Peer>();
   private readonly p2pCtx: Uint8Array;
@@ -206,6 +211,11 @@ export class Network {
     this.timers = [];
     for (const c of [...this.handshaking]) c.close();
     this.handshaking.clear();
+    for (const [c, timer] of [...this.rejected]) {
+      clearTimeout(timer);
+      c.close();
+    }
+    this.rejected.clear();
     for (const p of [...this.peers.values()]) p.close();
     await this.cfg.transport.close();
   }
@@ -233,6 +243,7 @@ export class Network {
     try {
       if (!this.running) throw new Error('network stopped');
       conn = await this.cfg.transport.dial(addr);
+      if (!this.running) throw new Error('network stopped'); // stopped while dialing: closed below, nothing is sent
       this.handshaking.add(conn);
       const peer = await this.handshakeOutbound(conn, addr);
       this.cfg.peerDb.markSuccess(addr);
@@ -277,9 +288,18 @@ export class Network {
 
   /** Tell the other side why, and close a moment later: closing at once could take the frame down with the socket. */
   private reject(conn: Conn, code: number, reason: string): void {
+    if (!this.running) {
+      conn.close(); // stopped while its handshake was checked: no timer may outlive the stop
+      return;
+    }
     conn.send(encodeMessage({ type: 'reject', code, reason }));
-    this.rejected.add(conn);
-    setTimeout(() => conn.close(), 50);
+    this.rejected.set(
+      conn,
+      setTimeout(() => {
+        this.rejected.delete(conn);
+        conn.close();
+      }, 50),
+    );
   }
 
   private async handshakeOutbound(conn: Conn, addr: string): Promise<Peer> {

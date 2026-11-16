@@ -253,7 +253,7 @@ export class Consensus {
 
     this.startRound(resumeRound);
     for (const v of votes) this.addVote(v, null);
-    for (const e of proposals) void this.handleProposal(e.proposal, e.from);
+    for (const e of proposals) this.proposalUnawaited(e.proposal, e.from);
   }
 
   private startRound(r: number): void {
@@ -308,7 +308,17 @@ export class Consensus {
     const proposal: Proposal = { ...unsigned, signature };
     this.log('info', 'proposing', { h: this.height, r: this.round, txs: block.txs.length, hash: blockHash(block) });
     this.d.broadcastProposal(proposal, null);
-    void this.handleProposal(proposal, null);
+    this.proposalUnawaited(proposal, null);
+  }
+
+  /**
+   * Our own proposal and the ones held for this height are handled without being waited for, so nobody else is
+   * there to catch a failure. One that comes while stopping is expected: the verifier or the store closed under it.
+   */
+  private proposalUnawaited(p: Proposal, fromPeer: string | null): void {
+    this.handleProposal(p, fromPeer).catch((e: unknown) => {
+      this.log(this.running ? 'error' : 'debug', 'handling a proposal failed', { h: p.height, r: p.round, err: e instanceof Error ? e.message : String(e) });
+    });
   }
 
   private createBlock(): Block | null {

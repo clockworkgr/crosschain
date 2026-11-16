@@ -6,12 +6,12 @@
  * is pooled, items taken only when they were asked for, and a bound on the evidence in a block.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CoreApp } from '../src/app/core/app.ts';
-import { appGenesisBytes, authorityJson } from '../src/app/core/genesis.ts';
+import { appGenesisBytes, authorityJson, loadAppGenesis } from '../src/app/core/genesis.ts';
 import { KvStoreApp } from '../src/app/kvstore.ts';
 import { encode } from '../src/codec/writer.ts';
 import { DEFAULT_LIMITS } from '../src/consensus/consensus.ts';
@@ -219,6 +219,40 @@ describe('the data directory', () => {
     guard = new MemoryGuard({ log: silentLogger, stats: () => full, onLevel: () => guard!.stop() });
     guard.start();
     expect((guard as unknown as { timer: unknown }).timer).toBeNull();
+  });
+
+  it('leaves nothing queued behind a stop made from a commit, and no file open behind a genesis that does not parse', async () => {
+    net = await makeTestnet({ validators: 1 });
+    const node = net.nodes[0]!;
+    const inner = node as unknown as { afterCommit: unknown; gcScheduler: { afterCommit: () => void }; blockSync: { nextBackfill: unknown } };
+    let stopped = false;
+    let after = 0;
+    const real = inner.gcScheduler.afterCommit.bind(inner.gcScheduler);
+    inner.gcScheduler.afterCommit = () => {
+      if (stopped) after++;
+      real();
+    };
+    // The node's own listener has queued the collection for after this commit when this one stops the node.
+    let stopping: Promise<void> | null = null;
+    node.executor.onCommitted(() => {
+      stopped = true;
+      stopping ??= node.stop();
+    });
+    await waitFor(() => stopping !== null, 10_000, 'a block to be committed');
+    await stopping;
+    await sleep(20);
+    expect(after).toBe(0);
+    expect(inner.afterCommit).toBeNull();
+    expect(inner.blockSync.nextBackfill).toBeNull();
+
+    // A genesis file that does not parse is closed by the one who opened it.
+    tmp = mkdtempSync(join(tmpdir(), 'r5-genesis-'));
+    const file = join(tmp, 'state.json');
+    writeFileSync(file, '{"accounts": [1, 2');
+    const open = () => readdirSync('/dev/fd').length;
+    const before = open();
+    for (let i = 0; i < 20; i++) await expect(loadAppGenesis({ ...net.genesis, appStateFile: file })).rejects.toThrow();
+    expect(open()).toBe(before);
   });
 
   it('is given back, with the store, by a node that fails to open', async () => {

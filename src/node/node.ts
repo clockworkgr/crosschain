@@ -609,7 +609,12 @@ export class Node {
     this.executor.onCommitted((block) => {
       this.network.broadcast({ type: 'status', height: block.header.height });
       // The idle moment after a commit is where collections are least in the way.
-      setImmediate(() => this.gcScheduler.afterCommit());
+      if (!this.stopping) {
+        this.afterCommit ??= setImmediate(() => {
+          this.afterCommit = null;
+          this.gcScheduler.afterCommit();
+        });
+      }
       this.evidenceAge();
     });
   }
@@ -684,6 +689,8 @@ export class Node {
   }
 
   private stopping: Promise<void> | null = null;
+  /** The collection queued for the moment after a commit, so that a stop can take it back. */
+  private afterCommit: NodeJS.Immediate | null = null;
 
   /**
    * Stopping twice is stopping once: a second caller waits for the first, and the claim is released when that one
@@ -707,6 +714,8 @@ export class Node {
         failed = true;
       }
     };
+    if (this.afterCommit) clearImmediate(this.afterCommit);
+    this.afterCommit = null;
     try {
       // A start still on its way ends first: it sees the stop after each of its waits and goes no further.
       await step(() => this.starting);

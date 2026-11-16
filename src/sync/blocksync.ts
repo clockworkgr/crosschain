@@ -75,6 +75,7 @@ export class BlockSync {
   private applying = false;
   private backfilling = false;
   private retryTimer: NodeJS.Timeout | null = null;
+  private nextBackfill: NodeJS.Immediate | null = null;
   private behindSince: number | null = null;
   private graceTimer: NodeJS.Timeout | null = null;
   private running = false;
@@ -107,6 +108,8 @@ export class BlockSync {
     this.graceTimer = null;
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = null;
+    if (this.nextBackfill) clearImmediate(this.nextBackfill);
+    this.nextBackfill = null;
   }
 
   get isSyncing(): boolean {
@@ -125,7 +128,7 @@ export class BlockSync {
   }
 
   private later(ms: number): void {
-    if (this.graceTimer) return;
+    if (this.graceTimer || !this.running) return;
     this.graceTimer = setTimeout(() => {
       this.graceTimer = null;
       this.check();
@@ -220,6 +223,7 @@ export class BlockSync {
     let progressed = false;
     try {
       for (;;) {
+        if (!this.running) return; // stopped while a block was applied: no timer is set and nothing more is read
         const ours = this.d.getState().lastHeight;
         // Consensus may have decided heights we were still holding; they are not needed any more.
         for (const h of this.buffer.keys()) if (h <= ours) this.buffer.delete(h);
@@ -362,7 +366,12 @@ export class BlockSync {
     } finally {
       this.backfilling = false;
       // Whatever happened (a decline returns early above), the next step is scheduled from here.
-      if (this.running && this.d.store.lowestHeight() > this.backfillFloor()) setImmediate(() => void this.backfill());
+      if (this.running && this.d.store.lowestHeight() > this.backfillFloor()) {
+        this.nextBackfill ??= setImmediate(() => {
+          this.nextBackfill = null;
+          void this.backfill();
+        });
+      }
     }
   }
 

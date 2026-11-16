@@ -621,7 +621,12 @@ peer's advertised address and the name it was dialed by are separate records in 
 peer database, and when two nodes dial each other and the inbound connection is the
 one that survives, the dialed address is dialed again, with backoff. A connection
 the node refuses with a `reject` frame is closed 50 ms later, by a timer alone, so
-the frame can leave first; a handshake that fails otherwise is closed at once.
+the frame can leave first; a handshake that fails otherwise is closed at once. A
+network that is stopped does not wait for those timers: it clears them and closes the
+connections, ends the dials still connecting, and sends nothing on a connection that
+opens after the stop. A handshake step given a connection that has already closed
+fails at once (`closed during handshake`) and does not wait for the handshake
+timeout.
 
 ### 4.7 Retention
 
@@ -718,7 +723,7 @@ bound; the codec's `u53` and `i53`; `Keystore.remove`; a peer clock read from it
 pong; and a node that makes and closes its own verifier pool. Two tests run the
 CLI as a process: `start` against a directory that does not exist, for the heap limit
 it keeps (`test/review3.test.ts`), and `keys add` and `keys remove`
-(`test/review4.test.ts`). `test/review5-rpc.test.ts` (ten cases) stops a server and
+(`test/review4.test.ts`). `test/review5-rpc.test.ts` (eleven cases) stops a server and
 finds its listener gone from the executor and a commit wait answered; stops one with a
 method still running and finds the method, which ends within the stop's one-second wait, ended when the stop returns; replays a block
 event with the fields of the pushed one, and with `failed: null` when the results
@@ -746,20 +751,25 @@ peers catches up a node started some 45 blocks late, and a node retaining ten
 blocks prunes behind that window (with the evidence window switched off, since it
 would otherwise keep every block); evidence created on one node reaches a proposer
 that never saw the votes; a node with +2/3 precommits and no proposal decides the
-height from a fetched block. `test/review5-net.test.ts` (15 cases) covers the peer
+height from a fetched block. `test/review5-net.test.ts` (20 cases) covers the peer
 layer (one success per outbound dial, a refused connection left open for the
-rejection to leave, a ban and an exclusion by the address dialed, an address list
+rejection to leave, nothing sent on a connection that opened after a stop and no
+refused connection or timer left behind, no wait on a connection that closed
+between two steps of its handshake and no timer of the in-memory hub left behind
+by a stop, a dial still connecting ended when the
+transport is closed, a ban and an exclusion by the address dialed, an address list
 taken only in answer to a request, a peer file cut short), block sync (nothing
-applied after a stop, the buffer dropped once no peer is ahead, a response with more
+applied after a stop, no timer set by a stop that came while a block was being
+applied, the buffer dropped once no peer is ahead, a response with more
 blocks than asked for, a block of another height and a commit naming another block),
 state sync (a snapshot from before the trusted height passed over, a manifest that
-does not decode charged), consensus intake (a vote far ahead dropped unverified, a
+does not decode charged), consensus intake (the failure of a proposal nobody waits for caught, a vote far ahead dropped unverified, a
 vote for the next height held once however often it is sent, a proposal for the next height held only when a validator signed it and two to a
 validator, block requests forgotten with the height), an empty
 validator set decoded only with proposer index -1, and the mempool (one of two
 concurrent checks admitted to the last place, a place given back, a pooled
-transaction never forgotten). `test/review5-node.test.ts` (25 cases) covers the data
-directory's claim and the takeover of a stale one, a store handed in closed before the claim is given up, a store closed only once whoever still reads it is done, a start that goes no further once a stop has begun and a closed store that answers with `StoreClosedError`, every step of an iteration and every use of a kept writer refused once the disk environment is closed, the evidence age read when asked, a block of which nothing is
+transaction never forgotten). `test/review5-node.test.ts` (26 cases) covers the data
+directory's claim and the takeover of a stale one, a store handed in closed before the claim is given up, a store closed only once whoever still reads it is done, a start that goes no further once a stop has begun and a closed store that answers with `StoreClosedError`, nothing left queued behind a stop made from a commit and no file left open behind a genesis that does not parse, every step of an iteration and every use of a kept writer refused once the disk environment is closed, the evidence age read when asked, a block of which nothing is
 stored when the application's commit throws, pruning in one transaction with the
 set by height, a past height answered with the set as it had it, proposer included, a set by hash removed once no header held names it, a repeated transaction indexed where it succeeded, the memory store's
 write order, a memory environment's transaction undone in every store when it throws, a heap flag of zero, gossiped evidence too old to pool, an item taken
