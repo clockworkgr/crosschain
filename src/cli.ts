@@ -1,7 +1,7 @@
 /**
  * Command line for running nodes and talking to them over JSON-RPC.
  *
- *   node src/cli.ts init <dir> <validators> [basePort=26656] [--scheme ml-dsa-44|secp256k1]
+ *   node src/cli.ts init [dir=testnet] [validators=4] [basePort=26656] [--scheme ml-dsa-44|secp256k1]
  *       Writes genesis.json with a funded faucet and one validator per node,
  *       a keystore with the faucet and operator keys, and a directory per
  *       node with its consensus key and config. Prints the keystore passphrase.
@@ -86,7 +86,7 @@ interface NodeFiles {
   stateSync?: { trustHeight: string; trustHash: string; backfill?: boolean };
   /** Blocks kept behind the latest (all when unset), provable heights, snapshots kept. */
   retain?: { blocks?: number; versions?: number; snapshots?: number; memoryVersions?: number };
-  /** 'store' reads the application's secondary indices from LMDB and never builds their trees in memory; 'memory' is the default. */
+  /** 'store' (the default) reads the application's secondary indices from LMDB and never builds their trees in memory; 'memory' builds them. */
   indexTrees?: 'memory' | 'store';
   snapshotInterval?: number;
 }
@@ -196,7 +196,8 @@ function startUnderHeapLimit(): boolean {
   const heapMb = flags.has('heap') ? Number(flags.get('heap')) : Math.floor((totalmem() / 2 ** 20) * 0.75);
   if (!Number.isInteger(heapMb) || heapMb < 256) throw new Error('--heap takes a size in MiB, at least 256');
   console.log(`start: running the node under a ${heapMb} MiB heap limit (--heap <MiB> changes it), collections scheduled after commits`);
-  const args = [`--max-old-space-size=${heapMb}`, '--max-semi-space-size=64', '--expose-gc', ...process.execArgv, process.argv[1]!, ...process.argv.slice(2)];
+  // The limit goes after the arguments this process was started with: the last such flag wins, and one of 0 (no limit) among them must not undo it.
+  const args = [...process.execArgv, `--max-old-space-size=${heapMb}`, '--max-semi-space-size=64', '--expose-gc', process.argv[1]!, ...process.argv.slice(2)];
   const child = spawn(process.execPath, args, { stdio: 'inherit', env: { ...process.env, CROSSCHAIN_CHILD: '1' } });
   // A signal addressed to this process is passed on; a terminal's interrupt reaches the child by itself as well,
   // and the child's shutdown runs once however many it gets.
@@ -295,7 +296,8 @@ function toUnits(amount: string, precision: number): bigint {
 function whole(units: string | bigint, precision: number): string {
   const u = BigInt(units);
   const unit = 10n ** BigInt(precision);
-  return `${u / unit}.${(u % unit).toString().padStart(precision, '0')}`;
+  // An asset of precision 0 has no fraction to print.
+  return precision === 0 ? u.toString() : `${u / unit}.${(u % unit).toString().padStart(precision, '0')}`;
 }
 
 async function accountId(rpc: RpcClient, name: string): Promise<ObjectId> {
@@ -377,11 +379,11 @@ async function proposedParameters(rpc: RpcClient, overrides: string[]) {
     const path = kv.slice(0, eq).split('.');
     let o = next;
     for (const k of path.slice(0, -1)) {
-      if (!o[k] || typeof o[k] !== 'object') throw new Error(`no parameter ${kv.slice(0, eq)}`);
+      if (!Object.hasOwn(o, k) || !o[k] || typeof o[k] !== 'object') throw new Error(`no parameter ${kv.slice(0, eq)}`);
       o = o[k] as Record<string, unknown>;
     }
     const leaf = path[path.length - 1]!;
-    if (!(leaf in o) || typeof o[leaf] === 'object') throw new Error(`no parameter ${kv.slice(0, eq)}`);
+    if (!Object.hasOwn(o, leaf) || typeof o[leaf] === 'object') throw new Error(`no parameter ${kv.slice(0, eq)}`);
     o[leaf] = typeof o[leaf] === 'number' ? Number(kv.slice(eq + 1)) : kv.slice(eq + 1);
   }
   return chainParametersFromJson(next);
@@ -483,7 +485,11 @@ async function lightClient(rpc: RpcClient, keystorePath: string, trust?: { heigh
   const status = await rpc.status();
   let anchor = trust;
   if (!anchor && existsSync(file)) {
-    const j = JSON.parse(readFileSync(file, 'utf8')) as { height: string; hash: string };
+    const j = JSON.parse(readFileSync(file, 'utf8')) as { chainId?: string; height: string; hash: string };
+    // The anchor is a header of one chain. A file written before the chain id was kept names none and is taken as it is.
+    if (j.chainId !== undefined && j.chainId !== status.chainId) {
+      throw new Error(`${file} holds a trusted header of chain ${j.chainId}, and this node is on chain ${status.chainId}; use the keystore directory of that chain, or set a new anchor with: light <target> trust <height> <hash>`);
+    }
     anchor = { height: BigInt(j.height), hash: fromHex(j.hash) };
   }
   if (!anchor) {
@@ -493,7 +499,7 @@ async function lightClient(rpc: RpcClient, keystorePath: string, trust?: { heigh
     console.log(`trusting height ${h} on first use`);
   }
   const client = await LightClient.trust({ chainId: status.chainId, provider: new RpcProvider(rpc), verifier: new InlineVerifier() }, anchor.height, anchor.hash);
-  const save = () => writeFileSync(file, JSON.stringify({ height: client.trusted.header.height.toString(), hash: toHex(headerHash(client.trusted.header)) }));
+  const save = () => writeFileSync(file, JSON.stringify({ chainId: status.chainId, height: client.trusted.header.height.toString(), hash: toHex(headerHash(client.trusted.header)) }));
   save();
   return Object.assign(client, { save });
 }
@@ -508,12 +514,17 @@ async function verifyTx(rpc: RpcClient, keystorePath: string, hash: string): Pro
   client.save();
   // What is printed is what was proven: the proof's own height, not the height the node claimed alongside it.
   const at = q.txProof.height;
-  if (verdict === null) console.log(`included at height ${at}; result not yet committed`);
+  // Without a result proof only inclusion was checked. The block after is what commits to the results: when the node
+  // sent its header and still no proof, it holds the block but not its results, having fetched it after a state sync.
+  if (verdict === null) console.log(`included at height ${at}; ${q.nextHeader ? 'this node does not hold the results of that block' : 'result not yet committed'}`);
   else if ('failed' in verdict) {
     console.log(`verification failed: ${verdict.error}`);
     process.exitCode = 1;
   } else console.log(`verified: included at height ${at}, ${verdict.ok ? 'succeeded' : 'failed: ' + verdict.error}`);
 }
+
+/** The commands that take a target: the cases of the second switch in main. */
+const TARGET_COMMANDS = new Set(['show', 'account', 'history', 'tx', 'verify-tx', 'create', 'transfer', 'create-validator', 'delegate', 'undelegate', 'unjail', 'parameters', 'proposals', 'propose', 'signal', 'light']);
 
 async function main(): Promise<void> {
   switch (cmd) {
@@ -550,6 +561,11 @@ async function main(): Promise<void> {
       console.log(`wrote ${nd}/config.json; start it with: node src/cli.ts start ${nd}`);
       return;
     }
+  }
+  // Told apart before the target is read, so that a mistyped command gets the usage and not a complaint about its target.
+  if (cmd === undefined || !TARGET_COMMANDS.has(cmd)) {
+    console.log('usage: see the comment at the top of src/cli.ts');
+    process.exit(1);
   }
   const t = target(need(0, 'target'));
   const { rpc, keystorePath } = t;
@@ -643,9 +659,6 @@ async function main(): Promise<void> {
       } else throw new Error(`unknown light subcommand ${sub}`);
       break;
     }
-    default:
-      console.log('usage: see the comment at the top of src/cli.ts');
-      process.exit(1);
   }
 }
 

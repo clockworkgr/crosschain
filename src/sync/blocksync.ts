@@ -138,6 +138,9 @@ export class BlockSync {
     const best = this.bestPeerHeight();
     if (best <= ours) {
       this.behindSince = null;
+      // Nothing held will be applied now: what is at or below our height consensus decided meanwhile, and no
+      // connected peer stands behind anything above it. Left here, it would keep the node reporting that it syncs.
+      this.buffer.clear();
       void this.backfill();
       return;
     }
@@ -187,14 +190,19 @@ export class BlockSync {
     this.d.log('debug', 'requesting blocks', { from, count, peer: peer.id.slice(0, 8) });
     try {
       const m = await this.d.requester.request(peer, { type: 'blocksRequest', from, count }, 'blocksResponse', (m) => m.from === from, this.d.requestTimeoutMs ?? 5000);
-      let got = 0;
-      m.blocks.forEach((b, i) => {
-        const h = from + BigInt(i);
-        if (b.block.header.height !== h || !bytesEqual(b.commit.blockHash, blockHash(b.block))) return;
-        this.buffer.set(h, { block: b.block, commit: b.commit, peerId: peer.id });
-        got++;
-      });
-      if (got === 0) this.peerHeights.set(peer.id, from - 1n); // it does not have them after all
+      // Only what was asked for is taken: at most `count` blocks, each of the height its place in the run gives
+      // it, with a commit that names it. No honest peer answers otherwise, so a response that does is not used at
+      // all and costs what a block that fails verification costs.
+      const matches = m.blocks.length <= count && m.blocks.every((b, i) => b.block.header.height === from + BigInt(i) && bytesEqual(b.commit.blockHash, blockHash(b.block)));
+      if (!matches) {
+        this.d.log('warn', 'blocks response does not match the request', { from, count, got: m.blocks.length, peer: peer.id.slice(0, 8) });
+        this.d.scorePeer?.(peer.id, 50, 'blocks response does not match the request');
+        this.peerHeights.delete(peer.id);
+      } else if (m.blocks.length === 0) {
+        this.peerHeights.set(peer.id, from - 1n); // it does not have them after all
+      } else {
+        m.blocks.forEach((b, i) => this.buffer.set(from + BigInt(i), { block: b.block, commit: b.commit, peerId: peer.id }));
+      }
     } catch (e) {
       this.d.log('warn', 'block request failed', { from, count, peer: peer.id.slice(0, 8), err: (e as Error).message });
       this.peerHeights.delete(peer.id);
@@ -232,6 +240,7 @@ export class BlockSync {
           this.stop();
           return;
         }
+        if (!this.running) return; // stopped while the block was verified: nothing more is applied
         if (err) {
           this.d.log('warn', 'bad block from peer', { h: ours + 1n, from: next.peerId.slice(0, 8), err });
           this.d.scorePeer?.(next.peerId, 50, 'bad block in sync');

@@ -1,6 +1,6 @@
 # 3. The chain types
 
-This part defines the nouns of the protocol: a validator set and how it picks proposers (`src/types/validator.ts`), a vote (`src/types/vote.ts`), a block with its header and commit (`src/types/block.ts`), double-sign evidence (`src/types/evidence.ts`), a proposal (`src/types/proposal.ts`), the chain state kept between blocks (`src/types/state.ts`), the genesis document (`src/types/genesis.ts`) and transaction inclusion proofs (`src/types/txproof.ts`), plus the small logger in `src/util/log.ts` that every later module takes as a dependency. Each type comes with its binary encoding, its hash where it has one, and the invariants its decoder enforces. The types are built from [the codec](01-codec.md) and [the crypto primitives](02-crypto.md), and borrow the dense Merkle tree from [the database](09-database.md) for transaction proofs. They are consumed by everything above: [consensus](04-consensus.md) votes on them, [the executor](08-node.md) advances the chain state, [the store](10-store.md) persists them, [the RPC](12-rpc.md) serves them, and [the light client](13-light-client.md) verifies them.
+This part defines the nouns of the protocol: a validator set and how it picks proposers (`src/types/validator.ts`), a vote (`src/types/vote.ts`), a block with its header and commit (`src/types/block.ts`), double-sign evidence (`src/types/evidence.ts`), a proposal (`src/types/proposal.ts`), the chain state kept between blocks (`src/types/state.ts`), the genesis document (`src/types/genesis.ts`) and transaction inclusion proofs (`src/types/txproof.ts`), plus the small logger in `src/util/log.ts` that every later module takes as a dependency. Each type comes with its binary encoding, its hash where it has one, and the invariants its decoder enforces. The types are built from [the codec](01-codec.md) and [the crypto primitives](02-crypto.md), and borrow the dense Merkle tree from [the database](09-database.md) for transaction proofs. They are consumed by everything above: [consensus](04-consensus.md) votes on them, [the executor](05-mempool-executor.md) advances the chain state, [the store](10-store.md) persists them, [the RPC](12-rpc.md) serves them, and [the light client](13-light-client.md) verifies them.
 
 ## Concepts
 
@@ -8,7 +8,7 @@ This part defines the nouns of the protocol: a validator set and how it picks pr
 
 A proof-of-stake chain is run by a known set of *validators*, each identified by a public key and carrying a *voting power*, an integer weight. In this chain the power ultimately comes from bonded stake (the staking module in [chapter 11](11-application.md) decides it), but the engine only sees the number. The *validator set* at a height is the list that is allowed to vote on that height's block.
 
-Tendermint tolerates up to one third of the voting power being faulty. The two thresholds that follow from that are expressed in `ValidatorSet`: a *quorum* is strictly more than two thirds of the total power, and the smaller threshold of strictly more than one third is the amount that is guaranteed to include at least one honest validator. The engine needs a quorum of prevotes to lock on a block and a quorum of precommits to commit it; it uses the one-third threshold to notice that the network has moved on to a later round (`src/consensus/consensus.ts`, "Line 55: f+1 validators are in a later round"). `DESIGN.md` section 1 states the consequences: "Each step needs >2/3 of bonded voting power" and "halts if >1/3 of voting power is offline or partitioned."
+Tendermint tolerates less than one third of the voting power being faulty. The two thresholds that follow from that are expressed in `ValidatorSet`: a *quorum* is strictly more than two thirds of the total power, and the smaller threshold of strictly more than one third is the amount that is guaranteed to include at least one honest validator. The engine needs a quorum of prevotes to lock on a block and a quorum of precommits to commit it; it uses the one-third threshold to notice that the network has moved on to a later round (`src/consensus/consensus.ts`, "Line 55: f+1 validators are in a later round"). `DESIGN.md` section 1 states the consequences: "more than two thirds of the bonded voting power in prevotes for one block is a polka, and more than two thirds in precommits decides it", and "a quorum is strictly more than two thirds, so the chain halts once a third or more of the voting power is offline or partitioned."
 
 ### Proposer selection: Tendermint's priority round-robin
 
@@ -58,11 +58,11 @@ A block is a header, a list of opaque transactions, the *commit* for the previou
 
 ### Merkle roots over transactions and results
 
-A *Merkle root* is a single hash computed from a list of values by hashing pairs up a binary tree. Its property is that a value's membership can be proved with only the sibling hashes along its path, logarithmically many, rather than the whole list. Header field `dataHash` is the root over the block's transactions; `lastResultsHash` is the root over the previous block's results. What that buys is in `RPC-SYNC-PROOFS.md` section 2: a client holding a verified header can be shown that a transaction was included at a position, and that it succeeded or failed with a given error, without downloading the block. The trees reuse the dense Merkle tree from `src/db/merkle.ts` and its ICS23 leaf shape (ICS23 is the Cosmos IBC proof specification; the hashing conventions are those of the tm2 B+ tree, from the Gno project), so a proof is "a path of siblings and the ICS23 leaf shape, with the transaction count fixing the tree's height" (`src/types/txproof.ts`).
+A *Merkle root* is a single hash computed from a list of values by hashing pairs up a binary tree. Its property is that a value's membership can be proved with only the sibling hashes along its path, logarithmically many, rather than the whole list. Header field `dataHash` is the root over the block's transactions; `lastResultsHash` is the root over the previous block's results. What that buys is in `RPC-SYNC-PROOFS.md` section 2: a client holding a verified header can be shown that a transaction was included at a position, and that it succeeded or failed with a given error, without downloading the block. The trees reuse the dense Merkle tree from `src/db/merkle.ts` and its ICS23 leaf shape (ICS23 is the Cosmos IBC proof specification; the hashing conventions are those of the tm2 B+ tree, from the Gno project), so "a proof is a path of siblings and the ICS23 leaf shape" (`src/types/txproof.ts`).
 
 ### Evidence
 
-The one fault this chain punishes is a validator signing two different votes of the same type at the same height and round (`DESIGN.md` section 1: "Slashable faults: duplicate vote"). Tendermint calls this `DuplicateVoteEvidence`, and it has the pleasant property of being self-contained: the two signed votes are the whole proof. The other Tendermint fault, amnesia (voting against a lock), is deferred.
+The one fault this chain punishes on evidence is a validator signing two different votes of the same type at the same height and round (`DESIGN.md` section 1: "Slashable faults: duplicate vote"). Tendermint calls this `DuplicateVoteEvidence`, and it has the pleasant property of being self-contained: the two signed votes are the whole proof. The other Tendermint fault, amnesia (voting against a lock), is deferred. The core application also slashes and jails a validator for downtime ([chapter 11](11-application.md)); that needs no evidence type, because the application counts missed signatures itself from each block's `lastCommitSigners`.
 
 ### Proposals
 
@@ -135,7 +135,7 @@ An empty set is allowed here (nothing is incremented), but `genesisState` refuse
   }
 ```
 
-Because the order is canonical, two sets with the same members and powers hash alike whatever their priorities. The unit test checks that advancing a set three rounds does not change its hash. The flip side is `DESIGN.md` section 10's known simplification: "Proposer priorities are not covered by the validator set hash," which review finding 8 turned into a concrete attack on state sync (a peer supplying genuine keys with altered priorities), mitigated by checking that imported sets pick the proposers the chain actually used.
+Because the order is canonical, two sets with the same members and powers hash alike whatever their priorities. The unit test checks that advancing a set three rounds does not change its hash. The flip side is `DESIGN.md` section 10's known simplification: "Proposer priorities are not covered by the validator set hash", which review finding 8 turned into a concrete attack on state sync (a peer supplying genuine keys with altered priorities), mitigated by checking that imported sets pick the proposers the chain actually used.
 
 **`incrementProposerPriority(times)`** is Tendermint's `IncrementProposerPriority`. It mutates the set and returns the new proposer:
 
@@ -209,12 +209,13 @@ The private **`rescalePriorities(diffMax)`** finds the spread between the highes
     ValidatorSet.assertUnique(vals);
     for (let i = 1; i < vals.length; i++) if (byPowerThenAddress(vals[i - 1]!, vals[i]!) >= 0) throw new Error('validator set out of order');
     const proposerIndex = r.i53();
-    if (vals.length > 0 && (proposerIndex < 0 || proposerIndex >= vals.length)) throw new Error('validator set proposer index out of range');
+    // An empty set has no proposer, and is written with the index create() leaves it: minus one and nothing else.
+    if (vals.length === 0 ? proposerIndex !== -1 : proposerIndex < 0 || proposerIndex >= vals.length) throw new Error('validator set proposer index out of range');
     return new ValidatorSet(vals, proposerIndex);
   }
 ```
 
-The order check uses `>= 0`, so an equal pair (a duplicate) would also be caught here, but `assertUnique` runs first and gives the clearer message. The address is recomputed from the key rather than trusted from the wire, which is why the wire format does not carry it.
+The order check uses `>= 0`, so an equal pair (a duplicate) would also be caught here, but `assertUnique` runs first and gives the clearer message. The proposer index must name a member; an empty set has none, and the only index it decodes with is the −1 that `create([])` leaves and `encode` writes, so an empty set has one encoding like every other. The address is recomputed from the key rather than trusted from the wire, which is why the wire format does not carry it.
 
 **`toJSON()`** returns an array of `{ address, power, priority }` with hex and decimal strings, for logs and the RPC.
 
@@ -294,7 +295,7 @@ export interface Commit {
 }
 ```
 
-`signatures[i]` belongs to validator `i` of that height's set, or is `null` if that validator's precommit was not seen. The doc comment notes "There is no aggregation with ML-DSA, so this is linear in the validator count", and plain ECDSA offers none either, so the shape is the same under both schemes; only the per-signature cost differs, 2,421 bytes with the tag under ML-DSA-44 and 65 under secp256k1, on top of 48 bytes of fields and one presence byte per slot. Validation checks that the length equals `state.lastValidators.size`. Which validators are `null` matters beyond verification: the executor reports the signers to the application, which uses absence for downtime slashing.
+`signatures[i]` belongs to validator `i` of that height's set, or is `null` if that validator's precommit was not seen. The doc comment notes "Signatures are not aggregated under either scheme, so this is linear in the validator count": ML-DSA has no aggregation and plain ECDSA offers none either, so the shape is the same under both schemes; only the per-signature cost differs, 2,421 bytes with the tag under ML-DSA-44 and 65 under secp256k1, on top of 48 bytes of fields and one presence byte per slot. Validation checks that the length equals `state.lastValidators.size`. Which validators are `null` matters beyond verification: the executor reports the signers to the application, which uses absence for downtime slashing.
 
 **`interface Block`** is `header`, `txs: Uint8Array[]` (opaque to the engine), `lastCommit: Commit | null` ("null only at height 1") and `evidence: DuplicateVoteEvidence[]`.
 
@@ -396,7 +397,7 @@ export interface ChainState {
 
 The file comment lays out the three sets: `lastValidators` signed block `lastHeight`, `validators` will sign `lastHeight + 1`, `nextValidators` will sign `lastHeight + 2`. "This keeps the set that commits a block equal to the one named in its header, and gives light clients one header's notice of every change." `scheme` is the tag of the chain's signature scheme ([chapter 2](02-crypto.md)), copied from genesis; the application keeps the same tag in its global properties for accounts and transactions, so the two halves of a node cannot disagree about it.
 
-**`genesisState(genesis, appHash, validatorsOverride?)`** builds the state before block 1. The validators come from the application's `initChain` if it supplied any, else from genesis; neither is an error. The scheme comes from `genesis.signatureScheme`, ML-DSA-44 when absent, and every validator key, from whichever side, must be of it:
+**`genesisState(genesis, appHash, validatorsOverride?)`** builds the state before block 1. The validators come from the application's `initChain` if it supplied any, else from genesis; using either source is fine, and a list from neither throws. The scheme comes from `genesis.signatureScheme`, ML-DSA-44 when absent, and every validator key, from whichever side, must be of it:
 
 ```ts
 export function genesisState(genesis: Genesis, appHash: Uint8Array, validatorsOverride?: ValidatorUpdate[]): ChainState {
@@ -514,7 +515,7 @@ export function genesisFromJson(s: string, baseDir = '.'): Genesis {
 
 `appState` may be written as a JSON string or as an inline object; either becomes bytes for the application. Validation is minimal: the chain id must be a non-empty string, `signatureScheme`, when present, must be a name the code knows (`schemeTag` throws `unknown signature scheme "x"; one of ml-dsa-44, secp256k1`), `fromHex` rejects malformed keys, and everything else is caught later by `ValidatorSet.create` (a tagged key of a known scheme, positive power), by `genesisState` (every key of the named scheme) or by the application. A bad `genesisTime` makes `BigInt()` throw a `SyntaxError` rather than a descriptive error. **`loadGenesisFile(path)`** reads the file and resolves `appStateFile` against its directory.
 
-The CLI writes `genesis.json` with `genesisToJson` at `init` and loads it at `start`; the RPC's `genesis` method returns the same JSON.
+The CLI writes `genesis.json` with `genesisToJson` at `init` and loads it at `start`; the RPC's `genesis` method returns the same JSON without `appStateFile`, which is a path on the node's own disk.
 
 ### src/types/txproof.ts
 
@@ -576,7 +577,7 @@ A hash prints as its first six bytes, a `bigint` height as a number, a nil block
 
 **`test/units.test.ts`, `describe('validator set')`.** `picks proposers in proportion to voting power` creates a set with powers 1, 2 and 3, advances a copy one step 600 times and asserts the proposer counts are exactly 100, 200 and 300: the round-robin is fair and deterministic. `applies updates, hashes independently of priorities, and survives a codec round-trip` adds a third validator with `applyUpdates` and asserts its priority is negative, removes one with power 0, asserts removing it again throws `/unknown/`, advances a set three rounds and asserts `hash()` is unchanged, then encodes and decodes the advanced set and asserts the proposer and every priority survive.
 
-**`test/review.test.ts`, `rejects decoded validator sets with duplicate members, wrong order or a bad proposer index`** hand-encodes three malformed sets with the codec and asserts `ValidatorSet.decode` throws `/duplicate/`, `/out of order/` and `/proposer index/`. It is the regression for review finding 1. `refuses validator powers whose total a priority could not track` calls `create` with two validators of 2^63 each and expects `/total power/`: the sum is above `MAX_TOTAL_POWER`. The same file's `keeps per-block results so a repeated transaction proves its real outcome at each position` builds a block whose `dataHash` is `txsRoot([raw, raw])`, stores it with results `[ok, duplicate failure]`, and asserts a result proof for position 1 verifies and says `ok: false` (review finding 18).
+**`test/review.test.ts`, `rejects decoded validator sets with duplicate members, wrong order or a bad proposer index`** hand-encodes three malformed sets with the codec and asserts `ValidatorSet.decode` throws `/duplicate/`, `/out of order/` and `/proposer index/`. It is the regression for review finding 1. `test/review5-net.test.ts`, `has no proposer when it is empty, and says so in the one way create() does`, decodes the encoding of `ValidatorSet.create([])` and a hand-encoded empty set with index −1, and asserts that the same empty set with index 0, 5 or −2 throws `/proposer index out of range/`. `refuses validator powers whose total a priority could not track` calls `create` with two validators of 2^63 each and expects `/total power/`: the sum is above `MAX_TOTAL_POWER`. The same file's `keeps per-block results so a repeated transaction proves its real outcome at each position` builds a block whose `dataHash` is `txsRoot([raw, raw])`, stores it with results `[ok, duplicate failure]`, and asserts a result proof for position 1 verifies and says `ok: false` (review finding 18).
 
 **`test/txproof.test.ts`.** `proves inclusion against the data hash and rejects tampering` uses seven small transactions: the empty root is `EMPTY`; every position's proof verifies, survives a byte round-trip, and fails with a different transaction, a different index, a path one sibling longer or one shorter, an index eight too high (one the path's length cannot address), an index of −1 and a root over six transactions; reversing the list changes the root. `proves results, including failures, against the results hash` does the same for results with every third one failing, and asserts flipping `ok` or appending to `error` breaks the proof.
 

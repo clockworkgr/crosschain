@@ -16,7 +16,7 @@ import { ObjectDatabase, type DatabaseOptions } from '../../db/database.ts';
 import { objectId } from '../../db/id.ts';
 import type { ObjectType } from '../../db/index.ts';
 import { EMPTY, rootFromRange } from '../../db/merkle.ts';
-import { objectLeaf, typeLegMatches } from '../../db/proof.ts';
+import { MAX_AUTHENTICATED_INDICES, objectLeaf, typeLegMatches } from '../../db/proof.ts';
 
 export const SNAPSHOT_FORMAT = 1;
 
@@ -68,7 +68,7 @@ export function decodeManifest(r: Reader): SnapshotManifest {
       type: r.u16(),
       nextInstance: r.u64(),
       typeRoot: r.fixed(HASH_SIZE),
-      indexRoots: r.array((r) => r.fixed(HASH_SIZE), 16),
+      indexRoots: r.array((r) => r.fixed(HASH_SIZE), MAX_AUTHENTICATED_INDICES),
       typeIndex: r.u32(),
       typeCount: r.u32(),
       topSiblings: r.array((r) => r.fixed(HASH_SIZE), 64),

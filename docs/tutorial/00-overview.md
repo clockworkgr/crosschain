@@ -14,7 +14,7 @@ made, with [STAKING.md](../../STAKING.md), [FEES.md](../../FEES.md),
 [RPC-SYNC-PROOFS.md](../../RPC-SYNC-PROOFS.md) and [STATE-PAGING.md](../../STATE-PAGING.md) as
 the detailed specifications it points to.
 [REVIEW-2026-10-28.md](../../REVIEW-2026-10-28.md) records an external review and what each
-finding changed; the tutorial refers to findings by number. The test suite is 25 files and 212
+finding changed; the tutorial refers to findings by number. The test suite is 29 files and 268
 tests; `npm test` runs it under ML-DSA-44 and `CHAIN_SCHEME=secp256k1 npm test` runs it again
 under secp256k1, the other signature scheme a genesis may choose; `INDEX_TREES=0` and `TREES=0`
 run it with the object database's index trees or Merkle trees dropped from the start, the
@@ -60,7 +60,7 @@ A **node** owns one of each box except the RPC server: `Node` constructs no `Rpc
 CLI's `start` command and the local network script build one next to the node, and a `Node`
 embedded in another program has no RPC until its owner adds one. The **consensus engine** agrees with the other validators on
 the next block; the **executor** hands decided blocks to the **application**, which keeps the
-state (accounts, balances, validators, delegations) in an in-memory **object database** whose
+state (accounts, balances, validators, delegations) in an **object database**, held in memory with the store behind it for what the heap does not keep, whose
 Merkle root is the app hash every header commits to; the **mempool** holds transactions waiting
 for a block; the **network** gossips transactions, votes, proposals and evidence to peers; the
 **sync** modules bring a lagging or new node up to date; the **stores** make everything survive
@@ -164,14 +164,15 @@ the concepts of the ones before it.
 8. [Node](08-node.md): wiring it all together, and running a network in one process.
 9. [Object database](09-database.md): ids, objects as bytes in an arena behind a cache of
    decoded ones, indices and Merkle trees whose entries, chunks and nodes the store keeps so
-   the memory guard can drop them, proofs, versions, snapshots.
+   the memory guard can drop them (a node leaves the index trees in the store by default),
+   proofs, versions, snapshots.
 10. [Store](10-store.md): the key-value interface, LMDB, the block store.
 11. [Application](11-application.md): accounts, assets, balances, fees, staking, history,
     genesis, snapshots, and the block procedure.
 12. [RPC](12-rpc.md): JSON-RPC methods, event streams, limits, the client.
 13. [Light client](13-light-client.md): verifying headers and queries with proofs.
 14. [Wallet and CLI](14-wallet-cli.md): the keystore and the command line.
-15. [Tests](15-tests.md): the harness, every suite (25 files, 212 tests, run under either
+15. [Tests](15-tests.md): the harness, every suite (29 files, 268 tests, run under either
     signature scheme and with the database's trees resident or dropped), and how to write a new
     test.
 
@@ -211,5 +212,6 @@ Then [benchmarks.md](../benchmarks.md) for what it all costs.
 - **Proof**: the sibling hashes that connect a leaf to a root, so a client holding only the
   root can check the leaf.
 - **Delegation**: tokens bonded to a validator by another account, counted in its power.
-- **Unbonding period**: the time withdrawn stake stays slashable, and the time a light
-  client may trust a header.
+- **Unbonding period**: the time withdrawn stake stays slashable, and the upper bound on how
+  long a light client may trust a header (its trusting period, four days by default against
+  seven for unbonding, is shorter).

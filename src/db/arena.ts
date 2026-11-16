@@ -201,9 +201,11 @@ export class Arena {
   /**
    * After a root: release every slab with nothing live left, which costs no copying however many there are, and
    * compact slabs that are more than half dead, copying their live entries into the current slab and telling the
-   * owner where they went, until the bytes copied reach what alloc() wrote since the last call (at least MIN_COPY).
-   * Each compacted slab gives back more than it copies, so reclaiming keeps pace with any rate of writes and a
-   * backlog drains, while the pause stays in proportion to the block's own writes. Returns the bytes released.
+   * owner where they went. No further slab is started once the bytes copied have reached what alloc() wrote since
+   * the last call (at least MIN_COPY); a slab that was started is finished, so a call can copy up to the live half
+   * of one slab (under 8 MiB) more than that. Each compacted slab gives back more than it copies, so reclaiming
+   * keeps pace with any rate of writes and a backlog drains, while the pause stays in proportion to the block's
+   * own writes. Returns the bytes released.
    */
   maintain(): number {
     let released = 0;

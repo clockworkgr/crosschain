@@ -47,7 +47,7 @@ const ARENA = process.env.BENCH_PAGING_ARENA ? Number(process.env.BENCH_PAGING_A
 const MEMORY_VERSIONS = process.env.BENCH_PAGING_MEMORY_VERSIONS ? Number(process.env.BENCH_PAGING_MEMORY_VERSIONS) : undefined;
 /** BENCH_PAGING_READS is how many index reads of each kind are made a second while the node commits. */
 const READS = Number(process.env.BENCH_PAGING_READS ?? 0);
-/** BENCH_PAGING_PROFILE names a directory: a CPU profile of the run's first 30 seconds and one of its last 30 are written there. */
+/** BENCH_PAGING_PROFILE names a directory: a CPU profile of thirty seconds from the fifth second and one of thirty seconds ending ten before the run does are written there. */
 const PROFILE = process.env.BENCH_PAGING_PROFILE;
 const t0 = performance.now();
 const verifier = new WorkerVerifier();
@@ -57,8 +57,8 @@ const start = performance.now();
 const valSeed = seed('paging/val');
 const nodeGenesis: Genesis = { ...genesis, validators: [{ publicKey: keyPairFromSeed(valSeed).publicKey, power: 10n, name: 'v0' }] };
 // The node opens the state the parent built as its own application, in its own environment, as `start` does: under
-// the heap limit a state whose trees would not fit below the warn line is opened paged, and a block's writes and
-// the application's are one store transaction.
+// the heap limit a state whose trees would not fit in the room left below Node.OPEN_FILL (half) of the limit is
+// opened paged, and a block's writes and the application's are one store transaction.
 const node = await Node.create({
   name: 'paged',
   genesis: nodeGenesis,

@@ -65,7 +65,7 @@ ECDSA raises the same question twice. Textbook ECDSA draws a random nonce for ev
 
 ### Why verification leaves the main thread
 
-Node runs JavaScript on one thread. `DESIGN.md` section 4 keeps the whole consensus state machine on that thread with no locks. Verifying one ML-DSA-44 signature in pure JavaScript costs about 0.9 ms of CPU, and one secp256k1 signature, also in pure JavaScript, about 0.7 ms (`bench/crypto.bench.ts`: 874 µs and 719 µs mean); the classical scheme is nearly forty times smaller on the wire but not much cheaper to check here, so the pool earns its keep under both. A block of a thousand transactions would hold the event loop for most of a second, during which no consensus timer fires and no vote is processed. The header comment of `src/crypto/verifier.ts` states the policy:
+Node runs JavaScript on one thread. `DESIGN.md` section 4 keeps the whole consensus state machine on that thread with no locks. Verifying one ML-DSA-44 signature in pure JavaScript costs about 0.9 ms of CPU, and one secp256k1 signature, also in pure JavaScript, about 0.7 ms (`bench/crypto.bench.ts`: 0.89 and 0.73 ms mean); the classical scheme is nearly forty times smaller on the wire but not much cheaper to check here, so the pool earns its keep under both. A block of a thousand transactions would hold the event loop for most of a second, during which no consensus timer fires and no vote is processed. The header comment of `src/crypto/verifier.ts` states the policy:
 
 ```ts
 /**
@@ -79,13 +79,13 @@ Node runs JavaScript on one thread. `DESIGN.md` section 4 keeps the whole consen
  */
 ```
 
-Node's `worker_threads` run JavaScript in parallel with their own event loops; messages between them are copied (structured clone). The pool here is a fixed set of workers that each take a batch of `(signature, message, publicKey, context)` jobs and return booleans. The benchmark suite measures 1,144 ML-DSA-44 verifications per second on one thread and 7,437 per second on the pool with 11 threads; for secp256k1, 1,391 and 9,215. Signing stays inline because it happens once per consensus step (about 2 ms for ML-DSA-44, a quarter of a millisecond for secp256k1) and because the private validator must persist its last signed vote to disk *before* the signature exists anywhere else; an asynchronous signer would complicate that ordering.
+Node's `worker_threads` run JavaScript in parallel with their own event loops; messages between them are copied (structured clone). The pool here is a fixed set of workers that each take a batch of `(signature, message, publicKey, context)` jobs and return booleans. The benchmark suite measures 1,130 ML-DSA-44 verifications per second on one thread and 7,781 per second on the pool with 11 threads; for secp256k1, 1,367 and 9,188. Signing stays inline because it happens once per consensus step (about 3 ms for ML-DSA-44, a quarter of a millisecond for secp256k1) and because the private validator must persist its last signed vote to disk *before* the signature exists anywhere else; an asynchronous signer would complicate that ordering.
 
 ## The code, file by file
 
 ### src/crypto/hash.ts
 
-Pure functions over bytes; no state. Six exports.
+Pure functions over bytes; no state. Seven exports.
 
 **`HASH_SIZE = 32`** and **`ZERO_HASH`**, a fresh 32-byte array of zeros. `ZERO_HASH` is the value of hash fields that have nothing to point at: the `lastBlockHash` of block 1, `commitHash(null)`, and the `evidenceHash` of an empty evidence list in `src/types/block.ts`. It is distinct from the Merkle tree's empty value `EMPTY = sha256(0x02)` in `src/db/merkle.ts`, which is what an empty *tree* hashes to. An empty block's `dataHash` is `EMPTY`, not `ZERO_HASH`; the two should not be confused.
 
@@ -356,7 +356,7 @@ export function keyPairFromSeed(seed: Uint8Array, scheme: SchemeTag = DEFAULT_SC
 }
 ```
 
-Key generation is deterministic from the seed under both schemes, so `DESIGN.md` section 5 rules "persist the 32-byte seed only. Derive the keypair at startup." That is visible in the node's configuration: `NodeConfig` in `src/node/node.ts` takes a `nodeKeySeed` for the p2p identity and an optional `validatorSeed` for the consensus key (`null` for a full node that does not vote), and the constructor derives both with `keyPairFromSeed(seed, scheme)`, where `scheme` is `schemeTag(cfg.genesis.signatureScheme ?? 'ml-dsa-44')`. The keystore in [chapter 14](14-wallet-cli.md) encrypts seeds, never expanded keys, and records each key's scheme beside the ciphertext. The test helper `seedFor(label)` in `test/helpers.ts` makes a seed as `sha256('seed:' + label)` so every test validator has a reproducible key, and `makeTestnet` derives validator and node seeds from the chain id and the node index and expands them with the testnet's scheme. One seed under the two schemes gives two unrelated key pairs with two different addresses, which `test/schemes.test.ts` checks.
+Key generation is deterministic from the seed under both schemes, so `DESIGN.md` section 5 rules "persist the 32-byte seed only, with the scheme beside it in the keystore. Derive the keypair at startup." That is visible in the node's configuration: `NodeConfig` in `src/node/node.ts` takes a `nodeKeySeed` for the p2p identity and an optional `validatorSeed` for the consensus key (`null` for a full node that does not vote), and the constructor derives both with `keyPairFromSeed(seed, scheme)`, where `scheme` is `schemeTag(cfg.genesis.signatureScheme ?? 'ml-dsa-44')`. The keystore in [chapter 14](14-wallet-cli.md) encrypts seeds, never expanded keys, and records each key's scheme beside the ciphertext. The test helper `seedFor(label)` in `test/helpers.ts` makes a seed as `sha256('seed:' + label)` so every test validator has a reproducible key, and `makeTestnet` derives validator and node seeds from the chain id and the node index and expands them with the testnet's scheme. One seed under the two schemes gives two unrelated key pairs with two different addresses, which `test/schemes.test.ts` checks.
 
 **`addressOf(publicKey)`** is `sha256(publicKey)`, over the tagged key.
 
@@ -515,7 +515,7 @@ The private **`submit(jobs)`** posts one batch to the next worker round-robin an
   }
 ```
 
-A batch of 1,500 transaction signatures on an 11-worker pool becomes eleven chunks of up to 137 jobs, posted to eleven workers at once, and the results are flattened back into the original order. This is why batching matters so much upstream: review finding 32 found that after an unrelated fix the application was handing the pool one signature at a time, running a cold block at single-thread speed (930 transfers per second); batching the block's uncached signatures first restored 5,100 per second. **`verifyOne(job)`** is `submit([job])` and takes the first result. **`close()`** settles everything before it stops the threads:
+A batch of 1,500 transaction signatures on an 11-worker pool becomes eleven chunks of up to 137 jobs, posted to eleven workers at once, and the results are flattened back into the original order. This is why batching matters so much upstream: review finding 32 found that after an unrelated fix the application was handing the pool one signature at a time, running a cold block at single-thread speed (930 transfers per second); batching the block's uncached signatures first restored 6,300 per second on the build that made the fix. **`verifyOne(job)`** is `submit([job])` and takes the first result. **`close()`** settles everything before it stops the threads:
 
 ```ts
   async close(): Promise<void> {
@@ -546,12 +546,12 @@ Failure modes worth knowing:
 
 - A worker that dies takes the batches it held with it: those promises reject with the worker's error, and the caller decides whether to resubmit. Nothing is retried automatically. Worker errors should not happen in practice, because `verify` in `keys.ts` catches everything the library can throw, so this is a recovery path for the unexpected (an out-of-memory in the thread, a killed thread), not for bad signatures, which are ordinary `false` results.
 - A batch is rejected as a whole, not per job; `Promise.all` in `verify` then rejects the caller's whole call even if the other chunks succeeded.
-- A worker that exits with code 0 while the pool is open is not replaced, since the handler treats a clean exit as intentional. The worker script never exits on its own, so this does not arise.
+- A worker that exits while the pool is open is replaced whatever its exit code, and the batches it held are rejected with `verification worker exited with code N`. The worker script never exits on its own, so this arises only when something ends the thread.
 - `close()` rejects what is pending and then terminates; a `submit` after `close()` rejects immediately.
 
 ### src/crypto/verify-worker.ts
 
-The body of each worker thread, eighteen lines:
+The body of each worker thread, seventeen lines with its header comment:
 
 ```ts
 import { parentPort } from 'node:worker_threads';
@@ -592,7 +592,7 @@ It imports the same `verify` as the inline verifier, so the two implementations 
 
 - **`signs and verifies under each scheme, with tagged keys and signatures that tell them apart`** loops over both schemes: the key pair reports its scheme, the public key and the signature start with the tag and are `publicKeySize` and `signatureSize` bytes long, the signature verifies under its context and fails under another purpose, another message and a flipped bit, signing twice gives identical bytes, and a key and a signature written with `fixed` come back through `decodePublicKey` and `decodeSignature`. Then one seed is expanded under both schemes: two different addresses, and neither key verifies the other's signature. `isPublicKey` refuses a truncated key, and the decoders throw `unknown signature scheme 9` and `unknown signature scheme 0` on tags nothing claims.
 - **`refuses the high-S twin of a secp256k1 signature, so no one but the signer can make a second valid one`** takes a valid signature, replaces `s` with `n - s` using the curve order from noble, and asserts the original verifies and the twin does not.
-- **`keeps each key's scheme in the keystore, and reads an old file as ML-DSA-44`** adds one key of each scheme to a keystore, reopens it and checks each comes back with its scheme; then deletes the `scheme` field from the file by hand, as a file written before there were two schemes lacks it, and checks the key reads as ML-DSA-44 ([chapter 14](14-wallet-cli.md)).
+- **`keeps each key's scheme in the keystore, reads a version 1 file as ML-DSA-44 and writes it as version 2`** adds one key of each scheme to a keystore, reopens it and checks each comes back with its scheme; then sets the file's version to 1 and deletes the `scheme` field from one key by hand, as a file written before there were two schemes lacks it, and checks the key reads as ML-DSA-44, that reading left the file alone and that the next `add` writes it as version 2 with every key's scheme named, also from a handle whose version 1 file was removed after it was opened; a key with no scheme in a version 2 file is refused as damaged ([chapter 14](14-wallet-cli.md)).
 - **`refuses a genesis whose validator keys are not of the scheme it names`** calls `genesisState` with an ML-DSA-44 key under `signatureScheme: 'secp256k1'` and with a secp256k1 key under no scheme at all, expecting `/not a secp256k1 key/` and `/not a ml-dsa-44 key/`, and checks that the matching cases set `state.scheme` ([chapter 3](03-types.md)).
 - **`runs on secp256k1 keys end to end and refuses keys and signatures of the other scheme`** starts a four-validator testnet with `scheme: Scheme.secp256k1`, waits for height 3, and checks the chain state's and the node key's scheme, that a stored commit holds 65-byte signatures, and that the RPC `status` reports `secp256k1`. It then creates an account with a secp256k1 key, and has the application refuse an ML-DSA-44 authority key (`must be a secp256k1 key`), an ML-DSA-44 consensus key in a `validatorCreate` (`consensus key must be a secp256k1 key`), and an ML-DSA-44 signature relabelled with a secp256k1 account's address (`signature of another scheme than the chain uses`, [chapter 11](11-application.md)).
 
@@ -600,20 +600,22 @@ It imports the same `verify` as the inline verifier, so the two implementations 
 
 `test/network.test.ts`, **`delivers a message sent the instant a peer connects, while the other side is still verifying the handshake`**, wraps the inline verifier in a custom `Verifier` whose `verifyOne` sleeps 100 ms. It exists to reproduce review finding 33 (a frame arriving while the handshake signature was still in the pool was dropped), and it shows that the `Verifier` interface is the seam the network depends on: any object with `verify`, `verifyOne` and `close` will do.
 
-Every other suite depends on this layer through the shared `InlineVerifier` in `test/helpers.ts` and through `keyPairFromSeed`, `sign` and `signContext`, which the engine, recovery and sync tests use to forge conflicting votes for evidence. `test/review.test.ts`, **`does not let a cached verification vouch for different signature bytes`**, replaces a valid signature with `zeroSignature(DEFAULT_SCHEME)` and checks the application rejects it on both a warm and a cold node (review finding 2). Its neighbour, **`accepts both valid signatures a key can make over one body, whichever was seen first`**, is ML-DSA-44 only: it strips the tag from the secret key, signs the body with noble's hedged signer and re-tags the result, a second valid signature the deterministic signer would never produce. It is declared with `it.skipIf(DEFAULT_SCHEME !== Scheme.mlDsa44)`, because under low-S secp256k1 there is no second valid signature to make, and it is the one test the suite skips under `CHAIN_SCHEME=secp256k1` (21 files; 141 tests under ML-DSA-44, 140 run and one skipped under secp256k1, all passing).
+Every other suite depends on this layer through the shared `InlineVerifier` in `test/helpers.ts` and through `keyPairFromSeed`, `sign` and `signContext`, which the engine, recovery and sync tests use to forge conflicting votes for evidence. `test/review.test.ts`, **`does not let a cached verification vouch for different signature bytes`**, replaces a valid signature with `zeroSignature(DEFAULT_SCHEME)` and checks the application rejects it on both a warm and a cold node (review finding 2). Its neighbour, **`accepts both valid signatures a key can make over one body, whichever was seen first`**, is ML-DSA-44 only: it strips the tag from the secret key, signs the body with noble's hedged signer and re-tags the result, a second valid signature the deterministic signer would never produce. It is declared with `it.skipIf(DEFAULT_SCHEME !== Scheme.mlDsa44)`, because the second signature is made with noble's ML-DSA signer; a secp256k1 key holder can make a second low-S signature too, with another nonce, but the test does not build one, so the case is not exercised under that scheme. It is the one test the suite skips under `CHAIN_SCHEME=secp256k1` (29 files; 268 tests under ML-DSA-44, 267 run and one skipped under secp256k1).
+
+`test/review4.test.ts`, **`makes a verifier pool of its own when it is given none, and closes it when it stops`**, creates a one-validator `Node` with no `verifier` in its configuration, checks that `node.verifier` is a `WorkerVerifier`, lets it reach height 2 so that blocks are signed and checked through the pool, stops the node, and asserts that a `verify` on the pool afterwards rejects with `/closed/`.
 
 `bench/crypto.bench.ts` measures, for each scheme in turn, `keyPairFromSeed`, `sign`, inline `verify`, `WorkerVerifier.verify` over 256 signatures and the round trip of `verifyOne`, then `sha256` over 2.5 KB; it also prints the tagged sizes. On an Apple M4 Pro with 11 verification threads:
 
 | benchmark | ML-DSA-44 | secp256k1 |
 |---|---|---|
 | public key / signature / secret key, tag included | 1313 / 2421 / 2561 B | 34 / 65 / 33 B |
-| `keyPairFromSeed` | 1,400/s (714 µs) | 4,708/s (212 µs) |
-| `sign`, 256-byte message | 504/s (1.98 ms) | 4,334/s (231 µs) |
-| `verify`, inline | 1,144/s (874 µs) | 1,391/s (719 µs) |
-| `WorkerVerifier.verify`, 256 signatures on 11 threads | 7,437/s (34.4 ms per 256) | 9,215/s (27.8 ms per 256) |
-| `WorkerVerifier.verifyOne`, round trip | 916/s (1.09 ms) | 1,304/s (767 µs) |
+| `keyPairFromSeed` | 1,479/s (0.68 ms) | 5,008/s (0.20 ms) |
+| `sign`, 256-byte message | 351/s (2.85 ms) | 4,296/s (0.23 ms) |
+| `verify`, inline | 1,130/s (0.89 ms) | 1,367/s (0.73 ms) |
+| `WorkerVerifier.verify`, 256 signatures on 11 threads | 7,781/s (32.9 ms per 256) | 9,188/s (27.9 ms per 256) |
+| `WorkerVerifier.verifyOne`, round trip | 940/s (1.06 ms) | 1,261/s (0.79 ms) |
 
-`sha256` over 2.5 KB runs at 776,570 per second. Key generation and signing are where secp256k1 is an order of magnitude cheaper; verification, the operation the node performs by the thousand, is only about a fifth faster, because both schemes run in pure JavaScript. Through the pool that is 134 µs per ML-DSA-44 signature and 109 µs per secp256k1 one across 11 threads.
+`sha256` over 2.5 KB runs at 784,962 per second. Signing is where secp256k1 is an order of magnitude cheaper, twelve times, and key generation more than three times; verification, the operation the node performs by the thousand, is only about a fifth faster, because both schemes run in pure JavaScript. Through the pool that is 129 microseconds per ML-DSA-44 signature and 109 microseconds per secp256k1 one across 11 threads.
 
 ## Limitations and ideas
 
@@ -622,7 +624,7 @@ Known simplifications:
 - A batch on a worker that dies is rejected, not retried; the caller must resubmit.
 - Jobs are copied to workers by structured clone; there is no transfer of ownership and no shared memory.
 - `bytesEqual` is not constant-time. That is fine for the values it compares today; it would not be fine for comparing secrets.
-- Signing is synchronous and in pure JavaScript, about 2 ms per ML-DSA-44 signature and about 0.2 ms per secp256k1 one; a validator signs at most a few times per block, so this is acceptable, but a wallet signing thousands of ML-DSA-44 transactions would notice.
+- Signing is synchronous and in pure JavaScript, about 3 ms per ML-DSA-44 signature and about 0.2 ms per secp256k1 one; a validator signs at most a few times per block, so this is acceptable, but a wallet signing thousands of ML-DSA-44 transactions would notice.
 - A chain's scheme is fixed by its genesis. There is no migration from one scheme to the other on a running chain, and no chain accepts both at once: the tag is a dispatch byte, not a negotiation.
 - secp256k1 verification is pure JavaScript, like ML-DSA-44's, and nearly as slow. A native binding would make the classical scheme far cheaper to check, as it is on most chains; nothing here uses one.
 

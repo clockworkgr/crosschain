@@ -74,7 +74,7 @@ export interface BlockStore {
   /** The lowest height with a header record; null when there is none. */
   lowestHeaderHeight(): bigint | null;
   setLowestHeaderHeight(height: bigint | null): void;
-  /** Remove a block with its hash and transaction index entries. */
+  /** Remove a block with its hash and transaction index entries, its results and the validator set stored for its height. */
   deleteBlock(height: bigint): void;
   /** Run several saves as one store transaction, so a crash leaves all or none of them. */
   batch(fn: () => void): void;
@@ -184,16 +184,16 @@ export class KvBlockStore implements BlockStore {
       );
       w.put(hashKey(blockHash(block)), encode((wr) => wr.u64(h)));
       if (results !== undefined) {
-        // A transaction repeated in one block can only have succeeded once, at its first position.
-        const seen = new Set<string>();
+        // A transaction repeated in one block is indexed once: at the first position it succeeded at, or at its
+        // first position when it succeeded nowhere (or the block was stored without executing it).
+        const seen = new Map<string, { hash: Uint8Array; index: number }>();
         block.txs.forEach((tx, i) => {
           const hash = txHash(tx);
           const k = toHex(hash);
-          if (seen.has(k)) return;
-          seen.add(k);
-          const r = results?.[i];
-          w.put(txKey(hash, h), encodeTx(h, i, r));
+          const first = seen.get(k);
+          if (!first || (results && !results[first.index]?.ok && results[i]?.ok)) seen.set(k, { hash, index: i });
         });
+        for (const { hash, index } of seen.values()) w.put(txKey(hash, h), encodeTx(h, index, results?.[index]));
         if (results) w.put(resultsKey(h), encode((wr) => wr.array(results, (wr, r) => wr.bool(r.ok).string(r.error ?? ''))));
       }
     });
@@ -266,6 +266,9 @@ export class KvBlockStore implements BlockStore {
       w.del(blockKey(height));
       w.del(hashKey(blockHash(stored.block)));
       w.del(resultsKey(height));
+      // The set by height serves a state-sync join at a snapshot height, which needs the block of that height too:
+      // without the block the record answers nothing. Sets by hash stay; headers still held name them.
+      w.del(valsetAtKey(height));
       for (const tx of stored.block.txs) w.del(txKey(txHash(tx), height));
     });
   }

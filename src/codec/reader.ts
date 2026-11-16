@@ -15,7 +15,9 @@ export class Reader {
   private pos: number;
 
   constructor(buf: Uint8Array, pos = 0) {
-    this.buf = buf;
+    // A Buffer's slice() is a view of its memory where a Uint8Array's is a copy. Read through a plain Uint8Array
+    // over the same bytes, so that what fixed() and bytes() return is the reader's caller's own whatever was passed.
+    this.buf = buf.constructor === Uint8Array ? buf : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
     this.view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     this.pos = pos;
   }

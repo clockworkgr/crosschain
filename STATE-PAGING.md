@@ -28,12 +28,16 @@ aborting. The way to have both is to make memory a cache at every tier and LMDB 
 with memory to spare nothing is ever evicted and the node is today's node; under pressure
 each tier is evicted in turn and reads fall through to the store, whose memory map the
 operating system pages in and out. What then bounds the node is the working set of one
-block plus whatever cache it is granted, not the size of the state.
+block plus whatever cache it is granted, and one thing that still grows with the state: each
+type's table by instance (3.1), which holds a reference, a length and the cache's bit, 13
+bytes, for every instance number the type has reached, grows by doubling, and is released
+neither by the guard nor by the arena's budget, nor when its objects are removed.
 
 The measured starting point (docs/benchmarks.md 4.9): 3.2 KB of heap per account with its
-balance whatever the signature scheme, because the keys live in array buffers and what the
+balance after building, whatever the signature scheme (2.1 KB after a restart as the node
+now stands), because the keys live in array buffers and what the
 heap holds is the database itself. Phase one measured how that divides: the decoded objects
-are about a sixth of it (0.55 KB), and the secondary indices, the name tree and the Merkle
+were about a sixth of it (0.55 KB), and the secondary indices, the name tree and the Merkle
 trees the rest (2.65 KB). The expectation when this was written, a third for the objects, was
 wrong, and it moves the weight of the later phases onto tiers two and three.
 
@@ -47,7 +51,7 @@ wrong, and it moves the weight of the later phases onto tiers two and three.
 | tier three, trees | the dense and sparse trees' changed chunks and nodes written at every commit; the live trees stay as droppable accelerators with chunk reads as the fallback |
 | eviction order | by the guard, as the heap fills: decoded cache, then the index trees and the history window (whose older versions are then read from the store), then the Merkle trees. The arena's cold slabs were to come second; as built they are released against a byte budget of the operator's, not by the guard (3.4) |
 | who turns the dials | the memory guard (`src/node/memory.ts`): `ok` evicts nothing, `warn` caps the cache, drops the index trees (where the node keeps them in memory, which is not the default; 7), trims the history window and halves the mempool's limit, `pressure` drops the Merkle trees, lowers the mempool's limit to a tenth and sheds load, `critical` stops cleanly |
-| always on | the extra writes per commit are not a mode; a node that never pages pays them anyway, a few percent of warm throughput, so that the fallback exists the moment it is needed (measured: nothing for local writes, a fifth of the commit for a block spread over 192,000 accounts; 5.3) |
+| always on | the extra writes per commit are not a mode; a node that never pages pays them anyway, a few percent of warm throughput, so that the fallback exists the moment it is needed (measured: nothing for local writes, a fifth of the commit for a block spread over 192,000 accounts when the chunks were first written; 5.3) |
 | determinism | unchanged: roots are computed from the same leaves and the same bytes, wherever they are read from |
 | history | past values kept as encoded bytes, not decoded objects; the retention window costs bytes, not records; from `warn` on only the last two versions are kept in memory, the store keeping the whole window (7.2); a version the window in memory no longer holds is read from the store's history records, slower and at no cost in memory (7.3) |
 
@@ -65,8 +69,10 @@ table of references, and a hot cache of decoded objects over it.
   dead. After a root, a slab with nothing live left is released outright, with no copying,
   however many there are; a slab whose dead bytes exceed half its used bytes is compacted: its
   live entries are copied into the current slab, their owners are told the new references,
-  and the slab's buffer is released. Compaction copies at most what the root's block wrote
-  into the arena (and at least 16 MiB), so the pause stays in proportion to the block, and
+  and the slab's buffer is released. Compaction starts on another slab only while it has
+  copied less than what the root's block wrote into the arena (and at least 16 MiB), and
+  finishes the slab it started, so it can pass that figure by the live bytes of the last
+  slab, under 8 MiB; the pause stays in proportion to the block, and
   since a compacted slab gives back more than it copies, reclaiming keeps up with any rate of
   writes and a backlog drains. An encoding larger than a slab is refused (no object is: the
   largest, the dynamic properties with a thousand validators, is under 2 MiB).
@@ -121,30 +127,35 @@ what `get` returns.
 ### 3.3 Measured effect
 
 At 191,896 accounts with two keys each under secp256k1 (the genesis benchmark at 56 MB),
-against the same run before the arena:
+measured on the build that introduced the arena, against the same run before it:
 
 | | before | resident (cache unbounded) | capped at 100,000 objects |
 |---|---:|---:|---:|
 | heap after building | 597 MiB | 607 MiB | 583 MiB |
 | heap after a restart | 601 MiB | 585 MiB | 489 MiB |
-| array buffers (keys, and now the arena) | 41 MiB | 79 MiB | 79 MiB |
+| array buffers (keys, and from then on the arena) | 41 MiB | 79 MiB | 79 MiB |
 | build (apply, root, persist) | 5.7 s | 5.9 s | 5.9 s |
 | block of 500 transfers among random accounts | 21.5 ms | 24.8 ms | 41 ms |
 | restart from LMDB | 8.7 s | 8.5 s | 8.5 s |
 
-And on the small-scale suites under ML-DSA-44: `finalizeBlock 500 transfers, warm` 27,400 to
+And on the small-scale suites under ML-DSA-44, at the time: `finalizeBlock 500 transfers, warm` 27,400 to
 25,000 a second, cold 6,290 to 6,040, admission 6,680 to 6,420, `get by id` 42 to 72 ns (a
 map lookup instead of an array index).
 
-So the resident mode costs about 6% more memory (the encoded copy beside the decoded one)
-and 5 to 15% of speed, and the capped mode saves 17% of the heap with an empty cache at the
+So the resident mode cost about 6% more memory (the encoded copy beside the decoded one)
+and 5 to 15% of speed, and the capped mode saved 17% of the heap with an empty cache at the
 price of a block of random transfers taking twice as long: that is the degraded mode the
 property calls for, and it is what the guard turns on. The arena is the object tier the later
 phases need, with the overlay and the dial already in place, but by itself it does not move
 memory much, because decoded objects were never the bulk of it. The history window does
 shrink from records to bytes, and snapshots and proofs no longer decode and re-encode.
 Acceptance held for speed (warm block within 10%, restart no slower) and not for memory
-(the 2.5 KB per account target assumed the wrong budget).
+(the 2.5 KB per account target assumed the wrong budget). As the node now stands, with the
+cache unbounded, the heap is 608 MiB after building and 381 MiB after a restart, the array
+buffers 79 and 90 MiB, the build takes 7.9 s and the restart 2.85 s (phases two to four and
+the history records moved those two), and on the small-scale suites a warm block of 500
+transfers runs at 25,000 a second, a cold one at 5,770, admission at 5,800 and `get by id`
+takes 74 ns (docs/benchmarks.md 4.10).
 
 ### 3.4 The arena as a cache
 
@@ -203,10 +214,12 @@ store instead of from a slab. What it costs is the read: an object that is neith
 hot cache nor in the arena is an LMDB get and a decode where it was a decode (section 8
 has the envelope). Measured on the 192,000-account state for three minutes under a full
 feed (docs/benchmarks.md 4.13): without a budget the arena grows from 48 to 64 MiB; held
-to 32 MiB it leaves 124,000 to 215,000 objects in the store; held to 16 MiB it leaves
-315,000 there at the start of the run and 652,000 at its end, and the process holds 48 MiB
-fewer array buffers. Throughput does not notice either budget: 1,511 transfers a second
-without one, 1,520 and 1,500 with.
+to 32 MiB it leaves 124,000 to 211,000 objects in the store (237,000 at most); held to 16
+MiB it leaves 310,000 there at the first report of the run and 627,000 at its last, and the
+process holds 48 MiB
+fewer array buffers. Throughput is the same with 32 MiB as without a budget, 1,692 and 1,694
+transfers a second, and reads 7% lower at 16 MiB, 1,577, which is inside what two runs of
+one configuration differ by.
 
 ## 4. Tier two: indices (phases two and three)
 
@@ -245,8 +258,9 @@ As built (`src/db/indexstore.ts`):
   imported as bytes with no decode at all (`importObject(id, bytes, indexed)`), and
   `loadIndexEntries()` walks the 'i' prefix once, filling the B+ trees in key order (their
   cheapest order to grow in) and the sparse trees from the same entries. Measured at 192,000
-  accounts this is as fast as decoding every object for its keys was, within a few percent
-  (both are dominated by hashing the name tree; 4.4), and it is the read a node with dropped
+  accounts when it was built, this was as fast as decoding every object for its keys was,
+  within a few percent
+  (both were dominated by hashing the name tree then; 4.4), and it is the read a node with dropped
   trees does anyway, so it is the one kept. The entries are then checked against the objects
   (`checkIndexEntries`, the default): every object is decoded once for its keys, without being
   cached, each key must be stored naming that object, and each index must hold no more entries
@@ -319,8 +333,10 @@ application's suites on the fallback (9).
 
 ### 4.4 Measured effect
 
-Index entries on disk, against the phase-one code run on the same machine, alternated with
-the new code (single runs vary by about 5%, so most rows give the range of several):
+Index entries on disk, measured when phase three was built, against the phase-one code run
+on the same machine, alternated with
+the new code (single runs varied by about 5%, so most rows give the range of several;
+docs/benchmarks.md 4.11 has the same rows as the node now stands):
 
 | | before | after |
 |---|---:|---:|
@@ -338,36 +354,40 @@ the new code (single runs vary by about 5%, so most rows give the range of sever
 | heap after a restart | 585 MiB | 572 MiB (array buffers 79 to 90 MiB) |
 
 A 500-transfer block writes about a thousand entries (each transfer leaves a recent
-transaction id, two index entries; the balances change no key), so the commit costs about
-0.7 ms more, 7%. The genesis writes 576,000 entries (a name, an owner-asset key
+transaction id, two index entries; the balances change no key), so the commit cost about
+0.7 ms more, 7%, when the change was made (it is 9.9 ms now, with the tree chunks of phase
+four as well). The genesis writes 576,000 entries (a name, an owner-asset key
 and an asset key per account): a third of a second to list them at the first root and half a
 second to write them, and 58 MiB of LMDB, about 100 bytes an entry with LMDB's page overhead.
 Peak RSS during the build rose with it (1.69 to 2.18 GiB), most likely the transient list
-and the larger write transaction; the heap after building is unchanged at 607 MiB. Writing
+and the larger write transaction; the heap after building was unchanged at 607 MiB (608 MiB
+now). Writing
 the genesis entries straight from the trees instead of from a list would remove the first
 part. The same restart run with the indices built from the objects instead (the old path,
 kept for a store that predates the entries) took 8.49 s (import 3,726 ms, root 1,200 ms)
 against 8.43 s from the entries; two direct reopens of the same store, 8.89 s against
-8.84 s. The name tree's hashing dominates both. The rows of the db suite carry no store, so they show only the bookkeeping (the keys
+8.84 s. The name tree's hashing dominated both, and phase four removed it from a restart. The rows of the db suite carry no store, so they show only the bookkeeping (the keys
 kept per dirty object).
 
-Droppable trees, from the db suite at 100,000 balances and 21,000 accounts (per 1,000
-lookups and per 100 scanned entries, same runs):
+Droppable trees, from the db suite as the node now stands (docs/benchmarks.md 4.11), at
+100,000 balances and 26,000 accounts (per 1,000
+lookups and per 100 scanned entries):
 
 | | resident | dropped, in-memory store | dropped, LMDB |
 |---|---:|---:|---:|
-| lookup by unique index (byOwnerAsset), 1,000 | 1.04 to 1.34 ms | 1.18 to 1.46 ms | 1.02 to 1.20 ms |
-| scan 100 entries of a non-unique index (byAsset) | 9 to 13 µs | 24 to 28 µs | 50 to 57 µs |
-| modify 1,000 balances + root | 19.7 to 20.8 ms | 22.1 to 23.0 ms | |
-| rebuild every index tree | | 130 to 138 ms | 182 to 212 ms |
+| lookup by unique index (byOwnerAsset), 1,000 | 1.28 ms | 1.24 ms | 1.22 ms |
+| scan 100 entries of a non-unique index (byAsset) | 10 microseconds | 24 microseconds | 92 microseconds (median 53) |
+| modify 1,000 balances + root | 20.4 ms | 24.4 ms | |
+| rebuild every index tree | | 136 ms | 295 ms |
 
-A lookup through LMDB costs about what a resident one does (the resident row varies more
-between runs than the difference), because both are dominated by building the key and
-fetching the object; a scan costs four to six times as much, the price of copying every key
+A lookup through LMDB costs about what a resident one does (1.22 to 1.28 ms per thousand in
+all three columns), because both are dominated by building the key and
+fetching the object; a scan costs five to nine times as much, by its median and its mean, the price of copying every key
 and value out of LMDB and merging two cursors, still under a microsecond an entry. At genesis scale (`account by name`, 192,000 accounts) resident lookups
 measured 1.41 ms per 1,000 before and 1.61 ms after in the genesis run, and 1.78 against 1.81
 ms in a direct comparison of the two builds at that size (15 rounds each, medians), so about
-2%; the genesis run's larger gap is mostly that run's noise.
+2%; the genesis run's larger gap is mostly that run's noise. The genesis suite reads 1.73 ms
+now.
 
 ## 5. Tier three: trees (phase four)
 
@@ -438,7 +458,10 @@ As built:
   transfers among 514,000 accounts, whose trees have about 1,100 chunks, took 271 ms to
   finalize with 256 chunks cached, against 60 to 69 ms with all of them cached and 45 to
   73 ms resident. With 4,096, trees of up to about two million leaves in all are cached
-  whole while dropped, and beyond that the cache is what bounds them. The cache remembers
+  whole while dropped, and beyond that the cache is what bounds them. Each type's tree and
+  the tree over the types hold one of the cache's 512 places (`MAX_SLOTS`), so a database
+  takes at most 511 object types and refuses more when it is made, before any tree is
+  touched. The cache remembers
   the key it last moved to the end and does not move it again: a root reads a node and its
   sibling, mostly from one chunk. A root works on private full-size copies
   of the chunks it changes, so nothing read from the store, cached or handed out in a change
@@ -486,8 +509,10 @@ As built:
 
 ### 5.3 Measured effect
 
-Trees on disk, against the phase-three code (commit a3914e7) run on the same machine, Apple
-M4 Pro, node 24; the genesis rows at 191,896 accounts under secp256k1 (56 MB), single runs:
+Trees on disk, measured when phase four was built, against the phase-three code (commit
+a3914e7) run on the same machine, Apple
+M4 Pro, node 24; the genesis rows at 191,896 accounts under secp256k1 (56 MB), single runs
+(docs/benchmarks.md 4.12 has the same rows as the node now stands):
 
 | | before | after |
 |---|---:|---:|
@@ -506,15 +531,16 @@ M4 Pro, node 24; the genesis rows at 191,896 accounts under secp256k1 (56 MB), s
 | `modify 1,000 balances + root` (no store) | 19.3 to 20.5 ms | 19.8 to 20.4 ms |
 | `modify 10,000 balances + root` (no store) | 159 to 162 ms | 161 to 167 ms |
 
-The three ways to reopen the same store, measured in one run: the trees from their chunks
+The three ways to reopen the same store, measured in one run at the time: the trees from their chunks
 and nodes with every object hashed against its leaf (the default) 5.18 s, the same without
-the leaf check 4.56 s, the trees computed from the objects 8.46 s. What is left of a restart is mostly the history (3.5 s at
-height 1): rebuilding the sparse trees' past versions replays every account, which the
-store does not hold in a form to load; that is not changed here. (It was changed later:
+the leaf check 4.56 s, the trees computed from the objects 8.46 s. What was left of a restart was mostly the history (3.5 s at
+height 1): rebuilding the sparse trees' past versions replayed every account, which the
+store did not hold in a form to load; that was not changed here. (It was changed later:
 the history records now carry the sparse tree nodes each commit overwrote, and a restart
-takes the past versions from them; 7.3. The same three reopens then measure 2.84 s, 1.46 s
-and 5.41 s, the node's restart 2.91 s with the history 2 ms of it, and the heap after a
-restart 381 MiB.)
+takes the past versions from them; 7.3. The same three reopens then measured 2.84 s, 1.46 s
+and 5.41 s; as the node now stands they take 2.84 s, 1.41 s and 5.17 s, the node's restart
+2.85 s with the history 2 ms of it, and the heap after a
+restart is 381 MiB.)
 
 Checking the trees and the index entries in full (every dense and sparse node, every leaf
 against an object, every index entry against the objects), measured the same way in one run
@@ -530,33 +556,37 @@ second more to list at the first root. A block's commit costs what its chunks co
 holds 1,024 hashes, so a block whose leaves are spread over the whole state rewrites nearly
 every chunk of the trees it touches, 6.1 MiB per root for a thousand random balances among
 100,000, the same for ten thousand; at 192,000 accounts that is about 12 MiB, and the
-commit of a scattered block grows by a fifth (9 ms). A block whose writes are local (the
+commit of a scattered block grew by a fifth (9 ms) when the chunks were first written; it
+takes 49 ms now. A block whose writes are local (the
 genesis suite's transfers among consecutive accounts) costs nothing measurable, nor does
 the 1,001-account application suite. Smaller chunks on disk would cut the scattered case
 about in half at this size and are the obvious next step if the commit matters; the
 format here is the one the specification set.
 
-Dropped trees, from the db suite (100,000 balances and 21,000 accounts, the trees over
-LMDB; means, and medians where a first cold iteration pulls the mean):
+Dropped trees, from the db suite as the node now stands (docs/benchmarks.md 4.12; 100,000
+balances and 26,000 accounts, the trees over
+LMDB; means, and medians where a slow iteration pulls the mean):
 
 | | resident | dropped |
 |---|---:|---:|
-| `modify 1,000 balances + root` | 20.2 ms | 53.7 ms (median 23.8) |
-| `modify 10,000 balances + root` | 170 ms | 207 ms (median 179) |
-| object proof, current version, per 100 | 1.13 ms | 1.35 ms |
-| object proof, past version, per 100 | 1.14 ms | 1.35 ms |
-| name proof (sparse tree), per 100 | 428 µs | 1.87 ms |
-| drop / rebuild every tree | | 0.3 / 180 ms |
+| `modify 1,000 balances + root` | 26.9 ms (median 20.3) | 54.2 ms (median 29.4) |
+| `modify 10,000 balances + root` | 221 ms (median 201) | 231 ms (median 203) |
+| object proof, current version, per 100 | 1.14 ms | 1.51 ms |
+| object proof, past version, per 100 | 1.20 ms | 1.51 ms |
+| name proof (sparse tree), per 100 | 0.36 ms | 1.78 ms |
+| drop / rebuild every tree | | 0.6 / 368 ms (0.3 / 63 ms in the secp256k1 run) |
 
-A root over dropped trees costs about what a resident one does once the upper levels are
-cached (215 chunks cached after these runs, of the 256 the cache then held; it holds
-4,096 now, 5.2); the first one after a drop reads
-every chunk it touches from LMDB. Object proofs cost about the same, being dominated by
-building the proof rather than reading twenty hashes (a fifth more, from the chunks read
-through the cache); a name proof reads about twenty nodes
-from LMDB and costs four times as much. (The resident and dropped columns of the first two
+At the median a root over dropped trees costs what a resident one does for ten thousand
+changes (203 against 201 ms) and half as much again for a thousand (29 against 20 ms) once
+the upper levels are
+cached (215 chunks cached after these runs, of the 4,096 the cache holds, 5.2; it held 256
+when phase four was built); the first one after a drop reads
+every chunk it touches from LMDB. An object proof costs a third more, 15 against 11 to 12
+microseconds, most of it still
+building the proof rather than reading twenty hashes; a name proof reads about twenty nodes
+from LMDB and costs five times as much, 18 against 3.6 microseconds. (The resident and dropped columns of the first two
 rows are the same database over LMDB; the resident one reports its changes, and costs what
-the no-store rows above do.) Rebuilding reads 400 chunks and the name tree's 42,000
+the no-store rows above do.) Rebuilding reads 400 chunks and the name tree's
 nodes, and every retained version of the name tree from the records.
 
 ## 6. The commit transaction
@@ -577,8 +607,20 @@ noisier part of a commit: the application's commit of a 500-transfer block at 19
 was 17 to 26 ms of LMDB's own work and 40 to 120 ms with the flush (15 to 19 ms of LMDB's
 own work since the account history became a log, 7.1). A block paid for two
 flushes and now pays for one, and the block and the application state land together or not
-at all. `persist` writes everything before `commit()` first awaits, which is what puts it
-inside the transaction. An application handed to the node, whose store is not in the node's
+at all. `CoreApp.commit()` returns a promise but is not an async function, and `persist`
+writes everything in it synchronously: a write of the application's that fails throws
+where `commit()` is called, inside the transaction, which is aborted with the chain's
+writes, so neither the block nor the chain state is stored and `applyBlock` rejects with
+the chain state as it was. (The executor calls an application's `commitSync()` instead when
+it has one.) `persist` puts the account history log back to what the store has
+(`HistoryLog.rollback()`: length, coverage and waiting heads are read again), keeps the
+block to be written and clears the list of stale history versions only after a write that
+succeeded, so `commit()` called again writes the same block with a correct history. In a
+node the application's memory is then a block ahead of the chain state; applying the
+block again makes the application refuse everything (a failure after a block's session
+is committed cannot be undone), and the node is restarted, which finds chain and
+application at the same height. A snapshot that fails after the write rejects the promise,
+with the block written. An application handed to the node, whose store is not in the node's
 environment, commits on its own after the chain store as before, and the replay at `open`
 that brings an application behind the chain state back level is unchanged and still what
 covers it.
@@ -592,8 +634,9 @@ between `finalizeBlock` and `commit` is invisible to dropped indices.
 Phase four as built: the chunks and nodes are `Changes.trees`, written by `CoreApp.persist`
 after the index entries in the same `kv.write`, and laid over the store until
 `dropChanges()` like the index entries. `commit to LMDB` at 1,001 accounts did not move
-(9.7 to 9.5 ms, noise); at 192,000 accounts a block spread over the whole state costs about
-12 MiB of chunks and 9 ms more, a fifth (5.3).
+(9.7 to 9.5 ms, noise); at 192,000 accounts a block spread over the whole state cost about
+12 MiB of chunks and 9 ms more, a fifth (5.3). As the node now stands the two commits take
+9.9 and 49 ms.
 
 ## 7. The guard's dials (phase five)
 
@@ -602,7 +645,7 @@ after the index entries in the same `kv.write`, and laid over the store until
 | ok | under 70% | caches unbounded; dropped index trees and Merkle trees rebuilt, each only if it fits; then the history window let grow back, if what it held fits | up to its limit (10,000 transactions) |
 | warn | 70% | hot cache capped at 100,000 decoded objects; index trees dropped; the history window cut to the last two versions; major collection started | up to half its limit (5,000) |
 | pressure | 85% | hot cache capped at 10,000; the Merkle trees dropped as well; costly RPC methods refused | up to a tenth of its limit (1,000) |
-| critical | 95% | everything kept dropped and trimmed; clean stop, reached only when one block's working set does not fit | nothing: the pool is paused |
+| critical | 95% | everything kept dropped and trimmed; clean stop. The guard compares a sample of the heap with the threshold and does not know what filled it, and one sample can go from `ok` straight to `critical` | nothing: the pool is paused |
 
 All of it is built. The table as decided had "cold slabs may be released" at `warn`; the
 arena is bounded by a byte budget instead, which the guard does not turn (3.4). As first
@@ -621,13 +664,15 @@ As built (`src/node/node.ts`, `onMemoryLevel`):
   `critical` keeps them so while the node stops. Load shedding is still `pressure`'s. As
   first built all three went at `pressure`. A loaded node commits more with its index
   trees in the store than with them in its heap, about a tenth more (a block of transfers
-  looks up no index; 7.1), and under that rule it reached that state only when the heap
+  looks its balances up by an index, which the store answers, and no tree is then kept up in
+  the heap; 7.1), and under that rule it reached that state only when the heap
   arrived at the pressure line, minutes into a full load. The history window goes with
   them for the memory it holds, not for the rate: a block reads no past version, and how
   much of the window is in memory does not change what the node commits (7.2).
 - **`ok` rebuilds what fits, not everything.** Dropping takes a large state from above the
   pressure line to well below the ok line in one go (at 192,000 accounts the heap gave back
-  130 MiB for the index trees and 193 MiB for the Merkle trees; 7.1), and rebuilding all of
+  130 MiB for the index trees and 193 MiB for the Merkle trees at the time, 181 and 223 MiB
+  in the current mode table; 7.1), and rebuilding all of
   it at `ok` takes the heap straight back over the pressure line. Measured with the literal
   rule, a node under load dropped, read `ok`, rebuilt and read `pressure` again within a
   second or two, over and over, a second of rebuilding each time. So the node rebuilds a
@@ -663,8 +708,8 @@ As built (`src/node/node.ts`, `onMemoryLevel`):
   that filled the heap once fills it again. In a ten-minute run under a heap 2.5 times the
   state the index trees were rebuilt four seconds after each drop and dropped again a few
   minutes later, and the node committed less while it had them (docs/benchmarks.md
-  section 4.13). With the wait that follows, the same run rebuilt them once, 30 seconds
-  after a drop at 34 s, and after the second drop, at 211 s, waited to 360 s, found no
+  section 4.13). With the wait that follows, the same run rebuilt them once, 29 seconds
+  after a drop at 32 s, and after the second drop, at 211 s, waited to 360 s, found no
   room and stayed paged to the end (7.1). So at each level
   other than `ok` the node sets a wait (`rebuildAfter`): the number of guard samples since
   something was last rebuilt, or since it started (`sinceRebuild`), at least
@@ -683,8 +728,8 @@ As built (`src/node/node.ts`, `onMemoryLevel`):
   records in the store (7.3).
 - **The index trees are left in the store unless the config asks for them.** `indexTrees: 'store'`
   (`NodeConfig.indexTrees`, and `indexTrees` in the CLI's `config.json`), the default,
-  makes a node that never builds them; `'memory'`, the default until the measurements
-  here, is the behaviour of the points above. With `'store'` the node passes `indexTrees: false` to the
+  makes a node that never builds them; `'memory'`, the default until measurements of the
+  kind given here, is the behaviour of the points above. With `'store'` the node passes `indexTrees: false` to the
   application it opens, drops them at start for an application it was handed, and reports
   them as needing nothing wherever it asks what waits to be rebuilt (`Node.rebuildEstimate`,
   which `onSample` and `rebuildWhatFits` read), so the Merkle trees and the history window
@@ -695,19 +740,26 @@ As built (`src/node/node.ts`, `onMemoryLevel`):
   minutes (`bench/paging-node.ts` takes `BENCH_PAGING_INDEX_TREES=store` or `=memory` for it
   and follows the node's default when it is unset): the node with `'store'`
   opens with 258 MiB of heap in use against 398 MiB with `'memory'`, a third less, commits
-  1,552 transfers a second against 1,485, which is within what two runs differ by (4.5%),
-  and reaches `warn` once, at 40 s, from the history window and the cache, against twice,
+  1,508 transfers a second against 1,522, which is within 1% (the pair of runs on the
+  earlier build, which decided the default, read 1,552 against 1,485),
+  and reaches `warn` once, at 39 s, from the history window and the cache, against twice,
   with nothing to rebuild but the window (docs/benchmarks.md section 4.13). What it gives
   up is index reads from memory. With 200 reads a second of each kind beside the load
   (`BENCH_PAGING_READS=200`, 2,380 MiB of heap so that the node with `'memory'` keeps its trees) a
-  lookup by key takes 5 microseconds at the median either way, a page of twenty accounts in
-  name order 33 microseconds from the store against 17 from memory (about 200 against 47 at
-  the 99th percentile), and the three runs with `'store'` commit 8% more than the three
-  with `'memory'`, 1,503 against 1,395 transfers a second. A store none of which was in the
+  lookup by key takes 4 to 7 microseconds at the median either way, a page of twenty accounts in
+  name order 31 to 34 microseconds from the store against 17 to 18 from memory (569 and 1,588
+  against 43 and 76 at
+  the 99th percentile, where the earlier build's two runs from the store read 186 and 215),
+  and the three runs with `'store'` commit 13% more than the three
+  with `'memory'`, 1,559 against 1,385 transfers a second. A store none of which was in the
   page cache when the node opened it gave the same reads from the first two seconds, the
-  open taking 3,965 ms against 3,355 to 3,545 ms: the node reads its whole store when it
-  opens (docs/benchmarks.md section 4.13); a store larger than the machine's memory was
-  not measured. Proofs and the Merkle trees are unaffected.
+  open taking 3,661 ms, inside the range of the warm opens (3,359 to 4,179 ms; 3,965 ms
+  against 3,355 to 3,545 ms on the earlier build): the node reads its whole store when it
+  opens (docs/benchmarks.md section 4.13). A read that does reach the device was measured
+  on a store of 576 MiB (514,008 accounts) read cold without a node
+  (`bench/cold-reads.ts`): a lookup that missed the cache took of the order of 140 to 320
+  microseconds (the median of the first object reads and the 99th percentiles) against 1 to 3
+  from the page cache, and a page of twenty entries 6 to 9 from the cache. A node under load on a machine whose memory the store exceeds was not measured. Proofs and the Merkle trees are unaffected.
 - **The limit is the old generation's.** V8's `heap_size_limit` adds the young generation's
   reserve to `--max-old-space-size` (192 MiB on the machine measured), which long-lived
   objects never fill; a process aborts when the old generation is full. With the CLI's
@@ -737,10 +789,11 @@ As built (`src/node/node.ts`, `onMemoryLevel`):
   `critical` at any of the five, visited `pressure` one to three times in forty seconds,
   and after its first two seconds refused 236 of 48,200 transactions at 0.8 times and
   nothing at the other four, for 1,149 to 1,567 transfers a second. As the node now
-  stands, with the index trees and the window going at `warn`, the same five runs refuse
+  stands, with the index trees in the store and the window going at `warn`, the same five
+  runs refuse
   nothing after their first two seconds, visit `pressure` three times at 0.8 times, once
-  at 1.0 and at 1.25 and not at all at 1.5 and 2.0, and commit, in transfers a second,
-  1,499 at 0.8 times, 1,497 at 1.0, 1,530 at 1.25, 1,476 at 1.5 and 1,711 at 2.0
+  at 1.0 and at 1.5 and not at all at 1.25 and 2.0, and commit, in transfers a second,
+  1,384 at 0.8 times, 1,476 at 1.0, 1,487 at 1.25, 1,411 at 1.5 and 1,657 at 2.0
   (docs/benchmarks.md 4.13).
 - **The mempool's limit follows the level.** Admission through the fallbacks is correct:
   `test/app.test.ts` checks transactions against dropped index trees and dropped Merkle
@@ -780,12 +833,29 @@ As built (`src/node/node.ts`, `onMemoryLevel`):
 ### 7.1 Measured effect: the paging benchmark
 
 `CHAIN_SCHEME=secp256k1 BENCH_GENESIS_MB=56 node --expose-gc bench/run.ts paging`, 191,896
-accounts. First a node, in a child process started with `--max-old-space-size=744`, 1.25
-times the heap of the resident state (595 MiB): a single validator over the store, its
-mempool kept two blocks ahead with transfers among random accounts, for 40 seconds, with
-the index trees dropped and the history window cut at `warn` (7). The runs of this
-section were made with `indexTrees: 'memory'`, the default at the time, except those
-marked `store`.
+accounts. First a node, in a child process started with `--max-old-space-size=745`, 1.25
+times the heap of the resident state (596 MiB): a single validator over the store, its
+mempool kept two blocks ahead with transfers among random accounts, for 40 seconds. As the
+node now stands, on its defaults (`indexTrees: 'store'`, a stored state opened against half
+the limit; docs/benchmarks.md 4.13):
+
+| seconds | what happened |
+|---|---|
+| 0 | store opened in 3.3 s with the Merkle trees and the history left in the store, because they do not fit within half the limit; 39 MiB of heap in use; 1,580 and then 1,790 transfers a second in the first two windows |
+| 2 to 20 | `ok`, the heap filling from 82 to 490 MiB with the pending session, the cache of decoded objects and the versions since opening; 1,790 to 2,020 transfers a second in each window of two seconds; no room to read the Merkle trees back (366 MiB needed, 269 MiB within half the limit) |
+| about 21 | `warn` at 526 of 745 MiB: the window in memory cut to two versions, the cache capped, the mempool admitting up to half its limit; `ok` half a second later at 100 MiB; 1,471 transfers a second in the window that holds it |
+| 22 to 40 | `ok` throughout, 92 to 205 MiB, 1,710 to 1,980 transfers a second in each window |
+
+In all: 129 blocks and 72,092 transfers in 40.7 s (1,771 a second), every block committed
+with the Merkle trees in the store, one visit to `warn`, none to `pressure`, and no abort.
+The 508 submissions refused were all in the first two seconds, before the first block. The
+heap is the old generation's use, which is what the guard's levels are taken from (7).
+
+The earlier runs of this section, which led to those defaults, were made with
+`indexTrees: 'memory'`, the default at the time, except those marked `store`. In the build
+just before the defaults changed, with the index trees dropped and the history window cut
+at `warn` (7) and a stored state opened against the warn line, the same configuration
+(744 MiB) ran so:
 
 | seconds | what happened |
 |---|---|
@@ -793,10 +863,9 @@ marked `store`.
 | about 5 | `warn` at 539 of 744 MiB: the index trees dropped, the history window cut to two versions, the cache capped, the mempool admitting up to half its limit; next sample 308 MiB, `ok` |
 | 5 to 40 | `ok` throughout, 311 to 501 MiB, 1,520 to 2,010 transfers a second in each window of two seconds, the Merkle trees resident; the index trees stay dropped, 161 to 183 MiB needed for them and no room within half the limit (372 MiB) |
 
-In all: 124 blocks and 69,492 transfers in 40.6 s (1,712 a second), no block committed
-with the Merkle trees dropped, one visit to `warn`, none to `pressure`, and no abort. The
-508 submissions refused were all in the first two seconds, before the first block. The
-heap is the old generation's use, which is what the guard's levels are taken from (7).
+In all that run committed 124 blocks and 69,492 transfers in 40.6 s (1,712 a second), no
+block committed
+with the Merkle trees dropped, with one visit to `warn`, none to `pressure`, and no abort.
 While the index trees and the window went only at `pressure`, the same run sat at `warn`
 from 6.8 s and reached `pressure` at 14.0 s (637 MiB), where both tree tiers were dropped
 and the next sample read 45 MiB; the index trees were rebuilt at 17.6 s, the Merkle trees
@@ -818,26 +887,32 @@ dial sheds is the recent transaction ids.
 Then the database alone, in the parent process after the node session (so with a full
 history window): blocks of 500 random transfers, six per mode, checked through `checkTx`
 first as admission does, then finalized and committed to LMDB; the modes added up as the
-guard's levels add them:
+guard's levels add them. From the published run above, as the node now stands:
 
 | mode | blocks/s | transfers/s | finalize | commit | checkTx of 500 | heap after | array buffers |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| resident | 10.9 | 5,474 | 50.5 ms | 40.9 ms | 56.9 ms | 950 MiB | 116 MiB |
-| cache capped at 10,000 | 10.8 | 5,415 | 49.0 ms | 43.3 ms | 51.0 ms | 946 MiB | 116 MiB |
-| and index trees dropped | 12.1 | 6,064 | 41.1 ms | 41.3 ms | 55.2 ms | 771 MiB | 102 MiB |
-| and Merkle trees dropped | 10.3 | 5,165 | 52.5 ms | 44.3 ms | 49.9 ms | 544 MiB | 86 MiB |
-| everything rebuilt (1.12 s) | 10.7 | 5,349 | 49.9 ms | 43.5 ms | 49.1 ms | 955 MiB | 117 MiB |
+| resident | 9.3 | 4,669 | 50.4 ms | 56.7 ms | 71.3 ms | 945 MiB | 116 MiB |
+| cache capped at 10,000 | 10.5 | 5,236 | 49.0 ms | 46.6 ms | 52.7 ms | 941 MiB | 116 MiB |
+| and index trees dropped | 11.6 | 5,824 | 39.6 ms | 46.2 ms | 55.6 ms | 760 MiB | 102 MiB |
+| and Merkle trees dropped | 10.0 | 4,983 | 42.0 ms | 58.4 ms | 49.9 ms | 537 MiB | 86 MiB |
+| everything rebuilt (1.06 s) | 9.9 | 4,959 | 54.5 ms | 46.3 ms | 59.5 ms | 951 MiB | 117 MiB |
 
-With the account history keyed by account (below) the same five modes ran at 8.7, 8.8,
+In that table the index trees give back 181 MiB of heap and the Merkle trees 223 MiB, and
+with both dropped and the cache capped the database runs on 537 MiB, 57% of the 945 MiB it
+holds resident with a full history window. With the account history keyed by account
+(below) the same five modes ran at 8.7, 8.8,
 10.0, 8.3 and 8.7 blocks a second, their commits 62, 63, 58, 76 and 63 ms. The same suite
 run then on the state before any node session (no history yet) gave 10.6, 10.2,
-11.5, 10.7 and 10.3 blocks a second and 493, 512, 382, 189 and 617 MiB of heap: the index
-trees give back 130 to 175 MiB and the Merkle trees 190 to 220 MiB, the cache up to 190 MiB
-when it holds 200,000 decoded objects (nothing when it held fewer than its cap), and with
-everything dropped the node runs on 40 to 50% of its resident heap. Throughput holds
-within 10% of the resident figure in every mode but the one with only the index trees
-dropped, which is faster (12.1 against 10.9 blocks a second). With the Merkle trees
-dropped it is 10.3 against 10.9 blocks a second in the table above, where it was 7.7
+11.5, 10.7 and 10.3 blocks a second and 493, 512, 382, 189 and 617 MiB of heap: there the
+index
+trees gave back 130 to 175 MiB and the Merkle trees 190 to 220 MiB, the cache up to 190 MiB
+when it held 200,000 decoded objects (nothing when it held fewer than its cap), and with
+everything dropped the database ran on 40 to 50% of its resident heap. In the table above
+no mode is slower than the resident row, which is the first one measured after the node
+session and reads 9.3 blocks a second where the same configuration, rebuilt at the end,
+reads 9.9; the fastest is the one with only the index trees
+dropped, 11.6. With the Merkle trees
+dropped as well it is 10.0 against 11.6 blocks a second, where it was 7.7
 against 9.4 while the dropped trees' cache held 256 chunks: the trees of this state have
 about 420, so a root read the rest from LMDB at every block, and at 514,000 accounts,
 whose trees have 1,100, a block of 500 transfers took 271 ms to finalize against 60 to 69
@@ -845,27 +920,31 @@ with every chunk cached and 45 to 73 resident. The cache now holds 4,096 chunks,
 at most and outside the heap (5.2), so the dense trees of up to two million leaves are
 read once after a drop and the cache bounds only larger ones. The index trees dropped
 cost nothing a block of transfers notices (the transfers
-look up no index; a block's finalize even gets faster without the B+ tree updates).
+look up no index; a block's finalize even gets faster without the B+ tree updates, 39.6 ms
+against 49.0).
 
 The node over longer runs and other heaps (docs/benchmarks.md 4.13 has the tables). Over
 three states (34,000, 192,000 and 514,000 accounts) and five limits (0.8 to 2.0 times the
 resident heap), forty seconds each, every run committed for the whole time and none
-reached `critical`; the 192,000-account node commits 1,650 to 1,800 transfers a second at
-every one of the five limits, the spread between runs, having reached `warn` once and run
-on with its index trees in the store and two versions of history in memory. Held for ten
-minutes at 1.0 and 2.5 times its resident heap it commits 1,619 and 1,485 transfers a
-second (1,608 at 0.8 times), refuses nothing after its
-first two seconds and never reaches `pressure`: each `warn`, five and two in the two
+reached `critical`; the 192,000-account node commits 1,589 to 1,644 transfers a second in
+the matrix's single runs at the five limits, a spread of 3.5%, less than two runs of one limit differ by,
+opened with its Merkle trees and its history in the store up to 1.25 times the resident
+heap and with them in memory above that, having reached `warn` once and run
+on with two versions of history in memory. Held for ten
+minutes at 1.0 and 2.5 times its resident heap it commits 1,610 and 1,508 transfers a
+second (1,567 at 0.8 times), refuses nothing after its
+first two seconds and never reaches `pressure`: each `warn`, five and one in the two
 runs, is followed by `ok` within half a second. Within the run at the resident figure
-every window of twenty seconds is between 1,530 and 1,780 transfers a second. The run at
-2.5 times shows the wait before a rebuild (7). The node opened resident, dropped its
-index trees at `warn` at 34 s, waited 30 seconds at `ok`, having run 34, and rebuilt
-them at 64.6 s; at the second `warn`, at 210.6 s, it had run 146 seconds since the
-rebuild, waited as long, to 360 s, found no room (565 MiB needed) and stayed paged to the
+every window of twenty seconds is between 1,502 and 1,789 transfers a second. The run at
+2.5 times with `indexTrees: 'memory'` shows the wait before a rebuild (7). The node opened
+with its index trees in memory, dropped
+them at `warn` at 32 s, waited about as long at `ok`, having run 32, and rebuilt
+them at 61 s; at the second `warn`, at 211 s, it had run 150 seconds since the
+rebuild, waited as long, to 360 s, found no room (563 MiB needed) and stayed paged to the
 end. That is one rebuild where the rule of ten samples made two, and the rates beside it
-give what resident index trees cost this load: 1,310 to 1,440 transfers a second while
-they were resident, from 80 to 200 s, against 1,550 to 1,610 before and 1,420 to 1,600
-after (1,517 on average), about a tenth. While the index
+give what index trees in memory cost this load: 1,342 to 1,437 transfers a second while
+they were in memory, from 61 to 211 s (1,379 on average), against 1,488 to 1,667
+after the second drop (1,567 on average), 12% less, about a tenth. While the index
 trees and the window went only at `pressure` the rates were lower: the forty-second rate was
 1,520 to 1,560 at 0.8 to 1.25 times the resident heap and 1,250 to 1,350 at 1.5 and 2.0
 times, where the index trees stayed resident; the
@@ -900,8 +979,8 @@ same in total as with the heads written together (the means over the last 200 bl
 19.2 to 24.0 ms against 17.5 to 19.3, within what runs differ by); what the slices remove
 is the block of 100 ms more. The history costs about 2 ms a block at the start and 4.5 ms
 at block 400, where the old layout cost 4 and 11.3 against the same run, about 60% less. The flush to the device is the larger and noisier
-part of a commit (40 to 120 ms with it when the first of these was measured, 41 to 44 ms
-in the table above), and a block now pays one, the block and the
+part of a commit (40 to 120 ms with it when the first of these was measured, 46 to 58 ms
+in the mode table above), and a block now pays one, the block and the
 application's state being one store transaction (6).
 
 ### 7.2 The history window
@@ -949,17 +1028,19 @@ unset, it keeps all of them until memory fills. The node calls `setHistoryWindow
 when it has opened the application, and when the guard has trimmed the window and the
 node widens it again, it widens it to this setting, not to the whole window. The store
 keeps the whole window either way, and a proof or a query at an older height is answered
-from the history records (7.3): of the order of 0.2 ms per version back, against under
-0.1 ms from memory. The setting is for a node with a large heap: it never reaches `warn`,
+from the history records (7.3): 0.1 to 0.35 ms per version back, against a tenth of a
+millisecond or less from memory. The setting is for a node with a large heap: it never reaches `warn`,
 so nothing trims its window, and it keeps a hundred versions of overwritten tree nodes
 and object bytes in its heap. Measured at 514,008 accounts under 3,126 MiB, twice the
 resident heap, for 120 seconds, two runs of each (`bench/paging-node.ts` takes
-`BENCH_PAGING_MEMORY_VERSIONS` for it): the node commits 1,355 and 1,255 transfers a
-second with the whole window and 1,369 and 1,241 with two versions, so throughput does
-not depend on the window. What the setting buys is memory and pause length: a peak heap
-of 1,630 MiB against 2,140, about 500 MiB less at this size, and a longest collection
-pause of 190 to 200 ms against 290 to 300 ms. What it costs is a proof at a past height,
-12 to 28 ms fifty and a hundred versions back instead of under 0.2 ms.
+`BENCH_PAGING_MEMORY_VERSIONS` for it): the node commits 1,335 and 1,402 transfers a
+second with the whole window and 1,246 and 1,348 with two versions, and the two runs of
+each setting differ by as much as the settings do, so throughput is
+not shown to depend on the window. What the setting buys is memory and pause length: a heap
+of 1,057 to 1,141 MiB at its highest report against 1,603 to 1,767, about 500 to 700 MiB
+less at this size, and a longest collection
+pause of 127 to 178 ms against 202 to 237 ms. What it costs is a proof at a past height,
+13 to 33 ms fifty and a hundred versions back instead of a small fraction of a millisecond.
 
 Trimming several versions in one call exposed a fault in the three pruning loops (the value
 history, the dense trees, the dropped sparse trees), which assumed one version was pruned
@@ -1018,8 +1099,10 @@ records of those heights all the while. The database now reads them.
   save. Nothing is cached between reads, so a trimmed window costs a past read time and
   not memory. A read from the records is slower than one from memory, the more so the
   further back the version is, since every later record is scanned: at 192,000 accounts
-  under blocks of 400 to 550 transfers, an account proof takes 0.04 ms from memory, 9.2 ms
-  fifty versions back and 19 ms a hundred back, about 0.2 ms per record
+  under blocks of 440 to 570 transfers, an account proof takes 0.08 ms at the newest height,
+  from memory, 8.9 ms
+  fifty versions back and 20 ms a hundred back, 0.1 to 0.35 ms per record over the runs
+  measured
   (docs/benchmarks.md 4.13).
 - **A missing record is a refusal.** The database keeps the list of the versions that
   have a record (`recorded`: every root after the first, and what `loadHistory` and
@@ -1053,10 +1136,10 @@ records of those heights all the while. The database now reads them.
   kept (its `nodes` is null) or a record does not hold a node a version needs.
   `openObjectDatabase` calls it where it called `rebuildIndexVersions`, and the startup
   line `loaded application state` reports the result as `indexVersions`. The restart
-  measured again at 192,000 accounts: 2.91 s where it was 5.2 s, of which 0.31 s is
-  reading the store, 2.59 s the indices, the trees and the root with every check, and
+  at 192,000 accounts is now 2.85 s where it was 5.2 s, of which 0.30 s is
+  reading the store, 2.54 s the indices, the trees and the root with every check, and
   2 ms the history, where replaying every account took 3.5 s. Without the leaf check it
-  is 1.46 s, and with the trees computed from the objects 5.41 s. The heap after the
+  is 1.41 s, and with the trees computed from the objects 5.17 s. The heap after the
   restart is 381 MiB where it was 572.
 - **Records without the sparse nodes.** A past read that needs sparse tree nodes (an
   object proof, a type leaf proof, a key proof: each carries the roots of the type's
@@ -1073,18 +1156,28 @@ records of those heights all the while. The database now reads them.
 
 ## 8. Performance envelope
 
+The table holds the estimates the design started from, as they were written before anything
+was measured. The measured figures follow it, and where the two differ the measured ones
+stand.
+
 | read | resident | from the page cache | from an NVMe |
 |---|---:|---:|---:|
-| object by id | 40 ns (hot) or 1 µs (decode) | 2 µs | 100 µs |
-| index lookup | 1 µs | 2 µs | 100 µs |
+| object by id | 40 ns (hot) or 1 microsecond (decode) | 2 microseconds | 100 microseconds |
+| index lookup | 1 microsecond | 2 microseconds | 100 microseconds |
 | root over 20,000 changed leaves | 300 ms | about 1 s | several seconds |
 
-Measured (5.3, 4.4, 3.3): an object decoded from the arena about 1 µs; an index lookup
-through LMDB 1.0 µs, as fast as a resident one at these sizes; a root over 10,000 changed
-leaves out of 100,000 with the trees dropped, from the page cache, 179 ms (median) against
-170 ms resident. The row for 20,000 changed leaves is about right resident; dropped it costs
-little more while LMDB sits in the page cache. None of it was measured from an NVMe with a
-cold page cache.
+Measured (5.3, 4.4, 3.3): an object by id from the hot cache 74 ns, and decoded from the
+arena about 1 microsecond; an index lookup
+through LMDB 1.2 microseconds, as fast as a resident one at these sizes; a root over 10,000
+changed
+leaves out of 100,000 with the trees dropped, from the page cache, 203 ms against
+201 ms resident, at the median. The row for 20,000 changed leaves is about right resident; dropped it costs
+little more while LMDB sits in the page cache. From a cold page cache the two single reads
+were measured since, on a store read without a node (docs/benchmarks.md section 4.13): an
+index entry or an object that reaches the device takes of the order of 140 to 320 microseconds on
+the internal solid-state disk of the machine measured (one median and the 99th percentiles
+of the cold reads), against 1 to 3 from the page cache.
+A root with the trees dropped was not measured from a cold page cache.
 
 A full node keeps committing at any of these; a validator slower than the round timeouts
 misses rounds and, past the downtime window, is jailed. The guard's log says which tier is
@@ -1124,9 +1217,11 @@ paging, so the operator knows whether to add memory or a faster disk.
    to a quarter under the benchmark's load. The matrix as it now stands
    (docs/benchmarks.md 4.13 has the table) is from after that, after the guard came to
    read the old generation (7) and after the dropped trees' chunk cache grew to 4,096
-   chunks (5.2): no cell reaches `critical`, the smallest state included, and throughput
-   paged is within a tenth of resident, the 192,000-account node committing 1,650 to
-   1,800 transfers a second at every limit from 0.8 times its resident heap to twice it.
+   chunks (5.2), with the index trees left in the store and a stored state opened against
+   half the limit: no cell reaches `critical`, the smallest state included, and throughput
+   paged is within 3.5% of resident at 192,000 accounts and 5 to 7% below it at 514,000, both
+   less than two runs of one cell differ by, the 192,000-account node committing 1,589 to
+   1,644 transfers a second in the matrix's single runs at every limit from 0.8 times its resident heap to twice it.
 
 ### 9.1 Opening a store too large for the heap
 
@@ -1139,7 +1234,7 @@ decision is made before anything is built (`openObjectDatabase` in `src/app/core
   sets) the node gives the application `heapRoom`: half the limit (`Node.OPEN_FILL`,
   0.5, what a rebuild is allowed) less the heap in use at that moment (`heapInUse`, the old
   generation's; 7). It was 0.7, the guard's warn line, at first. At the warn line a node with its index trees in the store opened its Merkle trees into a heap as large as its resident state and then ran 75 MiB under `warn`, visiting it 61 times in ten minutes; at half it opens paged and visits `warn` five times,
-  committing 1,523 transfers a second against 1,478 (docs/benchmarks.md section 4.13). Without a heap limit it
+  committing 1,610 transfers a second against 1,478 (docs/benchmarks.md section 4.13). Without a heap limit it
   gives none, and every tier is opened as before.
 - **The estimate.** The store keeps a counter per object type, an upper bound on how many
   objects the type holds. `estimateTiers` multiplies them by the figures
@@ -1171,26 +1266,28 @@ decision is made before anything is built (`openObjectDatabase` in `src/app/core
 The objects themselves are still loaded into the arena, outside the heap, unless
 `--arena` bounds it (3.4).
 
-Measured on the 191,896-account state (595 MiB of heap resident, 400 MiB to open
-resident), a single validator under a full feed of transfers, with `indexTrees: 'memory'`,
-the default at the time (docs/benchmarks.md 4.13):
+Measured on the 191,896-account state (596 MiB of heap resident, 258 MiB to open with
+the Merkle trees and the window in memory), a single validator under a full feed of
+transfers, as the node now stands, on its defaults (docs/benchmarks.md 4.13):
 
 | heap limit | of the resident heap | opened with | heap after opening | run | transfers/s | levels reached |
 |---|---:|---|---:|---:|---:|---|
-| 298 MiB | 0.5 | index trees; Merkle trees and history left in the store | 155 MiB | 120 s | 1,594 | `warn` four times |
-| 208 MiB | 0.35 | index trees; Merkle trees and history left in the store | 153 MiB | 60 s | 1,439 | `warn` three times |
-| 149 MiB | 0.25 | nothing; index trees, Merkle trees and history left in the store | 34 MiB | 60 s | 1,193 | `warn` twice |
+| 298 MiB | 0.5 | Merkle trees and history left in the store | 34 MiB | 120 s | 1,530 | `warn` five times |
+| 208 MiB | 0.35 | Merkle trees and history left in the store | 33 MiB | 60 s | 1,476 | `warn` four times |
+| 149 MiB | 0.25 | Merkle trees and history left in the store | 34 MiB | 60 s | 1,211 | `warn` twice, the second from 14 s to the end of the run |
 
-All three opened in 3.2 to 3.4 seconds and committed for the whole run, every
-block with the Merkle trees dropped, and none reached `pressure`. Every height of the
-window stayed provable from the
-records in all three (7.3), a proof at the oldest taking 13 ms after the run at 298 MiB.
-Opening with every tier left out took 34 MiB of heap (the old generation's use, as in the
-whole table). A quarter of the resident heap is enough under this load: the node opens
-with every tier in the store and commits 1,193 transfers a second, where the same run
+All three opened in 3.2 to 3.3 seconds and committed for the whole run, every
+block with the Merkle trees in the store, and none reached `pressure`. After each run proofs were
+made from the records at the newest height, fifty back and a hundred back (7.3; twenty at
+each, not verified by the benchmark), a proof at the oldest taking 9.3 to 19 ms; that every
+height stayed provable during the runs was not checked.
+With the index trees in the store all three open on the same 33 to 34 MiB of heap (the old
+generation's use, as in the
+whole table); the earlier build, which built the index trees when they fitted, opened the
+first two on about 155 MiB. A quarter of the resident heap is enough under this load: the
+node commits 1,211 transfers a second there, at `warn` for most of the run, where the same run
 reached `critical` once while the guard counted the young generation (7), and two thirds
-was the floor before stores were opened paged. The two that open with their index trees
-resident drop them at the first `warn`; while the index trees went only at `pressure`
+was the floor before stores were opened paged. While the index trees went only at `pressure`
 each of the three runs went there once, for 1,357, 1,197 and 1,171 transfers a second.
 Opening leaves garbage several times what
 it keeps, which the guard's first sample took for a full heap at 208 MiB (211 of 208,
@@ -1207,9 +1304,9 @@ it keeps, which the guard's first sample took for a full heap at 208 MiB (211 of
 | index trees | `indexTrees: 'store'` (the default): never built, read from LMDB, not counted as waiting to be rebuilt; `indexTrees: 'memory'`: resident when they fit at opening, dropped from `warn` on, rebuilt at `ok` after the wait below when they fit |
 | history window in memory | the configured retention (100 versions), or `retain.memoryVersions` of it when set; 2 from `warn` on (`Node.HISTORY_WHEN_PAGED`), let grow back at `ok` once both tiers are resident and what it held fits |
 | wait before a rebuild | the guard samples since something was last rebuilt or the node started, at least 10 (`Node.REBUILD_WINDOW`) and at most 600 (`Node.REBUILD_WAIT_MAX`), all of them at `ok` in a row; then a tier is rebuilt if it fits within 0.5 of the heap limit (`Node.REBUILD_FILL`) beside the highest of the last 10 samples |
-| room for opening a store | 0.7 of the heap limit less the heap in use (the old generation's), when the process runs under a heap limit |
+| room for opening a store | 0.5 of the heap limit (`Node.OPEN_FILL`) less the heap in use (the old generation's), when the process runs under a heap limit |
 | slab size | 256 KiB first, doubling to 16 MiB |
-| compaction | every slab with nothing live, without copying; then slabs with dead bytes over half their used bytes, copying at most what the root wrote (at least 16 MiB) |
+| compaction | every slab with nothing live, without copying; then slabs with dead bytes over half their used bytes, starting on a slab only while less than what the root wrote (at least 16 MiB) has been copied, and finishing that slab |
 | entry header | 10 bytes: type u16, instance u32, length u32 |
 | treeChunks | 4,096 dense tree chunks cached while the trees are dropped (at most 128 MiB, outside the heap) |
 | rebuild estimate | 210 bytes of heap per index entry; 2,000 per sparse tree leaf (1,000 kept, 1,000 thrown away) and 500 per node record of a retained version |
@@ -1332,3 +1429,17 @@ height, object proofs and name proofs as the resident application), runs blocks 
 leaves those records in the store to age out; the same store opened
 with room has its whole window back; and a tier asked for by name is opened resident
 whatever the room.
+
+For a write that fails and for the database's bounds, `test/review5-app.test.ts`: a store
+write that fails under `HistoryLog.append` leaves the log where the store is after
+`rollback()`, so the same entries are appended again; a failing store makes `commit()`
+throw where it is called, and the next `commit()` writes the block with its history; a
+snapshot that fails after the write rejects the promise with the block written; a block
+that fails after its session is committed stops the application until a restart, which
+has the state of the block before, while one that fails with its session open is undone
+and the application goes on; `getCommitted`, the committed counter and the committed
+bytes answer with the state of the last root after writes made outside a session; a
+database refuses more than 511 types and a type more than 16 authenticated indices; and
+a sparse tree keeps its own copy of a value it was given. `test/review5-node.test.ts`:
+nothing of a block is stored when the application's commit throws inside the shared
+transaction.

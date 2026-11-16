@@ -30,7 +30,8 @@ export class Writer {
 
   private ensure(n: number): void {
     if (this.len + n <= this.buf.length) return;
-    let cap = this.buf.length * 2;
+    // At least a few bytes: a writer made with no capacity has nothing to double.
+    let cap = Math.max(16, this.buf.length * 2);
     while (cap < this.len + n) cap *= 2;
     const next = new Uint8Array(cap);
     next.set(this.buf.subarray(0, this.len));

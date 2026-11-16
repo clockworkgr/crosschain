@@ -41,25 +41,38 @@ Principle: as simple as possible, borrowing proven ideas from other chains.
 - Interface is an in-process TypeScript interface, not a socket.
 
 ```ts
-interface Application {
-  initChain(genesis: Genesis): Promise<InitChainResult>                  // appHash, optional validator set
-  checkTx(tx: Uint8Array): Promise<CheckTxResult>                         // mempool admission
-  finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult>  // appHash, tx results, validator updates
-  commit(): Promise<void>                                                 // persist
-  info(): Promise<{ lastHeight: bigint; lastAppHash: Uint8Array }>        // crash recovery handshake
+export interface Application {
+  initChain(genesis: Genesis): Promise<InitChainResult>;
+  checkTx(tx: Uint8Array, opts?: CheckTxOptions): Promise<CheckTxResult>;
+  finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult>;
+  /**
+   * Persist the block just finalized. An application that keeps its state in the engine's store environment does
+   * its writes before its first await, so that they join the transaction the engine saves the block in (executor.ts).
+   */
+  commit(): Promise<void>;
+  info(): Promise<{ lastHeight: bigint; lastAppHash: Uint8Array }>;
 }
 ```
 
-Every method is asynchronous (`src/app/types.ts`). `FinalizeBlockRequest` is what the
+Every method is asynchronous (`src/app/types.ts`). `checkTx` is the mempool's admission
+check, `finalizeBlock` returns the app hash, the transaction results and the validator
+updates, and `info` is the crash recovery handshake. `FinalizeBlockRequest` is what the
 executor extracts from a decided block: height, time, the transactions, the proposer
 address, the addresses whose precommits are in `lastCommit`, and the misbehaviour the
-block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-empty
+block's evidence proves. `checkTx` takes an optional `admit` function (`CheckTxOptions`),
+which the mempool passes: the application asks it after its last wait, just before the
+transaction would go into its pending state, and a transaction the pool no longer takes
+(paused, or filled meanwhile) is refused and leaves nothing behind. A transaction the pool lets
+through holds a place in it from that answer on (`Mempool.reserved`, counted with the pooled
+transactions against the limit and given back on every way out of the check), so of several
+transactions checked at once no more are let through and applied than the pool has room for. `initChain` returns `{ appHash, validators? }`; a non-empty
 `validators` replaces the genesis list (STAKING.md section 2.3).
 
 - **Execution model:** deferred. Header of block N carries the app hash from executing
   block N-1.
 - **Mempool:** consensus receives a tx, calls CheckTx, and if valid stores it and floods
-  it to peers. Seen-cache prevents re-gossip loops. After every commit, all pending txs
+  it to peers. Seen-cache prevents re-gossip loops; a transaction still in the pool counts
+  as seen whether or not the cache still holds it. After every commit, all pending txs
   are re-checked and failures evicted. The app keeps a scratch state copy for CheckTx.
 - **Block proposal:** proposer reaps txs from mempool (FIFO, bounded by max bytes) and
   sends the whole block in one proposal message. Block parts only if blocks grow large.
@@ -97,7 +110,11 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   connected and disconnected, connect failed, rejected, handshake failed), success and
   failure counts. Address request / address reply messages exchange entries. (The
   implementation keeps last seen, the success and failure counts and the ban state of
-  an address, at most 4096 entries; the outcome enumeration was not needed.)
+  an address, at most 4096 entries; the outcome enumeration was not needed. One
+  successful outbound dial counts one success. The file is written beside itself and
+  renamed into place, and one that cannot be read is taken as empty, the node starting
+  from its seeds. One address reply is taken for each address request the node sent
+  that peer; any other is ignored.)
 - **Connection management:**
   - desired outbound peers and maximum inbound peers (defaults 8 and 32; Graphene
     uses 20 / 200). Handshakes in progress count toward the inbound limit.
@@ -125,7 +142,12 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   checked against the local clock alone.
 - **Gossip, two modes:**
   - **Inventory (announce hash, peer fetches):** transactions. Seen-cache per item type.
-    "Item not available" as the negative reply. Committed blocks are announced by a
+    "Item not available" as the negative reply. An item is taken only from a peer it
+    was fetched from, as the kind it was fetched as and within a minute of its first fetch (after
+    10 s without an answer it may be fetched from another peer as well, four at most); any other
+    is dropped unread, without a score. Fetches are remembered by kind and hash, 20,000 at most and
+    2,048 for one peer, which is then asked nothing more until answers or the minute free places,
+    so peers that announce and never answer cannot make a node remember without limit. Committed blocks are announced by a
     status message (height) and pulled through block sync.
   - **Direct push (no round trip):** consensus proposals and votes. Dedup by
     (height, round, validator, vote type). Inventory would add a round trip to each of
@@ -145,7 +167,13 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
 - **Firewall / reachability check:** optional. A node may ask a peer to connect back to
   its advertised endpoint to learn whether it is reachable. Defer.
 - **Misbehaviour:** invalid message means disconnect and a failure mark in the peer db.
-  Scoring and bans came with stage three (section 9).
+  Scoring and bans came with stage three (section 9). A ban names the peer's node id
+  and, for a peer this node dialed, the address as it was dialed (`Peer.dialedAddr`),
+  which is the record the peer database holds and the one the connect loop would pick
+  again; an inbound peer's address is not known to be its own, so only its id is
+  banned. A peer's advertised address and the name it was dialed by are separate
+  records, and when two nodes dial each other and the inbound connection survives, the
+  dialed address is dialed again, with the usual backoff.
 
 ## 4. Implementation
 
@@ -154,11 +182,12 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
 - **Concurrency:** single-threaded event loop. Consensus state machine has no locks.
   Round timeouts are setTimeout.
 - **Worker pool, verification only:** Node worker_threads, size = cpu count - 1. A job
-  is a batch of (sig, msg, pubkey, context) and returns booleans. The main thread never
-  calls verify directly outside tests. A node given no verifier makes a pool of its
+  is a batch of (sig, msg, pubkey, context) and returns booleans. In a node the main
+  thread never calls verify directly; the tests and the CLI's light client (`account`,
+  `verify-tx`, `light`) verify inline, on the main thread. A node given no verifier makes a pool of its
   own and closes it when it stops; several nodes in one process share one and pass
   it. Signing stays on the main thread: once per
-  consensus step, ~2 ms under ML-DSA-44 and a tenth of that under secp256k1, and it
+  consensus step, ~3 ms under ML-DSA-44 and a twelfth of that under secp256k1, and it
   keeps the persist-then-broadcast order of the double-sign guard trivial.
 - **Integers:** heights, times, amounts and voting power are BigInt. Plain numbers are
   doubles and carry only bounded integer fields whose encoding is u8, u16 or u32:
@@ -180,26 +209,55 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
     partitions. Used to run many validators in one process for tests and demos.
 - **Storage:** one key-value interface (get, range, atomic write, and a transaction
   spanning the stores of one environment), two implementations:
-  a B+ tree in memory for tests and simulations, and LMDB (lmdb-js) on disk. LMDB is
+  a B+ tree in memory for tests and simulations, and LMDB (lmdb-js) on disk. Both apply
+  the puts and deletes of one write in the order given, so a key put and then deleted in
+  one write ends deleted in either. LMDB is
   memory mapped, so reads are synchronous and the whole persistence path stays
   synchronous like the state machine it serves, and a transaction is durable before
   `transactionSync` returns. A data directory is claimed with a `LOCK` file holding
-  the owner's pid, so a second node on it is refused; the CLI reads state through the
+  the owner's pid, so a second node started on it while the owner runs is refused. The
+  pid is written to a private file, `LOCK.<pid>.<8 hex>`, which is hard-linked to `LOCK`
+  and then unlinked. The link fails when a `LOCK` is there, so of two nodes started at
+  the same moment one makes it and the other reads its pid, and `LOCK` never exists
+  without a pid in it: a claim created empty and filled afterwards could be read as
+  stale in between, and both would start. A file left by a process that no longer runs
+  is removed and the link tried again. The removal is done only by a process that holds a second
+  exclusively created file, `LOCK.takeover`, and only after it has read the claim again
+  and found it still stale, so of two processes that find the same stale file at the
+  same instant neither can remove the other's new claim and one gets the directory. A
+  process that finds `LOCK.takeover` there waits 20 ms and tries again. Fifty attempts
+  are made in all, whichever way each ended, about a second when that file is in the
+  way, and then the start fails naming the file. Releasing removes `LOCK` only if it
+  still holds this process's pid. Two nodes in one process are told apart by the directory's
+  real path, however it was spelled or linked to. The claim is released last when a node
+  stops, after the network has stopped, the block being applied has finished its writes
+  and the store is closed, and a node that fails while it is created gives back what it
+  opened, the claim included. The claim is a file and not an operating system lock,
+  which leaves these things: it trusts the pid, so a pid given since to an unrelated
+  process makes a stale claim look live; a process killed in the few file operations
+  for which it holds `LOCK.takeover` leaves that file behind, to be removed by hand; a
+  process killed between writing its private file and unlinking it leaves that file,
+  which is harmless and can be deleted; and the directory must be on a filesystem that
+  has hard links. The CLI reads state through the
   RPC (section 9), never by opening the environment. One environment per node holds
   a `chain` store (blocks, commits and transaction results by height, heights by
   block hash, the transaction index by hash and height, validator sets by hash and by the
   height they sign, the lowest retained height, the headers a state-synced node
   keeps alone below its lowest block as far back as evidence may reach, chain
-  state) and an `app` store (every object by id, counters, the version history of
+  state) and an `app` store (every object by id, counters, the secondary index
+  entries, the Merkle trees' chunks and nodes, the version history of
   the provable window, account history, snapshot manifests and chunks, height and
-  app hash). Validator sets are
+  app hash; section 6). Validator sets are
   stored by hash because they rarely change and are 1.3 KB per validator under
   ML-DSA-44 (50 B under secp256k1); a header
   names its set by hash, so the set that signed any past height is two lookups away,
   which is what evidence verification needs. They are also stored by height, with
-  proposer priorities, for a node joining by state sync (section 9). The double-sign
+  proposer priorities, for a node joining by state sync (section 9); that record is
+  deleted with the block of its height when the block is pruned, while a set by hash is
+  kept for good, one record per distinct set. The double-sign
   guard (last signed height/round/step/bytes/signature) is its own file, written
-  temp-fsync-rename before any vote is broadcast. The test app keeps a JSON snapshot.
+  temp-fsync-rename before any vote is broadcast. The test app keeps a JSON snapshot of
+  its entries and its validator set.
 - **Persistence order on commit:** app.finalizeBlock (in memory: begin-block steps,
   signature verification, the transactions, end-block, root), then save block +
   commit + results + the set for height+2 + new chain state (one batch of the chain
@@ -208,19 +266,31 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   node created the application itself, so that both stores are in its one environment,
   the executor runs the two inside a single store transaction (`ExecutorDeps.transaction`,
   `src/node/executor.ts`): the block and the state it produced land together or not at
-  all, and the device is flushed once per block. The flush is what a commit mostly costs
+  all, and the device is flushed once per block. That holds for a failure of the
+  application's write too. `CoreApp.commit` is not an async function: a store write that
+  fails throws where `commit` is called, inside the transaction, which is aborted with
+  the block, the validator set and the chain state the executor had written in it, and
+  `applyBlock` rejects with the chain state as it was before the block. (An application
+  that has a synchronous `commitSync()` is committed through that instead, to the same
+  effect.) The application's memory is then a block ahead of the store, and applying the
+  block again makes it refuse everything (section 7), so the node needs a restart, which
+  finds the chain and the application at the same height. Only what an application does
+  after an await, or a snapshot `CoreApp` takes after its write, fails by rejecting the
+  promise: the chain's writes have landed by then, and the block's own if it was the
+  snapshot that failed. The flush is what a commit mostly costs
   and where its variance is: the application's commit of a 500-transfer block at 192,000
   accounts measured 17 to 26 ms of LMDB's own work and 40 to 120 ms with the flush
   (`F_FULLFSYNC` on macOS), and a block used to pay for two. (The 17 to 26 ms
   were measured with the account history keyed by account, most of the growth between the
   two figures; it is now a log appended to in block order, section 9, and the same commit
-  measures 15 to 19 ms.) `Application.commit` is
+  measured 15 to 19 ms in the same ablation. With its flush it takes 46 to 58 ms in the
+  mode table of docs/benchmarks.md section 4.13.) `Application.commit` is
   asynchronous, and what it writes before its first await is what joins the transaction;
   `CoreApp` writes everything there. An application handed to the node (`cfg.app`) keeps
   its state elsewhere and commits after the chain store has, in a transaction of its own.
   So on startup the node still asks the app its height and replays any blocks the app
   missed, checking the app hash matches: that covers the application that commits
-  separately, and a commit that failed after the chain's writes landed.
+  separately.
 - **Memory guard and collection scheduling** (`src/node/memory.ts`): the state lives
   in the V8 heap, so the ceiling that matters is the heap limit, past which the process
   aborts with no chance to stop cleanly, and V8's default is a few gigabytes whatever
@@ -233,7 +303,8 @@ block's evidence proves. `initChain` returns `{ appHash, validators? }`; a non-e
   consensus and block sync keep running on whatever is pooled, since a validator that
   stopped voting would be jailed; `critical` at 95%, on which the CLI stops the node
   cleanly and exits with code 3, so a supervisor restarts it with a larger limit instead
-  of finding a dead process. The mempool is not paused under pressure. Its limit follows
+  of finding a dead process (the heap is sampled, so an allocation that fills what is
+  left between two samples still aborts the process). The mempool is not paused under pressure. Its limit follows
   the level instead (`Node.MEMPOOL_SHARE`, `Mempool.setLimit`): the pool admits up to its
   whole limit at `ok`, half at `warn`, a tenth at `pressure` and nothing at `critical`
   (10,000, 5,000, 1,000 and 0 transactions). Lowering the limit evicts nothing: what is
@@ -268,7 +339,7 @@ The guard's dials, as built (`src/node/node.ts`, `onMemoryLevel` and `rebuildWha
 | `ok` | under 70% | the cache of decoded objects unbounded; dropped index trees and Merkle trees rebuilt, each only when it fits (below), then the history window let grow back; the mempool at its whole limit |
 | `warn` | 70% | the cache capped at 100,000 decoded objects, the excess evicted at once; the index trees dropped; the history window in memory cut to the last two versions; a major collection started; the mempool admits up to half its limit |
 | `pressure` | 85% | the cache capped at 10,000; the Merkle trees dropped as well; the mempool admits up to a tenth of its limit; costly RPC methods refused |
-| `critical` | 95% | clean stop, the tiers kept dropped and the window trimmed while the node stops, the mempool paused; reached only when one block's working set does not fit |
+| `critical` | 95% | clean stop, the tiers kept dropped and the window trimmed while the node stops, the mempool paused. The guard compares a sample of the heap with the threshold and does not know what filled it; one sample can go from `ok` straight to `critical` |
 
 What the table says of the index trees holds for a node with `indexTrees: 'memory'`. By
 default (`'store'`, below) a node never builds them: there is nothing of theirs to drop at
@@ -278,7 +349,8 @@ window are waited for and rebuilt. The runs described next were made with
 
 Rebuilding is conditional because dropping takes a large state from above the pressure
 line to well below the ok line in one go (at 192,000 accounts the heap gave back 130 MiB
-for the index trees and 193 MiB for the Merkle trees), and a node that rebuilt everything
+for the index trees and 193 MiB for the Merkle trees at the time, 181 and 223 MiB in the
+current mode table of docs/benchmarks.md section 4.13), and a node that rebuilt everything
 at the first `ok` sample took the heap straight back over the pressure line: measured with
 the literal rule, it changed level 30 times in 40 seconds, rebuilding each time. So after
 a drop the node waits, and then rebuilds a tier only when its estimated heap fits within
@@ -292,8 +364,8 @@ of its rate. So at each level other than `ok` the node sets the wait
 (`rebuildAfter`) to the number of guard samples since something was last rebuilt, or
 since it started: at least ten and at most 600 (`Node.REBUILD_WAIT_MAX`, ten minutes at
 the default interval). Nothing is rebuilt until the level has been `ok` for that many
-samples in a row. The same run with the wait rebuilt the index trees once, 30 seconds
-after a drop at 34 s, and after the second drop waited as long as it had run since,
+samples in a row. The same run with the wait rebuilt the index trees once, 29 seconds
+after a drop at 32 s, and after the second drop waited as long as it had run since,
 found no room and stayed paged to the end.
 The room was taken to the warn line at first; with the guard reading the old generation, a
 node whose index trees just fitted under that line rebuilt them and then spent minutes
@@ -301,7 +373,7 @@ between `warn` and `pressure`, collections taking 7 to 12% of its time against 4
 with the trees dropped, and committed about a fifth less (1,050 to 1,280 transfers a
 second against 1,330 to 1,560). The same measurement moved the index trees and the
 history window from `pressure` to `warn`: a loaded node commits more with its index trees
-in the store than in its heap (a block of transfers looks up no index), and it used to
+in the store than in its heap (a transfer looks its two balances up by an index, which the store answers, and no index tree is then kept up in the heap), and it used to
 reach that state only when the heap arrived at the pressure line, minutes into a full
 load. The window goes with them for the heap it gives back; how much of it is in memory
 does not change what the node commits. The Merkle trees, which cost a
@@ -320,7 +392,8 @@ fill, and a process aborts when the old generation is full; with `--heap 744` th
 lines taken from 936 MiB put `pressure` past the abort, and a node under load died without
 shedding anything, so `memoryStats()` takes the limit from `--max-old-space-size` when the
 process was started with it, read as Node reads it: `NODE_OPTIONS` (with its quoting) first,
-then `node`'s own arguments, the last one winning, in either spelling V8 takes. The use
+then `node`'s own arguments, the last one winning, in either spelling V8 takes, and a size
+of 0 read as no flag, which is what it means to V8. The use
 it is compared with is the old generation's too. V8's `used_heap_size` includes the young
 generation, which between two minor collections holds up to a semi-space of garbage
 (64 MiB as `start` runs the node) that never reaches the old generation; counted against
@@ -362,30 +435,38 @@ all of them until memory fills. The store keeps the whole window either way and 
 for the older heights from its history records. The setting is for a node with a large
 heap, which never reaches `warn` and would otherwise keep the whole window in its heap.
 Measured at 514,008 accounts under twice the resident heap, it buys memory and pause
-length, about 500 MiB less heap (a peak of 1,630 against 2,140 MiB) and a longest
-collection pause of 190 to 200 ms against 290 to 300 ms, and costs proofs at past
-heights 12 to 28 ms instead of under 0.2 ms. Throughput is the same either way (1,255
-to 1,369 transfers a second with 100 versions in memory or with two). When the guard
+length, about 500 to 700 MiB less heap (1,057 to 1,141 MiB at the highest report against
+1,603 to 1,767) and a longest
+collection pause of 127 to 178 ms against 202 to 237 ms, and costs proofs at past
+heights 13 to 33 ms instead of a small fraction of a millisecond. Throughput is not shown
+to depend on it (1,246
+to 1,402 transfers a second with 100 versions in memory or with two). When the guard
 has trimmed the window and widens it again, it widens it to this setting.
 
 Whether the index trees are in memory at all is a setting too. `indexTrees` in the node's
 config is `'store'` by default: the node never builds them, index reads go to LMDB, and
 the guard does not count them among what waits to be rebuilt. With `'memory'` the trees
 are kept in the heap while they fit, dropped from `warn` and rebuilt after it, as above;
-that was the default until the measurements below, and it is for a node that mostly
+that was the default until measurements of the kind below, and it is for a node that mostly
 serves scans. Measured at 191,896 accounts under 2.5 times the resident
 heap for ten minutes, the node with `'store'` opens with 258 MiB of heap in use against 398 MiB, a
-third less, commits 1,552 transfers a second against 1,485, which is within what two
-runs differ by (4.5%), and reaches `warn` once against twice, with nothing to rebuild
+third less, commits 1,508 transfers a second against 1,522, which is within 1% (the pair
+of runs on the earlier build, which decided the default, read 1,552 against 1,485), and
+reaches `warn` once against twice, with nothing to rebuild
 but the window (docs/benchmarks.md section 4.13). What it gives up is index reads from
 memory, measured with 200 reads a second of each kind beside the load: a lookup by key
-takes 5 microseconds at the median either way, a page of twenty accounts in name order
-33 microseconds from the store against 17 from memory, and the three runs with
-`'store'` commit 8% more than the three with `'memory'` (1,503 against 1,395 transfers a second).
+takes 4 to 7 microseconds at the median either way, a page of twenty accounts in name order
+31 to 34 microseconds from the store against 17 to 18 from memory, with a longer tail (a
+99th percentile of 569 and 1,588 microseconds against 43 and 76), and the three runs with
+`'store'` commit 13% more than the three with `'memory'` (1,559 against 1,385 transfers a second).
 A store none of which was in the page cache when the node opened it reads the same: the
-node reads its whole store when it opens, so the open pays for the cold cache (3,965 ms
-against 3,355 to 3,545 ms) and index reads are warm from the first. A store larger than
-the machine's memory, whose index reads would go to the device, was not measured.
+node reads its whole store when it opens, so it is the open that meets the cold cache
+(3,661 ms, inside the range of the warm opens, 3,359 to 4,179 ms; 3,965 ms against 3,355
+to 3,545 ms on the earlier build) and index reads are warm from the first. What a read costs when it does go to the device
+was measured on a store of 576 MiB (514,008 accounts) read cold without a node: of the order of
+140 to 320 microseconds for a lookup that missed (one median and the 99th percentiles of
+the cold reads) against 1 to 3 from the page cache (docs/benchmarks.md section
+4.13). A node under load on a machine whose memory the store exceeds was not measured.
 Proofs and the Merkle trees are unaffected. `ObjectDatabase` and `CoreApp` used without
 a node still build the trees unless told otherwise.
 
@@ -394,7 +475,7 @@ outside V8's heap, which the guard does not see, so the arena is bounded by a by
 the operator sets (`start --arena <MiB>`; section 6), not by a level. And a tier that does
 not fit the heap would take it past the limit while the store is opened, before the guard's
 first sample, so under a heap limit the node tells the application how much room there is
-(`heapRoom`: 0.7 of the limit less the old generation's heap in use) and `openObjectDatabase` estimates
+(`heapRoom`: half the limit, `Node.OPEN_FILL`, less the old generation's heap in use) and `openObjectDatabase` estimates
 each tier from the type counters in the store with the figures `rebuildEstimate()` uses:
 the index trees are opened dropped if they do not fit, then the Merkle trees with the room
 left. If either was left out the history window is not read back either, since reading it
@@ -450,7 +531,7 @@ left out (`paged`), and `rebuildWhatFits` rebuilds the tiers later if room appea
 - **Speed:** measured by `bench/crypto.bench.ts` (`docs/benchmarks.md` section 4.1).
   Verification in pure JavaScript is close between the schemes, 0.9 ms for ML-DSA-44
   and 0.7 ms for secp256k1 on one thread, so verification goes through the worker
-  pool under either. Signing is not close, 2 ms against 0.23 ms, nor are sizes.
+  pool under either. Signing is not close, 2.85 ms against 0.23 ms, nor are sizes.
 - **API:**
   ```ts
   const keys = keyPairFromSeed(seed32, scheme)           // tagged publicKey and secretKey
@@ -480,7 +561,8 @@ left out (`paged`), and `rebuildWhatFits` rebuilds the tiers later if room appea
   FinalizeBlock consults the cache and verifies only what it has not seen, in one
   batch. The cached fact is pure crypto and never goes stale; authority thresholds,
   which depend on state, are rechecked every time. The cache holds 20 000 bodies and
-  evicts the oldest.
+  at most 40,000 signatures across them, four per signer and body, and evicts the
+  oldest.
 - **Consequences accepted:**
   - a simple transfer tx is 2,510 bytes under ML-DSA-44, nearly all of it the one
     signature, and 154 bytes under secp256k1.
@@ -503,7 +585,9 @@ ids make adding one unusually easy.
 - **Objects and ids.** Every piece of consensus state is an object with a type (16
   bits) and an instance number (48 bits in the id; the database refuses instances
   beyond 2^32 − 2, so an instance always indexes a dense array), packed into one u64
-  id and written `type.n`. Instances come from a per-type counter, which is itself
+  id and written `type.n`. A database takes at most 511 object types (each type's tree
+  and the tree over the types hold one of the 512 places in the chunk cache dropped
+  trees share) and refuses more when it is made. Instances come from a per-type counter, which is itself
   consensus state, and are never reused. Objects are immutable records, frozen
   through every nested object and array (a byte array cannot be frozen in
   JavaScript and is the one thing a caller must not write into); a modification
@@ -523,8 +607,9 @@ ids make adding one unusually easy.
   tens of nanoseconds; under pressure the memory guard (section 4) evicts tier by tier,
   the decoded objects, then the index trees, then the Merkle trees, and reads fall
   through to the store, whose memory map the operating system pages in and out. What
-  bounds the node is then the working set of one block plus the cache it is granted, not
-  the size of the state. Encodings are binary and compact in any case.
+  bounds the node is then the working set of one block plus the cache it is granted, and
+  each type's table by instance (next item), which is not paged: 13 bytes for every
+  instance number the type has reached, before the doubling it grows by. Encodings are binary and compact in any case.
 - **Indices.** The primary index of a type is a table by instance: slot i describes
   instance i, no hashing at all (what a slot holds is the next item). A secondary index is a key encoder plus one ordered byte map. Keys are
   byte strings whose lexicographic order is the scan order: big-endian integers, strings
@@ -549,7 +634,9 @@ ids make adding one unusually easy.
   one is counted dead; after a root, every slab with nothing live is released without
   copying, and a slab more than half dead is compacted, its live entries copied into the
   current slab (the header names the owner, which says whether an entry is still current)
-  and its buffer released, copying at most what the root's block wrote (at least 16 MiB),
+  and its buffer released; a slab is started on only while less than what the root's block
+  wrote (at least 16 MiB) has been copied, and is finished once started, so the copying
+  can pass that figure by one slab's live bytes,
   which keeps reclaiming level with the writes. A released slab's number is reused with a
   new generation, so references stay exact. Over
   the arena sits a hot cache of decoded, frozen objects per type, under one budget all
@@ -576,9 +663,10 @@ ids make adding one unusually easy.
   watches. History keeps past values as bytes, decoded only when a past version
   is read, and proofs, snapshots and export take their bytes from the arena or the
   history without a decode and re-encode. Measured at 191,896 accounts under secp256k1
-  (`docs/benchmarks.md` section 4.10): resident, about 6% more memory and 5 to 15% less
+  on the build that introduced it (`docs/benchmarks.md` section 4.10): resident, about 6%
+  more memory and 5 to 15% less
   speed; capped at 100,000 objects, 17% less heap with an empty cache and a block of
-  random transfers twice as slow. The budget it revealed: decoded objects are about a
+  random transfers twice as slow. The budget it revealed: decoded objects were about a
   sixth of the heap, 0.55 KB of the 3.2 KB per account, and the secondary indices, the
   name tree and the Merkle trees the other 2.65 KB, which is what the two tiers below
   put on disk.
@@ -607,15 +695,21 @@ ids make adding one unusually easy.
   store (tests, a snapshot being imported) builds an in-memory one when it first drops a
   tree and lets it go when every tree is resident again; `INDEX_TREES=0` starts every
   database in the tests dropped. Measured (`docs/benchmarks.md` section 4.11): the
-  entries cost a 500-transfer block's commit about 0.7 ms, 7%, and 58 MiB of LMDB at
+  entries cost a 500-transfer block's commit about 0.7 ms, 7%, when they were added, and
+  58 MiB of LMDB at
   192,000 accounts; a lookup through LMDB costs about what a resident one does and a scan
-  four to six times as much, still under a microsecond an entry.
+  five to nine times as much, still under a microsecond an entry.
 - **Undo sessions.** Nested, Graphene style, with two uses: one session per transaction,
   undone on failure, and one pending session holding the mempool's speculative state,
-  undone before every block and rebuilt by the engine's post-commit recheck. There is no
-  block-level undo because blocks are final. The outermost open session doubles as the
-  committed view: whatever it recorded as an old value is what was committed, which is
-  what queries and proofs return while the pending session is open.
+  undone before every block and rebuilt by the engine's post-commit recheck. A block
+  also runs inside one session, committed just before its root is taken and undone
+  only if applying the block throws (a verifier gone away), which leaves the database
+  as the previous block left it; a block that has been applied is final and is never
+  undone. The committed view is the state as of the last root: the first write to an
+  object after a root keeps the value it had at that root, for the next root to compare
+  with, and `getCommitted`, the committed counter and the committed bytes read that
+  first, whatever was written since, inside a session or outside one. That
+  is what queries and proofs return while the pending session is open.
 - **Merkle root, two dense trees.** Per type, a complete binary tree over instance
   numbers, padded on the right with the empty hash, so the shape depends only on the
   counter and the root climbs one level each time the counter crosses a power of two.
@@ -708,13 +802,16 @@ ids make adding one unusually easy.
   above names as its last block hash, and no commit is needed, since the trusted
   header stands for the whole chain before it; the walk is bounded (100 000 headers)
   and the trusted header stays put. The provider interface (signed headers, headers
-  alone and validator sets by hash) is what an RPC client would implement; the one
-  here reads a node in the same process.
+  alone and validator sets by hash) has two implementations: one reads a node in the
+  same process (`src/light/provider.ts`), the other a node's RPC
+  (`src/light/rpc-provider.ts`), which is what the CLI uses.
 - **Authenticated indices.** A unique index can be marked authenticated; the account
   name and asset symbol indices are. Such an index also keeps a compacted sparse
   Merkle tree (`src/db/smt.ts`, the Jellyfish shape) over sha256 of its keys, and the
   roots of a type's authenticated indices go into its type leaf after the counter and
-  type root. A key proof is the sparse tree's path (membership, an empty slot, or
+  type root. A type may have at most 16 of them (`MAX_AUTHENTICATED_INDICES`), which is
+  what the decoders of proofs and snapshot manifests take; a type defined with more is
+  refused. A key proof is the sparse tree's path (membership, an empty slot, or
   another leaf that owns the subtree, which proves absence) plus the same type leg,
   so "no account named alice" is provable. The B+ tree is not hashed on purpose: its
   root would depend on node layout, which depends on the order of writes, and a node
@@ -753,10 +850,12 @@ ids make adding one unusually easy.
   history records, from the window in memory or, for a version it no longer holds, from
   the store ("Past versions from the store" above). `TREES=0` starts every
   database in the tests dropped. Measured (`docs/benchmarks.md` section 4.12): writing
-  the chunks costs nothing measurable for a block whose writes are local and a fifth of
-  the commit (about 12 MiB of chunks) for a block scattered over 192,000 accounts; with
-  the trees dropped a root over 1,000 modifications takes 54 ms against 20 (median 24),
-  an object proof a fifth more and a name proof four times as much; the genesis store
+  the chunks costs nothing measurable for a block whose writes are local and was a fifth of
+  the commit (about 12 MiB of chunks) for a block scattered over 192,000 accounts when the
+  chunks were first written; with
+  the trees dropped a root over 1,000 modifications takes 54 ms against 27 (29 against 20
+  at the median),
+  an object proof a third more and a name proof five times as much; the genesis store
   grew from 92.7 to 213 MiB.
 - **Deferred execution caveat.** The state after block N is committed to by the app
   hash in header N+1, so a proof about height N is checked against header N+1 and
@@ -781,7 +880,7 @@ ids make adding one unusually easy.
   objects`, `the stored entry for object <id> is missing`). `checkLeaves: false` and
   `checkIndexEntries: false` skip the checks and `fromTrees: false` recomputes the trees
   from the objects, the old path: at 192,000 accounts the restart went from 8.4 to 5.2 s
-  with the trees on disk, the full checks took it to 6.5 s (STATE-PAGING.md 5.3), and the past versions read from the history records to 2.9 s. A store written before
+  with the trees on disk, the full checks took it to 6.5 s (STATE-PAGING.md 5.3), and the past versions read from the history records to 2.85 s. A store written before
   the entries or the chunks existed has no `'i'` or `'t'` prefix; opening it computes
   what is missing from the objects and writes it once. Then the engine replays the
   blocks after the stored height through the existing info() handshake. Nothing
@@ -809,15 +908,29 @@ The first real application on the object database, BitShares style.
 | recentTx | 6 | byTxId (unique), byExpiration | a tx id kept until it expires |
 
 - **Accounts** are named. Names are 3 to 63 characters of lowercase letters, digits and
-  hyphens in dot-separated segments that start with a letter. An account has an owner
+  hyphens in dot-separated segments that start with a letter and do not end with a
+  hyphen. An account has an owner
   authority and an active authority. An authority is a threshold plus weighted members,
   each a public key or another account; it is satisfied when the weights of the signing
   keys, plus those of member accounts whose active authority is satisfied, reach the
-  threshold. Recursion stops at depth 2. Owner can change everything including itself;
+  threshold. Recursion stops at depth 2. An authority set by accountCreate or
+  accountUpdate must be one that signatures could satisfy as the state stands: when its
+  own keys do not reach the threshold, every key reachable through its member accounts
+  to that depth is collected and the authority must be satisfied with all of them
+  signing (an update is judged against the account as the update leaves it), else the
+  operation fails with `authority can never be satisfied: its member accounts do not
+  lead to keys enough for the threshold`. So an account cannot be given an authority
+  that names only itself. A transaction carries at most 16 signatures, so when more
+  than 16 keys count toward the authority the cheapest way to its threshold, a key
+  costing one signature and a member account what its active authority costs, must
+  fit in 16, else the operation fails with `authority can never be satisfied: it needs
+  more than the 16 signatures a transaction can carry`. That count takes a key shared
+  by two member accounts once for each, so it errs toward refusal. Owner can change everything including itself;
   active everything else; an owner signature also satisfies an active requirement. A
   new account is registered by an existing one, the registrar, which pays the fee.
   Genesis accounts register themselves; the first one, `3.0`, issues the core asset.
-- **Assets** have a symbol (3 to 16 uppercase letters and digits), a precision, an
+- **Assets** have a symbol (3 to 16 uppercase letters and digits, in dot-separated segments that
+  start with a letter), a precision, an
   issuer, and a maximum supply of at most 10^15, which keeps every sum of balances
   inside a u64. Only the issuer can issue, up to the maximum. The core asset is created
   at genesis as `4.0` with the genesis balances and community pool as its supply; it
@@ -869,17 +982,28 @@ The first real application on the object database, BitShares style.
   transaction in order, resolve the signers' keys against the state as it stands at
   that point, check the thresholds and apply in its own session; run end-block (the
   proposal tally and the active set); update `dynamic`; commit the block session and
-  compute the root for the height; reopen the pending session. If anything throws on
-  the way (a verifier gone away), the block session is undone and the database is as
-  the previous block left it. The commit that follows writes the changed objects to
+  compute the root for the height; reopen the pending session. If anything throws
+  before the block session is committed (a verifier gone away), the session is undone
+  and the database is as the previous block left it. A failure while the root is
+  computed comes after that commit and can undo nothing: the block's changes are in
+  memory while the height and the app hash have not advanced. The application then marks
+  itself failed: `finalizeBlock` throws, every later `finalizeBlock` throws and every
+  `checkTx` answers not ok with the same message (`the application failed while taking
+  the root of block N (cause) and holds changes it cannot undo: restart the node, the
+  store has the state of the block before`), and `commit` writes nothing. Nothing of the
+  block was persisted, so a restart recovers. After a block that succeeded, the commit that follows writes the changed objects to
   the store. CheckTx does the same for one transaction inside the pending session: a
   transaction that passes stays applied there, so transactions queued behind each
   other are checked in sequence against each other's effects; a check that overlaps a
   block in progress waits for the block and is then checked against the new state,
   and the pending session is undone before every block.
 - **Concurrency:** signature verification is the only await. Everything that touches
-  the database is synchronous and runs after it, so sessions nest cleanly even though
-  checkTx calls overlap each other and finalizeBlock.
+  the database is synchronous. In checkTx it runs after the await. In finalizeBlock
+  the block session, the pruning and the begin-block steps come before the batch
+  verification, and each transaction is applied after its own signatures resolve; a
+  checkTx that overlaps a block waits for the block to finish before it touches the
+  database, so sessions nest cleanly even though checkTx calls overlap each other and
+  finalizeBlock.
 - **Validators** come from the application: the active set it computes at the end of each
   block is handed to the engine as updates (section 8 and STAKING.md).
 - **Genesis** (`appState`, JSON): the core asset's symbol, precision and max supply; the
@@ -923,14 +1047,34 @@ has an RPC provider. `src/app/core/snapshot.ts` exports chunks with range proofs
 every K blocks; `src/sync/statesync.ts` joins from a trusted header through the
 light client, verifies every chunk, and `src/sync/blocksync.ts` requests windows
 of blocks from several peers, backfills older blocks by hash chain, and serves
-both. Evidence travels by inventory, and the pool lets go of it, pending or
+both. State sync takes only a snapshot at or above the trust height less one (the
+header after the snapshot fixes its app hash, and trust only moves forward to it);
+when none offered qualifies it logs a warning and the node replays from genesis, as
+when none is offered, and a manifest that does not decode costs its sender 50 points
+and the next source is asked. A block sync response must hold at most the blocks
+asked for, each at the height its place in the run gives it and with a commit that
+names its hash; otherwise none of it is used and the peer is charged 50 points, as
+for a block that fails verification. A sync that was stopped applies nothing more,
+and blocks buffered when no peer is ahead any longer are dropped. Evidence travels
+by inventory. Gossiped evidence is checked for age, against the next height and the
+last block's time, before its signatures are verified: what is too old, names a
+height the node does not know or lies beyond the height being decided is dropped
+without being pooled and without a score. A block carries at most 16 pieces
+(`MAX_EVIDENCE_PER_BLOCK` in `src/consensus/validate.ts`), which block validation
+enforces on every node. The pool lets go of evidence, pending or
 committed, with its inventory entry once it is older than the evidence age, on every
 node after every commit, and holds at most 1,000 pending pieces; a block that +2/3 precommitted but was never
 proposed to a node is fetched and decided in place; peers are scored and banned
 (`Network.score`); the executor prunes blocks behind a retention window but never
 past the newest snapshot nor into the evidence window (blocks whose time is within
 the unbonding period of the latest stay, since evidence is checked against the set
-and time of its height). A node joining by state sync also fetches the headers below
+and time of its height). The evidence age is read from the application each time it
+is asked for (`Node.evidenceAge()`), so a block that lengthens the unbonding period
+is pruned behind with the new age; heights deleted under the shorter window are gone,
+and until a full new window has passed a pruning node refuses evidence that names
+them. Each pruning pass is one store transaction: the blocks, or the headers, go
+with the marker that says they are gone, and a block takes the validator set stored
+under its height with it. A node joining by state sync also fetches the headers below
 the snapshot as far back as evidence may reach, each bound to the one above by its
 hash, and keeps them alone until the window moves past them or backfill replaces
 them with blocks, so it checks evidence as a node that replayed from genesis does;
@@ -944,7 +1088,7 @@ node must continue consensus with the exact proposer priorities.
 
 ## 10. Implementation status (2026-11-15)
 
-Everything above is implemented in TypeScript under `src/`. 212 tests in 25 files
+Everything above is implemented in TypeScript under `src/`. 268 tests in 29 files
 pass, and the whole suite passes under either signature scheme
 (`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there) and with
 either tier of state paging dropped from the start (`INDEX_TREES=0`, `TREES=0`, or
@@ -978,7 +1122,7 @@ limit at `warn`, a tenth at `pressure` (a transaction beyond it refused as `full
 `retain.memoryVersions` set keeps that many past versions in memory and proves an older height from the store, and with `indexTrees: 'store'` leaves its index trees there and still finds an account by name. The history
 suite appends blocks of entries to the account history log and pages every account out
 of it in both directions against a model, counts the reads that reach the old end of a
-long history, checks that a block writes the heads of one slice of the account numbers and that a log opened after a stop has the waiting ones back, and moves a store written with the earlier layout into the log. The fourth review's suite (`test/review4.test.ts`) asks a node for a balance, an account, a key, a validator and a delegation as of past heights and checks their proofs against the next header's app hash, spends a rate limit with batches, indexes one transaction in three blocks, refuses a snapshot without every type's section and a number too large to hold exactly, prunes and bounds the evidence pool, removes a key from the keystore, reads a peer clock seven seconds ahead from its pong and runs a node on a verifier pool of its own. State paging (`STATE-PAGING.md`) has cases of its
+long history, checks that a block writes the heads of one slice of the account numbers and that a log opened after a stop has the waiting ones back, and moves a store written with the earlier layout into the log. The fourth review's suite (`test/review4.test.ts`) asks a node for a balance, an account, a key, a validator and a delegation as of past heights and checks their proofs against the next header's app hash, spends a rate limit with batches, indexes one transaction in three blocks, moves a transaction index of the earlier layout when its store is opened, refuses a snapshot without every type's section and a number too large to hold exactly, prunes and bounds the evidence pool, removes a key from the keystore, reads a peer clock seven seconds ahead from its pong and runs a node on a verifier pool of its own. Four more suites hold one case for each rule added after it. `test/review5-net.test.ts` (15 cases) counts one success for an outbound dial, leaves a refused connection open for the rejection to leave, bans and excludes a peer by the address dialed, takes an address list only in answer to a request, starts from the seeds on a peer file cut short, stops block sync cleanly, refuses a block response that does not match its request, passes over a snapshot below the trust height, drops a vote far ahead before verifying it, and admits one of two transactions checked at once for the pool's last place. `test/review5-node.test.ts` (15 cases) claims a data directory by its real path and releases it last, takes a stale claim over only while holding the takeover file, reads the evidence age from the application when asked, stores nothing of a block whose application commit throws, prunes in one transaction with the set by height going with its block, indexes a repeated transaction where it succeeded, does not pool gossiped evidence that is too old, takes an item only from the peer asked for it, remembers no more than 2,048 fetches for a peer that announces and never answers and refuses a block with more than 16 pieces of evidence. `test/review5-app.test.ts` (16 cases) fails a store write under the application and writes the block again with a correct history, stops the application after a failure past the block's session, refuses a delegation to a validator with shares and no tokens and an authority no key leads to or that needs more signatures than a transaction carries, reads the state of the last root after writes outside a session, and bounds the object types and the authenticated indices. `test/review5-rpc.test.ts` (9 cases) stops a server's events with it, replays a block event with the fields of a live one, opens an account stream only for an account there is, finds a validator by its operator's account id, keeps a key under a name every object inherits, and runs the command line for an unknown command, an asset of precision 0, a light client anchor of another chain and a block whose results the node lacks. State paging (`STATE-PAGING.md`) has cases of its
 own: the arena suite grows slabs, counts dead bytes and compacts, and releases whole
 slabs down to a byte limit, unread ones first; the database suite
 evicts clean objects and never dirty ones, keeps history as bytes, checks that the
@@ -1002,11 +1146,12 @@ store with no room for its tiers (both dropped, no history window read, the earl
 heights proven from the records left in the store) and with no room
 in the arena (every object read from the store), running blocks on each with the hashes
 and proofs of a resident application. All five phases are built;
-the paging benchmark (`docs/benchmarks.md` section 4.13) ran a node, with
-`indexTrees: 'memory'`, the default at the time, under a heap limit of
-1.25 times its resident state for 40 seconds, through `warn` once, with the index trees
-dropped and the history window cut from then on and without reaching `pressure`, for 124
-blocks and 69,492 transfers without an abort.
+the paging benchmark (`docs/benchmarks.md` section 4.13) ran a node on its defaults
+under a heap limit of
+1.25 times its resident state for 40 seconds: opened with its Merkle trees and its history
+left in the store, through `warn` once, with the history window in memory cut to two
+versions from then on and without reaching `pressure`, for 129
+blocks and 72,092 transfers without an abort.
 
 | module | what it is |
 |---|---|
@@ -1019,7 +1164,7 @@ blocks and 69,492 transfers without an abort.
 | `src/node/` | block executor with crash recovery, the memory guard with load shedding and the collection scheduler, and the node that wires everything |
 | `src/db/` | object ids, index keys, B+ tree, sparse Merkle tree with its nodes on disk, the arena of encoded objects (`arena.ts`), per-type indices with a bounded cache of decoded objects and droppable B+ trees, the index entries' disk form and the merged cursor over store and overlay (`indexstore.ts`), deep freezing of records (`freeze.ts`), dense Merkle tree with chunks and versions and a shared chunk cache for dropped trees, ICS23-shaped object and key proofs, the database with undo sessions, persisted history and the memory dials |
 | `src/store/` | key-value interface with environment-wide transactions, in-memory and LMDB stores, block store on top with headers kept alone |
-| `bench/` | benchmarks (`npm run bench`): crypto, codec, database, store, application, a four-validator network with block sync, and (`npm run bench:genesis`) a gigabyte genesis: load time, memory, disk, reads at that size, restart, then at that scale a live node serving RPC under load, scattered batch transfers, proofs at past heights, history, and a state-sync import, and (`npm run bench -- paging`) the same state under the memory guard: a node in a child process under a heap limit of 1.25 times its resident heap with its mempool kept full for 40 seconds, then the database through each mode the guard sets |
+| `bench/` | benchmarks (`npm run bench`): crypto, codec, database, store, application, a four-validator network with block sync, and (`npm run bench:genesis`) a gigabyte genesis: load time, memory, disk, reads at that size, restart, then at that scale a live node serving RPC under load, scattered batch transfers, proofs at past heights, history, and a state-sync import, and (`npm run bench -- paging`) the same state under the memory guard: a node in a child process under a heap limit of 1.25 times its resident heap with its mempool kept full for 40 seconds, then the database through each mode the guard sets; `bench/cold-reads.ts`, run by hand, times index reads on that suite's store with none of it in the page cache |
 | `src/light/` | light client with bisection forward and the hash chain walked backward, node-backed and RPC providers, and the checks on state, key and transaction queries |
 | `src/rpc/` | JSON-RPC server with events and limits, JSON shapes, methods, a fetch client |
 | `src/wallet/` | encrypted keystore, written under a lock file |
@@ -1033,7 +1178,12 @@ blocks and 69,492 transfers without an abort.
 Known simplifications, all deliberate and all revisitable:
 
 - Amnesia evidence (locking rule violations) is not detected. Only duplicate votes are.
-- Vote verification is not rate limited per peer.
+- Vote verification is not rate limited per peer; a vote more than 1,000 rounds ahead
+  of the node's round is dropped before its signature is verified.
+- Proposals for the next height are held unverified until it starts: 8 in all, 2 from
+  any one peer, each replayed with its sender, so a bad signature then costs that peer
+  20 points. Four peers acting together can still fill the 8 places and keep the real
+  proposal out until it is sent again.
 - Non-unique indices (balances by owner, transactions by expiry, validators by power)
   are not in the state root; only the authenticated unique indices are: account
   names, asset symbols, validators by operator and by current consensus address, and
@@ -1061,6 +1211,39 @@ done about each finding.
   advances the window and drops the versions that fall out of it. A node that joined
   from a snapshot can prove nothing before the snapshot height.
 - A failed transaction inside a block pays no fee.
+- The 1 MiB limit on a transaction is mempool policy, an option of each node, and not a
+  rule blocks are held to: a block may carry a larger one, bounded by the block's size.
+  The 16 pieces of evidence a block may carry are a rule of the chain.
+- `maxBlockBytes` (4 MiB) and `maxClockDriftMs` (15 s) are limits of each node, used
+  in block validation. They are not in genesis or in state, so nodes configured
+  differently would disagree about a block.
+- The claim on a data directory is a file, not an operating system lock. It trusts the
+  pid in `LOCK`: a pid given since to an unrelated process makes a stale claim look
+  live until that process exits. And a process killed in the few file operations for
+  which it holds `LOCK.takeover`, while taking over a stale claim, leaves that file
+  behind; it is never removed automatically, and the next start on the directory fails
+  naming it until it is removed by hand (section 4). A process killed between writing
+  its private `LOCK.<pid>.<8 hex>` file and unlinking it leaves that file, which is
+  harmless and can be deleted, and the claim is made with a hard link, so the directory
+  must be on a filesystem that has them.
+- When a block lengthens the unbonding period, the evidence window grows with it at
+  once, but heights a pruning node deleted under the shorter window are gone: until a
+  full new window has passed it refuses evidence that names them, and so a block that
+  carries such evidence.
+- A store write that fails under the application aborts the block's transaction and
+  leaves the application's memory a block ahead; a failure while a block's root is
+  taken leaves changes that cannot be undone. Either way the application refuses to go
+  on and the node needs a restart, which finds the state of the block before.
+- An authority is checked for keys that could satisfy it when it is set. A later
+  change to a member account can still leave another account's authority with no keys
+  that reach its threshold, or needing more than the 16 signatures a transaction
+  carries. The count of signatures an authority needs takes a key shared by two member
+  accounts once for each, so an authority that shared keys would satisfy within 16 can
+  be refused.
+- Validator sets by hash are kept for good, one record per distinct set. In a store
+  pruned by an earlier build the sets by height below the lowest block stay.
+- `changedSince()` does not see an object removed outside a session since the last
+  root. The node never writes outside a session.
 - A validator restarted in the middle of a height forgets its lock: the sign state keeps what
   was signed, not the locked block, so after a restart it may prevote another block in a later
   round of that height. Tendermint's accountability for this (amnesia evidence) is not implemented.
@@ -1069,12 +1252,12 @@ done about each finding.
   the window has grown back, proofs and queries at heights older than the last two are
   read from the history records in the store, which is slower than from memory, the more
   so the further back the height, since every later record is scanned and nothing is
-  cached: about 0.2 ms per height back at 192,000 accounts, 19 ms at the oldest of a hundred, against a tenth of a millisecond from memory (docs/benchmarks.md 4.13). A store written before the
+  cached: 0.1 to 0.35 ms per height back, 9 to 36 ms at the oldest of a hundred at 192,000 accounts, against a tenth of a millisecond or less from memory (docs/benchmarks.md 4.13). A store written before the
   records carried the sparse tree nodes cannot prove such a height until those records
   have aged out of the window (100 blocks by default). The recent transaction ids are
   still growth no dial sheds.
 - The mempool is bounded by count, 10,000 transactions, not by bytes; each may be up to
-  1 MiB. Under pressure the node lowers the count it admits up to (a half at `warn`, a
+  1 MiB (the transaction's hash is computed before its size is checked). Under pressure the node lowers the count it admits up to (a half at `warn`, a
   tenth at `pressure`) and evicts nothing: a pool already above the lowered limit stays as
   large as it is until blocks reap it.
 - ArrayBuffers (ML-DSA keys, stored bytes, the arena's slabs) live outside the V8 heap and
@@ -1083,33 +1266,39 @@ done about each finding.
   `rss` beside the heap figures but acts on the heap alone. The arena's share of them can
   be bounded by hand (`start --arena <MiB>`); nothing bounds it automatically, and the
   current slab (16 MiB at most) always stays.
-- What the memory guard can drop saves 50 to 60% of the resident heap, not more: with
-  the cache capped and both tiers dropped the database runs on 40 to 50% of it (at
-  192,000 accounts the index trees give back 130 to 175 MiB, the Merkle trees 190 to
-  220 MiB and the cache up to 190 MiB), at the throughput it has resident, within a
-  tenth, now that the dropped trees' chunk cache holds 4,096 chunks. Those figures are the
+- What the memory guard can drop saves about half of the resident heap, not more: with
+  the cache capped and both tiers dropped the database runs on 57% of it in the current
+  mode table, on a state with a full history window, and on 40 to 50% in an earlier
+  build's run on a state with no history yet (at
+  192,000 accounts the index trees give back 181 MiB and the Merkle trees 223 MiB; in the
+  earlier run 130 to 175 MiB, 190 to
+  220 MiB and the cache up to 190 MiB), at the throughput it has resident or above it,
+  now that the dropped trees' chunk cache holds 4,096 chunks. Those figures are the
   database's alone. A node held at its resident heap or 0.8
   times it, with the history window trimmed and the mempool's limit following the level,
-  committed 1,520 to 1,620 transfers a second for ten minutes, refused nothing after
+  committed 1,570 to 1,610 transfers a second for ten minutes, refused nothing after
   its first two seconds and did not reach `pressure`; under a full load it is about a
   tenth faster with its index trees in the store than with them resident
   (docs/benchmarks.md 4.13), which is why they go at `warn`, the history window with
   them for the heap it holds (1,320 to 1,360 while they
   went at `pressure` and the account history was keyed by account). So a node now
   leaves its index trees in the store unless told otherwise (`indexTrees: 'store'`, the
-  default) and gives up little: beside the load a lookup by key takes 5 microseconds either way and a
-  page of twenty 33 against 17 (docs/benchmarks.md section 4.13). With
+  default) and gives up little: beside the load a lookup by key takes 4 to 7 microseconds at the median either way and a
+  page of twenty 31 to 34 against 17 to 18, with a longer tail (docs/benchmarks.md section 4.13). With
   `indexTrees: 'memory'`, for a node that mostly serves scans, it starts with them
   resident when they fit and rebuilds them when the heap has stayed at `ok` long enough.
-  Index reads from a store larger than the machine's memory are not measured. A store whose
-  tiers do not fit the heap is now opened with them dropped and without its history
+  An index read that reaches the device, measured on a store read cold without a node,
+  takes of the order of 140 to 320 microseconds against 1 to 3 from the page cache for a
+  lookup; a node under
+  load on a machine whose memory the store exceeds is not measured. A store whose
+  tiers do not fit within half the heap limit is now opened with them dropped and without its history
   window in memory, the heights before the one it opened at proven from the records in
   the store and the window filling a block at a time; that took the floor for `--heap` from two thirds of the
   resident heap to a quarter under the benchmark's load. The store holds the sparse trees' current nodes, and their overwritten ones only inside the
   history records. A restart that reads the window now takes their past versions from
   those records; it used to replay every account for them, most of what remained of a
-  restart (3.5 s of 5.2 at 192,000 accounts; the same restart is now 2.91 s, the history
+  restart (3.5 s of 5.2 at 192,000 accounts; the same restart is now 2.85 s, the history
   2 ms of it, and leaves 381 MiB of heap where it left 572), and still does
   for a window that holds a record written before the nodes were kept. And chunks of 1,024 hashes on disk make a
   block scattered over the state rewrite nearly every chunk it touches, a fifth of the
-  commit at that size; smaller chunks would cut it about in half.
+  commit at that size when the chunks were first written; smaller chunks would cut it about in half.

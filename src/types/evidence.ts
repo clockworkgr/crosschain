@@ -4,9 +4,11 @@ import { bytesEqual, compareBytes } from '../crypto/hash.ts';
 import { decodeVote, encodeVote, type Vote } from './vote.ts';
 
 /**
- * The one slashable fault in this chain: a validator signing two different
- * votes of the same type at the same height and round. Anyone holding both
- * signatures can prove it, and the proof is self-contained.
+ * The one fault punished on evidence in this chain: a validator signing two
+ * different votes of the same type at the same height and round. Anyone
+ * holding both signatures can prove it, and the proof is self-contained.
+ * Downtime is slashed too, by the application, from who signed each block's
+ * commit (app/core/staking.ts); it needs no evidence.
  */
 export interface DuplicateVoteEvidence {
   voteA: Vote;

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { sha256, toHex } from '../src/crypto/hash.ts';
 import { decodeHistory, encodeHistory, ObjectDatabase, type UndoSession } from '../src/db/database.ts';
 import { MemoryKv } from '../src/store/kv.ts';
-import { instanceOf, objectId } from '../src/db/id.ts';
+import { instanceOf, objectId, typeOf } from '../src/db/id.ts';
 import { DbError, type ObjectType } from '../src/db/index.ts';
 import { key } from '../src/db/keys.ts';
 import { BPlusTree } from '../src/db/bptree.ts';
@@ -640,6 +640,7 @@ describe('object database', () => {
   it('undoes and commits nested sessions', () => {
     const db = fresh();
     const a = mk(db, 'alice', 1, 10n);
+    db.root(); // the committed view below is the one of this root
     const outer = db.startSession();
     db.modify(ItemType, a.id, (o) => ({ ...o, value: 20n }));
     const b = mk(db, 'bob', 1);
@@ -1376,6 +1377,40 @@ describe('object database: past versions from the store', () => {
       }
     });
   }
+
+  it('lists what a past version held of a type whose objects were removed since, from memory and from the store', () => {
+    const kv = new MemoryKv();
+    const db = new ObjectDatabase([ItemType, CounterType], { retainVersions: 8, indexStore: kv, historyStore: (v) => kv.get(historyKey(v)) });
+    for (let v = 0; v <= 5; v++) {
+      step(db, v);
+      persist(db, kv);
+    }
+    const live = () => Array.from(db.exportObjects(), ([id]) => id).filter((id) => typeOf(id) === ItemType.id);
+    // What the objects of now and those changed since a version give for it, each read as of then.
+    const heldAt = (v: number) =>
+      [...new Set([...live(), ...db.changedSince(ItemType, v)])]
+        .filter((id) => db.getAt(ItemType, id, v) !== null)
+        .map((id) => instanceOf(id))
+        .sort((a, b) => a - b);
+    // Version 2 held the 120 items made by then less the ten version 1 removed and the ten version 2 removed.
+    const want = Array.from({ length: 120 }, (_, i) => i).filter((i) => !(i < 30 && i % 3 === 0) && !(i >= 40 && i < 70 && (i - 40) % 3 === 0));
+    expect(want.length).toBe(100);
+    expect(heldAt(2)).toEqual(want);
+    // The objects of now alone miss the ten of them that version 3 removed: an index of now cannot answer for then.
+    expect(live().filter((id) => db.getAt(ItemType, id, 2) !== null).length).toBe(90);
+    expect(db.changedSince(ItemType, 5)).toEqual([]);
+    expect(db.changedSince(CounterType, 4)).toEqual([objectId(CounterType.id, 0)]);
+    // With no past version in memory the store's records say the same.
+    db.setHistoryWindow(0);
+    expect(heldAt(2)).toEqual(want);
+    expect(heldAt(4).length).toBe(200 - 40);
+    expect(() => db.changedSince(ItemType, 6)).toThrow(/not available/);
+    // A removal of the block in progress counts as well: the index no longer lists the object, the last root does.
+    const session = db.startSession();
+    db.remove(ItemType, objectId(7, 201));
+    expect(db.changedSince(ItemType, 5)).toEqual([objectId(7, 201)]);
+    db.undoSession(session);
+  });
 
   it('reads a record written before the sparse tree nodes were kept, and refuses to prove a key from it', () => {
     const kv = new MemoryKv();

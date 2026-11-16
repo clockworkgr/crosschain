@@ -79,7 +79,12 @@ error string)`, written by the executor in the same transaction as the block. A
 transaction that failed can be included again, so one hash can have several entries,
 one per block that carries it: `txLocations(hash)` lists every block still held that
 carries the transaction, oldest first, and `txLocation(hash)` is the block it
-succeeded in if there is one, else the newest. Pruning a block removes that block's
+succeeded in if there is one, else the newest. Within one block a hash is indexed
+once: at the first position where it succeeded, or at its first position when it
+succeeded at none. So a block that carries a transaction twice, failing at the first
+position and succeeding at a later one (a proposer can build such a block; the
+mempool never offers one), is indexed at the later one, and `tx` reports the success.
+Pruning a block removes that block's
 entry only. The index was first keyed `'t' || txHash`, one entry per hash, the last
 block written winning; a store of that layout has its entries moved to the new keys
 once, when it is next opened (`migrateTxIndex`), 5,000 entries a write, and `'T'`
@@ -111,9 +116,11 @@ application's own store, next to the objects:
   numbers (`HistoryLog.SLICES`), and every block that has entries writes the waiting
   heads of one slice, the next in turn: a block writes neighbours in the store, no
   single block carries the whole batch, and a head is written within 64 such blocks
-  of its change. A slice spans one account number at first, and the span doubles
-  (slices 2i and 2i+1 becoming slice i) whenever an account number beyond the last
-  slice turns up. All the slices are written at once only when 50,000 heads wait
+  of its change while the span of the slices stays as it is. A slice spans one account
+  number at first, and the span doubles (slices 2i and 2i+1 becoming slice i) whenever
+  an account number beyond the last slice turns up. A doubling moves the waiting heads
+  to their new slices without moving the turn, so a head whose new slice the turn has
+  just passed waits up to 64 blocks more; the log covers it meanwhile, as below. All the slices are written at once only when 50,000 heads wait
   (`HistoryLog.HEADS_HELD`), or when a store with the earlier layout is moved into
   the log. The log is their journal: a log opened after a stop reads the entries
   from `covered` to the end, each of which names its account and sequence, and has
@@ -142,11 +149,16 @@ application's own store, next to the objects:
   `slash { validator, amount, doubleSign }` to the operator, `jail`, `unjail`,
   `tombstone` to the operator, `unbondingMatured { validator, tokens }` and
   `redelegationMatured` to the delegator, `forcedUnbond { validator, tokens }` to
-  each delegator of a tombstoned validator. Rewards are recorded per validator per
-  block, not per delegator: a delegator's share is implicit in the exchange rate.
+  each delegator of a tombstoned validator. Rewards are recorded per payment to a
+  validator, not per delegator: a delegator's share is implicit in the exchange rate. A
+  proposer that also signed the previous commit gets two entries in the block, one for
+  the bonus and one for its share as a signer.
 
 Entries are collected during `finalizeBlock` and written by `commit`, so a crash
-between the two is repaired by the existing replay. A node that state-synced has
+between the two is repaired by the existing replay. A store write that fails takes
+the log back to what the store has (`HistoryLog.rollback`: the length, the coverage
+and the waiting heads are read again), and the block's entries are appended again
+when the block is next written. A node that state-synced has
 history only from its snapshot height; replay from genesis is the way to get all
 of it. Block pruning never touches account history, which grows for as long as the
 node runs.
@@ -163,13 +175,15 @@ unknown method, bad parameters, a rate limit or a failure all go unreported); a
 single notification, or a batch holding only notifications, gets HTTP 204 with an
 empty body, and a mixed batch an array holding only the answers to the requests
 that carried an id. An object that is not a request at all (no `jsonrpc: '2.0'`, no
-string `method`, an id of another type) is answered `-32600` with `id: null`.
+string `method`, an id of another type) is answered `-32600`, with its own id when
+that is a string, a number or null and with `id: null` otherwise.
 `GET /events` is the Server-Sent Events stream. `GET /health` returns height, peer count and
 the memory guard's level (`memory`). Default bind `127.0.0.1`
 on the p2p port plus one; config `rpcListen` sets host and port. Responses carry
-`Access-Control-Allow-Origin: *`. Bodies over 1 MB are rejected with HTTP 413. Each
+`Access-Control-Allow-Origin: *`. Bodies over 1 MiB are rejected with HTTP 413. Each
 remote address has a token bucket of 50 tokens per second with a burst of 100: every
-HTTP request costs one token, which covers its first call; each further call of a
+`POST /` costs one token, which covers its first call (`OPTIONS`, `GET /health` and a
+`GET /events` without replay cost none); each further call of a
 batch costs one more, taken before its method is looked up; and a costly method
 (`block`, `object`, `key`, `account`, `validator`, `delegation`, `balance`,
 `accountHistory`, `tx`, `broadcastTx`, `accounts`, `proposals`, whether or not a
@@ -180,10 +194,11 @@ or for a further call of a batch that cannot pay,
 it returns the `-32004` error for that call in its place inside an HTTP 200 response. At most 8
 event streams per address, and a reconnect that asks for replay pays the costly
 price; over either limit the stream request gets HTTP 429. While the node sheds load
-under memory pressure (DESIGN.md section 4), a costly method is answered `-32004` with
-`node under memory pressure` before its bucket is consulted, so the refusal costs the
-caller nothing, and a `GET /events` request gets HTTP 503; cheap methods, `/health` and
-the streams already open are unaffected.
+under memory pressure (DESIGN.md section 4), a costly method other than `broadcastTx` is
+answered `-32004` with `node under memory pressure` before the four tokens of a costly
+call are taken, and a `GET /events` request gets HTTP 503; cheap methods, `/health` and
+the streams already open are unaffected, and `broadcastTx` is still served, the
+mempool's lowered limit being its throttle then.
 
 ### 3.2 Encoding
 
@@ -202,7 +217,9 @@ the streams already open are unaffected.
 - headers and commits: JSON with hex fields; a missing signature is `null`.
 - errors: JSON-RPC error objects; `-32700` parse error (HTTP 400), `-32600` invalid
   request (a batch outside 1 to 20 is refused whole with HTTP 400; a malformed member
-  is answered in its place), `-32601` unknown method, `-32602` for bad parameters, `-32001`
+  is answered in its place), `-32601` unknown method (a name every JavaScript object
+  inherits, such as `toString` or `constructor`, is unknown like any other: the method
+  table is asked only for names of its own), `-32602` for bad parameters, `-32001`
   not found, including a state query for a height the application does not hold, `-32002` check failed (with the application's message), `-32003`
   timeout, `-32004` rate limited.
 
@@ -210,7 +227,7 @@ the streams already open are unaffected.
 
 | method | parameters | returns |
 |---|---|---|
-| status | | chain id, protocol version, `signatureScheme` (`ml-dsa-44` or `secp256k1`), latest height, hash and time, app hash, catching-up flag, lowest retained height, the height joined at by state sync (or null), peer count, validator address if any, `memory` (the guard's `level`, whether the node is `shedding`, and in bytes `heapUsed`, `heapLimit`, `heapTotal`, `arrayBuffers`, `external`, `rss`), `gc` (`available`, that is whether collections can be scheduled; the collections V8 ran since start as `collections`, `minor`, `major`, `incremental` with their pauses `totalMs`, `maxMs`, `lastMs`; and the `scheduledMinor` and `scheduledMajor` ones the node asked for), `rpcVersion` 1 |
+| status | | chain id, protocol version, `signatureScheme` (`ml-dsa-44` or `secp256k1`), latest height, hash and time, app hash, catching-up flag, lowest retained height, the height joined at by state sync (or null), peer count, validator address if any, `memory` (the guard's `level`, whether the node is `shedding`, and in bytes `heapUsed`, `heapLimit`, `heapTotal`, `arrayBuffers`, `external`, `rss` and, under a heap limit, `heapOld`, the old generation's use, from which the level is taken; and `database`, the object database's own figures as `ObjectDatabase.memory()` gives them, or null for an application other than the core one), `gc` (`available`, that is whether collections can be scheduled; the collections V8 ran since start as `collections`, `minor`, `major`, `incremental` with their pauses `totalMs`, `maxMs`, `lastMs`; and the `scheduledMinor` and `scheduledMajor` ones the node asked for), `rpcVersion` 1 |
 | genesis | | the genesis document, `signatureScheme` included when the file names one (absent means `ml-dsa-44`), without `appStateFile`: an application genesis kept in a file is not served |
 | header | height? | header; below the lowest retained block, a header the node keeps alone (section 4.2), where `block` and `commit` answer `-32001` |
 | block | height? | header, transactions (hex), lastCommit, evidence, and the block's own commit |
@@ -220,12 +237,12 @@ the streams already open are unaffected.
 | object | id, height?, prove? | type, height, the object as of that height or null, with `proof` hex when asked |
 | key | type, index, key (hex), height?, prove? | `{ height, id, proof? }`: the object id the key mapped to at `height` (`"type.n"`) or null, read from the key proof at `height`, which is returned when asked |
 | account | name, height?, prove? | `height`, the account object or null; with it the balances (asset symbol, id, precision, amount), the operated validator's id or null, and the history count, all as of `height`; the name proof at `height` when asked |
-| validator | operator (name) or id (validator id), height? | `height`, the validator object with status, active flag, power, self-bond and operator name as of `height`; `delegators`, a count at the latest height and null at a past one |
-| delegation | delegator, validator, height?, prove? | `height`, the delegation with its tokens' worth as of `height` or null; `unbonding`, the pending entries at the latest height and null at a past one; the key proof at `height` when asked |
+| validator | operator or id (either takes the operator's name, the operator's account id or the validator's id), height? | `height`, the validator object with status, active flag, power, self-bond and operator name as of `height`; `delegators`, the count of its delegations as of `height` |
+| delegation | delegator, validator, height?, prove? | `height`, the delegation with its tokens' worth as of `height` or null; `unbonding`, the entries pending as of `height`; the key proof at `height` when asked |
 | balance | account, asset?, height? | `height`, account id, asset id, amount as of `height` |
 | accountHistory | account, from?, limit?, reverse? | entries with sequence numbers, and the total; pagination below |
 | tx | hash, prove? | `{ hash, height, index, ok, error, tx, decoded, attempts?, proof? }`: the block the transaction succeeded in if there is one, else the newest that carries it; `attempts` lists height, index, ok and error for every block still held that carries it, oldest first, when there is more than one; `proof` holds `txProof`, the signed header, and `resultProof` with the next signed header, or nulls for those while the next block does not exist |
-| broadcastTx | tx hex, mode? (`sync` default, or `commit`), timeoutMs? (default 30 000, at most 120 000) | `sync`: `{ hash, status }`; `commit`: `{ hash, height, index, ok, error }` once included; `-32004` while the mempool is paused under memory pressure |
+| broadcastTx | tx hex, mode? (`sync` default, or `commit`), timeoutMs? (default 30 000, at most 120 000) | `sync`: `{ hash, status }`; `commit`: `{ hash, height, index, ok, error }` once included; `-32004` while the mempool is full at a limit lowered under memory pressure, or paused |
 | accounts | after? (name cursor, exclusive), limit? | accounts by name with id and core balance |
 | parameters | | height, core asset (id, symbol, precision), maximum transaction expiration, the fee schedule and the staking parameters in force |
 | proposals | | open proposals, soonest to expire first, each with the full parameters it would adopt |
@@ -234,8 +251,12 @@ the streams already open are unaffected.
 | snapshots | | reserved: an empty list (snapshot heights are exchanged over p2p, not the RPC) |
 
 Omitted heights default to the latest. An `account` or `delegator` parameter takes
-an account name or id; a `validator` parameter takes the operator's name or the
-validator's id; the `account` method itself takes a name. Every state query (`object`,
+an account name or id; a `validator` parameter, and `operator` or `id` of the
+`validator` method, takes the operator's name, the operator's account id or the
+validator's id: an id of the account type is resolved through the operator index at
+the height asked, as a name is, any other id is taken as a validator's, and an account
+that runs no validator is `-32001` with `<ref> runs no validator`. The `account`
+method itself takes a name. Every state query (`object`,
 `key`, `account`, `validator`, `delegation`, `balance`) answers as of one height, the
 one in `height` or the last committed one, and returns it, so a value and the proof
 beside it are about the same state. A height outside what the application holds, from
@@ -247,13 +268,22 @@ and says nothing of a past height, is not asked. `account` finds the account thr
 the name index at the height and reads it, its balances, its validator and its
 history count as of it; a balance object is never removed, so the balances the
 account has now are all it ever had, each read as it was then, one created since
-reading as absent. A name no account can have gives `account: null`, and with `prove`
-a `-32602` error, there being nothing to prove. `balance` by a name that had no
-account at the height is `-32001`; by id it is 0. Two fields are given for the latest
-height only and are null at a past one, because the objects behind them are removed:
-`validator`'s `delegators` (a delegation goes with its last share) and `delegation`'s
-`unbonding` (an entry goes when it matures). `accountHistory` and the listings read
-the latest state.
+reading as absent. A name that cannot be an index key (one holding a zero byte) gives
+`account: null`, and with `prove` a `-32602` error, there being nothing to prove. The
+name is not checked against the rules for account names: any other name no account
+has, `A` for one, gives `account: null` and with `prove` a proof of absence. `balance` by a name that had no
+account at the height is `-32001`; by id it is 0. Two fields list objects that are
+removed, which the index of today no longer holds: `validator`'s `delegators` (a
+delegation goes with its last share) and `delegation`'s `unbonding` (an entry goes
+when it matures). Both are answered for any height the node holds: to the ids the
+index gives now are added, at a past height, those of the type that a later height
+created, changed or removed (`ObjectDatabase.changedSince`), and each is read as of
+the height and kept if it existed then and belongs to the validator, or to the
+delegator and the validator. At the latest height that is the index scan alone; at a
+past height it costs one read as of the height for each object of the type changed
+since, and for a height older than the window in memory one history record, read
+once and decoded, for each height between the one asked for and the window.
+`accountHistory` and the listings read the latest state.
 
 Pagination: `accountHistory` returns 20 entries by default and at most 100, oldest
 first from sequence `from` (default 0); with `reverse`, entries come newest first and
@@ -262,28 +292,43 @@ after the name in `after` and returns at most `limit` (default 50, at most 200),
 `limit: 0` being honoured.
 
 Broadcast: `sync` answers after checkTx with status `added` or `seen`. `seen` means
-the hash is in the mempool's recently-seen cache, which includes transactions it
-rejected earlier and ones already committed; it is not inclusion. Admission failures
-(`invalid`, `too-large`, `full`) are `-32002`; a mempool paused under memory pressure
-answers `paused` inside the node and `-32004` with the reason, `node under memory
-pressure`, over the RPC. `commit` waits for inclusion: a
+the hash is in the pool or in the mempool's recently-seen cache, which includes
+transactions it rejected earlier and ones already committed; it is not inclusion. Admission failures
+(`invalid`, `too-large`, `full`) are `-32002`, except that a pool found `full` while
+the memory guard's level is not `ok` answers `-32004` with the pool's reason (`mempool
+full: its limit is lowered while the node is short of memory`), the transaction not
+being at fault; a mempool paused at the guard's `critical` level answers `paused`
+inside the node and `-32004` with the reason, `node out of memory`, over the RPC.
+`commit` waits for inclusion: a
 transaction seen before that is neither pending nor committed is refused at once
 (`-32002`) rather than waited for; a timeout answers `-32003` and leaves the
 transaction in the mempool, where a later `tx` call can still find it once included;
 once 1 000 commit waits are outstanding a further one answers `-32004`, and the
-client should broadcast in `sync` mode and poll `tx`.
+client should broadcast in `sync` mode and poll `tx`. When the server is stopped,
+every wait outstanding is answered at once as a timeout is, and the server's
+listener is taken back from the executor (`BlockExecutor.onCommitted` returns the function
+that removes it), so a node whose server is replaced keeps nothing of the old one.
 
 ### 3.4 Events
 
-`GET /events?types=block,tx,account,validatorSet&tx=<hash>&account=<name>`.
+`GET /events?types=block,tx,account,validatorSet&tx=<hash>&account=<name or id>`.
+`types` left out means `block`; an unknown type is answered HTTP 400, and an `account`
+that does not exist 404: a name no account has, an id no account has, an id of
+another type or one that is malformed, and any `account` on a node whose application
+is not the core one.
 
-- `block`: height, hash, time, transaction count, app hash, results summary.
+- `block`: height, hash, time, transaction count, the count of failed transactions,
+  app hash, proposer address.
 - `tx`: hash, height, index, ok, error; filtered to one hash when asked.
 - `account`: an account's new history entries; filtered by account.
 - `validatorSet`: height and the updates the application emitted.
 
 Event ids are heights; a reconnect with `Last-Event-ID` replays `block` events from
-the store, at most the last 1000 blocks, and stops at a missing block. A stream whose
+the store, at most the last 1000 blocks, with the fields of a live event
+(`blockEventJson` makes both), and stops at a missing block. On replay the count of
+failed transactions is taken from the stored results; it is `null` for a block with
+transactions whose results the node does not hold (one it backfilled after a state
+sync) and 0 for an empty block. A stream whose
 client has more than 1 MiB queued unread is ended; it resumes with `Last-Event-ID`.
 No stream is opened while the node sheds load: the request is answered HTTP 503, and the
 client retries once `/health` reports `ok` or `warn`.
@@ -294,8 +339,13 @@ most 1000 waiters at once.
 
 `src/light/rpc-provider.ts` implements `LightProvider` with `fetch` against the
 methods above, `header` serving the headers alone that backward verification walks.
-The CLI keeps its trusted state in `light.json` next to the keystore (height and
-hash) and updates it as it verifies forward.
+The CLI keeps its trusted state in `light.json` next to the keystore (`{ chainId,
+height, hash }`) and updates it as it verifies forward. A file that names another
+chain than the node's stops the command with exit code 1 and `<path>/light.json holds
+a trusted header of chain X, and this node is on chain Y; use the keystore directory
+of that chain, or set a new anchor with: light <target> trust <height> <hash>`; a file
+written before the chain id was kept names none, is accepted and is written back with
+it; `light <target> trust` overwrites the file.
 
 A height before the trusted one is verified backwards: the client walks down from
 the trusted header one header per step, each required to carry the expected height
@@ -310,12 +360,19 @@ the anchor.
 
 ### 3.6 Keystore
 
-`keystore.json`: `{ version: 1, kdf: { name: 'scrypt', N: 32768, r: 8, p: 1, salt },
+`keystore.json`: `{ version: 2, kdf: { name: 'scrypt', N: 32768, r: 8, p: 1, salt },
 keys: { [name]: { address, publicKey, scheme, iv, ciphertext, tag } } }`. One key is
 derived from the passphrase and the salt; every seed is sealed with AES-256-GCM under
 it with its own IV. `scheme` is `ml-dsa-44` or `secp256k1`, the scheme the seed's key
-pair is derived under; a key sealed before the field existed has none and is read as
-ML-DSA-44. The passphrase comes from `--passphrase-file`, the `CHAIN_PASSPHRASE`
+pair is derived under. A version 2 file names the scheme of every key, and a key in
+it with no `scheme` is damaged (`key <name> names no scheme; the keystore entry is
+damaged`). A version 1 file, written before, may hold keys sealed before the field
+existed; such a key has none and is read as ML-DSA-44. A version 1 file is read as it
+is, reading never writes, and the next change (`add`, `remove`) writes it as version
+2 with every key's scheme filled in. Any other version is refused with `unsupported
+keystore`, on opening and on every write. A key may have any name, `constructor`,
+`toString` and `__proto__` among them: the keys are held in an object without a
+prototype and looked up as its own properties. The passphrase comes from `--passphrase-file`, the `CHAIN_PASSPHRASE`
 variable, or a hidden prompt. Commands: `keys add <name> [--scheme <name>]`, `keys
 list` (name, scheme, address), `keys import <name> <seed hex> [--scheme <name>]`,
 `keys export <name>`, `keys remove <name>` (prints `removed <name> <address>`; the
@@ -345,8 +402,18 @@ the chain's scheme; `create` makes the new account's key in the chain's scheme t
 asking `status` for it. `start` opens the RPC. The
 inbox file, the read-only store opening and the per-account seed files go away. `show`
 reads through the RPC.
-New: `history <account>`, `tx <hash>`, `verify-tx <hash>` (light-client verified),
-`light trust <height> <hash>`, `light verify [height]`.
+New: `history <target> <account>`, `tx <target> <hash>`, `verify-tx <target> <hash>`
+(light-client verified), `light <target> trust <height> <hash>`,
+`light <target> verify [height]`.
+
+No command, or one the CLI does not know, prints `usage: see the comment at the top of
+src/cli.ts` and exits with code 1, whatever follows it; a known command without its
+target says `missing target`. Amounts of an asset of precision 0 are printed without
+a decimal point. `verify-tx` prints `verified: included at height H, succeeded` (or
+`failed: <error>`) when both proofs check; `included at height H; this node does not
+hold the results of that block` when the node holds the next block but not the
+results, having fetched the block after a state sync; and `included at height H;
+result not yet committed` only while there is no next block.
 
 ## 4. Stage three: snapshots, state sync, hardening, retention
 
@@ -385,17 +452,18 @@ directory with a trust anchor:
    messages) and start the light client from the anchor, which must be younger than
    the trusting period (4 days by default) and not from the future.
 2. Ask every peer for its snapshot heights (a height counts once per peer, however
-   often it is listed); choose the highest height offered by at least two peers, or
-   the highest offered at all when no height has two; verify header H+1 with the
-   light client, which means H+1 may not precede the anchor.
+   often it is listed). Only a height H with `H + 1 >= trustHeight` is a candidate:
+   header H+1 fixes the snapshot's app hash, and trust only moves forward to it.
+   Choose the highest candidate offered by at least two peers, or the highest
+   offered at all when none has two; verify header H+1 with the light client.
 3. Fetch the manifest from the snapshot's peers in turn and verify it: the right
    format, every registered type exactly once in order, each type leaf folding to
    header H+1's app hash through its top-tree path, chunk counts matching the
-   counters. A peer serving a bad manifest is charged 50 points and the next is
-   asked.
-4. Fetch chunks from up to four of those peers in parallel, verifying each by its
-   manifest hash, its range and its range proof against the type root, and load it
-   into a fresh database. A bad chunk charges its peer 50 points and excludes it as a
+   counters. A peer serving a manifest that fails these checks, or bytes that do not
+   decode as a manifest at all, is charged 50 points and the next is asked.
+4. Fetch chunks from up to four of those peers in parallel, verifying each as it
+   arrives by its manifest hash, its range and its range proof against the type root,
+   and keep it; when all are there, load them into a fresh database. A bad chunk charges its peer 50 points and excludes it as a
    source for the rest of the join, as do three timeouts; the chunk is refetched
    elsewhere.
 5. Set counters, compute `root(H)`, compare with the app hash; rebuild the
@@ -443,8 +511,10 @@ directory with a trust anchor:
    A backfilled block replaces the header record of its height. History before H is
    not reconstructed.
 
-Without the anchor the node replays from genesis; with one, no peer within the wait
-or no snapshot offered also falls back to genesis, while a snapshot that cannot be
+Without the anchor the node replays from genesis; with one, no peer within the wait,
+no snapshot offered, or none offered at or above the trust height less one (`state
+sync: every snapshot offered is from before the trusted height; replaying from
+genesis`, a warning) also falls back to genesis, while a snapshot that cannot be
 completed (no valid manifest, every source failed, a chunk count mismatch, no block
 H with a valid commit, no peer serving the headers below H) aborts startup; a
 restart tries again.
@@ -454,21 +524,42 @@ restart tries again.
 A window of 32 heights ahead of the applied height is kept requested, at most 8
 heights per request, spread across up to 4 peers that report having them. A serving
 node answers with at most 64 blocks and stops adding blocks past 16 MiB (the first
-always goes). Responses land in a buffer and are applied in order; heights that
-consensus decided meanwhile are discarded from the buffer. A request that times out
-or returns a bad block is re-issued to another peer; the first peer's height is
-forgotten, and a bad block costs it 50 points, while a mere timeout does not. Clock
-drift is not checked on synced blocks.
+always goes). A response must hold at most the `count` blocks asked for, the block
+at place i being of height `from + i` with a commit that names its hash; one that
+does not is not used at all, costs its peer 50 points (`blocks response does not
+match the request`) and has the peer's height forgotten. Responses land in a buffer
+and are applied in order; heights that consensus decided meanwhile are discarded
+from the buffer, and the whole buffer is dropped when no connected peer is ahead any
+longer. A request that times out or returns a bad block is re-issued to another
+peer; the first peer's height is forgotten, and a bad block costs it 50 points,
+while a mere timeout does not. A sync that is stopped while a block is being
+verified applies nothing after the verification returns. Clock drift is not checked
+on synced blocks.
 
 ### 4.4 Evidence gossip
 
 Evidence becomes an inventory item kind next to transactions: announce by key,
-fetch, verify against the validator set at its height, add to the pool, pass on. The
+fetch, verify against the validator set at its height, add to the pool, pass on.
+Before it is verified, fetched evidence is held to the age rule a block would hold
+it to (`evidenceAgeOk`, at the next height and the last block's time): evidence that
+is too old, names a height the node does not know, or lies beyond the height being
+decided is dropped, neither pooled nor charged to the peer, which may be ahead of
+this node or hold history this node has pruned. A block may carry at most 16 pieces
+(`MAX_EVIDENCE_PER_BLOCK`); a proposer takes no more from its pool, and
+`validateBlockStructure` refuses a block with more (`too much evidence`). The
 pool lets go of evidence, pending or committed, and of its inventory entry once it is
 older than the evidence age, on every node after every commit, and holds at most
 1,000 pending pieces (`EvidencePool.MAX_PENDING`), refusing more. A
 hash a peer announces is fetched at most once while a fetch for it is outstanding
-(ten seconds, or until the item or a not-found arrives), in batches of 256. A newly
+(ten seconds, after which another peer that announces it may be asked, four at most,
+or until the item arrives or every peer asked has said it lacks it), in
+batches of 256. A fetch is remembered by kind and hash for one minute from the first
+time it is sent, whatever is asked after; a node remembers 20,000 at most and 2,048
+for one peer, and asks a peer at its limit nothing more until answers or expiry free
+places. An `item` is processed only when its hash was fetched from the peer
+that sends it, as that kind, within that minute; any other is dropped
+unread and without a charge, so a peer cannot push transactions or evidence past the
+announce-and-fetch round. A newly
 connected peer receives every pending evidence key, in `inv` messages of 256, with
 its catch-up proposals and votes.
 
@@ -483,17 +574,33 @@ is validated and decided as if proposed. This replaces falling a height behind.
 Points per offence: bad vote or proposal signature 20, proposal body not matching
 its header 20, malformed message 20, malformed or invalid evidence 20, bad manifest,
 chunk, commit or batch of headers during state sync 50, bad block during sync or
-backfill 50, an
-oversized or repetitive fetch 5. Unsolicited responses are ignored without charge.
+backfill 50, a block sync response that does not match its request 50, an
+oversized or repetitive fetch 5. A proposal for the next height is held unverified
+until that height starts (8 in all, 2 from any one peer) and replayed with its
+sender, so a bad signature found then costs that peer its 20 points; four peers
+together can still fill the 8 places. A vote more than 1,000 rounds ahead of the
+node's round is dropped before its signature is verified. A response to a request the node
+awaits (blocks, headers, validator sets, snapshots, manifests, chunks) that matches no
+outstanding request is ignored without charge. Nothing is taken unasked: one
+`addrResponse` is taken for each `addrRequest` the node sent that peer and any other
+is ignored, and an `item` that was not fetched from its sender is dropped (4.4),
+both without a charge.
 Points decay by one per minute. At 100 the peer is disconnected and its node id is
-banned for an hour; if the node dialed it, the dialed address backs off in the peer
-database for the same time, doubling on each repeat. An inbound peer's advertised
-address is only a claim and is never banned on its account.
+banned. If the node dialed it, the address as it was dialed (`Peer.dialedAddr`, the
+record the peer database holds, whatever the name resolved to) is banned for an hour
+that doubles with each ban of that address, the connect loop passes it over, and the
+id is banned until the same time. An inbound peer's id is banned for an hour each
+time; its advertised address is only a claim and is never banned on its account. A
+peer's advertised address and the name it was dialed by are separate records in the
+peer database, and when two nodes dial each other and the inbound connection is the
+one that survives, the dialed address is dialed again, with backoff. A connection
+the node refuses with a `reject` frame is closed 50 ms later, by a timer alone, so
+the frame can leave first; a handshake that fails otherwise is closed at once.
 
 ### 4.7 Retention
 
-`retain: { blocks?: number, versions?: number, snapshots?: number }`, every field
-optional; `blocks` left out keeps every block. After each commit, blocks below
+`retain: { blocks?: number, versions?: number, snapshots?: number, memoryVersions?:
+number }`, every field optional; `blocks` left out keeps every block. After each commit, blocks below
 `lastHeight - blocks` are deleted with their results and transaction index entries,
 never below the newest snapshot height and never inside the evidence window: a block
 whose time is within the evidence age (the unbonding period) of the latest block
@@ -504,9 +611,18 @@ records older than the evidence age of the latest block are deleted from the low
 up and the marker moves, or is cleared when none remain; a backfilled block replaces
 the record of its height. So a state-synced node checks evidence as far back as the
 window reaches, as a node that replayed from genesis does.
-Validator sets, by hash and by height, and account history are not pruned.
+Each pass, over blocks or over headers, is one store transaction, so what is deleted
+goes with the marker that says so. The evidence age is read from the application
+each time the executor asks, so a block that lengthens the unbonding period is pruned
+behind with the new age; heights deleted under the shorter one are gone, and until a
+full new window has passed a pruning node refuses evidence that names them.
+A validator set stored by height is deleted with the block of its height (records
+below the lowest block in a store pruned by an earlier build stay). Validator sets
+by hash, one per distinct set, and account history are not pruned.
 `versions` is the provable window (default 100 heights, whose history is held in
-memory and in the store); `snapshots` the heights kept (default 2, at least 1).
+memory and in the store); `memoryVersions` is how many of those heights are kept in
+memory (all of them when left out), the store answering for the rest; `snapshots` the
+heights kept (default 2, at least 1).
 Suggested presets: validator `{ blocks: 10000, versions: 100, snapshots: 2 }`, query
 node `{ versions: 10000, snapshots: 2 }`, archive: no `blocks` and as many
 `versions` as memory allows.
@@ -518,7 +634,7 @@ node `{ versions: 10000, snapshots: 2 }`, archive: no `blocks` and as many
 | protocol version | 1 |
 | signature scheme | `ml-dsa-44` when genesis names none; `secp256k1` the other choice |
 | rpc bind | 127.0.0.1, p2p port + 1 |
-| rpc body limit | 1 MB |
+| rpc body limit | 1 MiB |
 | rpc rate | 50/s per address, burst 100, costly calls 5 |
 | event streams per address | 8 |
 | broadcast commit timeout | 30 s, at most 120 s |
@@ -535,7 +651,9 @@ node `{ versions: 10000, snapshots: 2 }`, archive: no `blocks` and as many
 | snapshots kept | 2, at least 1 |
 | sync window | 32 heights, 8 per request, 4 peers; 64 blocks or 16 MiB per response |
 | headers per response | 1000, downward from the height asked |
-| ban threshold | 100 points, 1 hour, doubling per repeat |
+| ban threshold | 100 points, 1 hour, doubling per repeat for an address the node dialed |
+| evidence per block | at most 16 pieces |
+| next-height proposals held | 8, at most 2 from one peer |
 | memory guard | sampled every second; `warn` at 70% of the heap limit, `pressure` at 85%, `critical` at 95%, each left 5 points below its threshold |
 | scheduled major collection | once the heap has grown 256 MiB, or a tenth of the limit, since the last one |
 | heap limit (`start`) | three quarters of physical memory, `--heap <MiB>` otherwise, at least 256; a 64 MiB semi-space |
@@ -566,8 +684,22 @@ index with one transaction in three blocks and an index of the old layout moved 
 the store is opened; a snapshot
 with a section missing, repeated or out of order; the evidence pool's pruning and
 bound; the codec's `u53` and `i53`; `Keystore.remove`; a peer clock read from its
-pong; and a node that makes and closes its own verifier pool. The CLI is not driven
-by a test, and no test compares the index or history with a replayed node's.
+pong; and a node that makes and closes its own verifier pool. Two tests run the
+CLI as a process: `start` against a directory that does not exist, for the heap limit
+it keeps (`test/review3.test.ts`), and `keys add` and `keys remove`
+(`test/review4.test.ts`). `test/review5-rpc.test.ts` (nine cases) stops a server and
+finds its listener gone from the executor and a commit wait answered; replays a block
+event with the fields of the pushed one, and with `failed: null` when the results
+are not held; opens an account stream only for an account there is, by name or by
+id; answers `-32601` for `toString` and a malformed request under the id it carries;
+finds a validator by its operator's account id; keeps keystore keys named
+`constructor`, `toString` and `__proto__`; checks the light client's trusting period
+at verification time on an injected clock; and runs the CLI as a process against a
+node for an unknown command, `show` on an asset of precision 0, `verify-tx` with
+and without the block's results, and `light verify` with an anchor of another chain
+and one without a chain id. The other client commands (`transfer`, `account`,
+`propose` and the rest) are not driven against a node by any test, and no test
+compares the index or history with a replayed node's.
 
 Stage three (`test/sync.test.ts`): a node joins a running testnet from a snapshot,
 serves queries at once, rejects a corrupted chunk (its source is charged 50 points
@@ -582,12 +714,29 @@ peers catches up a node started some 45 blocks late, and a node retaining ten
 blocks prunes behind that window (with the evidence window switched off, since it
 would otherwise keep every block); evidence created on one node reaches a proposer
 that never saw the votes; a node with +2/3 precommits and no proposal decides the
-height from a fetched block.
+height from a fetched block. `test/review5-net.test.ts` (15 cases) covers the peer
+layer (one success per outbound dial, a refused connection left open for the
+rejection to leave, a ban and an exclusion by the address dialed, an address list
+taken only in answer to a request, a peer file cut short), block sync (nothing
+applied after a stop, the buffer dropped once no peer is ahead, a response with more
+blocks than asked for, a block of another height and a commit naming another block),
+state sync (a snapshot from before the trusted height passed over, a manifest that
+does not decode charged), consensus intake (a vote far ahead dropped unverified, two
+unchecked proposals a peer, block requests forgotten with the height), an empty
+validator set decoded only with proposer index -1, and the mempool (one of two
+concurrent checks admitted to the last place, a place given back, a pooled
+transaction never forgotten). `test/review5-node.test.ts` (15 cases) covers the data
+directory's claim and the takeover of a stale one, the evidence age read when asked, a block of which nothing is
+stored when the application's commit throws, pruning in one transaction with the
+set by height, a repeated transaction indexed where it succeeded, the memory store's
+write order, a heap flag of zero, gossiped evidence too old to pool, an item taken
+only from the peer asked, the fetches remembered for a peer that never answers bounded,
+and a block with more than 16 pieces of evidence refused.
 
 Schemes (`test/schemes.test.ts`, five cases): signing, verifying, tagging and codec
 round trips under each scheme, cross-scheme refusal and unknown tags; the high-S twin
-of a secp256k1 signature refused; the keystore keeping each key's scheme and reading
-an old file as ML-DSA-44; genesis refusing validator keys of the wrong scheme under
+of a secp256k1 signature refused; the keystore keeping each key's scheme, reading
+a version 1 file as ML-DSA-44 and writing it as version 2; genesis refusing validator keys of the wrong scheme under
 each default; and a four-validator chain on secp256k1 end to end: 65-byte commit
 signatures, `status.signatureScheme`, an account created with a secp256k1 key, and
 refusals of an ML-DSA authority key, an ML-DSA consensus key and an ML-DSA signature

@@ -1,7 +1,7 @@
 /**
  * Runs the benchmarks and prints a summary table.
  *
- *   npm run bench                 # everything, about three minutes
+ *   npm run bench                 # everything, about two and a half minutes
  *   npm run bench -- db app       # only these suites
  *
  * Suites: crypto, codec, db, store, app, network, and genesis (npm run

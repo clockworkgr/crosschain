@@ -3,15 +3,20 @@
  * database, behind the engine's Application interface.
  *
  * Signature verification is the only asynchronous step, because it goes to
- * the worker pool. Everything that touches the database is synchronous and
- * happens after any await, so the undo sessions nest cleanly even though
- * checkTx calls overlap each other and a finalizeBlock.
+ * the worker pool. checkTx writes to the database only after its last await.
+ * finalizeBlock awaits the pool with its block session open: it opens the
+ * session and runs beginBlock, then prewarms the block's signatures, then
+ * resolves each transaction's signers just before applying it. checkTx calls
+ * wait behind a block in progress (`applying`), so the undo sessions nest
+ * cleanly even though checkTx calls overlap each other and a finalizeBlock.
  *
  * Sessions during normal operation:
  *   pending  opened after every block; checkTx applies into it so that
  *            transactions queued behind each other are checked in sequence
- *   tx       one per transaction, inside pending for a check and at top
- *            level for a block; undone if the transaction fails
+ *   block    opened by finalizeBlock around everything a block does and
+ *            committed before the root is taken; undone if the block fails
+ *   tx       one per transaction, inside pending for a check and inside
+ *            block for a block; undone if the transaction fails
  * finalizeBlock first undoes pending, so the block runs on committed state,
  * and then the engine's post-commit recheck rebuilds pending.
  *
@@ -20,8 +25,10 @@
  * index entries they added and removed, the Merkle tree chunks and nodes
  * they changed, the counters that moved, and the height and app hash, in one
  * transaction. On startup everything is read back (the indices from their
- * entries and the trees from their chunks and nodes, without decoding or
- * hashing an object), the root checked against the stored app hash, and the
+ * entries and the trees from their chunks and nodes, neither rebuilt from
+ * the objects; by default every object is then hashed against its leaf and
+ * every index entry checked against its object), the root checked against
+ * the stored app hash, and the
  * engine replays any blocks the store is behind on. The index entries and
  * the trees are also what the database falls back on when the memory guard
  * drops its index trees and its Merkle trees.
@@ -213,8 +220,9 @@ export function openObjectDatabase(kv: KvStore, types: ObjectType<any>[], opts: 
     if (c) db.setCounter(t.id, decode(c, (r) => r.u53()));
   }
   const t1 = performance.now();
-  // The trees come from their chunks and nodes: no object is hashed and no index key inserted into a sparse tree,
-  // which was most of a restart (STATE-PAGING.md 5.3). Recomputing them gives the same root, only slower.
+  // The trees come from their chunks and nodes: no tree is built by hashing every object and inserting every index
+  // key into a sparse tree, which was most of a restart (STATE-PAGING.md 5.3). Recomputing them gives the same root,
+  // only slower. With checkLeaves (the default) each object is still hashed once, against the leaf that was stored.
   if (treesStored) {
     if (opts.fromTrees ?? true) db.loadTrees(opts.checkLeaves ?? true);
     else db.assumeStoredTrees();
@@ -340,7 +348,16 @@ export class CoreApp implements Application {
   /** Serialises checkTx's state-touching part behind a block in progress. */
   private applying: Promise<void> | null = null;
 
+  /**
+   * Set when a block failed after its session was committed: its changes are in the database and cannot be undone,
+   * while the height and the app hash did not advance. Applying anything more would build on a block applied
+   * twice, so the application refuses every block and check from then on. Nothing of the block was written to the
+   * store, so a restart has the state of the block before.
+   */
+  private failed: string | null = null;
+
   async checkTx(bytes: Uint8Array, opts: CheckTxOptions = {}): Promise<CheckTxResult> {
+    if (this.failed) return { ok: false, error: this.failed };
     const d = this.decode(bytes);
     if ('error' in d) return { ok: false, error: d.error };
     while (this.applying) await this.applying;
@@ -352,11 +369,13 @@ export class CoreApp implements Application {
     // the transactions checked after it would be checked against them.
     const refused = opts.admit?.() ?? null;
     if (refused !== null) return { ok: false, error: refused };
+    if (this.failed) return { ok: false, error: this.failed };
     const r = this.applyChecked(d.tx, d.txId, signed, this.lastTime, this.height + 1n, this.pending !== null, false);
     return r.ok ? { ok: true } : { ok: false, error: r.error };
   }
 
   async finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult> {
+    if (this.failed) throw new Error(this.failed);
     let release: () => void = () => {};
     this.applying = new Promise<void>((resolve) => {
       release = resolve;
@@ -364,6 +383,7 @@ export class CoreApp implements Application {
     // Everything the block does happens inside one session until the root is taken, so a failure
     // on the way (a verifier gone away) leaves the database exactly as the previous block left it.
     let blockSession: UndoSession | null = null;
+    let committed = false;
     try {
       this.closePending();
       blockSession = this.db.startSession();
@@ -395,6 +415,8 @@ export class CoreApp implements Application {
       }
       const validatorUpdates = endBlock(this.db, this.log);
       this.db.modify(DynamicType, DYNAMIC_ID, (d) => ({ ...d, height: req.height, time: req.time }));
+      // The root needs every session closed, so from here to the end a failure can undo nothing.
+      committed = true;
       blockSession.commit();
       blockSession = null;
 
@@ -405,7 +427,8 @@ export class CoreApp implements Application {
       this.pending = this.db.startSession();
       return { appHash: this.appHash, txResults, validatorUpdates };
     } catch (e) {
-      if (blockSession) {
+      if (committed) this.failed = `the application failed while taking the root of block ${req.height} (${(e as Error).message}) and holds changes it cannot undo: restart the node, the store has the state of the block before`;
+      else if (blockSession) {
         blockSession.undo();
         this.pending = this.db.startSession();
       }
@@ -416,13 +439,24 @@ export class CoreApp implements Application {
     }
   }
 
-  async commit(): Promise<void> {
-    if (this.toPersist) {
-      this.persist(this.toPersist);
-      this.lastHistory = this.toPersist.history;
-      this.toPersist = null;
+  /**
+   * Write the block to the store. Everything here is synchronous, and the function is not an async one, so that a
+   * write that fails throws where commit() is called: a caller that holds a store transaction open around the call
+   * has it aborted with its own writes. The block stays to be written, and commit() can be called again. A snapshot
+   * that fails rejects the promise instead: the block is written by then.
+   */
+  commit(): Promise<void> {
+    const p = this.toPersist;
+    if (!p) return Promise.resolve();
+    this.persist(p);
+    this.lastHistory = p.history;
+    this.toPersist = null;
+    try {
       if (this.snapshotInterval > 0 && this.height > 0n && this.height % BigInt(this.snapshotInterval) === 0n) this.takeSnapshot();
+    } catch (e) {
+      return Promise.reject(e);
     }
+    return Promise.resolve();
   }
 
   // ---- snapshots ----
@@ -473,6 +507,19 @@ export class CoreApp implements Application {
   }
 
   private persist(p: { changes: Changes; meta: Meta; history: [ObjectId, HistoryEntry][] }): void {
+    try {
+      this.write(p);
+    } catch (e) {
+      // The store took nothing of the write; the history log, which counted the block's entries as it appended
+      // them, goes back to what the store has, so that the same block can be written again.
+      this.historyLog.rollback();
+      throw e;
+    }
+    this.staleHistory = [];
+    this.db.dropChanges();
+  }
+
+  private write(p: { changes: Changes; meta: Meta; history: [ObjectId, HistoryEntry][] }): void {
     this.kv.write((w) => {
       this.historyLog.append(w, p.history);
       for (const c of p.changes.objects) {
@@ -494,10 +541,8 @@ export class CoreApp implements Application {
       // The store's window is the full one even while the memory guard has trimmed the one in memory, so a restart has it back.
       if (this.db.lastStaleVersion > 0) w.del(historyKey(this.db.lastStaleVersion));
       for (const v of this.staleHistory) w.del(historyKey(v));
-      this.staleHistory = [];
       w.put(META_KEY, encode((wr) => wr.u64(p.meta.height).fixed(p.meta.appHash)));
     });
-    this.db.dropChanges();
   }
 
   /** An account's history, oldest first from `from`, or newest first when reversed. */
@@ -658,9 +703,10 @@ export class CoreApp implements Application {
       verified = new Map();
       this.sigCache.set(txKey, verified);
     }
-    // A set, never a replacement: two valid signatures by one key over one body can be in flight at once
-    // (signing is randomised), and a later one should not cost the earlier its cache entry. Past a few the oldest
-    // goes; a transaction in flight holds its own verified signers, so that costs at most a second verification.
+    // A set, never a replacement: two valid signatures by one key over one body can be in flight at once (this
+    // chain's signer is deterministic, but a hedged signer or any other can make a second valid one), and a later
+    // one should not cost the earlier its cache entry. Past a few the oldest goes; a transaction in flight holds
+    // its own verified signers, so that costs at most a second verification.
     let hashes = verified.get(address);
     if (!hashes) verified.set(address, (hashes = new Set()));
     if (hashes.has(sigHash)) return;

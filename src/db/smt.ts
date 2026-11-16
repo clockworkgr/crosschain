@@ -264,7 +264,10 @@ export class SparseMerkleTree {
   private readonly pending = new Map<string, PendingWrite>();
   /** The root hash as of each retained version. */
   private readonly roots = new Map<number, Uint8Array>();
-  /** The oldest version the tree can describe: set when it is dropped or first committed dropped, raised when the window is trimmed. */
+  /**
+   * The oldest version the tree can describe: set when it is dropped, when it is first committed dropped, and by
+   * loadVersions; raised when the window is trimmed and by a commit, resident or dropped, that moves the window past it.
+   */
   private floor = 0;
   /** Per node key (as a string): before version v the node was enc (null: absent). Ascending by v. */
   private readonly history = new Map<string, { v: number; enc: Uint8Array | null }[]>();
@@ -329,7 +332,9 @@ export class SparseMerkleTree {
     return this.source;
   }
 
+  /** The tree keeps its own copy of the value (a few bytes, next to a hash of the key): the caller's buffer stays the caller's. */
   set(key: Uint8Array, value: Uint8Array): void {
+    value = new Uint8Array(value);
     if (this.source) {
       const keyHash = sha256(key);
       this.pending.set(str(keyHash), { keyHash, value });

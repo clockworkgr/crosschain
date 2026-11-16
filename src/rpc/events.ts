@@ -32,10 +32,14 @@ const MAX_WAITERS = 1000;
 
 export class RpcEvents {
   private readonly listeners = new Set<(e: CommittedEvent) => void>();
-  private readonly waiters = new Map<string, Set<(t: TxLanded) => void>>();
+  private readonly waiters = new Map<string, Set<(t: TxLanded | null) => void>>();
+  private closed = false;
+  private readonly unsubscribe: () => void;
 
   constructor(node: Node) {
-    node.executor.onCommitted((block, commit, results, updates) => {
+    this.unsubscribe = node.executor.onCommitted((block, commit, results, updates) => {
+      // A commit being announced while this is closed may still reach here once.
+      if (this.closed) return;
       const app = node.app as Partial<CoreApp>;
       const history = Array.isArray(app.lastHistory) ? app.lastHistory : [];
       const e: CommittedEvent = { block, commit, results, updates, history };
@@ -54,13 +58,27 @@ export class RpcEvents {
     return () => this.listeners.delete(fn);
   }
 
-  /** Resolves with where the transaction landed, or null on timeout. */
+  /**
+   * Stop passing commits on: every listener is let go and every caller waiting for a transaction is answered with
+   * null, as on a timeout, and the executor is given its callback back.
+   */
+  close(): void {
+    this.closed = true;
+    this.unsubscribe();
+    this.listeners.clear();
+    for (const set of [...this.waiters.values()]) for (const w of [...set]) w(null);
+  }
+
   /** Waiters outstanding across all callers. */
   waiting = 0;
 
-  /** Null when too many waits are already outstanding; the caller then tells its client to poll. */
+  /**
+   * The promise resolves with where the transaction landed, or null on timeout, on cancel or when the events are
+   * closed. The call itself returns null when too many waits are already outstanding or the events are closed; the
+   * caller then tells its client to poll.
+   */
   waitForTx(hash: Uint8Array, timeoutMs: number): { promise: Promise<TxLanded | null>; cancel(): void } | null {
-    if (this.waiting >= MAX_WAITERS) return null;
+    if (this.closed || this.waiting >= MAX_WAITERS) return null;
     this.waiting++;
     let counted = true;
     const uncount = () => {
@@ -77,35 +95,34 @@ export class RpcEvents {
       if (set!.size === 0) this.waiters.delete(k);
       clearTimeout(timer);
     };
-    const handler = (t: TxLanded) => {
+    const handler = (t: TxLanded | null) => {
       cleanup();
       resolveFn(t);
     };
-    const timer = setTimeout(() => {
-      cleanup();
-      resolveFn(null);
-    }, timeoutMs);
+    const timer = setTimeout(() => handler(null), timeoutMs);
     set.add(handler);
     return {
       promise: new Promise((resolve) => {
         resolveFn = resolve;
       }),
-      cancel: () => {
-        cleanup();
-        resolveFn(null);
-      },
+      cancel: () => handler(null),
     };
   }
 }
 
-export function blockEventJson(e: CommittedEvent): unknown {
+/**
+ * A block as an event stream carries it, the same whether it is pushed at its commit or replayed from the store.
+ * `failed` counts the transactions that failed; it is null for a block with transactions whose results the node
+ * does not hold, which is one it fetched after a state sync and never executed.
+ */
+export function blockEventJson(block: Block, results: TxResult[] | null): unknown {
   return {
-    height: e.block.header.height.toString(),
-    hash: toHex(blockHash(e.block)),
-    time: e.block.header.time.toString(),
-    txs: e.block.txs.length,
-    failed: e.results.filter((r) => !r.ok).length,
-    appHash: toHex(e.block.header.appHash),
-    proposer: toHex(e.block.header.proposerAddress),
+    height: block.header.height.toString(),
+    hash: toHex(blockHash(block)),
+    time: block.header.time.toString(),
+    txs: block.txs.length,
+    failed: results ? results.filter((r) => !r.ok).length : block.txs.length === 0 ? 0 : null,
+    appHash: toHex(block.header.appHash),
+    proposer: toHex(block.header.proposerAddress),
   };
 }

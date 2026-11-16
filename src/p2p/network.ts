@@ -56,6 +56,11 @@ export interface Peer {
   readonly id: string;
   readonly publicKey: Uint8Array;
   readonly remoteAddr: string;
+  /**
+   * The address this node dialed to reach the peer, as the peer database holds it; null for an inbound peer. The
+   * connection's remote address is what that name resolved to and need not be the same string.
+   */
+  readonly dialedAddr: string | null;
   readonly listenAddr: string;
   readonly direction: 'in' | 'out';
   height: bigint;
@@ -138,6 +143,10 @@ export class Network {
   private readonly peerGoneListeners: ((p: Peer) => void)[] = [];
   private readonly dialing = new Set<string>();
   private readonly handshaking = new Set<Conn>();
+  /** Connections that were sent a rejection; each closes itself a moment later, once the frame has left. */
+  private readonly rejected = new WeakSet<Conn>();
+  /** Peers whose answer to an address request is still awaited. */
+  private readonly addrAsked = new WeakSet<Peer>();
   private readonly p2pCtx: Uint8Array;
   private timers: NodeJS.Timeout[] = [];
   private running = false;
@@ -231,7 +240,8 @@ export class Network {
     } catch (e) {
       this.cfg.peerDb.markFailure(addr);
       this.cfg.log('debug', 'dial failed', { addr, err: (e as Error).message });
-      conn?.close(); // a connection that did not become a peer is not kept
+      // A connection that did not become a peer is not kept; one that was sent a rejection closes itself.
+      if (conn && !this.rejected.has(conn)) conn.close();
       throw e;
     } finally {
       this.dialing.delete(addr);
@@ -265,8 +275,10 @@ export class Network {
     return null;
   }
 
+  /** Tell the other side why, and close a moment later: closing at once could take the frame down with the socket. */
   private reject(conn: Conn, code: number, reason: string): void {
     conn.send(encodeMessage({ type: 'reject', code, reason }));
+    this.rejected.add(conn);
     setTimeout(() => conn.close(), 50);
   }
 
@@ -314,7 +326,7 @@ export class Network {
       await this.handshakeInbound(conn);
     } catch (e) {
       this.cfg.log('debug', 'inbound handshake failed', { from: conn.remoteAddr, err: (e as Error).message });
-      conn.close();
+      if (!this.rejected.has(conn)) conn.close();
     } finally {
       this.pendingInbound--;
       this.handshaking.delete(conn);
@@ -362,6 +374,7 @@ export class Network {
       id,
       publicKey: their.publicKey,
       remoteAddr: conn.remoteAddr,
+      dialedAddr,
       listenAddr: their.listenAddr,
       direction,
       height: their.height,
@@ -401,9 +414,9 @@ export class Network {
     conn.onFrame((frame) => this.onFrame(peer, frame));
     conn.onClose(() => this.removePeer(peer));
     if (their.listenAddr) this.cfg.peerDb.add(their.listenAddr);
-    if (dialedAddr) this.cfg.peerDb.markSuccess(dialedAddr);
     this.cfg.log('info', 'peer connected', { peer: id.slice(0, 8), direction, addr: their.listenAddr || conn.remoteAddr, height: their.height });
 
+    this.addrAsked.add(peer);
     peer.send({ type: 'addrRequest' });
     peer.send({ type: 'status', height: this.cfg.getHeight() });
     for (const fn of this.peerListeners) fn(peer);
@@ -437,8 +450,11 @@ export class Network {
 
   /**
    * Charge a peer for misbehaving. Points decay by one a minute; at the
-   * threshold the peer is disconnected and its address and id are banned for
-   * an hour, doubling on each repeat.
+   * threshold the peer is disconnected and its id is banned. For a peer this
+   * node dialed, the address is banned as well, for an hour that doubles with
+   * each ban of that address (PeerDb.ban), and the id until the same time.
+   * An inbound peer's address is not known to be its own, so only its id is
+   * banned, for an hour each time.
    */
   score(peerId: string, points: number, reason: string): void {
     const now = Date.now();
@@ -450,8 +466,9 @@ export class Network {
     if (s.points < BAN_THRESHOLD) return;
     this.scores.delete(peerId);
     const peer = this.peers.get(peerId);
-    // Only an address we dialed is known to be this peer's; an advertised one could be anybody's.
-    const addr = peer?.direction === 'out' ? peer.remoteAddr : null;
+    // Only an address we dialed is known to be this peer's; an advertised one could be anybody's. It is banned as
+    // it was dialed, which is how the peer database holds it and how the connect loop would pick it again.
+    const addr = peer?.dialedAddr ?? null;
     const until = addr ? this.cfg.peerDb.ban(addr, BAN_MS, now) : now + BAN_MS;
     this.bannedIds.set(peerId, until);
     this.cfg.log('warn', 'peer banned', { peer: peerId.slice(0, 8), reason, untilMs: until - now });
@@ -500,6 +517,8 @@ export class Network {
         break;
       }
       case 'addrResponse':
+        // Only the answer to a request: addresses nobody asked for are not taken into the peer database.
+        if (!this.addrAsked.delete(peer)) break;
         for (const a of m.addrs) if (a !== this.cfg.advertiseAddr) this.cfg.peerDb.add(a);
         break;
       case 'hello':
@@ -522,7 +541,7 @@ export class Network {
     if (need <= 0) return;
     const exclude = new Set<string>([this.cfg.advertiseAddr, ...this.dialing]);
     // Addresses we dialed are taken; an inbound peer's advertised address is only a claim and must not stop us dialing it.
-    for (const p of this.peers.values()) if (p.direction === 'out') exclude.add(p.remoteAddr);
+    for (const p of this.peers.values()) if (p.dialedAddr) exclude.add(p.dialedAddr);
     for (const addr of this.cfg.peerDb.candidates(exclude).slice(0, need)) void this.connect(addr).catch(() => {});
   }
 

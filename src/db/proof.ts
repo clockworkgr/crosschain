@@ -17,8 +17,9 @@
  *   InnerSpec child order [0, 1], child size 32, prefix 0x01, EmptyChild = SHA256(0x02)
  * The object leg's key is the 8-byte id and its value the object's encoding;
  * the type leg's key is the 2-byte type and its value the counter followed
- * by the type root. A verifier that speaks ICS23 could check them with that
- * spec; the one here is a direct implementation of the same rules.
+ * by the type root and the list of the type's index roots (typeValue). A
+ * verifier that speaks ICS23 could check them with that spec; the one here
+ * is a direct implementation of the same rules.
  *
  * Absence comes in two shapes. An instance at or past the type's counter was
  * never created, and the counter is bound into the type leaf, so no path in
@@ -37,6 +38,9 @@ import { bytesEqual, HASH_SIZE } from '../crypto/hash.ts';
 import { instanceOf, typeOf, type ObjectId } from './id.ts';
 import { EMPTY, heightFor, leafHash, rootFromPath } from './merkle.ts';
 import { smtProofRoot, type SmtProof } from './smt.ts';
+
+/** The authenticated indices a type may have: a proof and a snapshot manifest carry one root for each, and their decoders take no more. */
+export const MAX_AUTHENTICATED_INDICES = 16;
 
 export interface ObjectProof {
   /** The state height this proof describes. */
@@ -151,7 +155,7 @@ export function decodeProof(r: Reader): ObjectProof {
     nextInstance: r.u64(),
     typeRoot: r.fixed(HASH_SIZE),
     typeSiblings: r.array((r) => r.fixed(HASH_SIZE), 64),
-    indexRoots: r.array((r) => r.fixed(HASH_SIZE), 16),
+    indexRoots: r.array((r) => r.fixed(HASH_SIZE), MAX_AUTHENTICATED_INDICES),
     typeIndex: r.u32(),
     typeCount: r.u32(),
     topSiblings: r.array((r) => r.fixed(HASH_SIZE), 64),
@@ -193,7 +197,7 @@ export function decodeKeyProof(r: Reader): KeyProof {
     },
     nextInstance: r.u64(),
     typeRoot: r.fixed(HASH_SIZE),
-    indexRoots: r.array((r) => r.fixed(HASH_SIZE), 16),
+    indexRoots: r.array((r) => r.fixed(HASH_SIZE), MAX_AUTHENTICATED_INDICES),
     typeIndex: r.u32(),
     typeCount: r.u32(),
     topSiblings: r.array((r) => r.fixed(HASH_SIZE), 64),

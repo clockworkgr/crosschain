@@ -8,9 +8,9 @@ This part brings a node that is behind up to date. Block sync (`src/sync/blocksy
 
 **No fork-point search.** Chains with probabilistic finality (Bitcoin, BitShares with its DPoS schedule) must first find where the local chain and the peer's chain diverge; Graphene exchanges a "synopsis" of block ids for that. Here finality is instant and there are no forks, so a node at height H simply asks for H+1 onward. DESIGN.md section 3: "Block sync: no fork-point synopsis. Lagging node requests blocks from height H+1. Both sides learn the other's height from the hello."
 
-**Verifying a commit against the set you know.** A block from a peer is untrusted bytes. What makes it trustworthy is its commit: precommit signatures from more than two thirds of the voting power of the validator set that was responsible for that height. The node knows that set without trusting the peer, because validator set changes take effect two heights after the block that requested them (the H+2 rule, [consensus](04-consensus.md)): chain state at height H holds `validators`, the set that signs H+1, and `nextValidators`, the set that signs H+2. So for the block at H+1, `verifyCommit(chainId, state.validators, blockHash(block), commit, verifier)` checks that every signature present verifies over the precommit sign bytes (chain id, vote type, height, round, block hash, validator index) and that the signers' power is a quorum of that set. Then the block's own content is checked as consensus would check a proposal (`validateBlockStructure`) and its `lastCommit` and evidence signatures are verified (`verifyBlockSignatures`). After applying the block the node has the state for H+1, including the set that signs H+2, and the chain of trust extends one step. A peer that served a block failing any of these checks is charged 50 points (RPC-SYNC-PROOFS.md section 4.6, "bad block during sync 50").
+**Verifying a commit against the set you know.** A block from a peer is untrusted bytes. What makes it trustworthy is its commit: precommit signatures from more than two thirds of the voting power of the validator set that was responsible for that height. The node knows that set without trusting the peer, because validator set changes take effect two heights after the block that requested them (the H+2 rule, [consensus](04-consensus.md)): chain state at height H holds `validators`, the set that signs H+1, and `nextValidators`, the set that signs H+2. So for the block at H+1, `verifyCommit(chainId, state.validators, blockHash(block), commit, verifier)` checks that every signature present verifies over the precommit sign bytes (chain id, vote type, height, round, block hash) under the key of the validator at that signature's index, and that the signers' power is a quorum of that set. The node runs that check second of three: first the block's own content is checked as consensus would check a proposal (`validateBlockStructure`, which needs no signatures), then the commit, then the block's `lastCommit` and evidence signatures (`verifyBlockSignatures`). After applying the block the node has the state for H+1, including the set that signs H+2, and the chain of trust extends one step. A peer that served a block failing any of these checks is charged 50 points (RPC-SYNC-PROOFS.md section 4.6, "bad block during sync or backfill 50").
 
-**Windows, batches, several peers.** Asking for one block at a time, waiting, applying, asking again, would be bounded by the round trip. Instead a *window* of heights ahead of the applied height is kept requested, in runs of a few consecutive heights, from several peers at once; responses land in a buffer and are applied in order. RPC-SYNC-PROOFS.md section 4.3: "A window of 32 heights ahead of the applied height is kept requested, at most 8 heights per request, spread across up to 4 peers that report having them. Responses land in a buffer and are applied in order; a request that times out or returns a bad block is re-issued to another peer; the first peer's height is forgotten, and a bad block costs it points, while a mere timeout does not."
+**Windows, batches, several peers.** Asking for one block at a time, waiting, applying, asking again, would be bounded by the round trip. Instead a *window* of heights ahead of the applied height is kept requested, in runs of a few consecutive heights, from several peers at once; responses land in a buffer and are applied in order. RPC-SYNC-PROOFS.md section 4.3: "A window of 32 heights ahead of the applied height is kept requested, at most 8 heights per request, spread across up to 4 peers that report having them. A serving node answers with at most 64 blocks and stops adding blocks past 16 MiB (the first always goes). Responses land in a buffer and are applied in order; heights that consensus decided meanwhile are discarded from the buffer. A request that times out or returns a bad block is re-issued to another peer; the first peer's height is forgotten, and a bad block costs it 50 points, while a mere timeout does not." The code keeps to this with two qualifications, both described with `fetchRun` below: a response is not held to the count that was asked for, and the 50 points are charged for a block that fails verification when it is applied, not for one that the cheaper filter on arrival sets aside.
 
 **Lag grace.** A node is normally "behind" for a few hundred milliseconds after every block: the others have decided height H+1 and announced it in `status` while this node is still finalizing. Starting a block request every time would waste bandwidth and race consensus. So a lag of exactly one block is tolerated for a grace period (`lagGraceMs`, default 3 s) before sync starts; a lag of two or more starts it at once.
 
@@ -20,11 +20,11 @@ This part brings a node that is behind up to date. Block sync (`src/sync/blocksy
 
 **Headers for the evidence window.** A block after the snapshot height may carry evidence of a double sign at any height within the evidence age (`maxEvidenceAgeMs`, the unbonding period). Applying it takes the validator set of that height, named by its header, and the time of that height, which every other node reads from its own blocks. A node that joined at H has no blocks below H, and a node that could not apply such a block would fall out of step with the chain at once. So, before the join is written, state sync fetches the headers below H back to the first one older than the evidence age, in batches of up to `MAX_HEADERS` (1000) per request, and keeps them without their blocks. No commit is needed for them: header H is already verified, and each header names the hash of the one before it, so a header is bound to the chain by its hash alone. Their validator sets are fetched by hash when the store lacks them. The executor's `headerAt` serves either a block's header or one of these records, so `validatorSetAtHeight` and `blockTimeAt` answer below the join ([chapter 5](05-mempool-executor.md)); backfill replaces each record with its block, and the executor's `pruneHeaders` drops the rest once the window has moved past them. The light client's backward verification ([chapter 13](13-light-client.md)) walks the same records, so a client anchored after the join can still verify a proof from before it.
 
-**State sync and the trusted header.** Replaying a long chain is slow (every signature of every transaction must be verified again). Cosmos SDK nodes instead download a *snapshot* of application state and verify it against a header; this chain does the same. A snapshot (RPC-SYNC-PROOFS.md section 4.1) is the application's object database at a height H, exported per object type in chunks of objects, each chunk with a range proof that folds its leaves to the type root, plus a manifest listing the chunk hashes and the type leaves with their paths to the app hash. Nothing in a snapshot proves itself: the chain of trust must start from a header whose hash the operator obtained out of band (from a block explorer, a friend, a published checkpoint). That is the "trust anchor" of RPC-SYNC-PROOFS.md: `stateSync: { trustHeight, trustHash }`. From it the light client verifies forward to header H+1, whose `appHash` commits to the state after H (execution is deferred by one block, DESIGN.md section 2); the manifest must fold to that app hash; every chunk must hash as the manifest says and fold to its type root; the rebuilt database must produce the same root. Cosmos state sync has the same shape: a trust height and hash, snapshot discovery from peers, chunk verification, then block sync from the snapshot height.
+**State sync and the trusted header.** Replaying a long chain is slow (every signature of every transaction must be verified again). Cosmos SDK nodes instead download a *snapshot* of application state and verify it against a header; this chain does the same. A snapshot (RPC-SYNC-PROOFS.md section 4.1) is the application's object database at a height H, exported per object type in chunks of objects, each chunk with a range proof that folds its leaves to the type root, plus a manifest listing the chunk hashes and the type leaves with their paths to the app hash. Nothing in a snapshot proves itself: the chain of trust must start from a header whose hash the operator obtained out of band (from a block explorer, a friend, a published checkpoint). That is the "trust anchor" of RPC-SYNC-PROOFS.md: `stateSync: { trustHeight, trustHash }`. From it the light client verifies forward to header H+1 (forward only: the anchor must be at or below H+1, so a snapshot that lies further back than that is not a candidate), whose `appHash` commits to the state after H (execution is deferred by one block, DESIGN.md section 2); the manifest must fold to that app hash; every chunk must hash as the manifest says and fold to its type root; the rebuilt database must produce the same root. Cosmos state sync has the same shape: a trust height and hash, snapshot discovery from peers, chunk verification, then block sync from the snapshot height.
 
-**Which snapshot.** Peers offer snapshot heights. The joiner picks the highest height offered by at least two peers (a height one peer lists several times counts once for it), so that chunks can be spread across sources and a single lying peer can be out-voted, falling back to the highest offered by one. A peer that serves a chunk that fails verification is charged 50 points, marked bad for the rest of the chunk phase, and its job is retried elsewhere; a peer whose manifest does not fold to the verified app hash is charged 50 and the next source is asked; a peer whose block at H does not match its header or whose commit does not verify is charged 50 and the next source is asked.
+**Which snapshot.** Peers offer snapshot heights. Of the heights the trust anchor can reach (H+1 at or above the anchor), the joiner picks the highest offered by at least two peers (a height one peer lists several times counts once for it), so that chunks can be spread across sources and a single lying peer can be out-voted, falling back to the highest offered by one. A peer that serves a chunk that fails verification is charged 50 points, marked bad for the rest of the chunk phase, and its job is retried elsewhere; a peer whose manifest does not decode or does not fold to the verified app hash is charged 50 and the next source is asked; a peer whose block at H does not match its header or whose commit does not verify is charged 50 and the next source is asked.
 
-**Rebuilding chain state, priorities included.** Block sync and consensus need more than the application state: the chain state at H (last block hash and time, app hash, results hash) and the three validator sets around it. The sets are fetched *by height* (`validatorsRequest`), because the by-hash copies do not carry proposer priorities and a state-synced validator must continue consensus with the exact priorities the others have (RPC-SYNC-PROOFS.md, "validator sets are stored by the height they sign with their proposer priorities so a joiner continues consensus exactly"). The priorities are not covered by the set hash, which finding 8 of the review flagged: a peer could serve genuine keys with altered priorities. The mitigation is to check that the sets given for H and H+1 pick, at some round from 0 up to the round each commit was decided in, the proposers the headers name; a block decided in round 2 may have been built and first proposed in round 0, and its header keeps that proposer's name. DESIGN.md section 10 records the residual: "a peer could still craft priorities that pass that check and diverge later." The three sets must also hold keys of the signature scheme the node's genesis names ([chapter 2](02-crypto.md)): every key the chain ever admitted was of that scheme, so a set of another kind is another chain's, and the chain state written at the join records the scheme as `genesisState` would have.
+**Rebuilding chain state, priorities included.** Block sync and consensus need more than the application state: the chain state at H (last block hash and time, app hash, results hash) and the three validator sets around it. The sets are fetched *by height* (`validatorsRequest`), because the by-hash copies cannot serve for this: the set hash covers keys and powers only, so one by-hash record stands for every height that set signs and holds the priorities of whichever height wrote it last, and a state-synced validator must continue consensus with the exact priorities the others have (RPC-SYNC-PROOFS.md, "validator sets are stored by the height they sign with their proposer priorities so a joiner continues consensus exactly"). The priorities are not covered by the set hash, which finding 8 of the review flagged: a peer could serve genuine keys with altered priorities. The mitigation is to check that the sets given for H and H+1 pick, at some round from 0 up to the round each commit was decided in, the proposers the headers name; a block decided in round 2 may have been built and first proposed in round 0, and its header keeps that proposer's name. DESIGN.md section 10 records the residual: "a peer could still craft priorities that pass that check and diverge later." The three sets must also hold keys of the signature scheme the node's genesis names ([chapter 2](02-crypto.md)): every key the chain ever admitted was of that scheme, so a set of another kind is another chain's, and the chain state written at the join records the scheme as `genesisState` would have.
 
 **The messages sync uses.** All are defined in `src/p2p/messages.ts` and matched through the `Requester` by the fields listed; every response echoes enough of its request to be matched without a correlation id.
 
@@ -59,7 +59,7 @@ Serving side handlers for headers, sets and snapshots live in `src/node/node.ts`
 - `isConsensusDeciding()`: true while consensus is applying a block it decided.
 - `onBlockApplied()`: called after each synced block.
 - `scorePeer?(peerId, points, reason)`: optional, wired to `Network.score`.
-- `requestTimeoutMs?` (5000), `lagGraceMs?` (3000), `window?` (32), `perRequest?` (8), `maxPeers?` (4), `backfill?` (false unless set; the node sets it true by default).
+- `requestTimeoutMs?` (5000), `lagGraceMs?` (3000), `window?` (32), `perRequest?` (8), `maxPeers?` (4), `backfill?` (false unless set; the node sets it true by default), `retainBlocks?` (how many blocks the node keeps behind its head, the node's `retain.blocks`; backfill stops at that edge, and with it unset goes down to genesis).
 
 `MAX_SERVED = 64` caps how many blocks one `blocksResponse` carries, matching the decoder's limit of 64 entries in `src/p2p/messages.ts`, and `MAX_SERVED_BYTES = 16 MiB` caps their encoded size: sixty-four blocks at the 4 MiB default block limit would be a 256 MiB frame, far past what the transport accepts, so a count cap alone is not a size cap.
 
@@ -84,7 +84,7 @@ The constructor subscribes:
 
 A new peer's height comes from its hello (`peer.height` at `onPeer`); later heights come from `status` messages, which every node broadcasts after each commit. Serving is registered here too, so a node serves blocks whether or not it is itself caught up.
 
-Public methods: `start()` sets `running` and runs `check()`; `stop()` clears the flag, the grace timer and the backfill retry timer; `isSyncing` is true while anything is buffered or requested; `bestPeerHeight()` is the maximum over `peerHeights`.
+Public methods: `start()` sets `running` and runs `check()`; `stop()` clears the flag, the grace timer and the backfill retry timer, and does not wait for a `drain` that is under way, which applies nothing more once it sees the flag cleared; `isSyncing` is true while anything is buffered or requested; `bestPeerHeight()` is the maximum over `peerHeights`.
 
 #### The decision: `check`
 
@@ -95,6 +95,9 @@ Public methods: `start()` sets `running` and runs `check()`; `stop()` clears the
     const best = this.bestPeerHeight();
     if (best <= ours) {
       this.behindSince = null;
+      // Nothing held will be applied now: what is at or below our height consensus decided meanwhile, and no
+      // connected peer stands behind anything above it. Left here, it would keep the node reporting that it syncs.
+      this.buffer.clear();
       void this.backfill();
       return;
     }
@@ -112,7 +115,7 @@ Public methods: `start()` sets `running` and runs `check()`; `stop()` clears the
   }
 ```
 
-`check` is the one entry point, called on every status, every peer change, every completed request, every applied block and every grace timer. Nothing to do: reset the grace clock and try a backfill step. One behind with nothing buffered: start or continue the grace period, and schedule a re-check for when it expires (`later` keeps a single timer). Otherwise issue requests and drain the buffer.
+`check` is the one entry point, called on every status, every peer change, every completed request, every applied block and every grace timer. Nothing to do: reset the grace clock, drop whatever the buffer still holds, and try a backfill step. Nothing buffered will be applied at that point: what is at or below the node's height consensus decided meanwhile, and no connected peer stands behind anything above it. Left in place it would keep `isSyncing` true. One behind with nothing buffered: start or continue the grace period, and schedule a re-check for when it expires (`later` keeps a single timer). Otherwise issue requests and drain the buffer.
 
 #### Issuing requests: `request`
 
@@ -155,14 +158,19 @@ The target is the lesser of the best peer height and `ours + window`. Heights ne
     this.d.log('debug', 'requesting blocks', { from, count, peer: peer.id.slice(0, 8) });
     try {
       const m = await this.d.requester.request(peer, { type: 'blocksRequest', from, count }, 'blocksResponse', (m) => m.from === from, this.d.requestTimeoutMs ?? 5000);
-      let got = 0;
-      m.blocks.forEach((b, i) => {
-        const h = from + BigInt(i);
-        if (b.block.header.height !== h || !bytesEqual(b.commit.blockHash, blockHash(b.block))) return;
-        this.buffer.set(h, { block: b.block, commit: b.commit, peerId: peer.id });
-        got++;
-      });
-      if (got === 0) this.peerHeights.set(peer.id, from - 1n); // it does not have them after all
+      // Only what was asked for is taken: at most `count` blocks, each of the height its place in the run gives
+      // it, with a commit that names it. No honest peer answers otherwise, so a response that does is not used at
+      // all and costs what a block that fails verification costs.
+      const matches = m.blocks.length <= count && m.blocks.every((b, i) => b.block.header.height === from + BigInt(i) && bytesEqual(b.commit.blockHash, blockHash(b.block)));
+      if (!matches) {
+        this.d.log('warn', 'blocks response does not match the request', { from, count, got: m.blocks.length, peer: peer.id.slice(0, 8) });
+        this.d.scorePeer?.(peer.id, 50, 'blocks response does not match the request');
+        this.peerHeights.delete(peer.id);
+      } else if (m.blocks.length === 0) {
+        this.peerHeights.set(peer.id, from - 1n); // it does not have them after all
+      } else {
+        m.blocks.forEach((b, i) => this.buffer.set(from + BigInt(i), { block: b.block, commit: b.commit, peerId: peer.id }));
+      }
     } catch (e) {
       this.d.log('warn', 'block request failed', { from, count, peer: peer.id.slice(0, 8), err: (e as Error).message });
       this.peerHeights.delete(peer.id);
@@ -174,7 +182,7 @@ The target is the lesser of the best peer height and `ours + window`. Heights ne
   }
 ```
 
-The response is matched on `from`. Each returned block is accepted into the buffer only if its header height is the expected one and its commit names its hash, a cheap structural filter; the real verification happens when the block is applied. A peer that returned nothing usable has its height lowered to `from - 1`, so it will not be asked for these heights again until its next `status` says otherwise. A timeout or disconnect forgets the peer's height entirely (it comes back with its next status). Either way the heights are released from `requested`, the peer from `busyPeers`, and `check` runs again, which re-issues the missing heights to another peer. RPC-SYNC-PROOFS.md section 4.3 states the policy: "the first peer's height is forgotten, and a bad block costs it points, while a mere timeout does not."
+The response is matched on `from`, and then held against the request as a whole: it must carry at most `count` blocks, and each must have the height its place in the run gives it, `from + i`, and a commit that names its hash. This is a cheap structural test; the real verification happens when the block is applied. No honest peer answers otherwise, so a response that fails the test is not used at all: nothing of it is buffered, the peer is charged 50 points, what a block that fails verification costs, with the reason `blocks response does not match the request`, and its height is forgotten. A response with no blocks lowers the peer's height to `from - 1`, so it will not be asked for these heights again until its next `status` says otherwise. A response that passes is buffered whole; it may be shorter than the run, and the heights it left out are asked for again. So the buffer never holds a height that was not requested, and a response cannot reach past the run or the window. A timeout or disconnect forgets the peer's height entirely (it comes back with its next status). Either way the heights are released from `requested`, the peer from `busyPeers`, and `check` runs again, which re-issues the missing heights to another peer. RPC-SYNC-PROOFS.md section 4.3 states the policy: "the first peer's height is forgotten, and a bad block costs it 50 points, while a mere timeout does not."
 
 #### Applying in order: `drain`
 
@@ -205,6 +213,7 @@ The response is matched on `from`. Each returned block is accepted into the buff
           this.stop();
           return;
         }
+        if (!this.running) return; // stopped while the block was verified: nothing more is applied
         if (err) {
           this.d.log('warn', 'bad block from peer', { h: ours + 1n, from: next.peerId.slice(0, 8), err });
           this.d.scorePeer?.(next.peerId, 50, 'bad block in sync');
@@ -232,7 +241,7 @@ The response is matched on `from`. Each returned block is accepted into the buff
   }
 ```
 
-`applying` makes the loop single-entry. Each iteration first discards every buffered block at or below the applied height: consensus may have decided heights that were still sitting in the buffer, and a response can carry heights the node applied while the request was in flight, so without the sweep those entries would stay in the `Map` until a restart, each holding a block's bytes. Then it takes the block for `ours + 1` out of the buffer, unless consensus is mid-decision, in which case it waits 200 ms. A bad block is dropped, its source charged 50 points and forgotten, and the loop continues: the height is now neither buffered nor requested, so the next `check` asks someone else. A verifier exception is treated as shutdown, not as a peer fault. `StaleHeightError` from `applyBlock` means consensus applied that height while sync was verifying it; the block is simply dropped and the loop reads the new state. Any other apply failure stops sync, because the executor is in an unknown condition.
+`applying` makes the loop single-entry. Each iteration first discards every buffered block at or below the applied height: consensus may have decided heights that were still sitting in the buffer, and a response can carry heights the node applied while the request was in flight, so without the sweep those entries would stay in the `Map`, each holding a block's bytes. `check` returns before calling `drain` when no peer is ahead, and clears the whole buffer itself in that case. Then `drain` takes the block for `ours + 1` out of the buffer, unless consensus is mid-decision, in which case it waits 200 ms. A bad block is dropped, its source charged 50 points and forgotten, and the loop continues: the height is now neither buffered nor requested, so the next `check` asks someone else. A verifier exception is treated as shutdown, not as a peer fault. `running` is read on entry to `drain` and again after the `await` on `verify`, so a block whose verification was in flight when `stop()` was called is not handed to `applyBlock` when the verification completes: a stopped sync applies nothing. `StaleHeightError` from `applyBlock` means consensus applied that height while sync was verifying it; the block is simply dropped and the loop reads the new state. Any other apply failure stops sync, because the executor is in an unknown condition.
 
 The closing comment records finding 30 of the review. Before the fix, `drain` always called `check`, and `check` always called `drain`; with an empty buffer that recursion never reached an `await`, so a single `status` message from a peer whose blocks nobody could serve overflowed the stack. Now `check` is re-entered only if a block was consumed. `test/review.test.ts` (`does a bounded amount of work on a peer status it cannot act on`) counts calls to `getState` after one unanswerable status: fewer than 10, against 7492 before.
 
@@ -247,7 +256,7 @@ Take a node at height 100 with four peers at 145, the defaults (window 32, 8 per
 5. This repeats until `ours = 145`. Then `best <= ours`: `behindSince` is cleared and `backfill` is tried, which returns at once because the lowest held height is 1.
 6. Meanwhile the validators have committed 146 and broadcast `status { height: 146 }`. The node is one behind with an empty buffer, so the grace clock starts. Either consensus, restarted at 146, decides it from the votes validators keep re-sending while the round is unresolved (DESIGN.md section 3), and the grace is cleared on the next `check` when `best <= ours`; or the others have already moved on, the grace expires after 3 s, and block sync fetches 146.
 
-A peer that answers 101 to 108 with a block whose commit does not verify is caught in step 4: the block is dropped, the peer charged 50 points and forgotten, and the next `check` re-requests 101 from another peer, because 101 is now neither buffered nor requested.
+A peer that answers 101 to 108 with nine blocks, with a block of another height, or with a commit that names another block is caught in step 3: nothing of the response is buffered, the peer is charged 50 points and forgotten, and the run is requested from another peer. A peer that answers 101 to 108 with a block whose commit does not verify is caught in step 4: the block is dropped, the peer charged 50 points and forgotten, and the next `check` re-requests 101 from another peer, because 101 is now neither buffered nor requested.
 
 #### Verification: `verify`
 
@@ -266,7 +275,7 @@ Three layers, in cost order. `validateBlockStructure` is the same check consensu
 
 #### Serving
 
-`serveBlock` answers a `blockRequest` with the stored block and commit or nulls. `serveBlocks` answers a `blocksRequest` with consecutive stored blocks from `from`, stopping at the first missing height or at `MAX_SERVED`, so a pruned or still-syncing node answers with what it has and the requester lowers its view of that peer accordingly.
+`serveBlock` answers a `blockRequest` with the stored block and commit or nulls. `serveBlocks` answers a `blocksRequest` with consecutive stored blocks from `from`, stopping at the first missing height, at `min(count, MAX_SERVED)` blocks, or before the block that would take the encoded blocks and commits past `MAX_SERVED_BYTES` (the first block always goes, however large), so a pruned or still-syncing node answers with what it has and the requester lowers its view of that peer accordingly.
 
 #### Backfill
 
@@ -351,11 +360,11 @@ export function bodyMatchesHeader(b: Block): boolean {
 
 **`proposerForRound(set, round)`**: the address a validator set with these priorities would pick at a round, computed as consensus does it, one `incrementProposerPriority(round)` on a copy from the base set (DESIGN.md section 1 explains why it must be one call, not round-by-round increments). Used for the priority check.
 
-A detail of the file: the `import type` lines for `ChainState`, `ValidatorSet` and `Logger` appear after `proposerForRound`, at lines 41 to 43. ES module imports are hoisted, so it is legal, but it is unusual placement.
+A detail of the file: the `import type` lines for `ChainState`, `ValidatorSet` and `Logger` appear after `proposerForRound`, at lines 42 to 44. ES module imports are hoisted, so it is legal, but it is unusual placement.
 
 **`StateSyncOptions`**: `chainId`, `network`, `requester`, `verifier`, `chainStore` (the `BlockStore`), `appKv` (the application's key-value store, which must be empty), `types` (the object types of the application, `CORE_TYPES` from the node), `retainVersions?`, `log`, `trustHeight`, `trustHash`, `scheme` (the chain's signature scheme from genesis, as a `SchemeTag`; the node passes its node key's, which it derived with that scheme), `evidenceAgeMs` (a function of the imported database: how old evidence may be, which is the unbonding period the state holds unless the operator fixed one; the node passes `cfg.limits?.maxEvidenceAgeMs ?? getGlobal(db).staking.unbondingPeriodMs`), `transaction?` (runs the install's writes as one transaction; the node passes `env.transaction`), `peerWaitMs?` (30,000), `requestTimeoutMs?` (10,000), `parallel?` (4).
 
-**`stateSync(o)`** returns `{ height }` when the node joined at a snapshot height, or `null` when no peer could be found or none offers a snapshot, in which case the caller replays from genesis. Any other problem throws, since a half-imported state must not be used. The steps:
+**`stateSync(o)`** returns `{ height }` when the node joined at a snapshot height, or `null` when no peer could be found, none offers a snapshot, or every snapshot offered lies before the trusted height, in which case the caller replays from genesis. Any other problem throws, since a half-imported state must not be used. The steps:
 
 1. **Wait for peers.** Poll every 200 ms until at least one peer exists or `peerWaitMs` passes (then `null`). Then wait up to 3 s more for a second peer, "so snapshots can be cross-checked and chunks spread".
 
@@ -382,26 +391,31 @@ A detail of the file: the `import type` lines for `ChainState`, `ValidatorSet` a
 
 `ask` tries candidates in turn and returns the first non-null answer, logging failures at debug level. The provider does not verify anything; the light client does.
 
-3. **Trust the anchor.** `LightClient.trust(..., trustHeight, trustHash)` fetches header `trustHeight`, refuses it if its hash is not `trustHash`, fetches the sets it names, and verifies its commit against its own set. From here on the light client's rules apply (sequential verification where sets are adjacent, skipping with a one-third overlap otherwise, bisection when overlap is insufficient; see [the light client](13-light-client.md)).
+3. **Trust the anchor.** `LightClient.trust(..., trustHeight, trustHash)` fetches header `trustHeight` and the sets it names, refuses it if its hash is not `trustHash`, if it is older than the trusting period (4 days by default) or if its time is in the future beyond the allowed clock drift, and verifies its commit against its own set. From here on the light client's rules apply (sequential verification where sets are adjacent, skipping with a one-third overlap otherwise, bisection when overlap is insufficient; see [the light client](13-light-client.md)).
 
 4. **Choose a snapshot.** Every peer is asked `snapshotsRequest`; a failure counts as an empty offer, and each peer's list is passed through a `Set` first, so a height a peer repeats counts once for that peer (otherwise one peer listing a height twice would pass the "two peers" test on its own). Heights are tallied by how many peers offer them:
 
 ```ts
   const tally = new Map<bigint, string[]>();
   for (const [id, heights] of offers) for (const h of heights) tally.set(h, [...(tally.get(h) ?? []), id]);
-  const heights = [...tally.keys()].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+  // The header after the snapshot fixes its app hash, and trust only moves forward to it: a snapshot more than one
+  // height below the trusted header cannot be verified and is not a candidate.
+  const heights = [...tally.keys()].filter((h) => h + 1n >= o.trustHeight).sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
   const chosen = heights.find((h) => tally.get(h)!.length >= 2) ?? heights[0];
   if (chosen === undefined) {
-    o.log('warn', 'state sync: no peer offers a snapshot; replaying from genesis');
+    if (tally.size > 0) o.log('warn', 'state sync: every snapshot offered is from before the trusted height; replaying from genesis', { trustHeight: o.trustHeight });
+    else o.log('warn', 'state sync: no peer offers a snapshot; replaying from genesis');
     return null;
   }
 ```
+
+Only a height H with `H + 1 >= trustHeight` is a candidate. The header after the snapshot fixes its app hash, and the light client moves trust forward only, so a snapshot more than one height below the anchor could never be verified; choosing it would make the join fail at the next step when a later snapshot, or a replay, would have worked. When every offer is from before the anchor the function logs `every snapshot offered is from before the trusted height` and returns `null`, as when nothing is offered.
 
 `sources()` from here on is the peers that offered the chosen height H and are still connected.
 
 5. **Verify to H+1.** `client.verifyToHeight(H + 1n)` moves trust from the anchor to the header after the snapshot. Its `appHash` is the root the state after H must have. The joiner logs `state sync: joining` with the height, app hash and number of sources.
 
-6. **The manifest.** Each source is asked `manifestRequest(H)` until one yields a manifest that passes `verifyManifest(next.appHash, candidate)`: same format, same app hash, and every type leaf folds to it through its top-tree path, with chunk counts consistent with the object counts. A manifest that fails costs its source 50 points, and the next source is asked; a request that fails or a manifest whose bytes do not decode is only logged at debug level. The chunk phase's `bad` set is not touched here, so a source that served a bad manifest is still asked for chunks, each of which is verified on its own. No valid manifest from any source is fatal.
+6. **The manifest.** Each source is asked `manifestRequest(H)` until one yields a manifest that passes `verifyManifest(next.appHash, candidate, o.types)`: same format, same app hash, a chunk size of at least 1, every registered type named exactly once in id order (a manifest with a type left out would fold just as well, and fail only after every chunk had been fetched), and every type leaf folds to the app hash through its top-tree path, with chunk counts consistent with the object counts. A source that answers with no manifest is skipped. A manifest whose bytes do not decode (`manifestFromBytes` throws) costs its source 50 points with the reason `undecodable snapshot manifest`, "what a manifest for another state costs", and a manifest that decodes and fails `verifyManifest` costs the same; in both cases the next source is asked. A request that fails is only logged at debug level. The chunk phase's `bad` set is not touched here, so a source that served a bad manifest is still asked for chunks, each of which is verified on its own. No valid manifest from any source is fatal.
 
 7. **Chunks in parallel.** One job per (type, chunk index). Up to `parallel` workers (but no more than there are sources) share the job list:
 
@@ -568,11 +582,12 @@ The sets are saved both by hash and by height for H, H+1 and H+2; block H is sav
 | condition | outcome |
 |---|---|
 | no peer within `peerWaitMs` | `null`: the node replays from genesis |
-| the header at `trustHeight` does not hash to `trustHash`, or its commit fails | `LightClient.trust` throws; the join fails |
+| the header at `trustHeight` does not hash to `trustHash`, is older than the trusting period or from the future, or its commit fails | `LightClient.trust` throws; the join fails |
 | no peer offers a snapshot | `null`: replay from genesis |
+| every snapshot offered is more than one height below `trustHeight` | `null`, with a warning: replay from genesis |
 | the light client cannot reach H+1 (set changed too much to skip and bisection fails, trusting period expired) | throws |
-| a manifest does not fold to header H+1's app hash | source charged 50; next source tried; none left: throws |
-| a manifest request fails or its bytes do not decode | logged; next source tried |
+| a manifest's bytes do not decode, or it does not fold to header H+1's app hash, or does not name every registered type once in order | source charged 50; next source tried; none left: throws |
+| a manifest request fails | logged; next source tried |
 | a chunk hash, range or range proof is wrong, or the chunk answers a different request | source charged 50 and marked bad; job retried elsewhere |
 | a chunk request times out, the source disconnects, or it has no such chunk | counted against the source, which is dropped (not charged) on its third failure; job retried |
 | every source marked bad | throws `every snapshot peer failed` |
@@ -592,7 +607,7 @@ Every `throw` in `stateSync` before the header walk happens before any write, so
 
 ## How it is tested
 
-`test/sync.test.ts` builds four-validator testnets on the core application through `makeTestnet` from `test/helpers.ts`.
+`test/sync.test.ts` builds four-validator testnets through `makeTestnet` from `test/helpers.ts`: on the core application for the first three tests, which join from snapshots, and on the helper's default, the key-value application, for the last two.
 
 - `joins from a snapshot, serves queries at once, survives a corrupt chunk, and backfills to genesis`. Only the first two validators take snapshots (every 6 blocks, 2 objects per chunk), so a joiner has exactly two sources. Three accounts are created so the account type spans two chunks. The test first checks the primitives: the manifest at 12 verifies against header 13's `appHash` and not against another field, and a chunk with one object swapped fails `verifyChunk` with `hash differs`. Then validator 1's `chunkBytes` is monkey-patched to corrupt every chunk it serves. A fifth node is created with `stateSync: { trustHeight: 2n, trustHash, backfill: true }` and no app (the node must build the core app itself). Assertions: `joinedAt` and `height` are 12; the store's lowest height is 12; below it the store holds header records back to genesis (`lowestHeaderHeight()` is 1, and header 7 hashes the same as validator 0's block 7); the app is at 12; `lowestProvableHeight` is 12 and a proof at 11 throws `not available`; the accounts are there; the liar's score on the joiner is above 40. After `start()`, the joiner follows the chain (height within one of validator 0 and above 14), serves a state query whose header is at `height`, backfills to lowest height 1 with `backfilled === 11n`, has the same block 1 as the validators, holds no header record any more (`lowestHeaderHeight()` is null and `loadHeader(7n)` is null, the backfilled blocks having replaced them), and indexes a backfilled transaction with `ok: null`.
 - `applies evidence for a height before its join, from the headers it fetched for the evidence window`. A joiner is created at a snapshot of height 6 or later with `backfill: false`, so what it knows of the heights below its join is exactly what state sync fetched: `loadBlock(3n)` is null, `lowestHeaderHeight()` is 1, header 3 equals validator 0's, and `executor.blockTimeAt(3n)` is that block's time. Then validator 3's key is used to forge two prevotes for height 3 with different block hashes; the evidence enters validator 0's pool, is gossiped, and lands in a block after the join. The joiner must apply that block and the one after it (whose header fixes the state the slash produced), which it can only do by resolving the evidence through the header of height 3. Finally a light client anchored at the joiner's tip verifies a state proof at height 3 served by validator 0, by walking back through the joiner's header records ([chapter 13](13-light-client.md)).
@@ -604,13 +619,16 @@ Every `throw` in `stateSync` before the header walk happens before any write, so
 
 `test/review.test.ts`, `does a bounded amount of work on a peer status it cannot act on`: the recursion regression described under `drain`.
 
-`bench/network.bench.ts` measures a fifth node catching up by block sync on blocks full of signed transfers and checks its app hash against the validators'. README.md reports 4,600 transfers/s for that sync on an Apple M4 Pro, against 6,300 transfers/s for cold `finalizeBlock` alone, so sync runs close to the speed of block execution.
+`test/review5-net.test.ts`, `describe('block sync')`, drives a `BlockSync` with one scripted peer and no real verification. `applies nothing after it was stopped, though a block was being verified`: `verify` is held open, `stop()` is called, the verification is let through, and `applyBlock` was never called. `lets go of the blocks it held once no peer is ahead`: with consensus reported as deciding, two blocks are buffered and `isSyncing` is true; the node's height is then set to the peer's and the next status empties the buffer. `uses nothing of a response with more blocks than it asked for, and charges the peer`: a request for 4 answered with 7 leaves the buffer empty and the peer charged 50 once. `charges a peer for a block of another height and for a commit that names another block`: either flaw in the second block of a response has the same outcome. In `describe('state sync')`, `passes over a snapshot from before the trusted height, and charges a peer for a manifest that does not decode`: two sources hold a snapshot at height 6 and the chain is stopped before the next; a join trusting the lower of the sources' heights, 8 or more, returns `null`; a join trusting height 2, with both sources made to serve seven bytes of `0xff` as their manifest, throws `no valid manifest` and leaves each source with more than 40 points.
+
+`bench/network.bench.ts` measures a fifth node catching up by block sync on blocks full of signed transfers. The validators go on making blocks while the node syncs, so the two are seldom at one height; the benchmark stops the synced node, waits up to 30 s for a validator to hold the block after the synced node's height, and compares the synced application's hash with the `appHash` in that block's header, which is what the validators agreed on for that height. It throws when the two differ or when no such block appears, and reports the height it compared at. README.md reports 3,400 transfers/s for that sync on an Apple M4 Pro, against 5,800 transfers/s for cold `finalizeBlock` alone, so sync runs at about three fifths of the speed of block execution, the rest being the fetch round trips.
 
 ## Limitations and ideas
 
+- The trust anchor must be at or below H+1 for a snapshot at height H to be usable. A node whose anchor is above every offered snapshot does not join by state sync: it replays from genesis.
 - Backfill fetches one block per round trip, and a peer that declined is not asked again for thirty seconds. A node joining a long chain backfills slowly.
 - State sync is tied to the core application: `CORE_TYPES` and `CoreApp.writeImportedState` are used directly, and `NodeConfig.app` must be left out.
-- The whole snapshot is held in memory as chunks before import. README.md: "plan for about three times the state in memory during the join."
+- The whole snapshot is held in memory as chunks before import. README.md: "plan for about three times the state's resting memory in all during the join (chunks, the rebuilt state and the opened store)."
 - A state-synced node has no account history before H (DESIGN.md section 10), holds headers rather than blocks below H until backfill fills them in, and backfilled blocks carry no results.
 - Proposer priorities remain only partly checked (DESIGN.md section 10).
 - Synced blocks are verified one at a time; the buffer could be verified ahead of application.

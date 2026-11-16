@@ -127,13 +127,32 @@ function accountRef(app: CoreApp, ref: unknown, height: bigint): ObjectId {
   return id;
 }
 
-/** A validator by its operator's name or by id, as of a height. */
+/**
+ * A validator as of a height: by its own id, or by its operator, which is named or given as an account id. An
+ * account id is told from a validator id by its type and resolved as the name is, through the operator index.
+ */
 function validatorRef(app: CoreApp, ref: unknown, height: bigint): ObjectId {
-  if (typeof ref !== 'string') throw new RpcError(INVALID_PARAMS, 'validator must be an operator name or an id');
-  if (/^\d+\.\d+$/.test(ref)) return parseId(ref);
+  if (typeof ref !== 'string') throw new RpcError(INVALID_PARAMS, 'validator must be an operator name, an account id or a validator id');
+  if (/^\d+\.\d+$/.test(ref) && typeOf(parseId(ref)) !== AccountType.id) return parseId(ref);
   const { id } = keyAt(app, ValidatorType, 'byOperator', key((w) => w.id(accountRef(app, ref, height))), height);
   if (id === null) throw new RpcError(NOT_FOUND, `${ref} runs no validator`);
   return id;
+}
+
+/**
+ * The objects of a type as of a height that pass a test, in id order, for a type whose objects come and go (a
+ * delegation is removed when its last share goes, an unbonding entry when it matures). `now` lists those the index
+ * of today holds; the ones changed or removed since the height are looked at as well, which at the latest height
+ * are those the block in progress removed, and each is read as it was then.
+ */
+function listAt<T extends { id: ObjectId }>(app: CoreApp, type: ObjectType<T>, now: Iterable<{ id: ObjectId }>, height: bigint, keep: (o: T) => boolean): T[] {
+  const ids = new Set<ObjectId>();
+  for (const o of now) ids.add(o.id);
+  for (const id of app.db.changedSince(type, Number(height))) ids.add(id);
+  return [...ids]
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+    .map((id) => objectAt(app, type, id, height))
+    .filter((o): o is T => o !== null && keep(o));
 }
 
 /**
@@ -288,19 +307,12 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
       async fn(p) {
         const app = coreApp(node);
         const height = stateHeight(app, p);
-        const latest = height === app.lastHeight;
         const v = objectAt(app, ValidatorType, validatorRef(app, p.operator ?? p.id, height), height);
         if (!v) throw new RpcError(NOT_FOUND, 'no such validator');
         const active = objectAt(app, DynamicType, DYNAMIC_ID, height)?.active.find((a) => a.validator === v.id);
         const selfId = keyAt(app, DelegationType, 'byDelegatorValidator', key((k) => k.id(v.operator).id(v.id)), height).id;
         const self = selfId === null ? null : objectAt(app, DelegationType, selfId, height);
-        // A delegation is removed when its last share goes, so the index of today cannot count those of a past
-        // height: the count is given for the latest height only.
-        let delegators: number | null = null;
-        if (latest) {
-          delegators = 0;
-          for (const d of app.db.scan(DelegationType, 'byValidator', key((k) => k.id(v.id)))) if (app.db.getCommitted(DelegationType, d.id)) delegators++;
-        }
+        const delegators = listAt(app, DelegationType, app.db.scan(DelegationType, 'byValidator', key((k) => k.id(v.id))), height, (d) => d.validator === v.id).length;
         return {
           height: height.toString(),
           ...(jsonify(v) as object),
@@ -327,16 +339,7 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
         const out: Record<string, unknown> = {
           height: height.toString(),
           delegation: d ? { ...(jsonify(d) as object), tokens: tokensForShares(v, d.shares).toString() } : null,
-          // An unbonding entry is removed when it matures, so those of a past height cannot be listed from the
-          // index of today: they are given for the latest height only.
-          unbonding:
-            height === app.lastHeight
-              ? app.db
-                  .range(UnbondingType, 'byDelegatorValidator', key((k) => k.id(delegator).id(validator)))
-                  .map((live) => app.db.getCommitted(UnbondingType, live.id))
-                  .filter((u): u is NonNullable<typeof u> => u !== null)
-                  .map((u) => jsonify(u))
-              : null,
+          unbonding: listAt(app, UnbondingType, app.db.range(UnbondingType, 'byDelegatorValidator', key((k) => k.id(delegator).id(validator))), height, (u) => u.delegator === delegator && u.validator === validator).map((u) => jsonify(u)),
         };
         if (bool(p, 'prove')) out.proof = toHex(keyProofToBytes(proof));
         return out;

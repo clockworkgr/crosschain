@@ -4,7 +4,7 @@
  *
  *   POST /        one request or a batch of at most 20
  *   GET  /events  SSE: ?types=block,tx,account,validatorSet&tx=<hash>&account=<name|id>
- *   GET  /health  height and peer count
+ *   GET  /health  height, peer count and the memory guard's level
  *
  * Exposure defaults to loopback. Every remote address has a token bucket;
  * costly methods spend more. Bodies over the limit are refused before they
@@ -15,14 +15,15 @@ import type { AddressInfo } from 'node:net';
 import { CoreApp } from '../app/core/app.ts';
 import { toHex } from '../crypto/hash.ts';
 import type { Node } from '../node/node.ts';
-import { blockHash, txHash } from '../types/block.ts';
+import { txHash } from '../types/block.ts';
 import { silentLogger, type Logger } from '../util/log.ts';
 import { blockEventJson, RpcEvents, type CommittedEvent } from './events.ts';
 import { jsonify } from './json.ts';
 import { INVALID_PARAMS, makeMethods, NOT_FOUND, RATE_LIMITED, RpcError, type RpcMethod } from './methods.ts';
 import { TxError } from '../app/core/state.ts';
 import { HISTORY_KIND_NAMES } from '../app/core/history.ts';
-import { idToString } from '../db/id.ts';
+import { idFromString, idToString } from '../db/id.ts';
+import { AccountType } from '../app/core/types.ts';
 
 export interface RpcLimits {
   bodyBytes: number;
@@ -70,12 +71,14 @@ export class RpcServer {
   private readonly host: string;
   private readonly port: number;
   private readonly server: Server;
+  /** Looked up with Object.hasOwn: a method named `toString` is unknown, not what every object inherits. */
   private readonly methods: Record<string, RpcMethod>;
   private readonly events: RpcEvents;
   private readonly buckets = new Map<string, Bucket>();
   private allowCalls = 0;
   private readonly streams = new Set<Stream>();
   private boundPort = 0;
+  private readonly unsubscribe: () => void;
 
   constructor(node: Node, opts: RpcServerOptions = {}) {
     this.node = node;
@@ -93,7 +96,7 @@ export class RpcServer {
         res.end();
       });
     });
-    this.events.onCommitted((e) => this.push(e));
+    this.unsubscribe = this.events.onCommitted((e) => this.push(e));
   }
 
   get url(): string {
@@ -114,9 +117,12 @@ export class RpcServer {
   /**
    * Stop listening and close every connection. One in the middle of a request is given `graceMs` to finish and is
    * then cut: a client that sends its body slowly, or never, must not hold up a node that is stopping, least of all
-   * one stopping because its heap is full.
+   * one stopping because its heap is full. The server stops hearing of commits as well, and callers waiting for a
+   * transaction are answered: a node whose server is replaced does not keep the old one alive or at work.
    */
   async stop(graceMs = 1000): Promise<void> {
+    this.unsubscribe();
+    this.events.close();
     for (const s of this.streams) s.res.end();
     this.streams.clear();
     const closed = new Promise<void>((resolve) => this.server.close(() => resolve()));
@@ -217,14 +223,15 @@ export class RpcServer {
     const rawId = hasId ? (r as { id: unknown }).id : null;
     const id = typeof rawId === 'string' || typeof rawId === 'number' || rawId === null ? rawId : null;
     const reply = (error: { code: number; message: string } | null, result?: unknown) => (error ? { jsonrpc: '2.0', id, error } : { jsonrpc: '2.0', id, result });
-    // Something that is not a request at all is answered with a null id, since no id could be read from it.
+    // Something that is not a request is answered as an invalid request under its own id when it has one that can be
+    // read (a string, a number or null), and under a null id when it has none or one of another kind.
     if (!r || typeof r !== 'object' || (r as { jsonrpc?: unknown }).jsonrpc !== '2.0' || typeof (r as { method?: unknown }).method !== 'string' || id !== rawId) {
       return reply({ code: -32600, message: 'invalid request' });
     }
     const answer = hasId ? reply : () => undefined;
     const { method, params } = r as { method: string; params?: unknown };
     if (charge && !this.allow(remote, 1)) return answer({ code: RATE_LIMITED, message: 'rate limited' });
-    const m = this.methods[method];
+    const m = Object.hasOwn(this.methods, method) ? this.methods[method] : undefined;
     if (!m) return answer({ code: -32601, message: `unknown method ${method}` });
     if (params !== undefined && (typeof params !== 'object' || params === null || Array.isArray(params))) return answer({ code: INVALID_PARAMS, message: 'params must be an object' });
     if (m.costly && !m.whileShedding && this.node.isShedding) return answer({ code: RATE_LIMITED, message: 'node under memory pressure' });
@@ -265,8 +272,16 @@ export class RpcServer {
     let account: bigint | null = null;
     const accountParam = url.searchParams.get('account');
     if (accountParam) {
-      if (/^\d+\.\d+$/.test(accountParam)) account = BigInt(accountParam.split('.')[0]!) * 2n ** 48n + BigInt(accountParam.split('.')[1]!);
-      else if (this.node.app instanceof CoreApp) account = this.node.app.accountByName(accountParam)?.id ?? null;
+      // By id or by name, the account must exist: a stream for one that does not would stay silent for ever.
+      const app = this.node.app instanceof CoreApp ? this.node.app : null;
+      if (app && /^\d+\.\d+$/.test(accountParam)) {
+        try {
+          const id = idFromString(accountParam);
+          if (app.db.getCommitted(AccountType, id)) account = id;
+        } catch {
+          // Not an id any object can have.
+        }
+      } else if (app) account = app.accountByName(accountParam)?.id ?? null;
       if (account === null) {
         res.writeHead(404, CORS).end();
         return;
@@ -291,7 +306,7 @@ export class RpcServer {
       for (let h = start; h <= this.node.height; h++) {
         const stored = this.node.store.loadBlock(h);
         if (!stored || res.writableLength > 1024 * 1024) break;
-        this.send(stream, 'block', h, { height: h.toString(), hash: toHex(blockHash(stored.block)), time: stored.block.header.time.toString(), txs: stored.block.txs.length, appHash: toHex(stored.block.header.appHash), proposer: toHex(stored.block.header.proposerAddress) });
+        this.send(stream, 'block', h, blockEventJson(stored.block, this.node.store.loadResults(h)));
       }
     }
   }
@@ -310,7 +325,7 @@ export class RpcServer {
   private push(e: CommittedEvent): void {
     const h = e.block.header.height;
     for (const s of this.streams) {
-      if (s.types.has('block')) this.send(s, 'block', h, blockEventJson(e));
+      if (s.types.has('block')) this.send(s, 'block', h, blockEventJson(e.block, e.results));
       if (s.types.has('tx')) {
         e.block.txs.forEach((tx, i) => {
           const hash = toHex(txHash(tx));

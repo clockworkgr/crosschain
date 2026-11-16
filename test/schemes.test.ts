@@ -72,7 +72,7 @@ describe('signature schemes', () => {
     expect(verify(twin, msg, kp.publicKey, ctx)).toBe(false);
   });
 
-  it('keeps each key\'s scheme in the keystore, and reads an old file as ML-DSA-44', () => {
+  it('keeps each key\'s scheme in the keystore, reads a version 1 file as ML-DSA-44 and writes it as version 2', () => {
     const dir = mkdtempSync(join(tmpdir(), 'schemes-'));
     try {
       const path = join(dir, 'keystore.json');
@@ -89,12 +89,43 @@ describe('signature schemes', () => {
         ['ec', 'secp256k1'],
       ]);
       // A file from before there were two schemes names none; its keys are ML-DSA-44.
-      const file = JSON.parse(readFileSync(path, 'utf8')) as { keys: Record<string, { scheme?: string }> };
+      const file = JSON.parse(readFileSync(path, 'utf8')) as { version: number; keys: Record<string, { scheme?: string }> };
+      expect(file.version).toBe(2);
+      file.version = 1;
       delete file.keys['ml']!.scheme;
       writeFileSync(path, JSON.stringify(file));
       const old = Keystore.open(path, 'pw');
+      expect(old.version).toBe(1);
       expect(old.get('ml').scheme).toBe(Scheme.mlDsa44);
       expect(old.list()[0]!.scheme).toBe('ml-dsa-44');
+      // Reading left the file as it was; the next change writes it as version 2, with the scheme of every key named.
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(file);
+      old.add('new', undefined, Scheme.secp256k1);
+      const upgraded = JSON.parse(readFileSync(path, 'utf8')) as { version: number; keys: Record<string, { scheme?: string }> };
+      expect(upgraded.version).toBe(2);
+      expect(Object.entries(upgraded.keys).map(([name, k]) => [name, k.scheme])).toEqual([
+        ['ml', 'ml-dsa-44'],
+        ['ec', 'secp256k1'],
+        ['new', 'secp256k1'],
+      ]);
+      expect(toHex(Keystore.open(path, 'pw').get('ml').publicKey)).toBe(toHex(ml.publicKey));
+      // A handle that read a version 1 file and writes after the file has gone still names every key's scheme.
+      const gone = join(dir, 'gone.json');
+      writeFileSync(gone, JSON.stringify(file));
+      const handle = Keystore.open(gone, 'pw');
+      rmSync(gone);
+      handle.add('later', undefined, Scheme.secp256k1);
+      const rewritten = JSON.parse(readFileSync(gone, 'utf8')) as { version: number; keys: Record<string, { scheme?: string }> };
+      expect(rewritten.version).toBe(2);
+      expect(Object.values(rewritten.keys).map((k) => k.scheme)).toEqual(['ml-dsa-44', 'secp256k1', 'secp256k1']);
+      expect(toHex(Keystore.open(gone, 'pw').get('ml').publicKey)).toBe(toHex(ml.publicKey));
+      // In a version 2 file a key that names no scheme is damaged, not assumed to be ML-DSA-44.
+      delete upgraded.keys['ec']!.scheme;
+      writeFileSync(path, JSON.stringify(upgraded));
+      const damaged = Keystore.open(path, 'pw');
+      expect(() => damaged.get('ec')).toThrow(/names no scheme/);
+      expect(() => damaged.list()).toThrow(/key ec names no scheme/);
+      expect(toHex(damaged.get('ml').publicKey)).toBe(toHex(ml.publicKey));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

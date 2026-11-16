@@ -4,7 +4,8 @@
  * code; a full node simply has no validator key.
  */
 import { join } from 'node:path';
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { linkSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import type { Application } from '../app/types.ts';
 import { CoreApp } from '../app/core/app.ts';
 import { loadAppGenesis } from '../app/core/genesis.ts';
@@ -20,7 +21,7 @@ import { stateSync } from '../sync/statesync.ts';
 import { CORE_TYPES } from '../app/core/types.ts';
 import { getGlobal } from '../app/core/state.ts';
 import { FileSignStateStore, MemorySignStateStore, PrivValidator } from '../consensus/privval.ts';
-import type { ValidationLimits } from '../consensus/validate.ts';
+import { evidenceAgeOk, type ValidationLimits } from '../consensus/validate.ts';
 import { keyPairFromSeed, schemeTag, type KeyPair } from '../crypto/keys.ts';
 import { WorkerVerifier, type Verifier } from '../crypto/verifier.ts';
 import { Mempool, type AddTxResult } from '../mempool.ts';
@@ -89,39 +90,97 @@ export interface NodeConfig {
   logLevel?: LogLevel;
   /** Heap thresholds and sampling for the memory guard (see memory.ts); tests inject their own `stats`. */
   memory?: Partial<Omit<MemoryGuardOptions, 'log' | 'onLevel' | 'onSample'>>;
-  /** Collection scheduling after commits; `gc: null` turns it off. */
+  /** Collection scheduling after commits; `gc: { gc: null }` turns it off. */
   gc?: Partial<Omit<GcSchedulerOptions, 'log'>>;
 }
 
-/**
- * Claim a data directory for this process. A stale claim from a process that no longer runs is taken over;
- * a live one refuses, since two nodes on one directory would double sign.
- */
-/** Directories this process holds, so two nodes in one process are refused as surely as two processes are. */
+/** Fetches of announced items a node remembers: in all, for one peer, for how long, and how soon another peer may be asked. */
+const MAX_OUTSTANDING = 20_000;
+const MAX_OUTSTANDING_PER_PEER = 2_048;
+const FETCH_LIFETIME_MS = 60_000;
+const FETCH_RETRY_MS = 10_000;
+
+/** Directories this process holds, by their real path, so two nodes in one process are refused as surely as two processes are. */
 const heldDirs = new Set<string>();
 
-function lockDataDir(dir: string): () => void {
-  const path = join(dir, 'LOCK');
-  if (heldDirs.has(dir)) throw new Error(`data directory ${dir} is in use by this process`);
-  if (existsSync(path)) {
-    const pid = Number(readFileSync(path, 'utf8'));
-    let alive = false;
-    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
-      try {
-        process.kill(pid, 0);
-        alive = true;
-      } catch (e) {
-        alive = (e as NodeJS.ErrnoException).code === 'EPERM';
-      }
-    }
-    if (alive) throw new Error(`data directory ${dir} is in use by process ${pid}`);
+/** Is the process whose id a claim file holds still running? A file that names no process, or this one, is not a live claim. */
+function claimAlive(text: string): number | null {
+  const pid = Number(text);
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return null;
+  try {
+    process.kill(pid, 0);
+    return pid;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM' ? pid : null;
   }
-  writeFileSync(path, String(process.pid));
-  heldDirs.add(dir);
-  return () => {
-    heldDirs.delete(dir);
+}
+
+/**
+ * Claim a data directory for this process. The claim is a file linked into place only if none is there, so of two
+ * nodes starting at once only one makes it. A live claim refuses, since two nodes on one directory would double sign. A stale one,
+ * from a process that no longer runs, is taken over, and only by a process holding a second exclusive file,
+ * `LOCK.takeover`: it reads the claim again, and removes it only if it is still stale. Without that, two processes
+ * that both found the stale claim could each remove the other's new one and both start. A process killed in the
+ * few file operations it holds `LOCK.takeover` for leaves it behind, and that file is never removed
+ * automatically: the next start says so and stops.
+ */
+function lockDataDir(dir: string): () => void {
+  // The directory exists by now; its real path is one name for it however it was spelled or linked to.
+  const real = realpathSync(dir);
+  const path = join(real, 'LOCK');
+  const takeover = join(real, 'LOCK.takeover');
+  if (heldDirs.has(real)) throw new Error(`data directory ${dir} is in use by this process`);
+  // The claim appears with the process id already in it: it is written under another name and linked into place,
+  // which fails if a claim is there. A claim created empty and filled afterwards could be read as stale in between.
+  const mine = join(real, `LOCK.${process.pid}.${randomBytes(4).toString('hex')}`);
+  for (let attempt = 0; ; attempt++) {
+    // Every way round the loop counts, so starts that keep finding and clearing stale claims end too.
+    if (attempt >= 50) throw new Error(`data directory ${dir}: could not claim it in 50 attempts; ${takeover} may have been left by a process that stopped while taking over a stale claim: check that no node runs on the directory, then remove it`);
+    writeFileSync(mine, String(process.pid));
     try {
-      unlinkSync(path);
+      linkSync(mine, path);
+      unlinkSync(mine);
+      break;
+    } catch (e) {
+      unlinkSync(mine);
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    }
+    let text: string;
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch {
+      // Released between the two calls: the next attempt creates it.
+      continue;
+    }
+    const pid = claimAlive(text);
+    if (pid !== null) throw new Error(`data directory ${dir} is in use by process ${pid}`);
+    try {
+      writeFileSync(takeover, String(process.pid), { flag: 'wx' });
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      // Another process is taking the stale claim over; it is done within a few file operations.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      continue;
+    }
+    try {
+      // Only the holder of the takeover file removes a claim, and only one still stale now that it holds it.
+      let still: string | null = null;
+      try {
+        still = readFileSync(path, 'utf8');
+      } catch {
+        // Gone: the link is tried again.
+      }
+      if (still !== null && claimAlive(still) === null) unlinkSync(path);
+    } finally {
+      unlinkSync(takeover);
+    }
+  }
+  heldDirs.add(real);
+  return () => {
+    heldDirs.delete(real);
+    try {
+      // Only this process's own claim is removed, not one that replaced it.
+      if (readFileSync(path, 'utf8') === String(process.pid)) unlinkSync(path);
     } catch {
       // Already gone: nothing to release.
     }
@@ -168,32 +227,56 @@ export class Node {
     // One scheme per chain, genesis's, for the node identity and the validator key alike.
     const scheme = schemeTag(cfg.genesis.signatureScheme ?? 'ml-dsa-44');
     this.nodeKey = keyPairFromSeed(cfg.nodeKeySeed, scheme);
-    if (cfg.dataDir) mkdirSync(cfg.dataDir, { recursive: true });
-    // Two nodes on one directory would share a signing guard that neither sees the other write.
-    this.releaseLock = cfg.dataDir ? lockDataDir(cfg.dataDir) : null;
-    this.env = cfg.env ?? (cfg.dataDir ? new LmdbEnv(join(cfg.dataDir, 'lmdb')) : new MemoryEnv());
-    this.ownsEnv = !cfg.env;
-    this.store = new KvBlockStore(this.env.store('chain'));
-    this.evidencePool = new EvidencePool();
-    this.privValidator = cfg.validatorSeed
-      ? new PrivValidator(
-          keyPairFromSeed(cfg.validatorSeed, scheme),
-          cfg.dataDir ? new FileSignStateStore(join(cfg.dataDir, 'priv_validator_state.bin')) : new MemorySignStateStore(),
-          this.chainId,
-        )
-      : null;
+    let env: KvEnv | null = null;
+    try {
+      if (cfg.dataDir) mkdirSync(cfg.dataDir, { recursive: true });
+      // Two nodes on one directory would share a signing guard that neither sees the other write.
+      this.releaseLock = cfg.dataDir ? lockDataDir(cfg.dataDir) : null;
+      this.env = env = cfg.env ?? (cfg.dataDir ? new LmdbEnv(join(cfg.dataDir, 'lmdb')) : new MemoryEnv());
+      this.ownsEnv = !cfg.env;
+      this.store = new KvBlockStore(this.env.store('chain'));
+      this.evidencePool = new EvidencePool();
+      this.privValidator = cfg.validatorSeed
+        ? new PrivValidator(
+            keyPairFromSeed(cfg.validatorSeed, scheme),
+            cfg.dataDir ? new FileSignStateStore(join(cfg.dataDir, 'priv_validator_state.bin')) : new MemorySignStateStore(),
+            this.chainId,
+          )
+        : null;
+    } catch (e) {
+      // Nothing is handed back to stop: what was opened so far is let go here, the claim on the directory last.
+      if (env && !cfg.env) void env.close().catch(() => {});
+      void this.ownVerifier?.close();
+      this.releaseLock?.();
+      throw e;
+    }
   }
 
   static async create(cfg: NodeConfig): Promise<Node> {
     const node = new Node(cfg);
-    await node.init();
+    try {
+      await node.init();
+    } catch (e) {
+      // A node that could not be set up gives back what it opened (the store, the verifier pool, the claim on its
+      // directory), so the caller can try again in this process.
+      await node.stop().catch(() => {});
+      throw e;
+    }
     return node;
   }
 
   private networkStarted = false;
+  /** The limits blocks and evidence are held to; the evidence age in it follows the application's unbonding period. */
+  private limits!: ValidationLimits;
+
+  /** The evidence age in force now: the operator's figure, else the unbonding period the application holds. */
+  private evidenceAge(): bigint {
+    if (this.app instanceof CoreApp && this.cfg.limits?.maxEvidenceAgeMs === undefined) this.limits.maxEvidenceAgeMs = this.app.stakingParameters().unbondingPeriodMs;
+    return this.limits.maxEvidenceAgeMs;
+  }
 
   private async init(): Promise<void> {
-    const limits = { ...DEFAULT_LIMITS, ...(this.cfg.genesis.consensus?.maxEvidenceAgeMs !== undefined ? { maxEvidenceAgeMs: this.cfg.genesis.consensus.maxEvidenceAgeMs } : {}), ...this.cfg.limits };
+    const limits = (this.limits = { ...DEFAULT_LIMITS, ...(this.cfg.genesis.consensus?.maxEvidenceAgeMs !== undefined ? { maxEvidenceAgeMs: this.cfg.genesis.consensus.maxEvidenceAgeMs } : {}), ...this.cfg.limits });
 
     this.network = new Network({
       chainId: this.chainId,
@@ -269,7 +352,7 @@ export class Node {
         snapshotsKept: this.cfg.retain?.snapshots,
         arenaBytes: this.cfg.arenaBytes,
         indexTrees: this.indexTrees === 'store' ? false : undefined,
-        // Under a heap limit, a stored state whose trees would not fit below the warn line is opened paged.
+        // Under a heap limit, a stored state whose trees would not fit in the room left below OPEN_FILL (half) of the limit is opened paged.
         heapRoom: heapLimitFlag() === null ? undefined : Math.max(0, Node.OPEN_FILL * memoryStats().heapLimit - heapInUse(memoryStats())),
       });
     }
@@ -288,12 +371,14 @@ export class Node {
         // The node's own application keeps its state in the node's environment: a block's writes and its are one transaction.
         transaction: this.cfg.app ? undefined : (fn) => this.env.transaction(fn),
         protectedHeight: () => (this.app instanceof CoreApp ? (this.app.snapshotHeights().at(-1) ?? 0n) : 0n),
-        evidenceAgeMs: () => limits.maxEvidenceAgeMs,
+        // Read from the application each time: the executor asks after a block is applied, and a block that changed
+        // the unbonding period is pruned behind with the new one, not the one in force before it.
+        evidenceAgeMs: () => this.evidenceAge(),
       },
       this.cfg.genesis,
     );
     // The evidence age follows the unbonding period the application holds now, not the one genesis had.
-    if (this.app instanceof CoreApp && this.cfg.limits?.maxEvidenceAgeMs === undefined) limits.maxEvidenceAgeMs = this.app.stakingParameters().unbondingPeriodMs;
+    this.evidenceAge();
 
     this.gcScheduler = new GcScheduler({ log: this.log, ...this.cfg.gc });
     this.memoryGuard = new MemoryGuard({
@@ -375,23 +460,81 @@ export class Node {
     // Transactions and evidence use announce-and-fetch.
     this.mempool.on('tx', (hash, _tx, source) => this.network.broadcast({ type: 'inv', kind: InvKind.Tx, hashes: [hash] }, source));
     this.evidencePool.onAdded((ev) => this.network.broadcast({ type: 'inv', kind: InvKind.Evidence, hashes: [evidenceId(ev)] }));
-    // What a peer announces and we lack is fetched at most once while a fetch is outstanding, in batches the serving side accepts.
-    const outstanding = new Map<string, number>();
-    const wanted = (hashes: Uint8Array[], have: (h: Uint8Array) => boolean) => {
-      const now = Date.now();
-      for (const [k, t] of outstanding) if (now - t > 10_000) outstanding.delete(k);
+    // What a peer announces and we lack is fetched at most once while a fetch is outstanding, in batches the serving
+    // side accepts. Each fetch is remembered with its kind and the peers it was sent to: only their answers are taken.
+    // After ten seconds without one the item may be asked of another peer, of four at most, and an entry lives a
+    // minute from its first fetch whatever is asked after. The entries are bounded in all and for each peer, so
+    // peers that announce and never answer cannot make the node remember without limit. An entry is for one kind
+    // and hash, so an announcement of one kind cannot stand in the way of another's, and its times are read from a
+    // clock that never goes back, which the order of expiry depends on.
+    const outstanding = new Map<string, { first: number; at: number; peers: Set<string> }>();
+    const asked = new Map<string, number>();
+    const release = (peer: string) => {
+      const n = (asked.get(peer) ?? 1) - 1;
+      if (n > 0) asked.set(peer, n);
+      else asked.delete(peer);
+    };
+    const drop = (k: string, o: { peers: Set<string> }) => {
+      for (const p of o.peers) release(p);
+      outstanding.delete(k);
+    };
+    const wanted = (peer: string, kind: number, hashes: Uint8Array[], have: (h: Uint8Array) => boolean) => {
+      const now = performance.now();
+      // Entries stay in the order they were made, so the expired ones are the first.
+      for (const [k, o] of outstanding) {
+        if (now - o.first <= FETCH_LIFETIME_MS) break;
+        drop(k, o);
+      }
       const out: Uint8Array[] = [];
+      let mine = asked.get(peer) ?? 0;
       for (const h of hashes) {
-        const k = toHex(h);
-        if (have(h) || outstanding.has(k)) continue;
-        outstanding.set(k, now);
+        if (mine >= MAX_OUTSTANDING_PER_PEER) break;
+        if (have(h)) continue;
+        const k = `${kind}:${toHex(h)}`;
+        const o = outstanding.get(k);
+        if (o) {
+          // A peer already asked is not asked again, and does not push back the moment another may be.
+          if (o.peers.has(peer) || now - o.at <= FETCH_RETRY_MS || o.peers.size >= 4) continue;
+          o.at = now;
+          o.peers.add(peer);
+        } else {
+          // Full: nothing new is remembered, but a hash further on that has an entry may still be due another peer.
+          if (outstanding.size >= MAX_OUTSTANDING) continue;
+          outstanding.set(k, { first: now, at: now, peers: new Set([peer]) });
+        }
+        mine++;
         out.push(h);
       }
+      if (mine > 0) asked.set(peer, mine);
       return out;
     };
+    /** Whether this peer was asked for this item within the last minute. The item settles the fetch; a peer that lacks it only steps out of it. */
+    const answered = (peer: string, kind: number, hash: Uint8Array, found: boolean) => {
+      const k = `${kind}:${toHex(hash)}`;
+      const o = outstanding.get(k);
+      if (!o || !o.peers.has(peer)) return false;
+      // An answer that comes after the entry's minute is not one to a fetch still open.
+      if (performance.now() - o.first > FETCH_LIFETIME_MS) {
+        drop(k, o);
+        return false;
+      }
+      if (found) drop(k, o);
+      else {
+        o.peers.delete(peer);
+        release(peer);
+        if (o.peers.size === 0) outstanding.delete(k);
+      }
+      return true;
+    };
+    // A peer that left will not answer. Its fetches are forgotten, so what it announces when it is back is asked again.
+    this.network.onPeerGone((peer) => {
+      if (!asked.has(peer.id)) return;
+      for (const [k, o] of outstanding) if (o.peers.delete(peer.id) && o.peers.size === 0) outstanding.delete(k);
+      asked.delete(peer.id);
+    });
     this.network.on('inv', (peer, m) => {
       // A mempool that would refuse them (full, or its limit lowered under memory pressure) fetches nothing peers announce.
-      const want = m.kind === InvKind.Tx ? (!this.mempool.accepting ? [] : wanted(m.hashes, (h) => this.mempool.seen(h))) : m.kind === InvKind.Evidence ? wanted(m.hashes, (h) => this.evidencePool.hasHash(h)) : [];
+      const want = m.kind === InvKind.Tx ? (!this.mempool.accepting ? [] : wanted(peer.id, m.kind, m.hashes, (h) => this.mempool.seen(h))) : m.kind === InvKind.Evidence ? wanted(peer.id, m.kind, m.hashes, (h) => this.evidencePool.hasHash(h)) : [];
       for (let i = 0; i < want.length; i += 256) peer.send({ type: 'fetch', kind: m.kind, hashes: want.slice(i, i + 256) });
     });
     this.network.on('fetch', (peer, m) => {
@@ -408,18 +551,20 @@ export class Node {
       }
     });
     this.network.on('item', (peer, m) => {
-      outstanding.delete(toHex(m.kind === InvKind.Tx ? txHash(m.data) : sha256(m.data)));
+      // An item nobody asked this peer for is dropped unread: a peer cannot push transactions or evidence past the
+      // announce-and-fetch round, which is what bounds how much of either it can make this node check.
+      if (!answered(peer.id, m.kind, m.kind === InvKind.Tx ? txHash(m.data) : sha256(m.data), true)) return;
       if (m.kind === InvKind.Tx) void this.mempool.addTx(m.data, peer.id);
       else if (m.kind === InvKind.Evidence) void this.acceptEvidence(peer.id, m.data);
     });
-    this.network.on('itemNotFound', (_peer, m) => outstanding.delete(toHex(m.hash)));
+    this.network.on('itemNotFound', (peer, m) => void answered(peer.id, m.kind, m.hash, false));
 
     // Every commit is announced so lagging peers know to sync, and the evidence age tracks the unbonding period.
     this.executor.onCommitted((block) => {
       this.network.broadcast({ type: 'status', height: block.header.height });
       // The idle moment after a commit is where collections are least in the way.
       setImmediate(() => this.gcScheduler.afterCommit());
-      if (this.app instanceof CoreApp && this.cfg.limits?.maxEvidenceAgeMs === undefined) limits.maxEvidenceAgeMs = this.app.stakingParameters().unbondingPeriodMs;
+      this.evidenceAge();
     });
   }
 
@@ -433,6 +578,11 @@ export class Node {
       return;
     }
     if (this.evidencePool.has(ev)) return;
+    // Evidence no later block could carry is not pooled: it would hold one of the pending places until the next
+    // commit let it go. Measured at the last block's time, which is the earliest the next block's can be. The peer
+    // is not marked for it: it may be ahead of this node, or hold history this node has pruned.
+    const state = this.executor.state;
+    if (evidenceAgeOk(ev.voteA.height, state.lastHeight + 1n, state.lastBlockTime, state, this.limits, (h) => this.executor.blockTimeAt(h))) return;
     const set = this.executor.validatorSetAtHeight(ev.voteA.height);
     if (!set) return;
     const err = await verifyDuplicateVoteEvidence(this.chainId, ev, set, this.verifier);
@@ -463,24 +613,29 @@ export class Node {
   }
 
   async stop(): Promise<void> {
-    this.releaseLock?.();
-    this.releaseLock = null;
-    if (this.started) {
-      this.started = false;
-      this.memoryGuard.stop();
-      this.gcScheduler.stop();
-      this.consensus.stop();
-      this.blockSync.stop();
+    try {
+      if (this.started) {
+        this.started = false;
+        this.memoryGuard.stop();
+        this.gcScheduler.stop();
+        this.consensus.stop();
+        this.blockSync.stop();
+      }
+      // The network may be up from a state-sync join even if start() was never called.
+      if (this.networkStarted) {
+        this.networkStarted = false;
+        await this.network.stop();
+      }
+      // A block being applied finishes its writes before the store goes away.
+      await this.executor?.idle();
+      if (this.ownsEnv) await this.env.close();
+      await this.ownVerifier?.close();
+    } finally {
+      // Last, and whatever failed above: until the store is closed and the writes are done, another node on the
+      // directory would be writing beside this one.
+      this.releaseLock?.();
+      this.releaseLock = null;
     }
-    // The network may be up from a state-sync join even if start() was never called.
-    if (this.networkStarted) {
-      this.networkStarted = false;
-      await this.network.stop();
-    }
-    // A block being applied finishes its writes before the store goes away.
-    await this.executor?.idle();
-    if (this.ownsEnv) await this.env.close();
-    await this.ownVerifier?.close();
   }
 
   get height(): bigint {

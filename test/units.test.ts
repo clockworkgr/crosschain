@@ -170,6 +170,9 @@ describe('mempool', () => {
     expect(await seen('d=6')).toBe(true);
     expect(await seen('d=5')).toBe(true);
     expect(await seen('d=4')).toBe(true);
+    // What is still pooled counts as seen whatever the cache holds; once committed, only the cache speaks.
+    expect(mp.seen(txHash(tx('d=3')))).toBe(true);
+    await mp.update(Array.from({ length: 7 }, (_, i) => tx(`d=${i}`)));
     expect(mp.seen(txHash(tx('d=3')))).toBe(false);
     expect(mp.seen(txHash(tx('a=1')))).toBe(false);
   });

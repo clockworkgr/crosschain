@@ -130,10 +130,13 @@ export async function stateSync(o: StateSyncOptions): Promise<{ height: bigint }
   }
   const tally = new Map<bigint, string[]>();
   for (const [id, heights] of offers) for (const h of heights) tally.set(h, [...(tally.get(h) ?? []), id]);
-  const heights = [...tally.keys()].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+  // The header after the snapshot fixes its app hash, and trust only moves forward to it: a snapshot more than one
+  // height below the trusted header cannot be verified and is not a candidate.
+  const heights = [...tally.keys()].filter((h) => h + 1n >= o.trustHeight).sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
   const chosen = heights.find((h) => tally.get(h)!.length >= 2) ?? heights[0];
   if (chosen === undefined) {
-    o.log('warn', 'state sync: no peer offers a snapshot; replaying from genesis');
+    if (tally.size > 0) o.log('warn', 'state sync: every snapshot offered is from before the trusted height; replaying from genesis', { trustHeight: o.trustHeight });
+    else o.log('warn', 'state sync: no peer offers a snapshot; replaying from genesis');
     return null;
   }
   const H = chosen;
@@ -149,7 +152,14 @@ export async function stateSync(o: StateSyncOptions): Promise<{ height: bigint }
     try {
       const m = await o.requester.request(p, { type: 'manifestRequest', height: H }, 'manifestResponse', (m) => m.height === H, timeout);
       if (!m.manifest) continue;
-      const candidate = manifestFromBytes(m.manifest);
+      let candidate: SnapshotManifest;
+      try {
+        candidate = manifestFromBytes(m.manifest);
+      } catch (e) {
+        // Bytes that are no manifest at all cost what a manifest for another state costs.
+        o.network.score(p.id, 50, `undecodable snapshot manifest: ${(e as Error).message}`);
+        continue;
+      }
       const problem = verifyManifest(next.appHash, candidate, o.types);
       if (problem) {
         o.network.score(p.id, 50, `bad snapshot manifest: ${problem}`);

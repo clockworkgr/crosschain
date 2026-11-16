@@ -10,15 +10,19 @@
  *
  * Undo sessions nest. A transaction runs in a session that is undone if it
  * fails. The mempool's speculative state is a session that is undone before
- * every block and rebuilt by re-checking. There is no block-level undo
- * because blocks are final. The outermost open session also doubles as the
- * committed view: whatever it recorded as an old value is what was committed,
- * which is what queries and proofs must return while the mempool session is
- * open.
+ * every block and rebuilt by re-checking. A block runs in a session of its
+ * own (the application's finalizeBlock), committed before the root is taken
+ * and undone if the block fails on the way; a committed block is final and
+ * is never undone. The committed view, which is what queries and proofs must
+ * return while the mempool session is open, is the state of the last root:
+ * what an object was then is kept from its first change since (the root
+ * shadow), whether the change was made in a session or not.
  *
- * root(version) is the only thing that touches the trees, and it must be
- * called with no session open. Until then changed objects are merely
- * remembered, so the trees always reflect the last committed state. Each
+ * root(version) is the only thing that touches the dense trees, and it must
+ * be called with no session open. Until then changed objects are merely
+ * remembered, so the dense trees always reflect the last committed state.
+ * (The sparse trees of the authenticated indices take each write as it is
+ * made and are undone with the session; root() commits their version.) Each
  * root() also reports the objects and counters that changed, which is what a
  * persistent store writes, and remembers the previous value of each changed
  * object so a proof can be produced for any version inside the window.
@@ -37,10 +41,16 @@
  * and the store keeps them beside the objects. dropTrees() lets every tree
  * go at once, dense and sparse together, since one dial is all the guard
  * needs: roots, proofs and key proofs then read the store, the dense chunks
- * through a shared LRU (treeChunks), and give the same answers. The
- * history of past versions stays in memory either way. rebuildTrees() reads
- * them back. A restart can take the trees from the store too (loadTrees)
- * instead of hashing every object and inserting every key again.
+ * through a shared LRU (treeChunks), and give the same answers.
+ * rebuildTrees() reads them back. A restart can take the trees from the
+ * store too (loadTrees) instead of hashing every object and inserting every
+ * key again.
+ *
+ * The history of past versions does not go with the trees. It stays in
+ * memory as far as the window in memory reaches, which setHistoryWindow can
+ * make shorter than the retention window; with a history store, a version
+ * the window in memory has forgotten is read from the store's history
+ * records.
  */
 import { decode, type Reader } from '../codec/reader.ts';
 import { encode, type Writer } from '../codec/writer.ts';
@@ -51,7 +61,7 @@ import { deepFreeze } from './freeze.ts';
 import { DbError, TypeIndex, type HotBudget, type ObjectFetch, type ObjectType } from './index.ts';
 import { MemoryIndexStore, overlaid, until, type IndexEntryChange, type IndexStore } from './indexstore.ts';
 import { BPlusTree } from './bptree.ts';
-import { ChunkCache, DenseMerkleTree, EMPTY, nodePosition, type PastTree, type StoreChange, type TreeRecords } from './merkle.ts';
+import { ChunkCache, DenseMerkleTree, EMPTY, MAX_SLOTS, nodePosition, type PastTree, type StoreChange, type TreeRecords } from './merkle.ts';
 import { objectLeaf, typeLeaf, type KeyProof, type ObjectProof } from './proof.ts';
 import { nodeString, SparseMerkleTree, type NodeRecord, type PastNodes } from './smt.ts';
 
@@ -470,6 +480,8 @@ export class ObjectDatabase {
         return pending ? overlaid(stored, until(pending.entriesFrom(start), end)) : stored;
       },
     };
+    // Every type's tree and the tree over the types take a place in the chunk cache when the trees are dropped.
+    if (types.length + 1 > MAX_SLOTS) throw new Error(`${types.length} object types: a database holds at most ${MAX_SLOTS - 1}`);
     for (const t of types) {
       if (this.types.has(t.id)) throw new Error(`duplicate object type ${t.id}`);
       if (t.id === TOP_TREE) throw new Error(`type id ${TOP_TREE} names the tree over the types`);
@@ -560,8 +572,11 @@ export class ObjectDatabase {
    * is taken from the change list the application is still to write. A record the store should hold and does not
    * is a refusal: without it an entry it named would be read as it is now, a wrong answer with nothing to show for it.
    */
-  private past(version: number, want: Partial<Wanted>): Past | null {
+  private past(version: number, ask: () => Partial<Wanted>): Past | null {
+    // What is wanted is worked out only when the store is asked: for a version in memory, which is nearly every
+    // call, listing the entries a proof would read costs more than the proof.
     if (!this.historyStore || version >= this.windowStart) return null;
+    const want = ask();
     const wanted: Wanted = { objects: want.objects ?? new Set(), counters: want.counters ?? new Set(), trees: want.trees ?? new Map(), nodes: want.nodes ?? new Set() };
     const past: Past = { objects: new Map(), counters: new Map(), trees: new Map(), nodes: new Map() };
     // Every tree asked about is answered for, also one no record names: nothing has changed it since.
@@ -1040,24 +1055,21 @@ export class ObjectDatabase {
 
   // ---- committed and historical views ----
 
-  /** The object as of the last root(), looking through every open session. */
+  /**
+   * The object as of the last root(), whatever has been written since, inside a session or outside one: the first
+   * write to an object after a root keeps the value it had at that root, for the next root to compare with.
+   */
   getCommitted<T extends AnyObject>(type: ObjectType<T>, id: ObjectId): T | null {
-    for (const s of this.sessions) {
-      if (s.created.has(id)) return null;
-      const m = s.modified.get(id);
-      if (m) return m as T;
-      const r = s.removed.get(id);
-      if (r) return r as T;
+    if (this.shadow.size > 0) {
+      const before = this.shadow.get(id);
+      if (before !== undefined) return before as T | null;
     }
     return this.get(type, id);
   }
 
+  /** A type's instance counter as of the last root(): the first create after a root keeps it. */
   committedNextInstance(type: number): number {
-    for (const s of this.sessions) {
-      const c = s.counters.get(type);
-      if (c !== undefined) return c;
-    }
-    return this.typeIndexById(type).nextInstance;
+    return this.counterShadow.get(type) ?? this.typeIndexById(type).nextInstance;
   }
 
   private checkVersion(version: number): void {
@@ -1068,17 +1080,44 @@ export class ObjectDatabase {
   /** The object as of a past version inside the retention window. */
   getAt<T extends AnyObject>(type: ObjectType<T>, id: ObjectId, version: number): T | null {
     this.checkVersion(version);
-    const before = this.past(version, { objects: new Set([id]) })?.objects.get(id);
+    const before = this.past(version, () => ({ objects: new Set([id]) }))?.objects.get(id);
     if (before !== undefined) return before ? deepFreeze(decode(before, (r) => type.decode(r, id))) : null;
     const entries = this.valueHistory.get(id);
     if (entries) for (const e of entries) if (e.v > version) return e.bytes ? deepFreeze(decode(e.bytes, (r) => type.decode(r, id))) : null;
     return this.getCommitted(type, id);
   }
 
+  /**
+   * Every object of a type that a version after `version` created, changed or removed, or that the block in
+   * progress removed. An index is of now: it lists what exists, and an object removed since a past version is not
+   * in it. These together with the objects of now are all that can have existed at that version, so a query about
+   * a past version reads each as of then (getAt) and keeps what was there.
+   */
+  changedSince(type: ObjectType<any>, version: number): ObjectId[] {
+    this.checkVersion(version);
+    const out = new Set<ObjectId>();
+    for (const [v, ids] of this.valueHistoryByVersion) if (v > version) for (const id of ids) if (typeOf(id) === type.id) out.add(id);
+    // Versions the window in memory no longer holds are in the store's records, one read and one decode each.
+    if (this.historyStore && version < this.windowStart) {
+      for (const v of this.recorded) {
+        if (v <= version || v > this.windowStart) continue;
+        let record = this.changes?.version === v ? this.changes.history : null;
+        if (!record) {
+          const stored = this.historyStore(v);
+          if (!stored) throw new RangeError(`version ${version} is not available: the store has no history record of version ${v}`);
+          record = decode(stored, decodeHistory);
+        }
+        for (const [id] of record.objects) if (typeOf(id) === type.id) out.add(id);
+      }
+    }
+    for (const s of this.sessions) for (const id of s.removed.keys()) if (typeOf(id) === type.id) out.add(id);
+    return [...out];
+  }
+
   /** The encoding of an object as of a past version inside the window, without decoding it: for snapshots and proofs. */
   bytesAt(id: ObjectId, version: number): Uint8Array | null {
     this.checkVersion(version);
-    return this.bytesIn(this.past(version, { objects: new Set([id]) }), id, version);
+    return this.bytesIn(this.past(version, () => ({ objects: new Set([id]) })), id, version);
   }
 
   /** As bytesAt, with what the store's records say if the version is older than the window. */
@@ -1088,17 +1127,17 @@ export class ObjectDatabase {
     const entries = this.valueHistory.get(id);
     if (entries) for (const e of entries) if (e.v > version) return e.bytes;
     const ti = this.typeIndexById(typeOf(id));
-    for (const s of this.sessions) {
-      if (s.created.has(id)) return null;
-      const old = s.modified.get(id) ?? s.removed.get(id);
-      if (old) return encode((w) => ti.type.encode(w, old));
+    // As getCommitted: an object written since the last root is read as of that root.
+    if (this.shadow.size > 0) {
+      const old = this.shadow.get(id);
+      if (old !== undefined) return old ? encode((w) => ti.type.encode(w, old)) : null;
     }
     return ti.bytesFor(instanceOf(id)) ?? null;
   }
 
   countAt(type: number, version: number): number {
     this.checkVersion(version);
-    return this.countIn(this.past(version, { counters: new Set([type]) }), type, version);
+    return this.countIn(this.past(version, () => ({ counters: new Set([type]) })), type, version);
   }
 
   private countIn(past: Past | null, type: number, version: number): number {
@@ -1357,7 +1396,7 @@ export class ObjectDatabase {
     const ti = this.typeIndexById(type);
     const tree = this.trees.get(type)!;
     const instance = instanceOf(id);
-    const past = this.past(version, { objects: new Set([id]), counters: new Set([type]), trees: this.wantedTrees(type, instance), nodes: this.wantedNodes(ti) });
+    const past = this.past(version, () => ({ objects: new Set([id]), counters: new Set([type]), trees: this.wantedTrees(type, instance), nodes: this.wantedNodes(ti) }));
     const count = this.countIn(past, type, version);
     const idx = this.order.indexOf(type);
     return {
@@ -1379,7 +1418,7 @@ export class ObjectDatabase {
     this.checkVersion(version);
     const ti = this.typeIndexById(type);
     const idx = this.order.indexOf(type);
-    const past = this.past(version, { counters: new Set([type]), trees: this.wantedTrees(type), nodes: this.wantedNodes(ti) });
+    const past = this.past(version, () => ({ counters: new Set([type]), trees: this.wantedTrees(type), nodes: this.wantedNodes(ti) }));
     return {
       nextInstance: BigInt(this.countIn(past, type, version)),
       typeRoot: this.trees.get(type)!.rootAt(version, past?.trees.get(type)),
@@ -1394,14 +1433,14 @@ export class ObjectDatabase {
   rangeProofAt(type: number, from: number, to: number, version: number): Uint8Array[] {
     this.checkVersion(version);
     const tree = this.trees.get(type)!;
-    const past = this.past(version, { trees: new Map([[type, new Set(from >= 0 && from < to ? tree.pastRangePositions(from, to) : [])]]) });
+    const past = this.past(version, () => ({ trees: new Map([[type, new Set(from >= 0 && from < to ? tree.pastRangePositions(from, to) : [])]]) }));
     return tree.rangeProofAt(from, to, version, past?.trees.get(type));
   }
 
   /** The app hash as of a version inside the window. */
   rootAt(version: number): Uint8Array {
     this.checkVersion(version);
-    const past = this.past(version, { trees: new Map([[TOP_TREE, new Set(this.top.pastPositions())]]) });
+    const past = this.past(version, () => ({ trees: new Map([[TOP_TREE, new Set(this.top.pastPositions())]]) }));
     return this.top.rootAt(version, past?.trees.get(TOP_TREE));
   }
 
@@ -1417,7 +1456,7 @@ export class ObjectDatabase {
     const position = ti.authenticated.indexOf(index);
     if (position < 0) throw new DbError(`${type.name}.${index} is not an authenticated index`);
     const idx = this.order.indexOf(type.id);
-    const past = this.past(version, { counters: new Set([type.id]), trees: this.wantedTrees(type.id), nodes: this.wantedNodes(ti, index, key) });
+    const past = this.past(version, () => ({ counters: new Set([type.id]), trees: this.wantedTrees(type.id), nodes: this.wantedNodes(ti, index, key) }));
     return {
       height: BigInt(version),
       type: type.id,

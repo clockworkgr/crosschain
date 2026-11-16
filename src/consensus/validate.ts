@@ -21,6 +21,12 @@ export interface ValidationLimits {
   maxEvidenceAgeMs: bigint;
 }
 
+/**
+ * The most evidence a block may carry. A rule of the chain, not of a node: a proposer takes no more from its pool,
+ * and a block with more is refused by everyone, so one proposer cannot make every node verify an unbounded list.
+ */
+export const MAX_EVIDENCE_PER_BLOCK = 16;
+
 /** Whether a block's body is the one its header commits to: transactions, evidence and the last commit. A relay can pair a signed header with another body. */
 export function bodyMatchesHeader(b: Block): boolean {
   return bytesEqual(txsRoot(b.txs), b.header.dataHash) && bytesEqual(evidenceHash(b.evidence), b.header.evidenceHash) && bytesEqual(commitHash(b.lastCommit), b.header.lastCommitHash);
@@ -67,6 +73,7 @@ export function validateBlockStructure(state: ChainState, block: Block, limits: 
     if (!bytesEqual(c.blockHash, state.lastBlockHash)) return 'lastCommit is for a different block';
     if (c.signatures.length !== state.lastValidators.size) return 'lastCommit signature count mismatch';
   }
+  if (block.evidence.length > MAX_EVIDENCE_PER_BLOCK) return 'too much evidence';
   for (const ev of block.evidence) {
     const age = evidenceAgeOk(ev.voteA.height, h.height, h.time, state, limits, blockTimeAt);
     if (age) return age;

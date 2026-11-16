@@ -86,7 +86,8 @@ export function heapLimitFlag(execArgv: readonly string[] = process.execArgv, no
   let mib: number | null = null;
   for (const f of flags) {
     const m = /^--max[-_]old[-_]space[-_]size=(\d+)$/.exec(f);
-    if (m) mib = Number(m[1]);
+    // A size of 0 is V8's way of saying none was set: it sizes the heap itself, and the last flag wins.
+    if (m) mib = Number(m[1]) || null;
   }
   return mib;
 }

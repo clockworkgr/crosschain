@@ -59,7 +59,7 @@ describe('engine changes for staking', () => {
     };
     const stale = makeDuplicateVoteEvidence(forge(2n, 1), forge(2n, 2));
     expect(node.evidencePool.add(stale)).toBe(true);
-    // Node 0 proposes within a few heights and discards it instead of proposing a block others would reject.
+    // Every node prunes its pool after each commit, and a proposer before it picks evidence: the stale piece goes and no block carries it.
     const h = node.height;
     await waitForHeight(net.nodes, h + 8n, 30_000);
     expect(node.evidencePool.size).toBe(0);

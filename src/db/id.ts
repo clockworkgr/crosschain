@@ -27,7 +27,7 @@ export function typeOf(id: ObjectId): number {
   return Number(id >> INSTANCE_BITS);
 }
 
-/** Instances are below 2^48, so a plain number is exact and indexes an array. */
+/** Instances are below 2^48, so a plain number is exact. An index's arrays hold fewer: MAX_INSTANCE in index.ts (2^32 - 2). */
 export function instanceOf(id: ObjectId): number {
   return Number(id & INSTANCE_MASK);
 }

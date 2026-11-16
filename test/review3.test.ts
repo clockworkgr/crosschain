@@ -303,7 +303,8 @@ describe('a keystore entry whose scheme was changed', () => {
         writeFileSync(path, JSON.stringify(file));
         const reopened = Keystore.open(path, 'pw');
         expect(reopened.get('good').scheme).toBe(Scheme.mlDsa44);
-        expect(() => reopened.get('secp')).toThrow(/does not derive the public key and address recorded/);
+        // The wrong scheme derives another key; no scheme at all, in a file of the version that names every key's, is damage in itself.
+        expect(() => reopened.get('secp')).toThrow(/does not derive the public key and address recorded|names no scheme/);
         file.keys.secp = original;
         writeFileSync(path, JSON.stringify(file));
         expect(toHex(Keystore.open(path, 'pw').get('secp').address)).toBe(toHex(listed.address));

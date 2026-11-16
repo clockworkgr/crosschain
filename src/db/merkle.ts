@@ -55,7 +55,7 @@ const CHUNK_BYTES = CHUNK * HASH_SIZE;
 /** A chunk index is below 2^38 (2^48 leaves in chunks of 2^10), a level below 64, a tree's cache slot below 2^9: one number holds all three. */
 const LEVEL_SPAN = 2 ** 38;
 const SLOT_SPAN = 2 ** 44;
-const MAX_SLOTS = 2 ** 9;
+export const MAX_SLOTS = 2 ** 9;
 
 /** First byte of a dense tree chunk's store key. */
 export const CHUNK_PREFIX = 0x74; // 't'
@@ -488,7 +488,6 @@ export class DenseMerkleTree {
     return this.records;
   }
 
-  /** Put back records a store kept, in ascending version order, after the current root is in place. */
   /**
    * Make `version` askable although no record of it was loaded: nothing changed
    * this tree between then and the oldest recorded version, so its entries, or
@@ -498,6 +497,7 @@ export class DenseMerkleTree {
     if (version < this.floor) this.floor = Math.max(0, version);
   }
 
+  /** Put back records a store kept, in ascending version order, after the current root is in place. */
   loadRecords(version: number, rec: TreeRecords): void {
     if (version > this.version) throw new RangeError(`cannot load history for version ${version} beyond ${this.version}`);
     // A record for version v describes version v-1 as well.

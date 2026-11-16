@@ -4,7 +4,7 @@
  * loop draws candidates from here, preferring addresses that have worked
  * before and backing off exponentially from ones that have not.
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 
 export interface PeerRecord {
   addr: string;
@@ -29,7 +29,13 @@ export class PeerDb {
   constructor(file: string | null = null, seeds: string[] = []) {
     this.file = file;
     if (file && existsSync(file)) {
-      for (const r of JSON.parse(readFileSync(file, 'utf8')) as PeerRecord[]) this.records.set(r.addr, r);
+      // The file is a convenience: one that cannot be read (cut short by a crash, edited by hand) is the same as
+      // none, and the node starts from its seeds.
+      try {
+        for (const r of JSON.parse(readFileSync(file, 'utf8')) as PeerRecord[]) if (typeof r?.addr === 'string') this.records.set(r.addr, r);
+      } catch {
+        this.records.clear();
+      }
     }
     this.addAll(seeds);
   }
@@ -78,7 +84,6 @@ export class PeerDb {
     this.save();
   }
 
-  /** Addresses worth dialing now, best first. */
   /** Ban an address for a while; each repeat doubles the time. */
   ban(addr: string, baseMs: number, now = Date.now()): number {
     const r = this.records.get(addr) ?? this.records.set(addr, { addr, lastSeen: 0, lastAttempt: 0, failures: 0, successes: 0 }).get(addr)!;
@@ -93,6 +98,7 @@ export class PeerDb {
     return r?.bannedUntil !== undefined && r.bannedUntil > now;
   }
 
+  /** Addresses worth dialing now, best first. */
   candidates(exclude: Set<string>, now = Date.now()): string[] {
     return this.all()
       .filter((r) => !exclude.has(r.addr))
@@ -111,7 +117,11 @@ export class PeerDb {
       .map((r) => r.addr);
   }
 
+  /** Written beside the file and renamed over it, so a crash leaves the old file or the new one, never part of one. */
   save(): void {
-    if (this.file) writeFileSync(this.file, JSON.stringify(this.all()));
+    if (!this.file) return;
+    const tmp = `${this.file}.tmp`;
+    writeFileSync(tmp, JSON.stringify(this.all()));
+    renameSync(tmp, this.file);
   }
 }

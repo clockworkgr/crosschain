@@ -7,7 +7,10 @@
  * A validator holds `tokens` and `shares`; a delegation owns shares. The rate
  * tokens/shares rises with rewards and falls with slashes, so every delegator's
  * value moves together and nothing is tracked per delegator. Shares are scaled
- * so integer division loses at most one base unit, in the validator's favour.
+ * (SHARE_SCALE to a base unit at the opening rate), so there integer division
+ * loses under one base unit. Once the rate has risen a share is worth more,
+ * and sharesForTokens can round away up to one share's worth. Every rounding
+ * is down, in the validator's favour.
  *
  * beginBlock runs before a block's transactions and endBlock after. Neither
  * opens a session, because a block is final; a throw here is a bug, not a
@@ -115,6 +118,9 @@ export function selfBondOf(db: ObjectDatabase, v: Validator): bigint {
 
 /** Put tokens behind a validator for a delegator. The caller has already taken them from somewhere. */
 export function bond(db: ObjectDatabase, delegator: ObjectId, v: Validator, tokens: bigint): Validator {
+  // Shares outstanding over no tokens (a full slash) are worth nothing, and there is no rate to price new ones at:
+  // at the opening rate the tokens would be shared with every holder of the old shares.
+  if (v.tokens === 0n && v.shares > 0n) throw new TxError('validator has lost all its tokens to slashing and takes no delegation');
   const shares = sharesForTokens(v, tokens);
   if (shares === 0n) throw new TxError('delegation is worth no shares at this exchange rate');
   if (v.shares + shares > MAX_U64 || v.tokens + tokens > MAX_U64) throw new TxError('delegation would overflow the validator');
@@ -134,7 +140,6 @@ export function unbond(db: ObjectDatabase, d: Delegation, v: Validator, shares: 
   return { tokens, validator };
 }
 
-/** Pay a validator: tokens rise for everyone, and the commission is minted as shares to the operator. */
 /** Pay a validator: tokens rise for everyone, and the commission is minted as shares to the operator. Returns false if it could not be paid. */
 export function reward(db: ObjectDatabase, v: Validator, amount: bigint, commissionBps: number): boolean {
   if (amount <= 0n) return false;

@@ -44,7 +44,7 @@ import { VoteType, voteSignBytes, voteTypeName, type Vote } from '../types/vote.
 import type { Logger } from '../util/log.ts';
 import { EvidencePool } from './evidence.ts';
 import { DoubleSignError, type PrivValidator } from './privval.ts';
-import { bodyMatchesHeader, evidenceAgeOk, validateBlockStructure, verifyBlockSignatures, type BlockTimeLookup, type ValidationLimits } from './validate.ts';
+import { MAX_EVIDENCE_PER_BLOCK, bodyMatchesHeader, evidenceAgeOk, validateBlockStructure, verifyBlockSignatures, type BlockTimeLookup, type ValidationLimits } from './validate.ts';
 import { HeightVoteSet } from './votes.ts';
 
 export interface ConsensusTimeouts {
@@ -82,7 +82,9 @@ const STEP_ORDER: Record<Step, number> = { propose: 0, prevote: 1, precommit: 2,
 
 /** Rounds beyond this many ahead of ours are ignored; a round number is otherwise a free CPU budget for a peer. */
 export const MAX_ROUND_AHEAD = 1000;
-const MAX_EVIDENCE_PER_BLOCK = 16;
+/** Proposals for the next height held until it starts, in all and from any one peer. */
+const MAX_NEXT_HEIGHT_PROPOSALS = 8;
+const MAX_NEXT_HEIGHT_PROPOSALS_PER_PEER = 2;
 const EMPTY_HEADER: Header = {
   chainId: '',
   version: 0,
@@ -173,7 +175,8 @@ export class Consensus {
   private timers = new Map<string, NodeJS.Timeout>();
   /** Votes for the next height with the key each was verified against, replayed once that height starts. */
   private nextHeightVotes: { vote: Vote; publicKey: Uint8Array }[] = [];
-  private nextHeightProposals: Proposal[] = [];
+  /** Proposals for the next height with the peer each came from, replayed once that height starts; nothing in them is checked yet. */
+  private nextHeightProposals: { proposal: Proposal; from: string | null }[] = [];
   private decided = false;
   private decidedRound = -1;
   private decidedHash: Uint8Array | null = null;
@@ -239,6 +242,7 @@ export class Consensus {
     this.prevoteTimeoutScheduled.clear();
     this.precommitTimeoutScheduled.clear();
     this.polkaHandled.clear();
+    this.fetchRequested.clear(); // the hashes asked for belong to the height that is over
     this.lockedBlock = null;
     this.lockedRound = -1;
     this.validBlock = null;
@@ -252,13 +256,13 @@ export class Consensus {
 
     // Only votes verified with the key that holds that index in this height's set count.
     const votes = this.nextHeightVotes.filter((e) => e.vote.height === this.height && bytesEqual(this.validators.byIndex(e.vote.validatorIndex)?.publicKey ?? null, e.publicKey)).map((e) => e.vote);
-    const proposals = this.nextHeightProposals.filter((p) => p.height === this.height);
+    const proposals = this.nextHeightProposals.filter((e) => e.proposal.height === this.height);
     this.nextHeightVotes = [];
     this.nextHeightProposals = [];
 
     this.startRound(resumeRound);
     for (const v of votes) this.addVote(v, null);
-    for (const p of proposals) void this.handleProposal(p, null);
+    for (const e of proposals) void this.handleProposal(e.proposal, e.from);
   }
 
   private startRound(r: number): void {
@@ -365,7 +369,10 @@ export class Consensus {
   async handleProposal(p: Proposal, fromPeer: string | null): Promise<void> {
     if (!this.running) return;
     if (p.height === this.height + 1n) {
-      if (this.nextHeightProposals.length < 8) this.nextHeightProposals.push(p);
+      // Unverified, so the places are few, and one peer may fill only some of them: a peer sending junk cannot
+      // alone keep the real proposal out.
+      const fromSame = this.nextHeightProposals.filter((e) => e.from === fromPeer).length;
+      if (this.nextHeightProposals.length < MAX_NEXT_HEIGHT_PROPOSALS && fromSame < MAX_NEXT_HEIGHT_PROPOSALS_PER_PEER) this.nextHeightProposals.push({ proposal: p, from: fromPeer });
       return;
     }
     if (p.height !== this.height) return;
@@ -435,6 +442,8 @@ export class Consensus {
     if (!set) return;
     const val = set.byIndex(v.validatorIndex);
     if (!val) return;
+    // Before the signature is verified: a vote this node will not count must not cost it a verification.
+    if (v.round > this.round + MAX_ROUND_AHEAD) return;
     const ok = await this.d.verifier.verifyOne({
       sig: v.signature,
       msg: voteSignBytes(this.d.chainId, v),
@@ -447,7 +456,7 @@ export class Consensus {
       return;
     }
     if (!this.running) return;
-    if (v.round > this.round + MAX_ROUND_AHEAD) return;
+    if (v.round > this.round + MAX_ROUND_AHEAD) return; // again: the height may have moved on, and the round with it
     if (v.height === this.height) this.addVote(v, fromPeer);
     else if (v.height === this.height + 1n && this.nextHeightVotes.length < 4096) this.nextHeightVotes.push({ vote: v, publicKey: val.publicKey });
   }

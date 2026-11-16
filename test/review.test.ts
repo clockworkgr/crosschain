@@ -181,7 +181,7 @@ describe('review regressions', () => {
   });
 
   it.skipIf(DEFAULT_SCHEME !== Scheme.mlDsa44)('accepts both valid signatures a key can make over one body, whichever was seen first', async () => {
-    // Signing is randomised, so two signatures over one body differ; the cache keeps every verified one.
+    // Two valid signatures over one body can differ (a hedged signer beside this chain's deterministic one); the cache keeps every verified one.
     const app = makeApp();
     await block(app);
     const body = { expiration: app.dynamic().time + 60_000n, operations: withFees([{ type: 'transfer' as const, from: FAUCET_ID, to: objectId(TYPE.account, 1), asset: CORE, amount: T(1) }], app.feeSchedule()) };

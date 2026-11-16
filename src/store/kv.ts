@@ -65,12 +65,14 @@ export class MemoryKv implements KvStore {
   }
 
   write(fn: (w: KvWriter) => void): void {
-    // Buffer the writes so a throw inside fn leaves the store untouched.
-    const puts: [Uint8Array, Uint8Array][] = [];
-    const dels: Uint8Array[] = [];
-    fn({ put: (k, v) => void puts.push([k.slice(), v.slice()]), del: (k) => void dels.push(k.slice()) });
-    for (const k of dels) this.tree.delete(k);
-    for (const [k, v] of puts) this.tree.set(k, v);
+    // Buffer the writes so a throw inside fn leaves the store untouched; applied in the order made, as LMDB does,
+    // so a key put and then deleted in one write ends deleted.
+    const ops: [Uint8Array, Uint8Array | null][] = [];
+    fn({ put: (k, v) => void ops.push([k.slice(), v.slice()]), del: (k) => void ops.push([k.slice(), null]) });
+    for (const [k, v] of ops) {
+      if (v) this.tree.set(k, v);
+      else this.tree.delete(k);
+    }
   }
 
   get size(): number {

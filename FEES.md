@@ -57,14 +57,14 @@ price at once. The result is capped at the maximum share supply.
   operations are the unit of payment here, as in BitShares. Left for a later revision
   if block space becomes the constraint.
 
-Defaults (`DEFAULT_FEES`, base units; with precision 5 a value of 100 is 0.001 of the
+Defaults (`DEFAULT_FEES` in `src/app/core/genesis.ts`, base units; with precision 5 a value of 100 is 0.001 of the
 core asset): transfer 100; accountCreate basic 1 000, premium 5 000, 100 per KB;
 accountUpdate 100 plus 100 per KB; assetCreate 100 000 / 50 000 / 10 000 for 3, 4
 and longer symbols; every other operation 100, validatorCreate 1 000; scale 10 000.
 
-Bounds (`checkFeeSchedule`): every amount at most the maximum share supply; scale
-at most 1 000 000 (one hundred times). Zero is allowed everywhere, so a chain can
-be free.
+Bounds (`checkFeeSchedule`, applied to the genesis schedule and to every proposal):
+every amount at most the maximum share supply; scale at most 1 000 000 (one hundred
+times). Zero is allowed everywhere, so a chain can be free.
 
 ## 3. Paying
 
@@ -87,11 +87,14 @@ A proposal carries the complete `ChainParameters`: the fee schedule and the stak
 parameters together, replaced wholesale on adoption, exactly like BitShares'
 `committee_member_update_global_parameters` carries all of `chain_parameters`.
 Creating and signalling, the two-thirds threshold of active stake, the lifetime and
-the lowest-id-wins rule are those of STAKING.md section 4; only the payload grew.
+the lowest-id-wins rule are those of STAKING.md (the operations in section 6, the
+tally in section 7 step 8, the lifetime in section 4); only the payload grew.
 
 The adopted schedule applies from the next block. Transactions already in a mempool
-that state the old fee fail at inclusion if the price went up, which is the "what
-you sign is what you pay" rule doing its job; wallets re-sign.
+that state the old fee fail the recheck that follows the adopting block's commit if the
+price went up, and leave the mempool; one that is in a block all the same fails when
+the block is applied. That is the "what you sign is what you pay" rule doing its job;
+wallets re-sign.
 
 CLI:
 
@@ -108,7 +111,7 @@ proposal only has to name what changes even though it carries everything.
 ## 5. Genesis
 
 `appState.fees` is a partial schedule merged over the defaults, amounts in base
-units as strings:
+units as strings or numbers:
 
 ```json
 "fees": { "scale": 10000, "transfer": { "fee": "100" }, "accountCreate": { "premiumFee": "20000" } }

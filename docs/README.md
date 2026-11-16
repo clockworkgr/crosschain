@@ -4,7 +4,7 @@
 |---|---|---|
 | [running.md](running.md) | operators and users | installing, starting nodes, the command line, configuration, genesis, the JSON-RPC, event streams, joining a chain, running a validator, the light client, operating notes, troubleshooting |
 | [benchmarks.md](benchmarks.md) | anyone sizing or tuning a node | how the benchmarks work, every suite with its results and analysis, what bounds what, the defects they found, sizing guidance, further work |
-| [tutorial/00-overview.md](tutorial/00-overview.md) | programmers learning how a blockchain is built | a part-by-part reading of the whole codebase in dependency order, fifteen chapters, every exported symbol, with the concepts, their provenance, the tests and exercises |
+| [tutorial/00-overview.md](tutorial/00-overview.md) | programmers learning how a blockchain is built | a part-by-part reading of the whole codebase in dependency order, fifteen chapters, nearly every exported symbol, with the concepts, their provenance, the tests and exercises |
 
 The design record and the specifications it points to live at the repository root:
 [DESIGN.md](../DESIGN.md) (every decision, in order), [STAKING.md](../STAKING.md),

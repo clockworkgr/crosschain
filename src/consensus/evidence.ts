@@ -3,13 +3,13 @@ import type { Verifier } from '../crypto/verifier.ts';
 import { checkDuplicateVoteShape, encodeEvidence, evidenceKey, type DuplicateVoteEvidence } from '../types/evidence.ts';
 import { encode } from '../codec/writer.ts';
 import { sha256, toHex } from '../crypto/hash.ts';
+import type { ValidatorSet } from '../types/validator.ts';
+import { voteSignBytes } from '../types/vote.ts';
 
 /** The inventory key of one piece of evidence (the header's `evidenceHash` in types/block.ts is the root over a list). */
 export function evidenceId(ev: DuplicateVoteEvidence): Uint8Array {
   return sha256(encode((w) => encodeEvidence(w, ev)));
 }
-import type { ValidatorSet } from '../types/validator.ts';
-import { voteSignBytes } from '../types/vote.ts';
 
 /**
  * Evidence waiting to be included in a block. Nodes that saw both votes build
@@ -65,6 +65,9 @@ export class EvidencePool {
   markCommitted(evs: DuplicateVoteEvidence[]): void {
     for (const ev of evs) {
       const k = evidenceKey(ev);
+      // What waited for the same offence may be another pair of votes, under another hash: its inventory entry goes too.
+      const waiting = this.pending.get(k);
+      if (waiting) this.byHash.delete(toHex(evidenceId(waiting)));
       this.pending.delete(k);
       this.committed.set(k, ev);
       // Evidence that came in a block without passing through the pool is served by hash like the rest.

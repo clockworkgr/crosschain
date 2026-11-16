@@ -57,6 +57,7 @@ import type { Arena } from './arena.ts';
 import { BPlusTree } from './bptree.ts';
 import { deepFreeze } from './freeze.ts';
 import { afterPrefix, EMPTY_VALUE, entryKey, INDEX_HEADER, indexHeader, overlaid, until, type IndexEntryChange, type IndexStore } from './indexstore.ts';
+import { MAX_AUTHENTICATED_INDICES } from './proof.ts';
 import { nodeHeader, SparseMerkleTree } from './smt.ts';
 
 export class DbError extends Error {
@@ -203,6 +204,8 @@ export class TypeIndex<T extends { id: ObjectId }> {
         this.authenticated.push(ix.name);
       }
     });
+    // A proof of this type carries a root for each, and a decoder of proofs refuses more.
+    if (this.authenticated.length > MAX_AUTHENTICATED_INDICES) throw new Error(`${type.name}: more than ${MAX_AUTHENTICATED_INDICES} authenticated indices`);
   }
 
   /** An empty sparse tree for an authenticated index, keyed in the store as the index's own is. */

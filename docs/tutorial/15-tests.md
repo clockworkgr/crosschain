@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-five files, 212 cases, about 6,850 lines counting the shared harness
-in `test/helpers.ts` and the setup file. The whole suite takes about two minutes (111.5 s, all
-passing, on the run this chapter was checked against, under the default ML-DSA-44 keys); nearly
-all of that time is the network scenarios, which run real consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (211 passing and
+`test/**/*.test.ts`: twenty-nine files, 268 cases, about 8,670 lines counting the shared harness
+in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
+default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
+consensus timers. The same suite runs
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (267 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -26,8 +26,12 @@ guard's dials on the object database show; `chain`, `app`, `staking`, `staking-n
 the external review and the later cases of the same kind, `review2` five more that each
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
-by title at the end of the suites, and `review4` the nine cases for the items the first review
-noted and left. Files run one after another, never in parallel, for a reason explained
+by title at the end of the suites, `review4` the nine cases for the items the first review
+noted and left, and the four `review5` files 55 cases for failures and unusual callers at the
+edges of every layer: `review5-net` the peer layer, sync, consensus intake and the mempool,
+`review5-node` the node, the executor and the block store, `review5-app` the application, the
+object database and the codec, and `review5-rpc` the RPC server, the keystore, the command
+line and the light client. Files run one after another, never in parallel, for a reason explained
 below.
 
 ## The harness
@@ -446,7 +450,10 @@ A `Mempool` with `cacheSize: 3`. Three transactions are `'added'` and then commi
 `update`, which takes them out of the pool; submitted again each is `'seen'`, because the
 cache of hashes outlives the pool, so gossip need not bring a committed transaction again.
 Seven more transactions are added, which takes the cache round its ring more than twice:
-`d=6`, `d=5` and `d=4` are `'seen'`, and `mp.seen(...)` is false for `d=3` and for `a=1`. The
+`d=6`, `d=5` and `d=4` are `'seen'`. `mp.seen(...)` is true for `d=3` as well, though the cache
+has let it go, because `d=3` is still in the pool, and what is pooled counts as seen whatever
+the cache holds. The seven are then committed through `update`, after which only the cache
+speaks, and `mp.seen(...)` is false for `d=3` and for `a=1`. The
 cache keeps exactly the last `cacheSize` hashes, each new one taking the place of the oldest
 ([chapter 5](05-mempool-executor.md) has the ring and why it replaced an array shifted for
 every transaction).
@@ -456,7 +463,9 @@ every transaction).
 Five tests on the two signature schemes ([02](02-crypto.md)), from a key pair up to a chain
 running on the second one. The first four are unit tests under `describe('signature schemes')`;
 the fifth runs a testnet under `describe('a chain on secp256k1')`, with an `RpcServer` stopped
-before the network in `afterEach`. These are the only cases that name a scheme explicitly;
+before the network in `afterEach`. These, a few regression cases in `test/review3.test.ts` (off-curve secp256k1 keys, a restart on
+a secp256k1 genesis, a handshake between nodes of the two schemes, a keystore holding both) and
+the hedged signature in `test/review.test.ts` are the cases that name a scheme explicitly;
 everything else in the suite follows `DEFAULT_SCHEME`.
 
 **`it('signs and verifies under each scheme, with tagged keys and signatures that tell them apart')`**.
@@ -478,11 +487,23 @@ from the curve order (`secp256k1.Point.Fn.ORDER`) and expects it refused while t
 verifies. Without low-S enforcement anyone relaying a transaction could rewrite its signature
 and give it a second valid encoding and a second hash.
 
-**`it('keeps each key's scheme in the keystore, and reads an old file as ML-DSA-44')`**. A
-keystore gets `ml` with the default scheme and `ec` with secp256k1; reopened, `get` returns each
-in its scheme with the same public key, and `list()` reports both schemes. Then the `scheme`
-field is deleted from `ml`'s record on disk, as a file written before there were two schemes
-would look; reopened again, `ml` is ML-DSA-44 in both `get` and `list` ([14](14-wallet-cli.md)).
+**`it('keeps each key's scheme in the keystore, reads a version 1 file as ML-DSA-44 and writes it as version 2')`**. A
+keystore gets `ml` with ML-DSA-44, named explicitly whatever `CHAIN_SCHEME` says, and `ec` with
+secp256k1; reopened, `get` returns each
+in its scheme with the same public key, and `list()` reports both schemes. The file on disk
+says `version: 2`. Then the version is set to 1 and the `scheme` field is deleted from `ml`'s
+record, as a file written before there were two schemes would look; reopened again, the
+handle's `version` is 1 and `ml` is ML-DSA-44 in both `get` and `list`. Reading wrote nothing:
+the file is still the one the test wrote. `add('new', undefined, Scheme.secp256k1)` on that
+handle then writes it as version 2 with a scheme beside every key, `ml-dsa-44`, `secp256k1`
+and `secp256k1`, and `ml` opens to the same public key. Then the version 1 file is written
+again under another name, `gone.json`, opened, and removed while the handle is open;
+`add('later', undefined, Scheme.secp256k1)` on that handle writes the file anew from the
+handle's own keys, as version 2 with the schemes `ml-dsa-44`, `secp256k1` and `secp256k1`, and
+`ml` opens from it to the same public key: a handle that read a version 1 file names every
+key's scheme when it writes, also when the file is no longer there to read. Last the `scheme` field is deleted from
+`ec` in the version 2 file: `get('ec')` throws `/names no scheme/`, `list()` throws
+`/key ec names no scheme/`, and `get('ml')` still gives its key ([14](14-wallet-cli.md)).
 
 **`it('refuses a genesis whose validator keys are not of the scheme it names')`**. `genesisState`
 with `signatureScheme: 'secp256k1'` and an ML-DSA key throws `/not a secp256k1 key/`; with no
@@ -580,7 +601,7 @@ and `stats.slabs` is 2. This is `Arena.shrink`, the arena as a cache over a stor
 
 ### test/db.test.ts
 
-Forty-three tests on the object database and the trees beneath it ([the database
+Forty-four tests on the object database and the trees beneath it ([the database
 chapter](09-database.md)). The fixture defines two object types: `ItemType` (type id 7) with
 a unique, authenticated index `byName` and a non-unique `byGroup`, and `CounterType` (type id
 3) with no indices. `fresh()` makes a database over both, `mk` creates an item, `byName` and
@@ -698,7 +719,8 @@ insertion order. Creating a second `alice` throws `DbError`. Modifying `bob` int
 it between ranges; removing `alice` makes `get` and the name lookup `null`; `nextInstance` is 3
 and the next item gets instance 3, so ids are never reused.
 
-**`it('undoes and commits nested sessions')`**. An outer session modifies `alice` and creates
+**`it('undoes and commits nested sessions')`**. `alice` is created and a root taken, so that
+the committed view the case reads below is that root's. An outer session modifies `alice` and creates
 `bob`; an inner session removes `alice`, creates `carol`, modifies `bob`. `inner.undo()` restores
 `alice` to the outer session's value, drops `carol`, resets `bob` and the counter. While the
 outer session is open, `getCommitted` still sees the original `alice` and no `bob`, and
@@ -916,6 +938,25 @@ they should. This is `restoreIndexVersions` and `SparseMerkleTree.loadVersions` 
 [chapter 9](09-database.md), with resident trees (each older version built against the next
 newer one) and with dropped ones (the records kept as the tree's own history).
 
+**`it('lists what a past version held of a type whose objects were removed since, from memory and from the store')`**.
+A database with `retainVersions: 8`, the `MemoryKv` as its index store and its history store
+takes versions 0 to 5 with `persist` after each: 240 items made, and from version 1 ten of
+the version before removed at each. `live()` is the items that exist now, from
+`exportObjects()`; `heldAt(v)` joins them with `changedSince(ItemType, v)`, reads each id with
+`getAt` at `v`, keeps the ones that are not `null` and sorts their instance numbers. `heldAt(2)`
+must be the 100 items version 2 held: the 120 made by then less the ten version 1 removed and
+the ten version 2 removed. The items of now alone give 90 of them, since version 3 removed
+ten: an index of now cannot answer for then, which is the case `changedSince` exists for.
+`changedSince(ItemType, 5)` is empty, nothing having changed since the current version, and
+`changedSince(CounterType, 4)` is the one counter object, which every version modifies. Then
+`setHistoryWindow(0)`, so that no past version is in memory: `heldAt(2)` is the same list,
+now from the store's records, `heldAt(4)` has 160 items (200 made less 40 removed), and
+`changedSince(ItemType, 6)`, a version that does not exist, throws `/not available/`. Last a
+session removes item 201: `changedSince(ItemType, 5)` is that one id, the removal of the
+block in progress, and the session is undone. This is `changedSince` of
+[chapter 9](09-database.md), which the RPC's `validator` and `delegation` use for a past
+height ([chapter 12](12-rpc.md)).
+
 **`it('reads a record written before the sparse tree nodes were kept, and refuses to prove a key from it')`**.
 A database with a history store runs versions 0 to 3, and after each `persist` the test
 overwrites the stored record with the bytes an earlier build wrote: the same record encoded
@@ -1005,7 +1046,7 @@ hash of block 3 is the same on all four nodes; every stored commit for height 3 
 least three non-null signatures:
 
 ```ts
-expect(commit.signatures.filter((s) => s !== null).length).toBeGreaterThanOrEqual(3);
+      expect(commit.signatures.filter((s) => s !== null).length).toBeGreaterThanOrEqual(3);
 ```
 
 Three of four at equal power is 30 of 40, strictly more than two thirds: the +2/3 rule in
@@ -1108,8 +1149,9 @@ downtime.
 `limits: { maxEvidenceAgeMs: 3000n }`; the test waits until the latest block's time is more than
 3.5 s past the time of height 2, then forges duplicate prevotes at height 2 and adds the
 evidence to node 0's pool (`add` returns `true`). Within eight heights the pool is empty and no
-app has slashed anyone: node 0 proposed, found the evidence too old by block time, and discarded
-it instead of proposing a block the others would reject. Evidence forged at the current height
+app has slashed anyone: the executor prunes the pool after every commit, on every node, and a
+proposer prunes before it picks evidence, so the stale piece was found too old by block time and
+dropped, and no block carried it. Evidence forged at the current height
 does reach every app.
 
 **`it('rejects a block from another protocol version')`**. The latest block with
@@ -1179,14 +1221,15 @@ what V8 does on its own as well as what the scheduler asks for.
 of the core application (`appFor` makes a `CoreApp`, and the application genesis holds one
 faucet account and no inflation): two validators and a full node that is created but not
 started, then made again with
-`net.makeNode(2, { memory: { stats: () => stats(heap, limit), intervalMs: 20 }, log: (_level, msg) => void logged.push(msg) })`, so its
-guard samples an invented heap against an invented limit fifty times a second, and `logged` holds
-every message the node logs; an `onMemory`
+`net.makeNode(2, { indexTrees: 'memory', memory: { stats: () => stats(heap, limit), intervalMs: 20 }, log: (_level, msg) => void logged.push(msg) })`, so its
+index trees are in memory whatever the mode of the run (the case is about dropping and
+rebuilding them), its guard samples an invented heap against an invented limit fifty times a
+second, and `logged` holds every message the node logs; an `onMemory`
 listener records the levels and an `RpcServer` is opened on it. At height 2 the level is `ok`,
 the database's `hotLimit` is `Infinity`, and `status.memory` is `{ level: 'ok', shedding: false }`.
 The heap is set to 750, 75% of the limit: within 5 s the level is `warn`, `isShedding` is
-false, and `memory()` reports `indexTrees: 'dropped'`, `trees: 'resident'` and
-`history: 'trimmed'` with `historyWindow: 2`. At `warn` the node pages what its blocks do not
+false, and `memory()` reports `indexTrees: 'dropped'`, `trees: 'resident'` (`'dropped'` under
+`TREES=0`, where they never were resident) and `history: 'trimmed'` with `historyWindow: 2`. At `warn` the node pages what its blocks do not
 need and sheds nothing: the `hotLimit` is 100,000, `mempool.currentLimit` is `maxTxs / 2`, and
 `block`, a costly method, still answers.
 Then the heap is set to 900, 90% of the limit: within 5 s `isShedding` is true, the level is
@@ -1260,8 +1303,8 @@ The state after block `h` is committed in header `h + 1` (deferred app hash, cha
 [03](03-types.md)), so the test waits for `h + 1` and checks on every node:
 
 ```ts
-const header = n.store.loadBlock(h + 1n)!.block.header;
-expect(verifyObjectProof(header.appHash, proof)).toBe(true);
+      const header = n.store.loadBlock(h + 1n)!.block.header;
+      expect(verifyObjectProof(header.appHash, proof)).toBe(true);
 ```
 
 A proof made by one node verifies against the header every other node holds, including the
@@ -1291,7 +1334,7 @@ balance is predictable. `block(app, txs)` calls `finalizeBlock` then `commit` wi
 `blockTime(h) = genesisTime + 1000n * h`. `tx(ops, keys, expiration)` signs with
 `DEFAULT_FEES` and an expiration a minute after genesis. `FEES` holds what the default schedule
 charges for a transfer and for registering the premium name `alice`. `withAlice()` is the common
-fixture: alice registered at height 1 and paid 5,000 at height 2. Eleven cases under
+fixture: alice registered at height 1 and paid 5,000 at height 2. Twelve cases under
 `describe('core application')` cover the account and asset layer; five more under
 `describe('core application: index entries in the store')` cover what the application writes
 for the database's index and tree tiers and how it reopens from them.
@@ -1433,8 +1476,9 @@ reopened from the store has the same hash and the identical `proofsOf`, and is c
 trees came from their chunks and nodes. `openObjectDatabase` with `{ fromTrees: false }`
 (compute the trees from the objects), `{ checkLeaves: true }` and `{ trees: false }` (start
 dropped) each give the same hash and alice's proof at every height. A copy of the store with
-alice's object overwritten by bob's bytes is refused: by the default path with
-`/does not hash to its leaf/` (the leaf check), and by the recomputing path with
+alice's object overwritten by bob's bytes is refused: with `checkLeaves: true` by
+`/does not hash to its leaf/` (the leaf check), and by the recomputing path
+(`fromTrees: false`, here with `checkIndexEntries: false`) with
 `/do not hash to the stored app hash/`. The reopened app and the twin keep agreeing on the next
 block. A copy of the store with every `'t'` and `'n'` key left out opens to the same hash and
 then holds exactly the trees of the original.
@@ -1485,7 +1529,7 @@ A fourth group, `describe('core application: a damaged store is refused at resta
 described here; its three cases, by title: "refuses an object missing while its leaf is still
 there", "refuses index entries that are missing, extra or name another object" and "refuses a
 dense tree node that is not the hash of its children, and a sparse node that does not hash to
-its parent's".
+its parent".
 
 ### test/history.test.ts
 
@@ -1709,7 +1753,9 @@ sixteen-key authorities cost more by more than thirty keys' worth of data fee; a
 is its flat fee plus data. Asset symbols cost by length: 100,000 for three characters, 50,000
 for four, 10,000 for six. `scale: 25_000` turns the 100 transfer into 250, `scale: 0` makes
 everything free, and the product is capped at `MAX_SHARE_SUPPLY`. The fee is part of the signed
-bytes: a transaction decoded from `rawTx` carries exactly the stated `777n`.
+bytes: a transaction decoded from `rawTx` carries exactly the stated `777n`. And the signature
+binds it: a signed transfer decoded, given a fee one higher and encoded again fails `checkTx`
+with `/invalid signature/`, not with a different price.
 
 **`it('refuses an operation stating less than the schedule, and charges exactly what is stated')`**.
 A transfer stating 99 fails `checkTx` with
@@ -1843,7 +1889,8 @@ awaiting a finished reader forever; findings 25 and 31 describe why this test on
 suite.
 
 **`it('serves a light client over the RPC')`**. A `LightClient` over `RpcProvider` trusts height 2
-by hash; `verifyLatest()` reaches the height `status` reports. The faucet's name proof from
+by hash; `verifyLatest()` reaches a height no later than the one `status` then reports. The
+faucet's name proof from
 `account`, with the header and commit of the next height fetched over the RPC, verifies
 through `client.verifyKey` to the id `3.0`. A wrong trusted hash is refused.
 
@@ -1861,7 +1908,7 @@ reported schedule commits; a transfer priced from `DEFAULT_FEES` is refused with
 with a given one; `list()` names both; adding `alice` again throws `/already exists/`. Reopened
 with the passphrase, it returns the same address, seed and public key; the wrong passphrase
 throws `/wrong passphrase/`; and the raw JSON file does not contain bob's seed in hex. The file
-is then rewritten with `version: 2`: `open` throws `/unsupported keystore/`, so does `add('carol')`
+is then rewritten with `version: 3`, one the code does not know: `open` throws `/unsupported keystore/`, so does `add('carol')`
 on the handle opened before, the file gains no `carol`, and no lock file is left behind.
 
 ### test/sync.test.ts
@@ -2050,7 +2097,7 @@ still signs at `H + 1`. The faucet undelegates at `undelegateHeight`; evidence f
 `undelegateHeight + 1n` slashes the entry by 5%:
 
 ```ts
-expect(after.tokens).toBe(entry.tokens - (entry.tokens * 500n) / 10_000n);
+    expect(after.tokens).toBe(entry.tokens - (entry.tokens * 500n) / 10_000n);
 ```
 
 **`it('drops a virtual history entry when the transaction it belongs to fails')`**. Finding 28:
@@ -2166,7 +2213,7 @@ re-proposed with `polRound` 0 in round 2 or later, a second or more after it was
 past the 300 ms drift limit. The single assertion is liveness:
 
 ```ts
-await waitForHeight(n.nodes, n.nodes[0]!.height + 4n, 30_000);
+    await waitForHeight(n.nodes, n.nodes[0]!.height + 4n, 30_000);
 ```
 
 The filter is shaped by a lesson about the test itself. Its first version dropped only the
@@ -2196,8 +2243,9 @@ and the new node stopped: the lock is released with the node, not left behind.
 accepted until the first verification step, and a set that had since unbonded could have signed
 it. Two validators; with header 2's hash as the anchor, `trust` with `trustingPeriodMs: 1n`
 rejects with `/trusting period/`, while with the default period the same anchor is accepted and
-`trusted.header.height` is 2. `test/light.test.ts` covers the period at verification time; this
-covers it at anchoring.
+`trusted.header.height` is 2. `test/light.test.ts` makes the same check at the anchor on a larger network. No case advances
+the clock after anchoring, so the trusting-period rule of `timeProblem`, applied at each
+verification step, is not exercised by a test.
 
 Findings fixed with tests elsewhere: 33 in `test/network.test.ts` (a message sent the instant a
 peer connects), 25 and 31 in `test/rpc.test.ts` (event streams and replay), 36 in
@@ -2288,7 +2336,9 @@ wherever a key enters the chain unless they are points on the curve". `a restart
 scheme in genesis`: "is refused, by the application state and by the chain state alike". `the
 p2p handshake`: "connects peers of the chain scheme and refuses a peer keyed under the other
 one, in either direction". `a keystore entry whose scheme was changed`: "fails to open rather
-than give another key under the same name". `CHAIN_SCHEME`: "is not read by the node code, so a
+than give another key under the same name" (a key whose `scheme` field was removed is
+refused with either message, that it does not derive the recorded key or, the file being
+version 2, that it names no scheme). `CHAIN_SCHEME`: "is not read by the node code, so a
 stray value cannot stop a node from starting".
 
 ### test/review4.test.ts
@@ -2302,8 +2352,9 @@ asserts.
 
 **`it('answers balance, account, key, validator and delegation as of the height asked for, with the proof of that height')`**.
 Four validators of the core application, made with `engineValidators: false` and a staking
-genesis (a faucet, four operators `op0` to `op3`, each validator with a self-bond of 200), and
-an RPC server on node 0. Four transactions go in through `broadcastTx` in commit mode, so the
+genesis (a faucet, four operators `op0` to `op3`, each validator with a self-bond of 200, an
+unbonding period of 2 s), and an RPC server on node 0, given a rate of 10,000 a second and a
+burst of 10,000 because the case makes many costly calls in a row. Four transactions go in through `broadcastTx` in commit mode, so the
 height of each is known: `created` registers alice, `paid` transfers her 5,000 base units,
 `delegated` delegates 300 tokens from the faucet to `op0`'s validator, `paidAgain` transfers 700
 more; a `validator` answer for `op0` is kept from before the delegation. `balance` for alice is
@@ -2316,11 +2367,21 @@ with a proof that `verifyKeyProof` accepts as absence (`null`) against the app h
 `paid`, `account` has id `3.5`, one balance of `CORE` at `5000`, `history` of `'2'`, and a proof
 that verifies against header `paid + 1` to the encoding of alice's id; with no height it has
 `5700` and `'3'`. `account` for `NOT A NAME` is `null`. `validator` for `op0` at
-`delegated - 1` has the tokens of the answer kept from before, a `delegators` of `null`, the
+`delegated - 1` has the tokens of the answer kept from before, a `delegators` of 1 (the
+operator's own delegation), the
 self-bond it has now and `operatorName` `op0`; now it has 300 tokens more and two delegators.
-`delegation` of the faucet to `op0` at `delegated - 1` is `{ delegation: null, unbonding: null }`
+`delegation` of the faucet to `op0` at `delegated - 1` is `{ delegation: null, unbonding: [] }`
 with a proof of absence against header `delegated`; now its `tokens` are the amount delegated
-and `unbonding` is `[]`. Then the test waits until every peer of node 0 has a `clockOffsetMs`
+and `unbonding` is `[]`. Next the objects are removed and the past is asked again. The faucet
+undelegates a third of its shares at height `partly` and the rest at `wholly`, which removes
+the delegation; the test polls `delegation` until `unbonding` is empty, up to 20 s, the two
+entries maturing after 2 s and being removed. Now `delegation` is `null` and `validator` has
+1 delegator. At `partly` the delegation is not `null`, `unbonding` has one entry and the
+validator has 2 delegators; at `wholly` the delegation is `null`, `unbonding` has two entries
+whose tokens sum to the 300 tokens delegated, and the validator has 1 delegator; at
+`delegated` `unbonding` is `[]`. None of the entries and neither state of the delegation is
+in the index of today: the answers come from `listAt` and `changedSince`
+([chapter 12](12-rpc.md)). Then the test waits until every peer of node 0 has a `clockOffsetMs`
 and requires the absolute value of each one `peers` returns to be under 1,000: the nodes share one
 clock.
 Last, a second server on the same node with `ratePerSecond: 0.001` and `burst: 6` is sent two
@@ -2369,7 +2430,10 @@ a height, their signatures placeholders: `add` of height 3 is `true` and a secon
 pending here, and `held` is `{ pending: 1, committed: 2, inventory: 3 }`; `add` of the
 height-5 evidence is `false`, and `hasHash` of its id is `true`. `pruneIf` for heights up to 4
 leaves `{ pending: 0, committed: 1, inventory: 1 }` and `hasHash` of the height-3 id `false`;
-`pruneIf(() => true)` leaves all three at 0. Then `MAX_PENDING + 10` pieces for different
+`pruneIf(() => true)` leaves all three at 0. With height-6 evidence pending, `markCommitted`
+of another pair of votes for the same offence leaves `{ pending: 0, committed: 1, inventory: 1 }`
+and `hasHash` of the pending pair's id `false`, and `pruneIf(() => true)` empties the pool
+again. Then `MAX_PENDING + 10` pieces for different
 validators are added: `size` and `held.inventory` are both `MAX_PENDING`.
 
 **`it('refuses a number too large to hold exactly where a 64-bit field is used as one')`**.
@@ -2380,11 +2444,15 @@ for 2^62. `decodeProposal` over a height, a round and a lock round of 2^60 throw
 
 `the keystore`, one case.
 
-**`it('removes a key by name, for good, and says so when there is none by that name')`**. A
+**`it('removes a key by name, for good, and says so when there is none by that name, as does the command')`**. A
 keystore created in a temporary directory gets `keep` and `drop`; `remove('drop')` succeeds, a
 second `remove('drop')` throws `/no key named drop/` and `remove('never')` throws
 `/no key named never/`. A handle opened afresh lists `['keep']`, and no `keystore.json.lock` is
-left. The directory is removed in `finally`.
+left. Then the command, `node src/cli.ts keys ...` in a child process with `CHAIN_PASSPHRASE`
+set: `add temp` exits 0; `remove keep` exits 0 and prints `removed keep` and the key's address;
+a second `remove keep` exits non-zero and says `no key named keep`; `list` begins with `temp`;
+and `remove temp` against a path with no keystore exits non-zero and creates no file there. The
+directory is removed in `finally`.
 
 `the network and the node`, two cases.
 
@@ -2400,6 +2468,460 @@ for `a` within 500 of −7,000: `b`'s clock is seven seconds ahead, `a` sees it 
 node's verifier is a `WorkerVerifier` by its constructor's name; started, the node reaches
 height 2, its blocks signed and checked through the pool; after `stop()`, a `verify` on the
 verifier rejects with `/closed/`.
+
+### test/review5-net.test.ts
+
+Fifteen tests for the peer layer, block sync, state sync, what consensus takes in before it has
+checked it, and the mempool, each at an edge: a failure, a peer that misbehaves, or two things
+happening at once. They are listed by group and title with what each sets up and asserts.
+
+`the peer layer`, five cases. `makeNet(name, transport, cfg)` makes a bare `Network` on chain
+`r5` with its own `PeerDb`, an inline verifier, a connect interval of 50 ms and a ping interval
+of 200 ms; every network made is stopped in `afterEach`.
+
+**`it('counts one success for one outbound connection')`**. On a `MemoryHub`, `b` has a peer
+database seeded with `a:1` and no listen address, so it dials and is not dialed back. Once the
+two are connected, the record of `a:1` in `b`'s database has `successes` of 1: one dial that
+succeeded is counted once.
+
+**`it('leaves a connection it refused open for a moment, so the rejection can leave before the close')`**.
+`a`'s transport is wrapped so that every connection it accepts notes the time a `reject` frame
+was sent on it and the time it was closed. `b` is on `another-chain`, and `b.connect('a:1')`
+rejects with `/rejected: wrong chain id/`. The accepting side's connection is closed, a
+rejection was sent, and the close came at least 40 ms after it: the connection a `reject` went
+out on is left to the 50 ms timer.
+
+**`it('excludes and bans a peer by the address it dialed, whatever that resolved to')`**. `b`'s
+transport records every dial and turns `name:1` into `a:1`, as a host name resolves over TCP;
+its database is seeded with `name:1`, and `a` advertises no address. Connected, `b`'s peer has
+`remoteAddr` `a:1` and `dialedAddr` `name:1`. After 1.3 s, past the first backoff, the dials are
+still `['name:1']` and the peer is the same object: the connect loop leaves the dialed address
+of a connected peer alone. `b.score(a.id, 100, 'test')` drops the peer, `isBanned('name:1')` is
+true, the database's only record is `name:1`, and it has no candidates two minutes on: the ban
+is on the record that was dialed, and none was made for the resolved address.
+
+**`it('takes an address list only in answer to its own request')`**. `a` and `b` connect as in
+the first case and the exchange each begins on connecting is given 100 ms to end. `a` then
+sends `b` an `addrResponse` naming `unasked:1` that `b` did not ask for. `b`'s database has no
+record of `unasked:1`, and the peer is still connected: the list is ignored and costs nothing.
+
+**`it('starts from its seeds when the peer file is cut short, and replaces the file whole when it saves')`**.
+A `peers.json` in a temporary directory holds JSON cut off in the middle of a record. A
+`PeerDb` on it with the seed `seed:1` holds `seed:1` alone. After `markFailure('seed:1')` the
+file parses to that one record with `failures: 1`, no `peers.json.tmp` is left beside it, and a
+second `PeerDb` on the file reads the failure back. A file holding valid JSON that is an object
+and not a list opens as a database of size 0.
+
+`block sync`, four cases. `harness(opts)` builds a `BlockSync` whose network has one peer, whose
+requester answers every `blocksRequest` with what the case's `respond(from, count)` returns,
+whose `applyBlock` notes the height and whose `scorePeer` notes the charge; `blockAt(height)`
+is a block of zero hashes with a commit naming its hash, and `status(height)` delivers the
+peer's status message. Nothing here verifies a block for real.
+
+**`it('applies nothing after it was stopped, though a block was being verified')`**. The sync's
+`verify` is replaced by one that waits on a gate. The peer reports height 2, the first block
+reaches verification, the sync is stopped and the gate released: `applied` stays empty.
+
+**`it('lets go of the blocks it held once no peer is ahead')`**. With consensus reported as
+deciding, the two blocks the peer sends are held in the buffer and `isSyncing` is true. The
+test then sets the node's own height to 2, as if consensus had decided both, and the peer
+reports height 2 again: the buffer is empty and `isSyncing` is false.
+
+**`it('uses nothing of a response with more blocks than it asked for, and charges the peer')`**.
+With four blocks to a request, the peer answers a request for four with seven. One request was
+made, for 4; the peer is charged 50 points once; the buffer is empty.
+
+**`it('charges a peer for a block of another height and for a commit that names another block')`**.
+Two runs: in one the second block of the response is of the height seven on, in the other its
+commit names a hash of nines. Each time the peer is charged 50 points and nothing of the
+response is buffered, the well-formed blocks before the bad one included.
+
+`state sync`, one case, the testnet and the joiner's network stopped in `afterEach`.
+
+**`it('passes over a snapshot from before the trusted height, and charges a peer for a manifest that does not decode')`**.
+Four validators of the core application, the first two taking a snapshot every 6 blocks in
+chunks of 2 objects. At height 8 the other two are stopped, which stops the chain before the
+snapshot due at 12, so the snapshot at 6 is the only one. A bare `Network` seeded with the two
+sources connects to both and `stateSync` is run on it twice. With the trusted height at the
+sources' tip, 8 or more, it returns `null`: the snapshot at 6 lies two heights or more before
+where trust begins, nothing could verify it, and the caller replays from genesis. Then both
+sources' `manifestBytes` is replaced by seven bytes of `0xff`, and a join trusting height 2
+rejects with `/no valid manifest/`, each source's score on the joiner's network above 40: one
+charge of 50 for a manifest that does not decode, less a moment's decay.
+
+`consensus intake`, one case.
+
+**`it('drops a vote for a round far ahead before verifying it, holds few unchecked proposals from one peer, and forgets block requests with the height')`**.
+Two of four validators are started, so node 0 stays at height 1. A prevote with a signature of
+zeros for round `round + MAX_ROUND_AHEAD + 1`, handed to `handleVote` as from the peer `far`,
+leaves `far`'s score at 0, while the same vote for `round + 1` from `near` leaves `near` above
+19: a bad signature costs its sender 20 points when it is verified, and a vote dropped for its
+round is never verified. Ten proposals for height 2 from the peer `junk` leave two of its
+entries in `nextHeightProposals`, and one from `other` is still taken. A made-up hash is put
+into `fetchRequested`; the other two validators are started, the network reaches height 2, and
+the hash is gone and so are `junk`'s entries.
+
+`a validator set from bytes`, one case.
+
+**`it('has no proposer when it is empty, and says so in the one way create() does')`**. The
+encoding of `ValidatorSet.create([])` decodes to a set of size 0, and so does an empty list
+followed by a proposer index of −1. An empty list followed by 0, 5 or −2 throws
+`/proposer index out of range/`.
+
+`the mempool`, three cases. `gatedApp()` is an application whose `checkTx` waits on a gate,
+then asks `admit` as the core application does after its last wait, refuses the byte `0xee`
+after admitting it, and notes what it applied.
+
+**`it('admits one of two transactions checked at once for the last place, and applies only that one')`**.
+A pool of one place is given two transactions before the gate opens. The first is `'added'`,
+the second `'full'`, and the application applied the first alone. `accepting` is false; after
+`update` commits the first it is true, and the second, submitted again, is `'added'`: the
+refusal was not remembered.
+
+**`it('gives back the place of a transaction that was admitted and then refused')`**. In a pool
+of one place the `0xee` transaction is `'invalid'`, `accepting` is true, and another
+transaction is `'added'`.
+
+**`it('keeps a transaction it forgot and saw again for as long as any other, and never forgets one that is pooled')`**.
+A pool with `cacheSize: 3` over an application whose `checkTx` throws at first. `addTx` of `x`
+rejects with `/verifier closed/`, which forgets `x`; submitted again it is `'added'`, and it is
+then committed through `update`. `a` and `b` are added, `b` taking the oldest place of the
+cache, the one `x`'s first coming left behind: `seen` of `x` is still true and `x` again is
+`'seen'`. `c` takes the place `x` holds now, and `seen` of `x` is false. Then a pool with
+`cacheSize: 1` and a counter on its `tx` event: `a` and `b` are added, `seen` of `a` is true
+although the cache has let it go, `a` again is `'seen'`, two transactions were announced and
+the pool holds two.
+
+### test/review5-node.test.ts
+
+Fifteen tests for the node, the executor and the block store. Two helpers serve several
+groups: `blockAfter(state, lastCommit, evidence)` builds the block that would follow a chain
+state as far as its structure goes, with a commit of no signatures, and
+`doubleSign(net, node, height, round)` signs two prevotes of validator 0 for different hashes
+and makes evidence of them.
+
+`the data directory`, five cases on a one-validator testnet whose node is not started
+(`skipStart: [0]`), with a temporary directory removed in `afterEach`.
+
+**`it('is one directory however its path is spelled or linked to')`**. A node is made on
+`<tmp>/data`. A second on the same path with `/.` appended, and a third on a symbolic link to
+it, are each refused with `/in use by this process/`, and the `LOCK` file still holds this
+process's id. After the first node stops there is no `LOCK`.
+
+**`it('takes over the claim of a process that is gone and refuses that of one that runs')`**. A
+`LOCK` holding the id of a child process that has already exited is taken over: the node is
+made and `LOCK` holds this process's id. With `LOCK` rewritten to the parent's id, a process
+that runs, making the node rejects with `in use by process <ppid>` and the file is unchanged.
+
+**`it('takes a stale claim over only while holding the takeover file')`**. `LOCK` and
+`LOCK.takeover` are both written with the id of a child process that has already exited, as
+if a process had stopped while taking the stale claim over. Making the node rejects with
+`/LOCK\.takeover may have been left by a process that stopped/`, after the fifty attempts,
+a second or so, in which it waits for the file to go, and `LOCK` still holds the id it was given: nothing removes a claim without
+holding the takeover file. With `LOCK.takeover` removed the node is made, `LOCK` holds this
+process's id and there is no `LOCK.takeover`.
+
+**`it('stays claimed until the network is down, and is released after')`**. The node's
+transport is wrapped so that its `close` notes whether `LOCK` exists. After `start()` and
+`stop()` the note is true and `LOCK` is gone: the claim is given up last.
+
+**`it('is given back, with the store, by a node that fails to open')`**. A `KvStoreApp` whose
+`initChain` throws makes `makeNode` reject with `/no genesis for you/`. No `LOCK` is left, and
+the same process makes a node on the directory again, at height 0: neither the claim nor the
+store environment stayed held.
+
+`the executor`, three cases.
+
+**`it('reads the evidence age from the application when asked, not at the commit before')`**.
+One validator of the core application with an unbonding period of 2 s, not started. The
+function the executor prunes by, `evidenceAgeMs` in its dependencies, gives the application's
+`unbondingPeriodMs`. The application's `stakingParameters` is then replaced by one that
+answers three times the period, as a block carrying a parameter change would leave it, and the
+same function gives three times the period with no commit in between.
+
+**`it('stores nothing of a block whose application commit throws inside the shared transaction')`**.
+A `BlockExecutor` over a `KvBlockStore` in an `LmdbEnv`, with the environment's `transaction`
+as its shared transaction and a `KvStoreApp` whose `commitSync` throws `disk full`.
+`applyBlock` of the first block rejects with `/disk full/`; the executor's state is at height
+0, the store has no block 1, its stored state is at height 0 and it has no validator set for
+height 3. The block, the set and the chain state went with the application's write.
+
+**`it('prunes blocks and headers in one transaction each, the set by height going with its block')`**.
+The chain store is a `MemoryKv` that records, for every write, the first byte of each key put
+and deleted. One validator with `maxEvidenceAgeMs: 1n` and `retain: { blocks: 2 }` runs until
+its lowest height is 4 or more. Every write that deletes a block (`'b'`) also puts the
+lowest-height marker (`'l'`), and no write puts the marker without deleting a block; in each
+such write as many sets by height (`'V'`) are deleted as blocks. `loadValidatorsAt` is null
+below the lowest block and for height 1, and not null for the lowest block and for the height
+two after the latest; the genesis set is still found by its hash. Two headers are then saved
+alone below the lowest block with times of 1 and 2 and the lowest-header marker set to the
+lower: the next commits delete them in exactly one write, which deletes at least two header
+records (`'H'`) and the marker (`'L'`).
+
+`the stores`, three cases.
+
+**`it('indexes a transaction repeated in one block where it succeeded')`**. On a
+`MemoryBlockStore`: block 3 holds a transaction at positions 0 and 2, failed at 0 and
+succeeded at 2, and `txLocations` has one entry, height 3, index 2, `ok: true`. Block 4 holds
+it twice, succeeded then failed as a duplicate: index 0, `ok: true`. Block 5 holds it at 1 and
+2, failed both times: index 1 with the first error. Block 6 is saved with no results: index 0,
+`ok: null`. After `deleteBlock(3n)` the heights are 4, 5 and 6.
+
+**`it('applies the operations of one write to the memory store in the order they were made')`**.
+On a `MemoryKv`, a write that puts a key and then deletes it leaves no value; one that puts,
+deletes and puts again leaves the last value; and a write that deletes and then throws leaves
+the value as it was.
+
+**`it('reads a heap flag of zero as no flag')`**. `heapLimitFlag` is null for
+`--max-old-space-size=0` on the command line and for `--max_old_space_size=0` in the options
+string; null when a 0 follows a 512 on the command line, and when the command line says 0 and
+the options string 512; and 512 when the command line says 512 and the options string 0.
+
+`gossip and block validation`, four cases.
+
+**`it('does not pool gossiped evidence that is already too old for a block')`**. One validator
+with `maxEvidenceAgeMs` of 1,500 runs until the latest block's time is more than 1,700 ms past
+block 1's; consensus is then stopped, so that no later commit prunes the pool and hides what
+was let in. Evidence of a double sign at height 1, handed to the node's `acceptEvidence` as
+gossip, is not in the pool, whose size stays 0; evidence for the height two past the latest is
+not pooled either; evidence for the latest height is.
+
+**`it('takes an item only from the peer it asked for it')`**. Two validators. `b` broadcasts
+an `item` carrying a transaction that was never announced or fetched; three blocks later `a`
+has not seen it and has it in no block. A transaction submitted to `b` in the ordinary way,
+announced and fetched, reaches `a`'s index and its mempool's memory.
+
+**`it('remembers a bounded number of fetches for a peer that announces and never answers')`**.
+Two validators, past height 2. `b` listens for `fetch` messages and collects the hashes `a`
+asks it for, then broadcasts one `inv` of 3,000 transaction hashes that no node holds. `a`
+reads the announcement in one go, before any `itemNotFound` from `b` could free a place, so it
+asks for as many as it remembers for one peer and no more: the set reaches 2,048
+(`MAX_OUTSTANDING_PER_PEER`) within ten seconds and still holds exactly 2,048 after another
+300 ms.
+
+**`it('refuses a block with more evidence than a block may carry')`**. One validator, stopped
+at height 2 or later. `validateBlockStructure` on the next block carrying
+`MAX_EVIDENCE_PER_BLOCK + 1` pieces of evidence, double signs of validator 0 in as many rounds,
+answers `too much evidence`, and with `MAX_EVIDENCE_PER_BLOCK` of them `null`.
+
+### test/review5-app.test.ts
+
+Sixteen tests for the application, the object database, the codec and the toy application. The
+application cases run a `CoreApp` over a genesis with a faucet, three operator accounts and two
+validators (self-bonds 200 and 100), a downtime window of four blocks and no block reward,
+driven a block at a time by `block(app, txs, signers)`. `FlakyKv` is a store over a `MemoryKv`
+whose write number `failAt` runs its callback to the end and then throws `disk full`, taking
+nothing, as a store does whose transaction fails when it commits.
+
+`a store write that fails`, three cases.
+
+**`it('leaves the account history log where the store is, so the entries can be appended again')`**.
+A `HistoryLog` over a `FlakyKv` takes one entry for account `3.3`. A second append, of three
+entries for `3.3` and `3.700`, an account beyond the first slices so that the write also widens
+them, is made in the write that fails. After `rollback()` the totals are 1 and 0. The same
+entries are appended again, then one more for `3.700`: `3.3` reads heights 1, 2, 2 oldest
+first and `3.700` reads 3, 2 newest first, and a log opened over the store reads both accounts
+as the one that went through the failure does.
+
+**`it('throws out of commit() where it is called, and the block is written by the next commit() with its history')`**.
+An application on a `FlakyKv` and a control on a store that never fails apply the same blocks.
+After block 2 is finalized the next write is set to fail: `app.commit()` throws `disk full`
+where it is called, not as a rejected promise, and an application opened on the store is at
+height 1. `commit()` called again writes the block. After a third block the account histories
+of the faucet and two operators, whole and as the newest two, equal the control's, the faucet
+has four entries, the app hashes agree, and an application reopened from the store is at
+height 3 with the control's history for the faucet.
+
+**`it('rejects the promise, with the block written, when only the snapshot after it fails')`**.
+With `snapshotInterval: 1` the second write of a commit is the snapshot, and it is the one set
+to fail. `commit()` returns a promise that rejects with `disk full`, and an application opened
+on the store is at height 1.
+
+`a block that fails after its session is closed`, two cases.
+
+**`it('stops the application until a restart, which has the state of the block before')`**.
+After block 1, `db.root` is made to throw once. `finalizeBlock` of block 2 rejects with the
+root's error and `lastHeight` stays 1. The same request again rejects with
+`/failed while taking the root of block 2.*restart/`, a `checkTx` answers not `ok` with an
+error matching `/restart/`, and `commit()` resolves with nothing to write. An application
+opened on the store is at height 1 with the operator's balance as it was before the block,
+applies the block with its transfer `ok`, and the balance is 6 more.
+
+**`it('still undoes a block that fails while its session is open, and goes on')`**. The
+verifier's `verify` rejects once with `the pool is gone`; `finalizeBlock` rejects, `lastHeight`
+is 1, and the same request then succeeds and the height is 2.
+
+`staking and authorities`, three cases.
+
+**`it('refuses a delegation to a validator that has shares and no tokens')`**. With
+`downtimeSlashBps: 10_000`, the faucet delegates 50 tokens to validator A and four blocks are
+signed by A alone, so B is slashed for downtime and the slash takes everything: B has 0 tokens
+and more than 0 shares. A `delegate` of 5 tokens to B is refused in `checkTx` with
+`/lost all its tokens/`. A block carrying that `delegate` and a `redelegate` of half the
+faucet's shares from A to B fails both, the second with the same error; B's tokens are still 0
+and A's shares unchanged.
+
+**`it('refuses an account update whose new authority no key leads to')`**. An update making
+both authorities of `op-a` a reference to `op-a` itself is refused with
+`/can never be satisfied/` in `checkTx` and in a block, and so is one making only the active
+authority that. Making the owner alone a reference to the account succeeds: it is satisfied by
+the key the active authority keeps. Then a chain of accounts: `op-b`'s active authority is set
+to name `op-c`, which has a key, and `op-a`'s to name `op-b`; both succeed. The faucet's active
+authority naming `op-a` alone is refused, the key being three accounts away. One with the
+faucet's own key, a threshold of 2 and `op-a` as member is refused too, and the same with
+`op-c` as member is accepted. And `op-a` is still usable: a transfer from it signed by
+`op-c`'s key passes `checkTx`.
+
+**`it('refuses an authority that needs more signatures than a transaction carries')`**. `op-a`'s
+active authority is set to sixteen keys with a threshold of 16, the most one transaction can
+sign for, and the update succeeds. An update making the faucet's active authority `op-a` and
+`op-b` with a threshold of 2 needs seventeen signatures and is refused with
+`/more than the 16 signatures/` in `checkTx` and in a block. The same two members with a
+threshold of 1 are accepted: seventeen keys count toward it, and the cheaper way is one
+signature.
+
+`object database`, four cases on an `ObjectDatabase` over an `Item` type made by
+`itemType(id, authenticated)` with a chosen number of authenticated indices.
+
+**`it('answers with the state of the last root after writes made outside a session')`**. Two
+items are created and a root taken at version 1; then, with no session open, one is modified,
+the other removed and a third created. `getCommitted` gives the first at its old value, the
+removed one still there and the new one null; `committedNextInstance` is 2, `countAt(7, 1)` is
+2, `getAt` at version 1 gives the old value, and `proofAt` at version 1 proves the first two
+present and the third absent against the root. The same holds with a session open and a
+further write inside it, and after that session is undone. After the next root `getCommitted`
+gives the new value and null for the removed item, and proofs verify against both roots.
+
+**`it('refuses more types than its dropped trees have places for, before any tree is touched')`**.
+A database of 512 types throws `/at most 511/`. One of 511 is made, roots, drops its trees,
+rebuilds them, drops them again, and proves an object against the root.
+
+**`it('refuses more authenticated indices on a type than a proof can be decoded with')`**. A
+type with `MAX_AUTHENTICATED_INDICES + 1` authenticated indices throws
+`/more than 16 authenticated indices/`. With exactly 16, an object's proof encoded and decoded
+has 16 index roots and verifies.
+
+**`it('keeps its own copy of a value set in a sparse tree')`**. For a resident tree and a
+dropped one: a value is set, the caller's buffer is then filled with `0xff`, and `get` still
+returns the original bytes and the tree's commit equals that of a reference tree.
+
+`codec`, two cases.
+
+**`it('reads a copy out of a Buffer as out of a Uint8Array')`**. For a `Uint8Array` input and
+a `Buffer` input: `bytes()` and `fixed(2)` are read, the input is overwritten, and both results
+still hold what was read; the `fixed` result is a plain `Uint8Array` on a buffer of its own.
+
+**`it('grows a writer that was made with no capacity')`**. `new Writer(0)` writes a `u8` and a
+`u64`, and 100 fixed bytes, and `new Writer(1)` a `u32`, each finishing with the right bytes.
+
+`the toy application and its validator set`, two cases on `KvStoreApp` with `val:<key>:<power>`
+transactions and a genesis set of alice at power 10.
+
+**`it('fails a transaction whose update the engine could not apply to the set')`**. Block 1 adds
+bob and removes him: both transactions succeed and there is no validator update. Block 2
+removes alice (refused, `/last validator/`), adds bob at `MAX_TOTAL_POWER` (refused,
+`/exceed the limit/`), adds bob at `MAX_TOTAL_POWER - 10` (accepted) and raises alice to 11
+(refused); the one update is bob's. Block 3 removes alice and then bob: the first succeeds,
+the second fails, bob then being the last, and the one update is alice at power 0.
+
+**`it('has its validator set back from its file')`**. A `KvStoreApp` on a file adds bob and
+commits. A second one opened on the file removes bob and then alice: the first succeeds and the
+second fails, which it could not if the set had not come back from the file. The file is then
+overwritten with a height and entries and no `validators`, as one written before the set was
+kept would be, and opening a `KvStoreApp` on it throws
+`/written before the validator set was kept/`.
+
+### test/review5-rpc.test.ts
+
+Nine tests for the RPC server, the keystore, the command line and the light client.
+`readEvents(res, enough)` reads the records of an event stream until `enough` says so and then
+closes it.
+
+`the rpc server`, five cases. `up()` starts four validators of the core application with
+`engineValidators: false` and a staking genesis whose operators `op0` to `op3` are the accounts
+`3.1` to `3.4` and run the validators `7.0` to `7.3`, an `RpcServer` on node 0 with limits out
+of the way, and waits for height 3. Servers and the network are stopped in `afterEach`.
+
+**`it('hears of no commit once it is stopped, and answers those waiting for a transaction')`**.
+A second `RpcServer` is started on the same node with its `push` wrapped to count calls. Once a
+commit has reached it, a waiter is registered through its events for a hash of zeros with a
+timeout of a minute, and `waiting` is 1. `stop()` is called: the waiter's promise resolves to
+`null`, `waiting` is 0, and a further `waitForTx` returns `null`. The node commits two more
+blocks and the count of `push` calls does not move.
+
+**`it('replays a block event as it was pushed, failed count and all, and says when it holds no results to count')`**.
+A stream of `block` events is read for three records while a transfer is broadcast in commit
+mode; the first has `failed` of 0. A stream opened with the `Last-Event-ID` before that first
+record replays three records equal to the three pushed. Then the store's `loadResults` is made
+to return null, as for blocks fetched after a state sync and never executed: in a replay from
+before the transfer's height, the transfer's block is `{ txs: 1, failed: null }` and a block
+with no transactions has `failed` of 0.
+
+**`it('opens an account stream only for an account there is, named or by id')`**.
+`GET /events?types=account&account=` answers 200 for `op0` and `3.1`, and 404 for `nobody`,
+for `3.999`, for the validator id `7.0`, and for `3.999999999999999999999` and `99999999.1`,
+numbers no id can hold.
+
+**`it('knows no method by a name every object inherits, and answers a malformed request under the id it carries')`**.
+`toString`, `constructor`, `hasOwnProperty` and `__proto__` as method names are each `-32601`.
+Posted raw: `{ id: 7, method: 'status' }`, which lacks `jsonrpc`, is `-32600` with `id: 7`; a
+request with `id: 'seven'` and a numeric `method` is `-32600` with `id: 'seven'`; one with no
+id, and one whose id is an object, are `-32600` with `id: null`.
+
+**`it('finds a validator by the account id of its operator, as by the name')`**. `validator`
+with `operator: 'op0'` has id `7.0`; with `operator: '3.1'`, `id: '3.1'` and `id: '7.0'` at the
+same height the answers equal it. `delegation` of `op0` to `validator: '3.1'` is op0's own
+delegation to `7.0` and equals the answer for `validator: '7.0'` at that height. `validator`
+for `3.0`, the faucet, is `-32001` with `/3\.0 runs no validator/`, `delegation` to `3.0` is
+`-32001` with `/runs no validator/`, and `validator` with `id: '7.9'` is `-32001` with
+`no such validator`.
+
+`the keystore`, one case.
+
+**`it('keeps a key under a name every object inherits, and has none by such a name until one is added')`**.
+In a keystore created in a temporary directory, for each of `constructor`, `toString`,
+`__proto__` and `hasOwnProperty`: `has` is false, and `get`, `publicKeyOf` and `remove` throw
+`no key named <name>`. Each is then added, and a second `add('constructor')` throws
+`/already exists/`. The handle and one opened afresh list the four names in the order added,
+`has` is true for each, and `get` and `publicKeyOf` give the public key `add` returned. Through
+the second handle `__proto__` and `toString` are removed; a third handle lists `constructor`
+and `hasOwnProperty` and has no `toString`.
+
+`the command line`, two cases. `cli(...args)` runs `src/cli.ts` in a child process and
+collects its exit status and what it wrote to both streams; the node answers from the test's
+own process, so the command runs beside it.
+
+**`it('points at the usage for a command it does not know, with or without a target after it')`**.
+With no arguments, with `frobnicate`, with `frobnicate` and a URL, and with `frobnicate` and a
+directory that does not exist, the status is 1 and the output is exactly
+`usage: see the comment at the top of src/cli.ts`. `show` with nothing after it prints
+`missing target`.
+
+**`it('prints whole amounts of an asset without decimals, keeps the chain with its light client anchor, and says when a node holds no results')`**.
+Four validators of the core application on chain `r5-cli`, the core asset of precision 0 and a
+faucet of 1,000,000,000 units, with an `RpcServer` on node 0 and a temporary directory for the
+keystore path. `show` exits 0 with the faucet's line ending in `1000000000` and the pool and
+bonded figures as digits alone. An `accountCreate` is broadcast in commit mode and the next
+block awaited; `verify-tx` of its hash prints
+`verified: included at height H, succeeded` and exits 0. With the store's `loadResults`
+returning null, the last line of `verify-tx` is
+`included at height H; this node does not hold the results of that block`, exit 0. The
+`light.json` beside the keystore path has `chainId` `r5-cli`. Rewritten with `another-chain`,
+it makes `light verify` exit 1 with
+`/light\.json holds a trusted header of chain another-chain, and this node is on chain r5-cli/`
+and is left naming `another-chain`. Rewritten with the height and hash alone, it is taken:
+`light verify` prints `verified height ...`, exits 0, and the file names `r5-cli` again.
+
+`the light client`, one case.
+
+**`it('verifies no header from a trusted one that has reached the trusting period, the next one or a later one')`**.
+Four validators at height 6, and a `LightClient` through a `NodeProvider` with a trusting
+period of 60 s and a clock the test sets. It trusts height 2 and verifies to 3. With the clock
+at the trusted header's time plus the period, `verifyToHeight(4n)` throws
+`header 4: trusted header is older than the trusting period`, `verifyToHeight(6n)` the same for
+header 6, and `verifyLatest()` an error matching `/older than the trusting period/`; the trusted
+height is still 3 and `verifiedHeights` is `[3n]`. With the clock one millisecond earlier,
+`verifyToHeight(4n)` succeeds and `verifyToHeight(6n)` returns header 6.
 
 ## Writing a new test
 

@@ -2,7 +2,7 @@ import type { ObjectDatabase } from '../../db/database.ts';
 import { idToString, type ObjectId } from '../../db/id.ts';
 import { key } from '../../db/keys.ts';
 import { addressOf, isPublicKey, schemeName, schemeOf } from '../../crypto/keys.ts';
-import { checkAuthority, type Authority } from './authority.ts';
+import { authoritySatisfied, checkAuthority, collectKeys, minSignatures, type Authority, type AuthorityLookup } from './authority.ts';
 import { HistoryKind, virtualData } from './history.ts';
 import { checkAccountName, checkAssetSymbol } from './names.ts';
 import {
@@ -20,7 +20,7 @@ import {
   validatorOf,
 } from './staking.ts';
 import { accountOf, adjustBalance, adjustPool, assetOf, getDynamic, getGlobal, TxError, type EvalContext } from './state.ts';
-import { calculateFee, encodeOperation, type Operation, type Transaction } from './tx.ts';
+import { calculateFee, encodeOperation, MAX_SIGNATURES, type Operation, type Transaction } from './tx.ts';
 import { encode } from '../../codec/writer.ts';
 import {
   AccountType,
@@ -105,10 +105,29 @@ function checkAmount(amount: bigint, what: string): void {
   if (amount < 1n || amount > MAX_SHARE_SUPPLY) throw new TxError(`${what} must be between 1 and ${MAX_SHARE_SUPPLY}`);
 }
 
-function checkNewAuthority(db: ObjectDatabase, auth: Authority): void {
+/**
+ * A new authority must be well formed, name accounts that exist, and be one that the signatures of one
+ * transaction could satisfy as the state stands. Without that an account could be given authorities that lead to
+ * no key, such as a reference to itself, or to more keys than a transaction may carry signatures, and nobody
+ * could ever change it again. `lookup` reads the member accounts; an update passes one that shows the account as
+ * the update leaves it.
+ */
+function checkNewAuthority(db: ObjectDatabase, auth: Authority, lookup: AuthorityLookup = (id) => db.get(AccountType, id)): void {
   const bad = checkAuthority(auth, getGlobal(db).scheme);
   if (bad) throw new TxError(bad);
   for (const m of auth.accounts) accountOf(db, m.account);
+  // The usual authority reaches its threshold with its own keys, at most 16 of them, and no account is read.
+  if (auth.keys.reduce((sum, k) => sum + k.weight, 0) >= auth.threshold) return;
+  // With every key that counts toward it signing (its own, and those of its member accounts' active authorities
+  // to the depth limit), the threshold must be reached.
+  const keys = new Map<string, Uint8Array>();
+  collectKeys(auth, lookup, keys);
+  if (!authoritySatisfied(auth, new Set(keys.keys()), lookup)) throw new TxError('authority can never be satisfied: its member accounts do not lead to keys enough for the threshold');
+  // No more keys than a transaction has signatures: all of them can sign at once. Otherwise the cheapest way to
+  // the threshold must fit; it is counted without regard to keys two member accounts share, so it errs toward refusal.
+  if (keys.size > MAX_SIGNATURES && minSignatures(auth, lookup, MAX_SIGNATURES) > MAX_SIGNATURES) {
+    throw new TxError(`authority can never be satisfied: it needs more than the ${MAX_SIGNATURES} signatures a transaction can carry`);
+  }
 }
 
 export function applyOperation(ctx: EvalContext, op: Operation): void {
@@ -137,9 +156,12 @@ export function applyOperation(ctx: EvalContext, op: Operation): void {
     }
     case 'accountUpdate': {
       if (!op.owner && !op.active) throw new TxError('nothing to update');
-      accountOf(db, op.account);
-      if (op.owner) checkNewAuthority(db, op.owner);
-      if (op.active) checkNewAuthority(db, op.active);
+      const account = accountOf(db, op.account);
+      // An authority may name the account itself, and then it is the account's new active authority that counts.
+      const updated = { owner: op.owner ?? account.owner, active: op.active ?? account.active };
+      const lookup: AuthorityLookup = (id) => (id === op.account ? updated : db.get(AccountType, id));
+      if (op.owner) checkNewAuthority(db, op.owner, lookup);
+      if (op.active) checkNewAuthority(db, op.active, lookup);
       db.modify(AccountType, op.account, (a) => ({ ...a, owner: op.owner ?? a.owner, active: op.active ?? a.active }));
       return;
     }

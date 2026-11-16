@@ -6,9 +6,10 @@
  * compound key is just the parts written one after another.
  *
  * Integers are big-endian so they sort numerically. Strings end with a zero
- * byte instead of carrying a length prefix, so "ab" sorts before "abc" and a
- * prefix scan on "ab" finds both; a zero byte inside a string is therefore
- * rejected.
+ * byte instead of carrying a length prefix, so "ab" sorts before "abc". A
+ * prefix scan on the raw bytes of "ab" finds both; one on the encoded key
+ * str("ab"), which ends with the zero byte, finds only "ab". A zero byte
+ * inside a string is therefore rejected.
  */
 import { Writer } from '../codec/writer.ts';
 

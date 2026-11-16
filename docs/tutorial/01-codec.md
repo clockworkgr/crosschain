@@ -48,11 +48,11 @@ Three things to notice.
 
 *Fixed versus length-prefixed.* A hash is always 32 bytes, so there is no point spending 4 bytes saying so; `fixed` writes the raw bytes and the reader is told how many to take. Transactions and strings vary in length and get a `u32` prefix. Which one a field uses is part of the schema: the reader of `fixed` must know the length from context. Keys and signatures are a third case: their size depends on the chain's signature scheme ([chapter 2](02-crypto.md)), so each carries a one-byte scheme tag in front of its raw bytes. The writer still emits them with `fixed`, tag included, and the readers are `decodePublicKey` and `decodeSignature` in `src/crypto/keys.ts`, which read the tag and then exactly the number of bytes that scheme needs: a tagged value is self-delimiting without a length prefix, and an unknown tag is a `CodecError`.
 
-*There is no schema language.* The order of fields is the schema, written twice, once in each `encode` function and once in each `decode` function. That is the Graphene approach. It is simple and fast, and the cost is that adding a field to a header changes every header hash. `RPC-SYNC-PROOFS.md` section 2.1 is the record of exactly that happening: two fields were added to the header, and a protocol `version` field was added at the same time so that a node can reject headers from the other layout.
+*There is no schema language.* The order of fields is the schema, written twice, once in each `encode` function and once in each `decode` function. That is the Graphene approach. It is simple and fast, and the cost is that adding a field to a header changes every header hash. `RPC-SYNC-PROOFS.md` section 2.1 is the record of exactly that happening: two fields were added to the header, `lastResultsHash` and a protocol `version`, the second so that a node can reject headers from the other layout.
 
 ### Integers and BigInt
 
-JavaScript numbers are IEEE doubles, exact only up to 2^53. Heights, amounts and voting power can exceed that, and `DESIGN.md` section 4 rules that they "are BigInt. Plain numbers are doubles and must never carry consensus-critical values. No floats in state." The codec enforces this at the type level: `u64` and `i64` take and return `bigint`, while `u8`, `u16` and `u32` use `number`, which is exact in that range.
+JavaScript numbers are IEEE doubles, exact only up to 2^53. Heights, amounts and voting power can exceed that, and `DESIGN.md` section 4 rules that they "are BigInt. Plain numbers are doubles and carry only bounded integer fields whose encoding is u8, u16 or u32", and that there are "No floats in state." The codec enforces this at the type level: `u64` and `i64` take and return `bigint`, while `u8`, `u16` and `u32` use `number`, which is exact in that range.
 
 ### Decoding hostile input
 
@@ -64,12 +64,13 @@ The writer only ever sees data the node built itself, so its errors are programm
 
 The writer owns a growable byte buffer and appends to it. It exports one class and one helper.
 
-**`class Writer`.** Private state is `buf: Uint8Array`, a `DataView` over it, and `len`, the number of bytes written so far. The constructor takes an `initialCapacity` (default 256) and the private `ensure(n)` doubles the buffer until `n` more bytes fit:
+**`class Writer`.** Private state is `buf: Uint8Array`, a `DataView` over it, and `len`, the number of bytes written so far. The constructor takes an `initialCapacity` (default 256), which it does not check, and the private `ensure(n)` doubles the buffer until `n` more bytes fit. The doubling starts from at least 16 bytes: doubling zero stays zero, so a writer made with capacity 0 would otherwise never return from its first write. The callers in `src/` pass nothing or 32.
 
 ```ts
   private ensure(n: number): void {
     if (this.len + n <= this.buf.length) return;
-    let cap = this.buf.length * 2;
+    // At least a few bytes: a writer made with no capacity has nothing to double.
+    let cap = Math.max(16, this.buf.length * 2);
     while (cap < this.len + n) cap *= 2;
     const next = new Uint8Array(cap);
     next.set(this.buf.subarray(0, this.len));
@@ -80,7 +81,7 @@ The writer owns a growable byte buffer and appends to it. It exports one class a
 
 The `DataView` is rebuilt whenever the buffer is replaced, because a view is bound to one `ArrayBuffer`. Doubling keeps the amortized cost of appending constant.
 
-Every write method returns `this`, so encoders can be written as chains. `src/types/txproof.ts` does exactly that: `w.u64(p.height).u32(p.index).bytes(p.tx).u32(p.count).array(p.siblings, (w, s) => w.fixed(s))`.
+Every write method returns `this`, so encoders can be written as chains. `src/types/txproof.ts` does exactly that: `w.u64(p.height).u32(p.index).bytes(p.tx).array(p.siblings, (w, s) => w.fixed(s))`.
 
 **`u8(v)`, `u16(v)`, `u32(v)`.** Each checks that `v` is an integer in range and throws `RangeError` otherwise, then writes big-endian through the view (`setUint16`, `setUint32` default to big-endian when the little-endian flag is omitted). `u8` writes directly into the array:
 
@@ -97,7 +98,7 @@ The `Number.isInteger` check matters: `w.u8(1.5)` would otherwise be silently tr
 
 **`bool(v)`** is `u8(v ? 1 : 0)`.
 
-**`u64(v: bigint)`** and **`i64(v: bigint)`** check the range (`0` to `2^64 - 1`, and `-2^63` to `2^63 - 1`) and write with `setBigUint64` and `setBigInt64`. `i64` is two's complement, which is what `setBigInt64` produces. The only `i64` fields in the chain are proposer priorities, which go negative, and a proposal's `polRound`, which is `-1` when there is no proof-of-lock round.
+**`u64(v: bigint)`** and **`i64(v: bigint)`** check the range (`0` to `2^64 - 1`, and `-2^63` to `2^63 - 1`) and write with `setBigUint64` and `setBigInt64`. `i64` is two's complement, which is what `setBigInt64` produces. The only `i64` fields in the chain are proposer priorities, which go negative, a proposal's `polRound`, which is `-1` when there is no proof-of-lock round, and a validator set's proposer index, which is `-1` while the set has no proposer.
 
 **`fixed(b)`** copies the bytes with no prefix. It does not check the length: `encodeHeader` writes `w.fixed(h.lastBlockHash)` trusting that the hash is 32 bytes. If a bug ever produced a 31-byte hash, the writer would emit it without complaint, and the error would surface only on the other side, where `decodeHeader` reads `fixed(HASH_SIZE)` and every later field comes out shifted by one byte until `finish()` or a `need` check fails. The writer's contract is that its callers pass values of the right type and size; the decoder is the one that enforces sizes, because it is the one facing untrusted input. **`bytes(b)`** writes `u32(b.length)` then the bytes. **`string(s)`** first refuses a string holding a lone surrogate, then encodes with `TextEncoder` (always UTF-8) and writes it as `bytes`:
 
@@ -151,19 +152,23 @@ Failure modes: every writer method throws on out-of-range input, and nothing cat
 
 The reader walks a buffer from a position and refuses to go past the end. It exports an error class, the reader, and a helper.
 
-**`class CodecError extends Error`.** Every decoding failure caused by the input is a `CodecError` with `name = 'CodecError'`, so a log line or a test can tell a structural failure from anything else. Nothing in `src/` dispatches on the class today: the network's frame handler in `src/p2p/network.ts` wraps `decodeMessage` in a `try/catch`, treats any error as a malformed message, logs it as `'undecodable message'` with the error text and scores the peer 20 points. That is the right policy, because the type-level decoders in `src/types/` throw plain `Error`s for semantic problems ("bad vote type", "validator set out of order"), and both kinds of failure mean the same thing about the peer.
+**`class CodecError extends Error`.** Every decoding failure the reader itself detects in the input is a `CodecError` with `name = 'CodecError'`; the one exception is malformed UTF-8 in `string`, which is the `TypeError` that `TextDecoder` throws (below). So a log line or a test can tell a structural failure from anything else. Nothing in `src/` dispatches on the class today: the network's frame handler in `src/p2p/network.ts` wraps `decodeMessage` in a `try/catch`, treats any error as a malformed message, logs it as `'undecodable message'` with the error text and scores the peer 20 points. That is the right policy, because the type-level decoders in `src/types/` throw plain `Error`s for semantic problems ("bad vote type", "validator set out of order"), and both kinds of failure mean the same thing about the peer.
 
 **`class Reader`.** The constructor takes the buffer and an optional starting position:
 
 ```ts
   constructor(buf: Uint8Array, pos = 0) {
-    this.buf = buf;
+    // A Buffer's slice() is a view of its memory where a Uint8Array's is a copy. Read through a plain Uint8Array
+    // over the same bytes, so that what fixed() and bytes() return is the reader's caller's own whatever was passed.
+    this.buf = buf.constructor === Uint8Array ? buf : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
     this.view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     this.pos = pos;
   }
 ```
 
-The `DataView` is built with the array's `byteOffset` and `byteLength`. That is essential: a `Uint8Array` can be a window into a larger `ArrayBuffer` (a Node `Buffer` from a socket almost always is), and a view over `buf.buffer` alone would read the wrong bytes. The writer does not need this because its buffer always starts at offset 0.
+The reader keeps a plain `Uint8Array`. One it is given is kept as it is; anything else (a Node `Buffer` is a `Uint8Array` too, of a subclass) is wrapped in a plain `Uint8Array` over the same bytes, which copies nothing. The reason is `fixed`, below: `slice` copies on a `Uint8Array` and returns a view of the same memory on a `Buffer`.
+
+The `DataView` is built with the array's `byteOffset` and `byteLength`, and so is the wrapper. That is essential: a `Uint8Array` can be a window into a larger `ArrayBuffer` (a Node `Buffer` from a socket almost always is), and a view over `buf.buffer` alone would read the wrong bytes. The writer does not need this because its buffer always starts at offset 0.
 
 **`remaining()`** is `buf.length - pos`. The private **`need(n)`** throws `CodecError('need N bytes, have M')` when fewer than `n` remain. Every read calls it first.
 
@@ -209,7 +214,7 @@ The decoders used to write `Number(r.u64())`, which rounds anything beyond 2^53 
   }
 ```
 
-A copy rather than a `subarray` means decoded objects never alias the buffer they were decoded from. The TCP transport (`src/p2p/tcp.ts`) already copies each frame out of its receive buffer before delivering it, so today this is a second copy; it is what makes the reader safe to use on a buffer the caller intends to reuse, such as an LMDB value, without the caller having to know. The cost is an allocation per field.
+A copy rather than a `subarray` means decoded objects do not alias the buffer they were decoded from, and every field is a plain `Uint8Array` of its own, whatever the reader was given: the constructor's wrapper is what makes `slice` copy for a `Buffer` as well. Nothing in `src/` gives the reader a `Buffer`: the TCP transport (`src/p2p/tcp.ts`) copies each frame out of its receive buffer into a `Uint8Array` before delivering it, and the LMDB store (`src/store/lmdb.ts`) does the same with every value it returns, so on those paths this is a second copy. The cost is an allocation per field.
 
 **`bytes(maxLen = 64 MiB)`** reads a `u32` count, rejects it if above `maxLen`, then reads that many bytes with `fixed`. The default limit is generous; callers that know better pass a tighter one. **`string(maxLen = 1 MiB)`** decodes the bytes as UTF-8:
 
@@ -260,7 +265,7 @@ export function decode<T>(buf: Uint8Array, f: (r: Reader) => T): T {
 }
 ```
 
-Every top-level decode in the node uses this helper, so the trailing-bytes rule is enforced wherever a whole message or stored record is decoded. Tagged unions are decoded inside the callback: `decodeMessage` in `src/p2p/messages.ts` reads one `r.u8()`, looks the code up in a table, throws `'unknown message type'` if it is not there, and switches on the name to decode the rest. There is no separate "peek at the type" step.
+Every decode of a whole message, block, proof or chain record uses this helper, so the trailing-bytes rule is enforced there. Two places build a `Reader` themselves and never call `finish()`: the account history log reading an entry's links (`src/app/core/history.ts`) and the RPC rendering a history entry's operation (`src/rpc/methods.ts`), both over records the node wrote itself. Tagged unions are decoded inside the callback: `decodeMessage` in `src/p2p/messages.ts` reads one `r.u8()`, looks the code up in a table, throws `'unknown message type'` if it is not there, and switches on the name to decode the rest. There is no separate "peek at the type" step.
 
 What is deliberately absent: there is no `peek`, no `skip`, no way to rewind, and no streaming. A message is decoded in one pass from one buffer. The limits on `bytes`, `string` and `array` are the only tunables.
 
@@ -282,6 +287,9 @@ The defaults on `bytes`, `string` and `array` are the outer fence. The real fenc
 | `src/p2p/messages.ts` | address list | `array(string(256), 256)` |
 | `src/p2p/messages.ts` | inventory hashes | `array(fixed(32), 10_000)` |
 | `src/p2p/messages.ts` | blocks in a sync response | `array(..., 64)` |
+| `src/p2p/messages.ts` | headers in a headers response | `array(decodeHeader, MAX_HEADERS)`, 1,000 |
+| `src/p2p/messages.ts` | snapshot heights offered | `array(..., 64)` |
+| `src/p2p/messages.ts` | the reason in a reject | `string(1024)` |
 
 Two things bound what these can add up to. A TCP frame is refused above `MAX_FRAME = 32 * 1024 * 1024` in `src/p2p/tcp.ts` before any decoding starts, and a block is rejected above `maxBlockBytes` (default 4 MiB, `DEFAULT_LIMITS` in `src/consensus/consensus.ts`) by validation after decoding. So a transaction's 64 MiB `bytes()` default is never the binding limit; the frame is. The database proofs in `src/db/proof.ts` and the snapshot chunks in `src/app/core/snapshot.ts` carry their own, tighter numbers (sibling lists of 16, 64, 128 or 256; keys of at most 4,096 bytes).
 
@@ -315,7 +323,7 @@ The `héllo` line is worth a second look: the length prefix is six because `é` 
 
 `test/units.test.ts`, `describe('codec')`, has three cases.
 
-**`round-trips every primitive`** encodes one value of every kind in a single chain (`u8(255)`, `bool(true)`, `u32(0xdeadbeef)`, `u64(2n ** 64n - 1n)`, `i64(-5n)`, `bytes`, a non-ASCII `string('héllo')`, an absent and a present `option`, an `array` of `u64`) and decodes them in the same order, asserting deep equality. It proves the writer and reader agree on every primitive, including the extremes of `u64` and a negative `i64`, and that UTF-8 survives.
+**`round-trips every primitive`** encodes one value of most kinds in a single chain (`u8(255)`, `bool(true)`, `u32(0xdeadbeef)`, `u64(2n ** 64n - 1n)`, `i64(-5n)`, `bytes`, a non-ASCII `string('héllo')`, an absent and a present `option`, an `array` of `u64`) and decodes them in the same order, asserting deep equality. It proves the writer and reader agree on those primitives, including the extremes of `u64` and a negative `i64`, and that UTF-8 survives. Despite its name it leaves out `u16` and `fixed`, and `u53` and `i53`, which the `test/review4.test.ts` case below covers.
 
 **`rejects truncated input, trailing bytes, and hostile lengths`** proves the four guards:
 
@@ -334,9 +342,11 @@ Two bytes where four are needed; one byte left over; a `bytes` length of 4,294,9
 
 `test/review4.test.ts`, **`refuses a number too large to hold exactly where a 64-bit field is used as one`**, covers `u53` and `i53`: 2^53 − 1 reads as `Number.MAX_SAFE_INTEGER` and 2^53 throws `out of range`; −1 reads as −1 and −2^53 and 2^62 throw; and a proposal encoded with a lock round of 2^60 is refused by `decodeProposal` before its block is read.
 
+`test/review5-app.test.ts`, `describe('codec')`, has two cases. **`reads a copy out of a Buffer as out of a Uint8Array`** reads a `bytes` field and a `fixed(2)` from the same eight bytes given once as a `Uint8Array` and once as a `Buffer`, overwrites the input with `0xff`, and asserts that both fields still hold what was read, that the fixed one is a plain `Uint8Array`, and that it does not share the input's `ArrayBuffer`. **`grows a writer that was made with no capacity`** writes a `u8` and a `u64` through `new Writer(0)`, a 100-byte `fixed` through another, and a `u32` through `new Writer(1)`, and checks the bytes that come out.
+
 Beyond that, the codec is exercised indirectly by every other suite, because every block, vote, validator set, state record and proof goes through it. One test uses it to build *malformed* input on purpose: `test/review.test.ts`, `rejects decoded validator sets with duplicate members, wrong order or a bad proposer index`, hand-encodes validator sets with `encode((w) => w.array(...).i64(...))` to feed `ValidatorSet.decode` a duplicate member, a reversed order and an out-of-range proposer index. That is the pattern to copy when writing a test for any decoder: `encode` lets you write bytes the honest encoder would never produce.
 
-`bench/codec.bench.ts` measures `encodeTransaction`, `decodeTransaction`, `txHash` and `txsRoot` over 500 signed transfers; under ML-DSA-44 a signed transfer is about 2.5 KiB and `README.md` reports that 1,668 fit in the default 4 MiB block, while under secp256k1 the same transfer is about 150 bytes.
+`bench/codec.bench.ts` measures `encodeTransaction`, `decodeTransaction`, `txHash` and `txsRoot` over 500 signed transfers; under ML-DSA-44 a signed transfer is about 2.5 KiB and `README.md` reports that the codec suite estimates 1,667 fit in the default 4 MiB block and that 1,663 filled one in the four-validator run, while under secp256k1 the same transfer is about 150 bytes.
 
 ## Limitations and ideas
 
@@ -347,6 +357,8 @@ Known simplifications:
 - `string` and `bytes` always copy, and `TextEncoder`/`TextDecoder` instances are created per call.
 - The reader decodes from a complete buffer; a message larger than memory cannot be streamed. The p2p layer bounds frame sizes instead.
 - `Writer.fixed` does not check the length of what it is given; a wrong-sized hash or signature is caught only at decode time.
+- Malformed UTF-8 surfaces as a `TypeError`, not a `CodecError`.
+- No test round-trips `u16` directly.
 
 Exercises:
 

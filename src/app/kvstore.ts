@@ -15,12 +15,14 @@ import { encode } from '../codec/writer.ts';
 import { fromHex, sha256 , toHex } from '../crypto/hash.ts';
 import { isPublicKey } from '../crypto/keys.ts';
 import type { Genesis } from '../types/genesis.ts';
-import type { ValidatorUpdate } from '../types/validator.ts';
+import { MAX_TOTAL_POWER, type ValidatorUpdate } from '../types/validator.ts';
 import type { Application, CheckTxResult, FinalizeBlockRequest, FinalizeBlockResult, InitChainResult } from './types.ts';
 
 interface Snapshot {
   height: string;
   entries: [string, string][];
+  /** The validator set, public key hex to power; absent in a file written before it was kept, which is refused. */
+  validators?: [string, string][];
 }
 
 export class KvStoreApp implements Application {
@@ -41,6 +43,10 @@ export class KvStoreApp implements Application {
       const snap = JSON.parse(readFileSync(file, 'utf8')) as Snapshot;
       this.lastHeight = BigInt(snap.height);
       this.committed = new Map(snap.entries);
+      // Without the set a restarted application would take every removal for one of an unknown validator, and
+      // would pass a total power the engine refuses. A file from before the set was kept cannot supply it.
+      if (!snap.validators) throw new Error(`${file} was written before the validator set was kept in it and cannot be used: remove the data directory and sync again`);
+      this.validators = new Map(snap.validators.map(([k, power]) => [k, BigInt(power)]));
       this.lastAppHash = this.hashOf(this.committed);
     }
   }
@@ -102,8 +108,13 @@ export class KvStoreApp implements Application {
   async finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult> {
     this.working = new Map(this.committed);
     for (const m of req.misbehavior) this.slashed.push(m);
-    // One update per key per block (the last wins), and a removal only of a validator the set has.
+    // One update per key per block (the last wins). Each is tried on the set as the block has made it so far, and
+    // the transaction fails if the engine would refuse the set that results: a removal of a validator it does not
+    // have, a set left empty, or a total power beyond the engine's limit. The engine halts on such an update.
     const updates = new Map<string, ValidatorUpdate>();
+    const set = new Map(this.validators);
+    let total = 0n;
+    for (const power of set.values()) total += power;
     const txResults = req.txs.map((tx) => {
       const p = this.parse(tx);
       if (p.kind === 'bad') return { ok: false, error: p.error };
@@ -112,9 +123,17 @@ export class KvStoreApp implements Application {
         return { ok: true };
       }
       const k = toHex(p.update.publicKey);
-      const known = this.validators.has(k) || (updates.get(k)?.power ?? 0n) > 0n;
-      if (p.update.power === 0n && !known) return { ok: false, error: 'unknown validator' };
-      updates.set(k, p.update);
+      const { power } = p.update;
+      if (power === 0n && !set.has(k)) return { ok: false, error: 'unknown validator' };
+      if (power === 0n && set.size === 1) return { ok: false, error: 'the last validator cannot be removed' };
+      const next = total - (set.get(k) ?? 0n) + power;
+      if (next > MAX_TOTAL_POWER) return { ok: false, error: `total power ${next} would exceed the limit ${MAX_TOTAL_POWER}` };
+      total = next;
+      if (power === 0n) set.delete(k);
+      else set.set(k, power);
+      // A validator added and removed within the block was never the engine's to remove.
+      if (power === 0n && !this.validators.has(k)) updates.delete(k);
+      else updates.set(k, p.update);
       return { ok: true };
     });
     this.pendingUpdates = [...updates.values()];
@@ -143,7 +162,7 @@ export class KvStoreApp implements Application {
 
   private persist(): void {
     if (!this.file) return;
-    const snap: Snapshot = { height: this.lastHeight.toString(), entries: [...this.committed.entries()] };
+    const snap: Snapshot = { height: this.lastHeight.toString(), entries: [...this.committed.entries()], validators: [...this.validators].map(([k, power]) => [k, power.toString()]) };
     writeAtomic(this.file, new TextEncoder().encode(JSON.stringify(snap)));
   }
 }

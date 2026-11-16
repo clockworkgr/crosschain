@@ -222,12 +222,12 @@ export function decodeStakingParameters(r: Reader): StakingParameters {
   };
 }
 
-/** Returns a problem, or null if the parameters are usable. */
 /** A hundred years: the longest duration any parameter may hold, so `time + duration` stays a u64. */
 export const MAX_DURATION_MS = 100n * 365n * 24n * 3_600_000n;
 /** Signals a proposal can hold; the codec reads at most this many. */
 export const MAX_SIGNALS = 1000;
 
+/** Returns a problem, or null if the parameters are usable. */
 export function checkStakingParameters(p: StakingParameters): string | null {
   if (p.maxValidators < 1 || p.maxValidators > 1000) return 'maxValidators must be 1 to 1000';
   for (const [name, v] of [

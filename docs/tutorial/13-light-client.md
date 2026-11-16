@@ -134,44 +134,44 @@ The hash check is what binds a set to a header: a provider can send any set it l
 **`timeProblem(trusted, candidate)`** applies the three time rules, in the order trusting period, future, monotonic:
 
 ```ts
-private timeProblem(trusted: TrustedState, candidate: TrustedState): string | null {
-  const now = this.o.now();
-  if (trusted.header.time + this.o.trustingPeriodMs <= now) return 'trusted header is older than the trusting period';
-  if (candidate.header.time > now + this.o.maxClockDriftMs) return 'header is from the future';
-  if (candidate.header.time <= trusted.header.time) return 'header time does not advance';
-  return null;
-}
+  private timeProblem(trusted: TrustedState, candidate: TrustedState): string | null {
+    const now = this.o.now();
+    if (trusted.header.time + this.o.trustingPeriodMs <= now) return 'trusted header is older than the trusting period';
+    if (candidate.header.time > now + this.o.maxClockDriftMs) return 'header is from the future';
+    if (candidate.header.time <= trusted.header.time) return 'header time does not advance';
+    return null;
+  }
 ```
 
 **`verifyAdjacent(trusted, c)`** is sequential verification:
 
 ```ts
-/** The next height: the trusted header named its validator set. */
-private async verifyAdjacent(trusted: TrustedState, c: TrustedState): Promise<string | null> {
-  if (!bytesEqual(c.validators.hash(), trusted.header.nextValidatorsHash)) return 'validator set is not the one the trusted header named';
-  if (!bytesEqual(c.header.lastBlockHash, headerHash(trusted.header))) return 'header does not extend the trusted one';
-  return (await verifyCommit(this.o.chainId, c.validators, headerHash(c.header), c.commit, this.o.verifier)) ?? this.timeProblem(trusted, c);
-}
+  /** The next height: the trusted header named its validator set. */
+  private async verifyAdjacent(trusted: TrustedState, c: TrustedState): Promise<string | null> {
+    if (!bytesEqual(c.validators.hash(), trusted.header.nextValidatorsHash)) return 'validator set is not the one the trusted header named';
+    if (!bytesEqual(c.header.lastBlockHash, headerHash(trusted.header))) return 'header does not extend the trusted one';
+    return (await verifyCommit(this.o.chainId, c.validators, headerHash(c.header), c.commit, this.o.verifier)) ?? this.timeProblem(trusted, c);
+  }
 ```
 
 **`verifySkipping(trusted, c)`** is the jump:
 
 ```ts
-/** A later height: its own set signed it, and enough of the set we trust is among the signers. */
-private async verifySkipping(trusted: TrustedState, c: TrustedState): Promise<string | null> {
-  const err = await verifyCommit(this.o.chainId, c.validators, headerHash(c.header), c.commit, this.o.verifier);
-  if (err) return err;
-  const known = trusted.nextValidators;
-  let overlap = 0n;
-  c.commit.signatures.forEach((sig, i) => {
-    if (sig === null) return;
-    const v = c.validators.byIndex(i);
-    const idx = v ? known.indexOf(v.address) : -1;
-    if (idx >= 0) overlap += known.byIndex(idx)!.power;
-  });
-  if (3n * overlap <= known.totalPower) return INSUFFICIENT_TRUST;
-  return this.timeProblem(trusted, c);
-}
+  /** A later height: its own set signed it, and enough of the set we trust is among the signers. */
+  private async verifySkipping(trusted: TrustedState, c: TrustedState): Promise<string | null> {
+    const err = await verifyCommit(this.o.chainId, c.validators, headerHash(c.header), c.commit, this.o.verifier);
+    if (err) return err;
+    const known = trusted.nextValidators;
+    let overlap = 0n;
+    c.commit.signatures.forEach((sig, i) => {
+      if (sig === null) return;
+      const v = c.validators.byIndex(i);
+      const idx = v ? known.indexOf(v.address) : -1;
+      if (idx >= 0) overlap += known.byIndex(idx)!.power;
+    });
+    if (3n * overlap <= known.totalPower) return INSUFFICIENT_TRUST;
+    return this.timeProblem(trusted, c);
+  }
 ```
 
 Two details. The set compared against is `trusted.nextValidators`, not `trusted.validators`: the trusted header promised that set for the height after it, so it is the most recent set the client can vouch for. And the power added is the signer's power *in the trusted set* (`known.byIndex(idx)!.power`), not in the candidate's; a validator whose power grew in the meantime does not get to vouch with power nobody trusted yet. The quorum arithmetic mirrors `ValidatorSet.isOneThird`: strictly more than a third. The order of checks (commit first, overlap second, time last) means a header with an invalid commit is reported as such, and `INSUFFICIENT_TRUST` is only returned for a header that is genuinely signed by its own set.
@@ -179,39 +179,39 @@ Two details. The set compared against is `trusted.nextValidators`, not `trusted.
 **`verifyToHeight(target)`** drives both:
 
 ```ts
-/** Move trust forward to `target`, bisecting where the validator set changed too much to skip. */
-async verifyToHeight(target: bigint): Promise<TrustedState> {
-  let cur = this.trusted;
-  if (target < cur.header.height) throw new Error(`height ${target} is before the trusted height ${cur.header.height}`);
-  while (cur.header.height < target) {
-    let pivot = target;
-    for (;;) {
-      const candidate = await this.fetch(pivot);
-      const adjacent = pivot === cur.header.height + 1n;
-      const err = adjacent ? await this.verifyAdjacent(cur, candidate) : await this.verifySkipping(cur, candidate);
-      if (err === null) {
-        cur = candidate;
-        this.verifiedHeights.push(pivot);
-        break;
+  /** Move trust forward to `target`, bisecting where the validator set changed too much to skip. */
+  async verifyToHeight(target: bigint): Promise<TrustedState> {
+    let cur = this.trusted;
+    if (target < cur.header.height) throw new Error(`height ${target} is before the trusted height ${cur.header.height}`);
+    while (cur.header.height < target) {
+      let pivot = target;
+      for (;;) {
+        const candidate = await this.fetch(pivot);
+        const adjacent = pivot === cur.header.height + 1n;
+        const err = adjacent ? await this.verifyAdjacent(cur, candidate) : await this.verifySkipping(cur, candidate);
+        if (err === null) {
+          cur = candidate;
+          this.verifiedHeights.push(pivot);
+          break;
+        }
+        if (err !== INSUFFICIENT_TRUST || adjacent) throw new Error(`header ${pivot}: ${err}`);
+        pivot = cur.header.height + (pivot - cur.header.height) / 2n;
       }
-      if (err !== INSUFFICIENT_TRUST || adjacent) throw new Error(`header ${pivot}: ${err}`);
-      pivot = cur.header.height + (pivot - cur.header.height) / 2n;
     }
+    this.trusted = cur;
+    return cur;
   }
-  this.trusted = cur;
-  return cur;
-}
 ```
 
 The outer loop advances `cur` until it reaches the target; the inner loop tries the target, then halves the distance on `INSUFFICIENT_TRUST` until something verifies. Halving always terminates because the distance shrinks to 1, at which point the adjacent rule applies and either succeeds or throws. The client's `trusted` is only replaced at the end, but `cur` and `verifiedHeights` advance step by step, so an exception midway leaves `trusted` where it was while `verifiedHeights` records the steps that did succeed. A target equal to the trusted height returns at once. A target before the trusted height is refused here: moving trust is forward only, and an earlier height is `verifyBackward`'s job, below.
 
-A trace makes the loop concrete. Suppose the client trusts height 2, whose `nextValidators` are four validators of power 10, and is asked for height 40, by which time a fifth validator of power 100 has joined and the original four have left (the situation `test/light.test.ts` constructs, with heights made up here):
+A trace makes the loop concrete. Suppose the client trusts height 2, whose `nextValidators` are four validators of power 10, and is asked for height 40, by which time a fifth validator of power 100 has joined and three of the original four have left (the membership change `test/light.test.ts` makes, with heights made up here):
 
-1. `pivot = 40`. `fetch(40)`: header, commit and both sets. `verifySkipping`: the commit is valid for 40's own set, but of the four trusted validators none signed, so `overlap = 0` and `3n * 0n <= 40n` returns `INSUFFICIENT_TRUST`. Not adjacent, so `pivot = 2 + (40 - 2) / 2n = 21`.
+1. `pivot = 40`. `fetch(40)`: header, commit and both sets. `verifySkipping`: the commit is valid for 40's own set, the fifth validator and the one original that stayed, but of the four trusted validators only that one can have signed, so `overlap` is 10 at most and `3n * 10n <= 40n` returns `INSUFFICIENT_TRUST`. Not adjacent, so `pivot = 2 + (40 - 2) / 2n = 21`.
 2. `fetch(21)`: say the fifth validator has joined but nobody has left, so the set is five with total power 140. The four trusted validators signed: `overlap = 40` against `known.totalPower = 40` (the *trusted* set's total), `3n * 40n > 40n`, accepted. `cur` becomes 21, `verifiedHeights = [21]`.
 3. Back to the outer loop with `pivot = 40` again. Now `known` is 21's `nextValidators` (the five). At 40 the fifth validator signed with power 100 of a trusted total of 140: `3n * 100n > 140n`, accepted. `cur` becomes 40, `verifiedHeights = [21, 40]`, and `trusted` is set.
 
-Had step 2 also failed, the pivot would have gone to `2 + 19n / 2n = 11`, then 6, 4, 3, and at 3 the adjacent rule would decide. Each fetched height costs the provider four calls, so this run made three fetches and twelve calls; the sequential alternative from 2 to 40 would have made thirty-eight fetches.
+Had step 2 also failed, the pivot would have gone to `2 + 19n / 2n = 11`, then 6, 4, 3, and at 3 the adjacent rule would decide. Each fetched height costs three provider calls (the signed header and the two validator sets), which over the RPC are four requests, so this run made three fetches, nine provider calls and twelve requests; the sequential alternative from 2 to 40 would have made thirty-eight fetches.
 
 **`verifyLatest()`** is `verifyToHeight(await provider.latestHeight())`.
 
@@ -267,12 +267,12 @@ The trusted header for its own height; a walk back for an earlier one; forward v
 **`verifyState(q)`** and **`verifyKey(q)`** apply the next-header rule:
 
 ```ts
-/** Check a node's answer to a state query. Returns a problem, or null. */
-async verifyState(q: StateQueryResult): Promise<string | null> {
-  const header = await this.verifiedHeader(q.proof.height + 1n);
-  if (!bytesEqual(headerHash(header), headerHash(q.header))) return `header ${q.header.height} is not the verified one (${toHex(headerHash(header)).slice(0, 12)})`;
-  return verifyObjectProof(header.appHash, q.proof) ? null : 'proof does not lead to the app hash';
-}
+  /** Check a node's answer to a state query. Returns a problem, or null. */
+  async verifyState(q: StateQueryResult): Promise<string | null> {
+    const header = await this.verifiedHeader(q.proof.height + 1n);
+    if (!bytesEqual(headerHash(header), headerHash(q.header))) return `header ${q.header.height} is not the verified one (${toHex(headerHash(header)).slice(0, 12)})`;
+    return verifyObjectProof(header.appHash, q.proof) ? null : 'proof does not lead to the app hash';
+  }
 ```
 
 `verifiedHeader(q.proof.height + 1n)` is the whole point: the client fetches and verifies header N+1 through its own provider and trust chain, and only then compares it with the one in the query. The proof is checked against *the client's* header's `appHash`, which is the same bytes once the hashes match, but the direction of trust is the right way round. Notice that `q.commit` is not used by the client: it has its own verified copy. The commit field is there for the standalone `verifyStateQuery`, which has no provider. `verifyKey` is identical with `verifyKeyProof` and returns `{ value }` (with `null` for absence) or `{ error }`.
@@ -280,20 +280,20 @@ async verifyState(q: StateQueryResult): Promise<string | null> {
 **`verifyTx(q)`** does the two legs:
 
 ```ts
-/** Check a transaction query: inclusion against its header, result against the next. Null means only inclusion is provable yet. */
-async verifyTx(q: TxQueryResult): Promise<TxVerdict> {
-  const header = await this.verifiedHeader(q.txProof.height);
-  if (!bytesEqual(headerHash(header), headerHash(q.header))) return { failed: true, error: `header ${q.header.height} is not the verified one` };
-  if (!verifyTxProof(header.dataHash, q.txProof)) return { failed: true, error: 'transaction is not in the block' };
-  if (!q.resultProof || !q.nextHeader) return null;
-  const next = await this.verifiedHeader(q.txProof.height + 1n);
-  if (!bytesEqual(headerHash(next), headerHash(q.nextHeader))) return { failed: true, error: 'next header is not the verified one' };
-  if (q.resultProof.index !== q.txProof.index || !verifyResultProof(next.lastResultsHash, q.resultProof)) return { failed: true, error: 'result is not the one committed' };
-  return { ok: q.resultProof.ok, error: q.resultProof.error };
-}
+  /** Check a transaction query: inclusion against its header, result against the next. Null means only inclusion is provable yet. */
+  async verifyTx(q: TxQueryResult): Promise<TxVerdict> {
+    const header = await this.verifiedHeader(q.txProof.height);
+    if (!bytesEqual(headerHash(header), headerHash(q.header))) return { failed: true, error: `header ${q.header.height} is not the verified one` };
+    if (!verifyTxProof(header.dataHash, q.txProof)) return { failed: true, error: 'transaction is not in the block' };
+    if (!q.resultProof || !q.nextHeader) return null;
+    const next = await this.verifiedHeader(q.txProof.height + 1n);
+    if (!bytesEqual(headerHash(next), headerHash(q.nextHeader))) return { failed: true, error: 'next header is not the verified one' };
+    if (q.resultProof.index !== q.txProof.index || !verifyResultProof(next.lastResultsHash, q.resultProof)) return { failed: true, error: 'result is not the one committed' };
+    return { ok: q.resultProof.ok, error: q.resultProof.error };
+  }
 ```
 
-Inclusion is checked against header H (where the transaction's bytes are under `dataHash`), the result against header H+1. Unlike `verifyTxQuery`, there is no explicit "next header follows" check, because the two headers come from `verifiedHeader`, and whichever way it went for each, they are both on the client's own chain: a header reached forward extends it, and one reached backward hashes into it. A long-lived client that has verified to the tip can still verify an old transaction, since `verifiedHeader(H)` for an H below the trusted height is a backward walk, and so can a client whose anchor is after the transaction: nothing below the anchor is out of reach, only bounded by `maxBackwardSteps`. The CLI constructs a fresh client from its saved anchor on every run, and the anchor it saves is the newest header the previous run verified, so each run starts where the last one ended and walks back for anything older. The anchor is held to `trust`'s own rules: one at or beyond the trusting period, or one dated in the future beyond the drift allowance, is refused on reload rather than silently accepted, so a `light.json` left over from a long absence makes the next run fail with a clear message instead of extending trust from a header that could by now have been signed for free.
+Inclusion is checked against header H (where the transaction's bytes are under `dataHash`), the result against header H+1. Unlike `verifyTxQuery`, there is no explicit "next header follows" check, because the two headers come from `verifiedHeader`, and whichever way it went for each, they are both on the client's own chain: a header reached forward extends it, and one reached backward hashes into it. A long-lived client that has verified to the tip can still verify an old transaction, since `verifiedHeader(H)` for an H below the trusted height is a backward walk, and so can a client whose anchor is after the transaction: nothing below the anchor is out of reach, only bounded by `maxBackwardSteps`. The CLI constructs a fresh client from its saved anchor on every run, and the anchor it saves is the newest header the previous run verified, so each run starts where the last one ended and walks back for anything older. The anchor is held to `trust`'s own rules: one at or beyond the trusting period, or one dated in the future beyond the drift allowance, is refused on reload rather than silently accepted, so a `light.json` left over from a long absence makes the next run fail with a clear message instead of extending trust from a header that could by now have been signed for free. The file also names the chain its header belongs to, and the CLI refuses to use it against a node of another chain (chapter 14).
 
 ### src/light/provider.ts
 
@@ -335,6 +335,9 @@ export class RpcProvider implements LightProvider {
       throw e;
     }
   }
+
+  // ...
+}
 ```
 
 In `signedHeader`, `header` and `commit` are fetched in parallel and decoded with the shape-specific decoders from `src/rpc/json.ts`; the provider's own `header` fetches the header alone, through the RPC method that serves a header kept without its block as well (chapter 12); `validatorSet` calls the `validatorSet` method by hex hash and rebuilds the set with `validatorSetFromJson`. In all three, the RPC's not-found code (`-32001`) becomes `null`, which the client turns into "provider has no header"; any other error (network, rate limit, parse) propagates. A set that comes back from JSON is rebuilt with `ValidatorSet.create`, which recomputes addresses from the public keys and rejects duplicates, so the hash the client then compares against the header is computed from what was actually received, not copied from the response. The provider makes four RPC calls per fetched height going forward (status aside) and one per header going backward, and caches nothing itself; a bisection that touches many heights pays for each, while the backward walk is cached in the client.
@@ -345,7 +348,7 @@ In `signedHeader`, `header` and `commit` are fetched in parallel and decoded wit
 
 `test/chain.test.ts`, "gossips signed transactions, agrees on state, and proves it against the next header", runs the core application on four validators and a full node, creates alice and pays her, and then: a `queryState` for alice at height `h` carries header `h + 1`; `verifyStateQuery` with the set for `h + 1` returns `null`; the same query with `value: null` (claiming absence) fails with a proof error; with header and commit of height `h` instead of `h + 1` it fails with a height error; a query for an earlier height verifies against its own next header, and the default latest query too; `verifyKeyQuery` on `queryAccountName('alice')` yields the 8-byte id and on `'bob'` yields `{ value: null }`, a proven absence. A `LightClient` trusting height 2 through the full node's `NodeProvider` verifies the state query (`verifyState` returns `null` and the trusted height moves to `h + 1`), verifies the key query, and rejects a query whose header has a zeroed `appHash` with "not the verified one"; a wrong trust hash is refused. For transactions, `queryTx` of the transfer has a result proof; `verifyTxQuery` accepts it as `{ ok: true, error: '' }` and rejects it with the transaction bytes swapped for another transaction's; a fresh client's `verifyTx` returns the same verified result.
 
-`test/rpc.test.ts`, "serves a light client over the RPC", does the trust-and-verify sequence through `RpcProvider` against a live `RpcServer`: `verifyLatest` reaches the height `status` reports, a name proof fetched with `account('faucet', true)` verifies with header `height + 1` and commit from the same RPC, and a wrong anchor hash is refused. "broadcasts in sync and commit mode, finds transactions with proofs, and records history" runs `verifyTxQuery` on a proof that travelled as JSON through `txQueryFromJson`.
+`test/rpc.test.ts`, "serves a light client over the RPC", does the trust-and-verify sequence through `RpcProvider` against a live `RpcServer`: `verifyLatest` reaches a height no later than the one `status` then reports, a name proof fetched with `account('faucet', true)` verifies with header `height + 1` and commit from the same RPC, and a wrong anchor hash is refused. "broadcasts in sync and commit mode, finds transactions with proofs, and records history" runs `verifyTxQuery` on a proof that travelled as JSON through `txQueryFromJson`.
 
 `test/staking-net.test.ts`, "owns the validator set: delegation raises power, a stopped validator is jailed, and it returns after unjail", ends with a light client that trusted height 2 following the whole sequence (a validator jailed for downtime and unjailed) to a latest header signed by the set of four, and verifying a `queryAccountName('op3')` key proof against it.
 
@@ -353,15 +356,17 @@ In `signedHeader`, `header` and `commit` are fetched in parallel and decoded wit
 
 `test/review2.test.ts`, "binds a served header to the height asked for and refuses an anchor from the future": on a four-validator chain, a client trusts height 2 through an honest `NodeProvider`, then has its provider swapped for one whose `signedHeader(h)` answers with the genuine header `h + 1`; `verifyToHeight(4)` must fail with "answered height 4 with header 5", since the commit on that header is perfectly valid and only the height check can tell it was not the header asked for. Then two anchor refusals: with a `now` sixty seconds before the anchor's own time, `trust` rejects it as "from the future", and with a ten-second trusting period and a `now` exactly ten seconds after the anchor's time, it rejects it as outside the "trusting period", one period old being already too old. Then backward verification: a client anchored at height 4 walks back to 2 with `verifyBackward` and gets the header whose hash the honest anchor at 2 had; height 0 is refused as "not a block" and height 5 as "after the trusted height"; a provider whose `header` answers height 3 with the real header's `appHash` zeroed is caught with "header 3 is not the one header 4 names", since the altered header no longer hashes to what header 4 names; and a client with `maxBackwardSteps: 1` refuses the two-step walk with "more than 1 headers before".
 
-`test/sync.test.ts` exercises the client at both ends of a join. "joins from a snapshot" runs `LightClient.trust` indirectly: a node joining from a snapshot runs the light client from its anchor to the snapshot height over p2p before importing (chapter 7). "applies evidence for a height before its join" ends with a client anchored at the joiner's tip, through a `NodeProvider` on the joiner, verifying with `verifyState` a query for the faucet at height 3 answered by validator 0: the joiner holds no block below its snapshot, only the headers state sync fetched, and the walk back to header 4 goes through those records.
+`test/review5-rpc.test.ts`, "verifies no header from a trusted one that has reached the trusting period, the next one or a later one", is the trusting period at the time a header is verified, where the cases above are about the anchor. A client with a period of sixty seconds and an injected clock trusts height 2 on a four-validator chain and verifies to 3. The clock is then set to the trusted header's time plus the period: `verifyToHeight(4)`, the adjacent rule, and `verifyToHeight(6)`, the skipping rule, both throw `trusted header is older than the trusting period` under their own height, `verifyLatest` throws the same, and the trusted height stays 3 with `verifiedHeights` of `[3]`. One millisecond earlier the same two calls succeed and trust moves to 6.
+
+`test/sync.test.ts` exercises the client at both ends of a join. "joins from a snapshot, serves queries at once, survives a corrupt chunk, and backfills to genesis" runs `LightClient.trust` indirectly: a node joining from a snapshot runs the light client from its anchor to the snapshot height over p2p before importing (chapter 7). "applies evidence for a height before its join, from the headers it fetched for the evidence window" ends with a client anchored at the joiner's tip, through a `NodeProvider` on the joiner, verifying with `verifyState` a query for the faucet at height 3 answered by validator 0: the joiner holds no block below its snapshot, only the headers state sync fetched, and the walk back to header 4 goes through those records.
 
 ## Limitations and ideas
 
 - One provider, no witnesses. The Tendermint light client cross-checks a header against several providers and reports a conflicting header as evidence (the "detector"); this client trusts whichever provider it was given and throws on the first problem. Nothing here produces or submits evidence.
-- No persistence in the library. The client is in-memory; the CLI saves `{ height, hash }` in `light.json` and rebuilds a client from it each run, re-verifying the anchor's commit every time.
+- No persistence in the library. The client is in-memory; the CLI saves `{ chainId, height, hash }` in `light.json` and rebuilds a client from it each run, re-verifying the anchor's commit every time.
 - The trusting period is a constant the caller chooses (`DESIGN.md` section 10); nothing ties it to the chain's unbonding period.
-- Backward verification is sequential: one header per step, with no skipping rule, so a query about height 100 from a client trusting height 100,100 fetches ten thousand headers, and one further back than `maxBackwardSteps` is refused. The cache is cleared outright when full, not trimmed.
-- Every forward `fetch` costs four provider calls and nothing is cached; a bisection over a long range re-fetches validator sets that have not changed.
+- Backward verification is sequential: one header per step, with no skipping rule, so a query about height 100 from a client trusting height 100,100 fetches 100,000 headers, exactly the default `maxBackwardSteps`, and one further back than that is refused. The cache is cleared outright when full, not trimmed.
+- Every forward `fetch` costs three provider calls, four requests over the RPC, and nothing is cached; a bisection over a long range re-fetches validator sets that have not changed.
 - `verifyState` and `verifyKey` ignore `q.commit`; it is carried for the standalone verifiers only.
 - Fault assumption: a set in which more than a third of trusted power is dishonest can fool skipping verification, as in Tendermint. That is the price of jumping.
 

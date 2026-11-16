@@ -190,18 +190,22 @@ const decodeRecord = (r: Reader): LogRecord => ({ ...decodeLinks(r), entry: deco
  * The heads (an account's count and newest entry) are keyed by account, so writing each at the block that changes
  * it would put back the scattered writes the log removes: about half of what the old layout cost, measured. They
  * wait in memory instead, in SLICES slices of the account numbers, and every block with entries writes the waiting
- * heads of one slice, the next in turn: neighbours in the store, a few pages, and each head within SLICES blocks of
- * its change (all of them at once should HEADS_HELD ever wait). The log is their journal: it records how far the
- * stored heads cover it, the place of the oldest change still waiting, and a log opened after a stop reads the
- * entries from there on, which name their account and sequence, to have the waiting heads back.
+ * heads of one slice, the next in turn: neighbours in the store, a few pages, and each head within SLICES such
+ * blocks of its change while the slices keep their width. A widening (wait) moves the waiting heads to other
+ * slices without moving the turn, so a head that was waiting then is written within SLICES such blocks of the
+ * widening instead, and of the last one if there are several. All of them are written at once should HEADS_HELD
+ * ever wait.
+ * The log is their journal: it records how far the stored heads cover it, the place of the oldest change still
+ * waiting, and a log opened after a stop reads the entries from there on, which name their account and sequence,
+ * to have the waiting heads back.
  */
 export class HistoryLog {
   static readonly SLICES = 64;
   static readonly HEADS_HELD = 50_000;
   private readonly kv: KvStore;
-  private length: bigint;
+  private length = 0n;
   /** Every head changed by the log's first `covered` entries is stored; the heads changed since wait in `slices`. */
-  private covered: bigint;
+  private covered = 0n;
   /** The waiting heads by slice of the account numbers, and per slice the place in the log of its oldest waiting change. */
   private slices: Map<ObjectId, Head>[] = Array.from({ length: HistoryLog.SLICES }, () => new Map());
   private since: bigint[] = new Array<bigint>(HistoryLog.SLICES).fill(0n);
@@ -213,13 +217,32 @@ export class HistoryLog {
 
   constructor(kv: KvStore) {
     this.kv = kv;
-    const v = kv.get(LENGTH_KEY);
+    this.load();
+    this.migrate();
+  }
+
+  /** The length and the waiting heads as the store has them: the entries past `covered` name their account and sequence. */
+  private load(): void {
+    const v = this.kv.get(LENGTH_KEY);
     [this.length, this.covered] = v ? decode(v, (r) => [r.u64(), r.u64()]) : [0n, 0n];
+    this.slices = Array.from({ length: HistoryLog.SLICES }, () => new Map());
+    this.since = new Array<bigint>(HistoryLog.SLICES).fill(0n);
+    this.width = 1;
+    this.held = 0;
+    this.turn = 0;
     for (let index = this.covered; index < this.length; index++) {
       const e = decodeLinks(new Reader(this.stored(index)));
       this.wait(e.account, { count: e.sequence + 1n, last: index });
     }
-    this.migrate();
+  }
+
+  /**
+   * A write that append() was part of did not land. append() had already counted its entries and moved its heads,
+   * and the store has none of that, so the next block's entries would point at places the log does not have. The
+   * store is the journal: everything is read from it again, as by a log opened now.
+   */
+  rollback(): void {
+    this.load();
   }
 
   private slice(account: ObjectId): number {
@@ -317,7 +340,10 @@ export class HistoryLog {
     return v;
   }
 
-  /** Append a block's entries, in the order they were recorded, as part of the write `w`; with `flush`, the waiting heads too. */
+  /**
+   * Append a block's entries, in the order they were recorded, as part of the write `w`; with `flush`, the waiting
+   * heads too. The log counts the entries as written when this returns: a caller whose write then fails calls rollback().
+   */
   append(w: KvWriter, entries: Iterable<[ObjectId, HistoryEntry]>, flush = false): void {
     // The store may not show this write's own entries yet, so what the block has added so far is kept here.
     const heads = new Map<ObjectId, Head>();

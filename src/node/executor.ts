@@ -56,6 +56,15 @@ export interface ExecutorDeps {
   transaction?: (fn: () => void) => void;
 }
 
+/**
+ * An application that can persist a block without a promise in between. Under a shared transaction the executor
+ * calls this instead of commit(): a throw out of it leaves the transaction's callback, which aborts the chain's
+ * writes with the application's, where a promise can only reject after the transaction has ended.
+ */
+interface SyncCommit {
+  commitSync?: () => void;
+}
+
 export class BlockExecutor {
   state: ChainState;
   private readonly d: ExecutorDeps;
@@ -91,8 +100,13 @@ export class BlockExecutor {
     return exec;
   }
 
-  onCommitted(fn: (block: Block, commit: Commit, results: TxResult[], updates: ValidatorUpdate[]) => void): void {
+  /** Hear of every committed block; what is returned takes the listener back. */
+  onCommitted(fn: (block: Block, commit: Commit, results: TxResult[], updates: ValidatorUpdate[]) => void): () => void {
     this.committedListeners.push(fn);
+    return () => {
+      const i = this.committedListeners.indexOf(fn);
+      if (i >= 0) this.committedListeners.splice(i, 1);
+    };
   }
 
   getLastCommit(): Commit | null {
@@ -185,14 +199,20 @@ export class BlockExecutor {
       });
     let persisted: Promise<void>;
     if (this.d.transaction) {
-      // One transaction and one flush for the chain's writes and the application's. commit() is called inside it:
-      // what the application writes before its first await joins the transaction (CoreApp writes everything there),
-      // and what it writes after lands on its own afterwards, as without a shared transaction. A commit that fails
-      // rejects the promise, not the transaction: the chain's writes stay, and the restart replays the block.
-      let inside!: Promise<void>;
+      // One transaction and one flush for the chain's writes and the application's. An application with a
+      // synchronous commit (commitSync) is committed through it: if it throws, the transaction is aborted and
+      // neither the block nor the chain state is stored, so the node is where it was before the block. Otherwise
+      // commit() is called inside the transaction: what the application writes before its first await joins it,
+      // and a commit() that throws where it is called (the core application's does when its write fails) aborts
+      // the transaction the same way. What it writes after an await lands on its own afterwards, as without a
+      // shared transaction, and failing there rejects the promise, not the transaction: the chain's writes stay,
+      // and the restart replays the block.
+      const app = this.d.app as Application & SyncCommit;
+      let inside: Promise<void> = Promise.resolve();
       this.d.transaction(() => {
         save();
-        inside = this.d.app.commit();
+        if (typeof app.commitSync === 'function') app.commitSync();
+        else inside = app.commit();
       });
       persisted = inside;
     } else {
@@ -205,12 +225,13 @@ export class BlockExecutor {
     this.prune();
     this.d.evidencePool.markCommitted(block.evidence);
     // What the pool holds that is now too old for any later block goes, on every node: the proposer prunes before
-    // it picks evidence, but a node that never proposes would otherwise keep all it ever saw.
+    // it picks evidence, but a node that never proposes would otherwise keep all it ever saw. A height whose time
+    // is no longer held was pruned as older than evidence may be (prune keeps the evidence window), so it is stale.
     const age = this.d.evidenceAgeMs?.();
     if (age !== undefined) {
       this.d.evidencePool.pruneIf((ev) => {
         const at = ev.voteA.height === newState.lastHeight ? newState.lastBlockTime : this.blockTimeAt(ev.voteA.height);
-        return at !== null && newState.lastBlockTime - at > age;
+        return at === null || newState.lastBlockTime - at > age;
       });
     }
     this.d.log('info', 'committed', {
@@ -223,7 +244,7 @@ export class BlockExecutor {
       valUpdates: res.validatorUpdates.length,
     });
     await this.d.mempool.update(block.txs);
-    for (const fn of this.committedListeners) fn(block, commit, res.txResults, res.validatorUpdates);
+    for (const fn of [...this.committedListeners]) fn(block, commit, res.txResults, res.validatorUpdates);
   }
 
   private prune(): void {
@@ -248,8 +269,11 @@ export class BlockExecutor {
       while (floor > lowest && (this.d.store.loadBlock(floor - 1n)?.block.header.time ?? 0n) >= oldest) floor--;
       if (floor <= lowest) return;
     }
-    for (let h = lowest; h < floor; h++) this.d.store.deleteBlock(h);
-    this.d.store.setLowestHeight(floor);
+    // One transaction for the pass: the blocks go with the marker that says they are gone, or none of it does.
+    this.d.store.batch(() => {
+      for (let h = lowest; h < floor; h++) this.d.store.deleteBlock(h);
+      this.d.store.setLowestHeight(floor);
+    });
     this.d.log('debug', 'pruned blocks', { below: floor });
   }
 
@@ -261,9 +285,13 @@ export class BlockExecutor {
     const top = this.d.store.lowestHeight();
     let h = lowest;
     // A record that is missing (the block backfill replaced it) is passed over like one that has aged out.
-    while (h < top && (this.d.store.loadHeader(h)?.time ?? oldest - 1n) < oldest) this.d.store.deleteHeader(h++);
+    while (h < top && (this.d.store.loadHeader(h)?.time ?? oldest - 1n) < oldest) h++;
     if (h === lowest) return;
-    this.d.store.setLowestHeaderHeight(h < top ? h : null);
+    // One transaction for the pass, as for blocks.
+    this.d.store.batch(() => {
+      for (let d = lowest; d < h; d++) this.d.store.deleteHeader(d);
+      this.d.store.setLowestHeaderHeight(h < top ? h : null);
+    });
     this.d.log('debug', 'pruned headers', { below: h });
   }
 

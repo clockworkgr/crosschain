@@ -114,3 +114,28 @@ export function authoritySatisfied(auth: Authority, signed: ReadonlySet<string>,
   }
   return false;
 }
+
+/**
+ * The fewest signatures that satisfy `auth`, or `limit + 1` when more than `limit` are needed or none will do.
+ * Each key costs one signature and each member account what its own active authority costs; the cheapest choice
+ * of members reaching the threshold is a small knapsack over at most `limit` signatures. A key that two member
+ * accounts share is counted once for each, so the result can exceed the true minimum, never fall below it.
+ */
+export function minSignatures(auth: Authority, lookup: AuthorityLookup, limit: number, depth = 0): number {
+  // best[c] is the most weight c signatures can buy.
+  const best = new Array<number>(limit + 1).fill(0);
+  const add = (cost: number, weight: number): void => {
+    for (let c = limit; c >= cost; c--) best[c] = Math.max(best[c]!, best[c - cost]! + weight);
+  };
+  for (const k of auth.keys) add(1, k.weight);
+  if (depth < MAX_AUTHORITY_DEPTH) {
+    for (const m of auth.accounts) {
+      const acct = lookup(m.account);
+      if (!acct) continue;
+      const cost = minSignatures(acct.active, lookup, limit, depth + 1);
+      if (cost <= limit) add(cost, m.weight);
+    }
+  }
+  for (let c = 1; c <= limit; c++) if (best[c]! >= auth.threshold) return c;
+  return limit + 1;
+}

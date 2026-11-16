@@ -145,12 +145,18 @@ export async function run(): Promise<void> {
     const syncedTxs = committed;
     fact(`block sync: ${synced} blocks holding ${syncedTxs.toLocaleString('en-US')} transfers`, `${fmtMs(syncMs)}: ${(synced / (syncMs / 1000)).toFixed(1)} blocks/s, ${(syncedTxs / (syncMs / 1000)).toFixed(0)} tx/s`);
     const lateApp = late.app as CoreApp;
-    const app0 = n0.app as CoreApp;
-    const sameHeight = lateApp.lastHeight === app0.lastHeight;
-    const agree = sameHeight && lateApp.lastAppHash.every((b, i) => b === app0.lastAppHash[i]);
-    if (sameHeight && !agree) throw new Error('the synced node disagrees with the validators on the app hash');
-    fact('block sync: app hash agrees with the validators', sameHeight ? 'yes' : `not compared: heights ${lateApp.lastHeight} and ${app0.lastHeight}`);
+    // The validators go on making blocks while the node syncs, so the two are seldom at one height. The synced node
+    // is stopped, and its app hash is held against what the validators agreed on for that height: the app hash in
+    // the header of the block after it, from a validator's store.
     await late.stop();
+    const at = lateApp.lastHeight;
+    const deadline = performance.now() + 30_000;
+    while (n0.height <= at && performance.now() < deadline) await sleep(20);
+    const after = n0.store.loadBlock(at + 1n);
+    if (!after) throw new Error(`no validator block ${at + 1n} to compare the synced node's app hash with`);
+    const agreed = after.block.header.appHash;
+    if (agreed.length !== lateApp.lastAppHash.length || !agreed.every((b, i) => b === lateApp.lastAppHash[i])) throw new Error(`the synced node disagrees with the validators on the app hash of height ${at}`);
+    fact('block sync: app hash agrees with the validators', `yes, at height ${at}`);
     for (const n of net.nodes) await n.stop();
     await sleep(200);
   }

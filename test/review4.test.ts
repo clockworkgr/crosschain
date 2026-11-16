@@ -5,6 +5,7 @@
  * that lets everything go, clock offsets from the ping, exact numbers from the codec and a node that makes its
  * own verifier pool.
  */
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -71,13 +72,14 @@ describe('state queries at a height, and a batch that pays for its calls', () =>
               { name: 'faucet', owner: authorityJson([faucet.publicKey]), active: authorityJson([faucet.publicKey]), balance: '100000000000' },
               ...operators.map((k, i) => ({ name: `op${i}`, owner: authorityJson([k.publicKey]), active: authorityJson([k.publicKey]), balance: '100000000' })),
             ],
-            staking: { minSelfBond: 100, minDelegation: 1, validatorCreationFee: 1, inflationMinBps: 0, inflationMaxBps: 0 },
+            staking: { minSelfBond: 100, minDelegation: 1, validatorCreationFee: 1, unbondingPeriodMs: 2000, inflationMinBps: 0, inflationMaxBps: 0 },
             validators: keys.map((k, i) => ({ operator: `op${i}`, consensusKey: toHex(k), selfBond: 200 })),
           }),
         ),
     });
     const node = net.nodes[0]!;
-    const server = new RpcServer(node, { port: 0 });
+    // The case makes many costly calls in a row; the limits are for the second server below.
+    const server = new RpcServer(node, { port: 0, limits: { ratePerSecond: 10_000, burst: 10_000 } });
     servers.push(server);
     await server.start();
     await waitForHeight(net.nodes, 3n);
@@ -131,16 +133,39 @@ describe('state queries at a height, and a batch that pays for its calls', () =>
     const is = await rpc.call('validator', { operator: 'op0' });
     expect(was.tokens).toBe(before.tokens);
     expect(BigInt(is.tokens) - BigInt(was.tokens)).toBe(300n * 100_000n);
-    expect(was.delegators).toBeNull(); // the index of today cannot count the delegations of then
+    expect(was.delegators).toBe(1); // the operator's own
     expect(is.delegators).toBe(2);
     expect(was.selfBond).toBe(is.selfBond);
     expect(was.operatorName).toBe('op0');
     const none = await rpc.call('delegation', { delegator: 'faucet', validator: 'op0', prove: true, ...at(delegated - 1n) });
-    expect(none).toMatchObject({ delegation: null, unbonding: null });
+    expect(none).toMatchObject({ delegation: null, unbonding: [] });
     expect(verifyKeyProof((await headerAt(delegated)).appHash, keyProofFromBytes(fromHex(none.proof)))).toBeNull();
     const some = await rpc.call('delegation', { delegator: 'faucet', validator: 'op0' });
     expect(some.delegation.tokens).toBe((300n * 100_000n).toString());
     expect(some.unbonding).toEqual([]);
+
+    // What is removed since is still listed for the height it was there at. A third of the delegation is taken
+    // back and waits in the unbonding queue; the rest follows, which removes the delegation; the entries mature and
+    // are removed in their turn. The heights in between still show the delegation, its delegator and the queue.
+    const shares = BigInt(some.delegation.shares);
+    const partly = await send([{ type: 'undelegate', delegator: FAUCET_ID, validator: VAL0, shares: shares / 3n }]);
+    const wholly = await send([{ type: 'undelegate', delegator: FAUCET_ID, validator: VAL0, shares: shares - shares / 3n }]);
+    const queue = async (h?: bigint) => (await rpc.call('delegation', { delegator: 'faucet', validator: 'op0', ...(h === undefined ? {} : at(h)) })) as { delegation: unknown; unbonding: { tokens: string }[] };
+    for (const deadline = Date.now() + 20_000; (await queue()).unbonding.length > 0; await new Promise((r) => setTimeout(r, 100))) {
+      if (Date.now() > deadline) throw new Error('timed out waiting for the unbonding entries to mature');
+    }
+    expect((await queue()).delegation).toBeNull();
+    expect((await rpc.call('validator', { operator: 'op0' })).delegators).toBe(1);
+    const mid = await queue(partly);
+    expect(mid.delegation).not.toBeNull();
+    expect(mid.unbonding.length).toBe(1);
+    expect((await rpc.call('validator', { operator: 'op0', ...at(partly) })).delegators).toBe(2);
+    const late = await queue(wholly);
+    expect(late.delegation).toBeNull();
+    expect(late.unbonding.length).toBe(2);
+    expect(late.unbonding.reduce((sum, u) => sum + BigInt(u.tokens), 0n)).toBe(300n * 100_000n);
+    expect((await rpc.call('validator', { operator: 'op0', ...at(wholly) })).delegators).toBe(1);
+    expect((await queue(delegated)).unbonding).toEqual([]);
 
     // Every peer has answered a ping by now, and says its clock is this node's: they share one.
     await waitFor(() => [...node.network.peers.values()].every((p) => p.clockOffsetMs !== null), 5000, 'a pong from every peer');
@@ -269,6 +294,15 @@ describe('snapshots, evidence, the codec', () => {
     expect(pool.hasHash(evidenceId(ev(3n)))).toBe(false);
     pool.pruneIf(() => true);
     expect(pool.held).toEqual({ pending: 0, committed: 0, inventory: 0 });
+    // A block may carry another pair of votes for the offence that waits here: the pair that waited leaves no entry behind.
+    const other = ev(6n);
+    other.voteB.blockHash!.fill(3);
+    expect(pool.add(ev(6n))).toBe(true);
+    pool.markCommitted([other]);
+    expect(pool.held).toEqual({ pending: 0, committed: 1, inventory: 1 });
+    expect(pool.hasHash(evidenceId(ev(6n)))).toBe(false);
+    pool.pruneIf(() => true);
+    expect(pool.held).toEqual({ pending: 0, committed: 0, inventory: 0 });
     for (let i = 0; i < EvidencePool.MAX_PENDING + 10; i++) pool.add(ev(100n, i));
     expect(pool.size).toBe(EvidencePool.MAX_PENDING);
     expect(pool.held.inventory).toBe(EvidencePool.MAX_PENDING);
@@ -287,7 +321,7 @@ describe('snapshots, evidence, the codec', () => {
 });
 
 describe('the keystore', () => {
-  it('removes a key by name, for good, and says so when there is none by that name', () => {
+  it('removes a key by name, for good, and says so when there is none by that name, as does the command', () => {
     const dir = mkdtempSync(join(tmpdir(), 'crosschain-r4-'));
     try {
       const path = join(dir, 'keystore.json');
@@ -299,6 +333,20 @@ describe('the keystore', () => {
       expect(() => ks.remove('never')).toThrow(/no key named never/);
       expect(Keystore.open(path, 'pw').list().map((k) => k.name)).toEqual(['keep']);
       expect(existsSync(`${path}.lock`)).toBe(false);
+      // The command: it names what it removed, fails on a name that is not there, and makes no keystore to remove from.
+      const cli = (...args: string[]) => spawnSync(process.execPath, [join(import.meta.dirname, '..', 'src', 'cli.ts'), 'keys', ...args], { env: { ...process.env, CHAIN_PASSPHRASE: 'pw' }, encoding: 'utf8' });
+      const address = Keystore.open(path, 'pw').list()[0]!.address;
+      expect(cli('add', 'temp', '--keystore', path).status).toBe(0);
+      const removed = cli('remove', 'keep', '--keystore', path);
+      expect(removed.status).toBe(0);
+      expect(removed.stdout.trim()).toBe(`removed keep ${address}`);
+      const missing = cli('remove', 'keep', '--keystore', path);
+      expect(missing.status).not.toBe(0);
+      expect(missing.stderr + missing.stdout).toMatch(/no key named keep/);
+      expect(cli('list', '--keystore', path).stdout).toMatch(/^temp /);
+      const nowhere = cli('remove', 'temp', '--keystore', join(dir, 'none.json'));
+      expect(nowhere.status).not.toBe(0);
+      expect(existsSync(join(dir, 'none.json'))).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
