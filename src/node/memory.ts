@@ -175,14 +175,20 @@ export class MemoryGuard {
     return this.last;
   }
 
+  private running = false;
+
   start(): void {
-    if (this.timer) return;
+    if (this.running) return;
+    this.running = true;
     this.check();
+    // A listener told of the first sample may have stopped the guard: it then stays stopped.
+    if (!this.running) return;
     this.timer = setInterval(() => this.check(), this.o.intervalMs);
     this.timer.unref?.();
   }
 
   stop(): void {
+    this.running = false;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
   }

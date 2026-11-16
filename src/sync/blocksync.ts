@@ -317,6 +317,8 @@ export class BlockSync {
     const height = lowest - 1n;
     try {
       const m = await this.d.requester.request(peer, { type: 'blockRequest', height }, 'blockResponse', (m) => m.height === height, this.d.requestTimeoutMs ?? 5000);
+      // Stopped while the request was out: the store may be closed by now, and nothing more is read or written.
+      if (!this.running) return;
       if (!m.block || !m.commit) {
         this.noOldBlocks.add(peer.id);
         return;
@@ -332,6 +334,7 @@ export class BlockSync {
       let set = this.d.store.loadValidatorSet(m.block.header.validatorsHash);
       if (!set) {
         const r = await this.d.requester.request(peer, { type: 'validatorSetRequest', hash: m.block.header.validatorsHash }, 'validatorSetResponse', (r) => bytesEqual(r.hash, m.block!.header.validatorsHash), this.d.requestTimeoutMs ?? 5000);
+        if (!this.running) return;
         if (!r.set || !bytesEqual(r.set.hash(), m.block.header.validatorsHash)) {
           this.noOldBlocks.add(peer.id);
           return;
@@ -340,6 +343,7 @@ export class BlockSync {
         this.d.store.saveValidatorSet(set);
       }
       const commitErr = await verifyCommit(this.d.chainId, set, hash, m.commit, this.d.verifier);
+      if (!this.running) return;
       if (commitErr) {
         this.d.scorePeer?.(peer.id, 50, `backfilled commit: ${commitErr}`);
         this.noOldBlocks.add(peer.id);

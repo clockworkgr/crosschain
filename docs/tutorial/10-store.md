@@ -201,40 +201,97 @@ Purpose: the same interface on LMDB.
 Exports:
 
 - `class LmdbEnv implements KvEnv` with `constructor(path, { readOnly? })`, `store(name)`, `transaction(fn)` and `close()`.
+- `class StoreClosedError extends Error`, with the message `the store is closed`: what every call on a closed environment, or on a store of one, throws.
+
+```ts
+/** What a store of a closed environment answers every call with. */
+export class StoreClosedError extends Error {
+  constructor() {
+    super('the store is closed');
+    this.name = 'StoreClosedError';
+  }
+}
+```
 
 The store class is private to the file:
 
 ```ts
 class LmdbStore implements KvStore {
   private readonly db: Database<Buffer, Buffer>;
+  /** Throws once the environment is closed: work that outlived a stop fails here, in JavaScript, and not in the native library on memory that is gone. */
+  private readonly open: () => void;
 
-  constructor(db: Database<Buffer, Buffer>) {
+  constructor(db: Database<Buffer, Buffer>, open: () => void) {
     this.db = db;
+    this.open = open;
   }
 ```
 
-Its three methods are each one call into lmdb-js:
+`open` is a function the environment hands each of its stores, its own `assertOpen` (below). It returns while the environment is open and throws `StoreClosedError` once its close has been called. Each of the three methods calls it first. `get` is then one call into lmdb-js; `range` and `write` call it again as they go:
 
 ```ts
   get(key: Uint8Array): Uint8Array | undefined {
+    this.open();
     const v = this.db.get(buf(key));
     return v === undefined ? undefined : new Uint8Array(v);
   }
 
   *range(start: Uint8Array, end: Uint8Array): IterableIterator<[Uint8Array, Uint8Array]> {
-    for (const { key, value } of this.db.getRange({ start: buf(start), end: buf(end) })) yield [new Uint8Array(key), new Uint8Array(value)];
+    this.open();
+    const it = this.db.getRange({ start: buf(start), end: buf(end) })[Symbol.iterator]();
+    try {
+      for (;;) {
+        // Before every step, not only the first: a caller that keeps an iteration across a wait must not move a
+        // cursor of an environment closed meanwhile.
+        this.open();
+        const step = it.next();
+        if (step.done) return;
+        yield [new Uint8Array(step.value.key), new Uint8Array(step.value.value)];
+      }
+    } finally {
+      // Left early: the cursor is given back, unless the environment went first and took it along.
+      try {
+        this.open();
+        it.return?.();
+      } catch {
+        // Closed: nothing of the cursor is left to release.
+      }
+    }
   }
 
   write(fn: (w: KvWriter) => void): void {
-    this.db.transactionSync(() => {
-      fn({
-        put: (k, v) => void this.db.put(buf(k), buf(v)),
-        del: (k) => void this.db.remove(buf(k)),
+    this.open();
+    // The writer is good for the callback and no longer: kept and used later, it would write outside a transaction.
+    let live = true;
+    const use = (): void => {
+      if (!live) throw new Error('a store writer was used after its write() returned');
+      this.open();
+    };
+    try {
+      this.db.transactionSync(() => {
+        fn({
+          put: (k, v) => {
+            use();
+            void this.db.put(buf(k), buf(v));
+          },
+          del: (k) => {
+            use();
+            void this.db.remove(buf(k));
+          },
+        });
       });
-    });
+    } finally {
+      live = false;
+    }
   }
 }
 ```
+
+The check is there for work that outlives a stop. A node that stops closes its environment ([chapter 8](08-node.md)), and a request to a peer, a signature verification or an RPC method that was waiting at that moment may resume afterwards and go on to read or write. lmdb-js keeps the environment in native memory that the close frees, so such a call would reach the native library after the environment is gone. With the check it fails "here, in JavaScript, and not in the native library on memory that is gone", as an ordinary error the caller's own handling catches.
+
+`range` is a generator, so nothing in it runs until the first `next()`. It takes the lmdb-js iterator and steps it by hand, not with `for ... of`, so that `open` can be called "before every step, not only the first": a caller may keep an iteration across a wait, and the environment may be closed during it. An iteration begun before a close and stepped after it throws `StoreClosedError` at that step, and no cursor of the closed environment is moved. The `finally` is for an iteration left early, by a `break` or a `return()`: it gives the cursor back through the iterator's `return`, unless `open` throws first. Then the environment "went first and took it along", and nothing of the cursor is left to release.
+
+`write` checks once before it opens the transaction and again in every `put` and `del`, through `use`. The writer handed to the callback is "good for the callback and no longer": `live` is set to false in a `finally`, whether `transactionSync` returned or threw, and a `put` or `del` on a writer that was kept and used afterwards throws `a store writer was used after its write() returned`. Without the flag such a call "would write outside a transaction".
 
 `buf` wraps a `Uint8Array` as a Node `Buffer` over the same memory without copying, for lmdb-js's binary encodings:
 
@@ -258,16 +315,22 @@ Results are copied into fresh `Uint8Array`s (`new Uint8Array(v)`), which is the 
   store(name: string): KvStore {
     // A read-only environment cannot create a database: asked for one that is not there, lmdb-js hands back
     // undefined, and the first read would fail far from here with nothing to say why.
+    this.assertOpen();
     const db = this.root.openDB<Buffer, Buffer>({ name, keyEncoding: 'binary', encoding: 'binary' }) as Database<Buffer, Buffer> | undefined;
     if (!db) throw new Error(`the store has no database named ${name}${this.readOnly ? ', and a read-only environment cannot create it' : ''}`);
-    return new LmdbStore(db);
+    return new LmdbStore(db, this.assertOpen);
   }
 ```
 
-Binary key encoding is what makes LMDB's order the bytewise order the keys were designed for; with a key encoding that transforms keys before comparison, the ranges would not line up with `prefixEnd`. `close` closes the root once and returns that one close to every caller:
+Binary key encoding is what makes LMDB's order the bytewise order the keys were designed for; with a key encoding that transforms keys before comparison, the ranges would not line up with `prefixEnd`. `store` calls `assertOpen` before it opens the database, so a closed environment gives out no new store, and passes the same function to the `LmdbStore` it returns. `close` closes the root once and returns that one close to every caller, and `assertOpen` reads the field `close` sets:
 
 ```ts
   private closing: Promise<void> | null = null;
+
+  /** From the moment close() is called, not from when it is done: nothing new is begun on an environment going away. */
+  private readonly assertOpen = (): void => {
+    if (this.closing) throw new StoreClosedError();
+  };
 
   /**
    * Closing twice is closing once: a node closes the store of a directory it claimed, and its owner may close it
@@ -280,12 +343,15 @@ Binary key encoding is what makes LMDB's order the bytewise order the keys were 
 
 The first call keeps the promise of the root's close in `closing`, and a later call is handed the same promise, so a second caller waits for the close instead of returning at once while the store is still open. `Node` calls it for an environment it created itself (`ownsEnv`) and for one it was handed for a data directory it holds the claim on ([chapter 8](08-node.md)).
 
+`assertOpen` throws `StoreClosedError` when `closing` is set, which is "from the moment close() is called, not from when it is done": the close of the root is asynchronous, and a call that arrived between its start and its end would begin work on an environment that is going away. It is an arrow function in a field and not a method, so it can be handed to a store as it is and still read the environment's `closing`. Every entry into lmdb-js from this file therefore passes it first: `get`, `range` and `write` of every store the environment gave out, and the environment's own `store` and `transaction`. `close` itself does not, so closing a closed environment stays harmless. `test/review5-node.test.ts`, `does not go on starting once it is being stopped, and answers a closed store with an error`, stops a node on a data directory and then calls `loadBlock(1n)` and `setLowestHeight(1n)` on its block store: the read throws a `StoreClosedError` and the write throws with the message `the store is closed`. `refuses every step of an iteration and every use of a writer once the disk environment is closed`, in the same file, opens an `LmdbEnv` in a temporary directory and writes keys 1 to 3 to its `chain` store, keeping the writer its callback was given. A `put` of key 9 on the kept writer throws `after its write() returned`, and key 9 is absent. An iteration over the store is then stepped once, which yields key 1, and the environment is closed: the next step of that iteration throws `StoreClosedError`, and so do a `get`, a new iteration, a `write` and the environment's `transaction`.
+
 `transaction` is a write transaction on the root database:
 
 ```ts
   transaction(fn: () => void): void {
     // A store's write() inside the callback runs as a child of this transaction, whatever database it is on; a throw
     // out of the callback aborts the lot, and nothing reaches the disk until the callback returns.
+    this.assertOpen();
     this.root.transactionSync(fn);
   }
 ```
@@ -547,7 +613,7 @@ The file is either the old content or the new content, never a mix: the data goe
 
 `test/review4.test.ts` has two cases on the transaction index. "keeps every block a transaction is in, answers with the one it succeeded in, and loses only the pruned one" saves one transaction in blocks 5 (failed), 8 (succeeded, at position 1) and 9 (failed): `txLocations` lists the three in height order, `txLocation` answers block 8, after `deleteBlock(8n)` the list is 5 and 9 and the answer block 9, and after the other two are deleted it is null. "moves an index of the old layout, one entry per hash, when the store is opened, and reads it before that" writes 12,000 entries under the hash alone and opens a `KvBlockStore` on them: no 33-byte key is left, the first and the last entry read back with their heights, positions and results, a transaction given an entry at height 5 by hand that lands again at height 9 has both and keeps the first when block 9 is deleted, a second store opened on the same data makes no range read, and a store whose `write` throws answers from an entry of the old layout.
 
-`test/review5-node.test.ts` has five cases on this chapter's code. "indexes a transaction repeated in one block where it succeeded": on a `MemoryBlockStore`, a block `[T, U, T]` with results failure, success, success is indexed at position 2 with `ok: true`; a block `[T, T]` with success then failure at position 0; one where both fail at the first of the two with its error; one saved with `null` results at position 0 with `ok: null`; and `txLocations` has one entry per block, which goes when the block is deleted. "applies the operations of one write to the memory store in the order they were made": a put followed by a delete of one key in a single `write` leaves the key absent, put, delete, put leaves the last value, and a callback that deletes and then throws leaves the store as it was. "prunes blocks and headers in one transaction each, the set by height going with its block": a one-validator node retaining two blocks runs on a `MemoryKv` that records the first byte of every key each `write` puts and deletes. Every write that deletes a block also puts the lowest-height marker, no write moves the marker alone, and each deletes as many `'V'` records as blocks; `loadValidatorsAt` is null below the lowest block and answers at it and two heights above the latest, and the genesis set is still found by hash, the chain's one validator never having changed. Two header records written below the lowest block with times older than the evidence age are then deleted, with their marker, in a single write after the next commit. The fourth, "removes a validator set by hash once no header held names it" ([chapter 5](05-mempool-executor.md)), exercises `deleteValidatorSet`: a set replaced by a `val:` transaction is gone from the store once every block that names it has been pruned, and each block still held finds both sets its header names. The fifth, "undoes the writes of a memory environment transaction that throws, in every store", puts a key in the `chain` store of a `MemoryEnv`, then in a transaction overwrites it, adds a second key, deletes the first, writes to an `app` store first asked for inside a nested transaction, and throws: the first key holds its old value, the second key and the `app` store's key are absent. A transaction that returns keeps its write, and a write made after it is not undone by a later transaction that throws. Last, an outer transaction puts the first key, runs an inner one that overwrites it, writes to a `late` store first asked for there and throws, catches the error and puts the second key: afterwards the first key holds the outer transaction's value, the second key its new one, and the `late` store has nothing.
+`test/review5-node.test.ts` has seven cases on this chapter's code; two, on a closed LMDB environment, are described under `src/store/lmdb.ts` above, and the other five are these. "indexes a transaction repeated in one block where it succeeded": on a `MemoryBlockStore`, a block `[T, U, T]` with results failure, success, success is indexed at position 2 with `ok: true`; a block `[T, T]` with success then failure at position 0; one where both fail at the first of the two with its error; one saved with `null` results at position 0 with `ok: null`; and `txLocations` has one entry per block, which goes when the block is deleted. "applies the operations of one write to the memory store in the order they were made": a put followed by a delete of one key in a single `write` leaves the key absent, put, delete, put leaves the last value, and a callback that deletes and then throws leaves the store as it was. "prunes blocks and headers in one transaction each, the set by height going with its block": a one-validator node retaining two blocks runs on a `MemoryKv` that records the first byte of every key each `write` puts and deletes. Every write that deletes a block also puts the lowest-height marker, no write moves the marker alone, and each deletes as many `'V'` records as blocks; `loadValidatorsAt` is null below the lowest block and answers at it and two heights above the latest, and the genesis set is still found by hash, the chain's one validator never having changed. Two header records written below the lowest block with times older than the evidence age are then deleted, with their marker, in a single write after the next commit. The fourth, "removes a validator set by hash once no header held names it" ([chapter 5](05-mempool-executor.md)), exercises `deleteValidatorSet`: a set replaced by a `val:` transaction is gone from the store once every block that names it has been pruned, and each block still held finds both sets its header names. The fifth, "undoes the writes of a memory environment transaction that throws, in every store", puts a key in the `chain` store of a `MemoryEnv`, then in a transaction overwrites it, adds a second key, deletes the first, writes to an `app` store first asked for inside a nested transaction, and throws: the first key holds its old value, the second key and the `app` store's key are absent. A transaction that returns keeps its write, and a write made after it is not undone by a later transaction that throws. Last, an outer transaction puts the first key, runs an inner one that overwrites it, writes to a `late` store first asked for there and throws, catches the error and puts the second key: afterwards the first key holds the outer transaction's value, the second key its new one, and the `late` store has nothing.
 
 `test/app.test.ts`, "restarts from the store with the same app hash and keeps producing the same hashes": the application on a `MemoryKv` is reopened from it, serves the same app hash and the same proofs, and after the window slides the history keys under prefix `0x68` are exactly versions 4 to 7, showing that commit deletes the record that left the window. `test/genesis.test.ts` reopens an application from a `MemoryKv` and checks the app hash matches an inline genesis.
 

@@ -409,6 +409,9 @@ export class Consensus {
       return;
     }
 
+    // Stopped while the signature was verified: the checks below read stored blocks, and the store may be closed.
+    if (!this.running) return;
+
     // The signature covers the header; a relay can pair it with another body. That is a corrupt message, not
     // the round's proposal: drop it without recording the round, so the real one can still arrive.
     if (!bodyMatchesHeader(p.block)) {

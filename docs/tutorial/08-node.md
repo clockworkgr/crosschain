@@ -495,17 +495,34 @@ The same executor and `limits`; `blockTimeAt` is the executor's, so a synced blo
 ```ts
     // A block fetched for the height consensus is on: it stands in for the proposal.
     this.network.on('blockResponse', (_peer, m) => {
-      if (m.block && m.height === this.consensus.height) void this.consensus.handleFetchedBlock(m.block);
+      if (m.block && m.height === this.consensus.height) this.detached(this.consensus.handleFetchedBlock(m.block), 'fetched block');
     });
 ```
 
 The `Requester` also subscribes to `blockResponse` for backfill; the two handlers filter by height on one side and by pending request on the other, so they never claim the same response.
 
+`handleFetchedBlock` returns a promise, and the handler does not wait for it: the next message from the network is not held up by the work one message began. The promise is handed to `detached`, as is that of each of the four other handlers below that begin work for a peer's message:
+
+```ts
+  /**
+   * Work begun for a message from a peer and not waited for. Whatever it ends with is taken here: one that was
+   * waiting on a verification when the node stopped resumes to a closed store or a closed verifier pool, and that
+   * is the end of it, not an error nobody handles. While the node runs a failure is worth a line in the log.
+   */
+  private detached(work: Promise<unknown>, what: string): void {
+    work.catch((e) => {
+      this.log(this.stopping ? 'debug' : 'warn', `handling a ${what} failed`, { err: e instanceof Error ? e.message : String(e) });
+    });
+  }
+```
+
+`work.catch` takes whatever the work ends with, so a failure is never "an error nobody handles", a rejected promise with no handler, which Node treats as an error of the whole process. The line logged is `handling a <what> failed` with the error's message, `what` being `fetched block`, `proposal`, `vote`, `transaction` or `evidence`. Its level depends on `stopping`, which is set from the moment `stop()` is called: `warn` while the node runs, where a handler that failed is worth a line, and `debug` once the node is stopping, where it is expected. Work that was waiting on a signature verification when the node stopped resumes to a closed store, which throws `StoreClosedError`, or to a closed verifier pool, which rejects with `verifier closed`, "and that is the end of it" (see `stop()` below).
+
 Consensus messages are pushed through unchanged, and a new peer is caught up:
 
 ```ts
-    this.network.on('proposal', (peer, m) => void this.consensus.handleProposal(m.proposal, peer.id));
-    this.network.on('vote', (peer, m) => void this.consensus.handleVote(m.vote, peer.id));
+    this.network.on('proposal', (peer, m) => this.detached(this.consensus.handleProposal(m.proposal, peer.id), 'proposal'));
+    this.network.on('vote', (peer, m) => this.detached(this.consensus.handleVote(m.vote, peer.id), 'vote'));
     // A peer that just connected missed everything flooded before; catch it up on the current height.
     this.network.onPeer((peer) => {
       const { proposals, votes } = this.consensus.messagesForPeer();
@@ -636,13 +653,13 @@ Hashes are deduplicated and capped at 256 per fetch; a peer whose fetch needed t
       // An item nobody asked this peer for is dropped unread: a peer cannot push transactions or evidence past the
       // announce-and-fetch round, which is what bounds how much of either it can make this node check.
       if (!answered(peer.id, m.kind, m.kind === InvKind.Tx ? txHash(m.data) : sha256(m.data), true)) return;
-      if (m.kind === InvKind.Tx) void this.mempool.addTx(m.data, peer.id);
-      else if (m.kind === InvKind.Evidence) void this.acceptEvidence(peer.id, m.data);
+      if (m.kind === InvKind.Tx) this.detached(this.mempool.addTx(m.data, peer.id), 'transaction');
+      else if (m.kind === InvKind.Evidence) this.detached(this.acceptEvidence(peer.id, m.data), 'evidence');
     });
     this.network.on('itemNotFound', (peer, m) => void answered(peer.id, m.kind, m.hash, false));
 ```
 
-An `item` is taken only if its hash was fetched from that peer with that kind, within the minute the entry lives. Then the fetch is settled and the data goes to the mempool (`addTx` with the peer id as source) or to `acceptEvidence`. Any other item, one nobody asked for, one asked only of other peers, one of the other kind, or one whose entry is more than a minute past its first fetch, is dropped without being decoded or checked, and the peer is not charged: the hash is all the node computes for it. Without that rule a peer could send items without announcing them and have every one checked against the application or the validator set; with it a peer can make the node check only what the node asked it for. An `itemNotFound` counts only when it comes from a peer that was asked, and takes only that peer out of the fetch, so a peer cannot clear another peer's outstanding fetch and have the hash fetched again from itself.
+An `item` is taken only if its hash was fetched from that peer with that kind, within the minute the entry lives. Then the fetch is settled and the data goes to the mempool (`addTx` with the peer id as source) or to `acceptEvidence`, either of them through `detached`. Any other item, one nobody asked for, one asked only of other peers, one of the other kind, or one whose entry is more than a minute past its first fetch, is dropped without being decoded or checked, and the peer is not charged: the hash is all the node computes for it. Without that rule a peer could send items without announcing them and have every one checked against the application or the validator set; with it a peer can make the node check only what the node asked it for. An `itemNotFound` counts only when it comes from a peer that was asked, and takes only that peer out of the fetch, so a peer cannot clear another peer's outstanding fetch and have the hash fetched again from itself.
 
 **12. After every commit.**
 
@@ -934,14 +951,53 @@ Shedding itself is the last method:
 
 #### `start`, `stop` and the accessors
 
-`start()` starts the network (unless state sync already did), then block sync, then consensus; then it awaits one major collection from the scheduler (`gcScheduler.major()`, which does nothing without `--expose-gc`), because opening a store leaves garbage several times what it keeps and the guard's first sample would otherwise take it for a full heap; then the memory guard's sampling timer (unreferenced, so it never keeps the process alive on its own) and the scheduler's collection observer, and logs the height, the validator address if any, and the node id. The order matters: block sync must be listening for `status` before consensus starts, and consensus must start after the executor has replayed. `stop()` is one line over a private `shutDown()`, quoted with it:
+`start()` is one line over a private `startUp()`, as `stop()` is over `shutDown()`:
+
+```ts
+  private starting: Promise<void> | null = null;
+
+  /** A start that a stop overtakes goes no further, and the stop waits for it before it closes anything. */
+  start(): Promise<void> {
+    return (this.starting ??= this.startUp());
+  }
+
+  private async startUp(): Promise<void> {
+    if (this.started || this.stopping) return;
+    this.started = true;
+    if (!this.networkStarted) {
+      // Marked before the wait, so a stop that comes during it stops the network this is starting.
+      this.networkStarted = true;
+      await this.network.start();
+    }
+    if (this.stopping) return;
+    this.blockSync.start();
+    this.consensus.start();
+    // Opening a store leaves garbage several times what it keeps (every stored entry read and checked), and the
+    // guard's first sample would take it for a full heap and stop a node that fits: collect it first.
+    await this.gcScheduler.major();
+    if (this.stopping) return;
+    this.memoryGuard.start();
+    // The guard's first sample may have found the heap critical and its listener begun a stop.
+    if (this.stopping) return;
+    this.gcScheduler.start();
+    this.log('info', 'node started', {
+      height: this.executor.state.lastHeight,
+      validator: this.privValidator ? this.privValidator.address : null,
+      nodeId: this.network.id.slice(0, 8),
+    });
+  }
+```
+
+`startUp()` starts the network (unless state sync already did), then block sync, then consensus; then it awaits one major collection from the scheduler (`gcScheduler.major()`, which does nothing without `--expose-gc`), because opening a store leaves garbage several times what it keeps and the guard's first sample would otherwise take it for a full heap; then the memory guard's sampling timer (unreferenced, so it never keeps the process alive on its own) and the scheduler's collection observer, and logs the height, the validator address if any, and the node id. The order matters: block sync must be listening for `status` before consensus starts, and consensus must start after the executor has replayed.
+
+The first call keeps the promise of `startUp()` in `starting` and every later call is handed the same one, so a node is started once however often `start()` is called, and a stop can wait for a start that has not finished. That matters because a start has waits in it, and a stop may come during any of them: the command line stops a node on a signal, and the memory guard's listener stops one that is `critical` at its first sample, which is taken inside `start()`. A start that went on after such a stop would start consensus and block sync on a node whose store is being closed. So `startUp()` does nothing if a stop has already begun, and after each of its waits it reads `stopping` and "goes no further": after the network's start, before block sync and consensus are started; after the collection, before the guard is started; and after the guard's start, whose first sample "may have found the heap critical and its listener begun a stop", before the scheduler is started and the line `node started` is logged. `networkStarted` is set before the network's start is awaited and not after it, "so a stop that comes during it stops the network this is starting": `shutDown()` stops the network only when the flag is set. `stop()` is one line over a private `shutDown()`, quoted with it:
 
 ```ts
   private stopping: Promise<void> | null = null;
 
   /**
    * Stopping twice is stopping once: a second caller waits for the first, and the claim is released when that one
-   * is done. `beforeClose` is waited for once the node has stopped working and before its store is closed: whoever
+   * is done. `beforeClose` is waited for once the node has stopped what it runs and before its store is closed: whoever
    * still reads the store, an RPC server finishing its requests for one, is given until then. Only the first
    * caller's is used.
    */
@@ -962,6 +1018,8 @@ Shedding itself is the last method:
       }
     };
     try {
+      // A start still on its way ends first: it sees the stop after each of its waits and goes no further.
+      await step(() => this.starting);
       await step(async () => {
         if (this.started) {
           this.started = false;
@@ -993,7 +1051,7 @@ Shedding itself is the last method:
   }
 ```
 
-The first call starts the shutdown and keeps its promise in `stopping`; every later call is handed the same promise, and a `beforeClose` it brings is not used. Two callers stopping at once therefore wait for the one shutdown, and neither returns before the store is closed and the claim released. `shutDown()`, if `start()` ran, stops the guard and the scheduler, then consensus and block sync; then, if the network is up, stops it, which covers a node whose `init` started the network for a state-sync join and that was never started; then awaits `executor.idle()`, the tail of the executor's apply chain, so a block in the middle of its store batch or `app.commit` finishes its writes before the stores go away (`this.executor?.idle()`: a node whose `init` failed before the executor was opened has none); then awaits `beforeClose`, if the first caller passed one. The node has stopped working by then and its store is still open, so whoever still reads the store has until that promise settles: the command line passes the RPC server's stop, and a request still being served is answered from an open store ([chapter 14](14-wallet-cli.md)). `shutDown()` then closes the environment, if the node opened it or holds the claim on a data directory (`this.ownsEnv || this.releaseLock ? this.env.close() : undefined`), and after that the verifier pool if the node made it. Each of the five (stopping consensus, block sync and the network; the wait for the executor; `beforeClose`; the close of the store; the close of the verifier pool) is run through the local `step`, which awaits it inside a `try` of its own: "every step is tried whatever the ones before it did, and the first failure is the one the caller is given". A network that fails to stop therefore does not leave the store open, a `beforeClose` that rejects does not either, and a store that fails to close does not leave the node's verifier threads running. `step` keeps the first failure in `failure` and notes in the flag `failed` that there was one; later failures are dropped. The flag is separate from the value because a promise may reject with anything, `undefined` included, and a test of the value alone would take such a rejection for none. The five steps are inside a `try`, and the data directory lock is released last, in its `finally`: "until the store is closed and the writes are done, another node on the directory would be writing beside this one". Only then, if a step failed, is its failure thrown, so `stop()` rejects with the first failure, whatever value it is, and by the time the caller sees it everything that could be closed is closed and the claim is gone. That is why a store the caller handed in is closed here too when the node claimed a directory for it, as a test or a program that embeds a node may hand one (the command line's `start` leaves the store to the node): "the claim says nobody else writes there, so it cannot be given up while that store is open". Were it left to the caller, the claim would go first and a second node could open the directory while the first one's store was still open. `LmdbEnv.close()` closes once and hands every caller the promise of that one close ([chapter 10](10-store.md)), so the caller closing its store after `stop()` returns is harmless, and one closing it while the node is still closing it waits until it is shut. An environment handed to a node without a data directory, as the tests hand a `MemoryEnv`, stays the caller's. `test/review5-node.test.ts`, `closes a store it was handed for a directory it claimed before giving the claim up`, opens an `LmdbEnv` in a temporary directory, hands it to a node with that `dataDir`, and wraps the environment's `close` to note whether `LOCK` exists when it is first called. It stops the node twice at once (`await Promise.all([node.stop(), node.stop()])`): the file was there at the first close, it is gone once both calls have returned, and closing the environment again afterwards does not throw. `waits for whoever still reads the store before closing it, and releases the claim after`, in the same file, stops a started node with a `beforeClose` that sleeps 50 ms, loads block 1 from the node's store and notes whether `LOCK` exists: the block is read and the file is there, and the file is gone once `stop` has returned. A second node on the directory is then stopped with a `beforeClose` that rejects: `stop` rejects with that error and `LOCK` is gone all the same. A third is stopped with one that rejects with `undefined`: `stop` still rejects, with `undefined`, and `LOCK` is gone; and a fourth node opens on the directory. The wait for the executor matters for a node stopped while syncing: block sync hands the executor one block after another, and closing LMDB under a half-written one would leave the chain store and the application store at different heights, which `open` would then have to repair by replay on the next start. A verifier passed in the config is closed by neither `start` nor `stop`: the caller owns it because it is shared.
+The first call starts the shutdown and keeps its promise in `stopping`; every later call is handed the same promise, and a `beforeClose` it brings is not used. Two callers stopping at once therefore wait for the one shutdown, and neither returns before the store is closed and the claim released. `shutDown()` first waits for `starting`, the promise of a start still on its way (null, and no wait, on a node never started): "it sees the stop after each of its waits and goes no further", so by the time the wait is over the start has ended and whatever it had begun is there to be stopped. Then, if `start()` ran, it stops the guard and the scheduler, then consensus and block sync; then, if the network is up, stops it, which covers a node whose `init` started the network for a state-sync join and that was never started; then awaits `executor.idle()`, the tail of the executor's apply chain, so a block in the middle of its store batch or `app.commit` finishes its writes before the stores go away (`this.executor?.idle()`: a node whose `init` failed before the executor was opened has none); then awaits `beforeClose`, if the first caller passed one. The node has by then stopped what it runs, and its store is still open, so whoever still reads the store has until that promise settles: the command line passes the RPC server's stop, and a request still being served is answered from an open store ([chapter 14](14-wallet-cli.md)). Stopping consensus and block sync clears their `running` flags and their timers; it does not end work of theirs that is suspended at that moment on a signature verification or on a request to a peer, and the wait for the executor covers only a block being applied. The RPC server's stop likewise waits one second at most for its methods ([chapter 12](12-rpc.md)). Any of these may resume after the store is closed, and each then ends in one of two ways. Where the wait is known, the code checks `running` when it resumes and returns: a proposal whose signature was being verified ([chapter 4](04-consensus.md)), a backfill step whose block request, validator set request or commit verification was out, and a drain that was verifying a block ([chapter 7](07-sync.md)). Anything else that reaches the store finds it closed: from the moment the environment's `close()` is called every read and write on it throws `StoreClosedError`, `the store is closed` ([chapter 10](10-store.md)), which the caller's own error handling catches. An RPC method that outlived the server's wait gets it, and its handler turns it into an error answer on a connection already cut. Work a gossip handler began for a peer's proposal, vote, fetched block, transaction or evidence gets it too, or a rejection from the closed verifier pool, and it ends in `detached` (step 11 of `init` above), which logs `handling a ... failed` at `debug` because the node is stopping. No call is begun on LMDB after the close. `shutDown()` then closes the environment, if the node opened it or holds the claim on a data directory (`this.ownsEnv || this.releaseLock ? this.env.close() : undefined`), and after that the verifier pool if the node made it. Each of the six (the wait for a start; stopping consensus, block sync and the network; the wait for the executor; `beforeClose`; the close of the store; the close of the verifier pool) is run through the local `step`, which awaits it inside a `try` of its own: "every step is tried whatever the ones before it did, and the first failure is the one the caller is given". A network that fails to stop therefore does not leave the store open, a `beforeClose` that rejects does not either, and a store that fails to close does not leave the node's verifier threads running. `step` keeps the first failure in `failure` and notes in the flag `failed` that there was one; later failures are dropped. The flag is separate from the value because a promise may reject with anything, `undefined` included, and a test of the value alone would take such a rejection for none. The six steps are inside a `try`, and the data directory lock is released last, in its `finally`: "until the store is closed and the writes are done, another node on the directory would be writing beside this one". Only then, if a step failed, is its failure thrown, so `stop()` rejects with the first failure, whatever value it is, and by the time the caller sees it everything that could be closed is closed and the claim is gone. That is why a store the caller handed in is closed here too when the node claimed a directory for it, as a test or a program that embeds a node may hand one (the command line's `start` leaves the store to the node): "the claim says nobody else writes there, so it cannot be given up while that store is open". Were it left to the caller, the claim would go first and a second node could open the directory while the first one's store was still open. `LmdbEnv.close()` closes once and hands every caller the promise of that one close ([chapter 10](10-store.md)), so the caller closing its store after `stop()` returns is harmless, and one closing it while the node is still closing it waits until it is shut. An environment handed to a node without a data directory, as the tests hand a `MemoryEnv`, stays the caller's. `test/review5-node.test.ts`, `closes a store it was handed for a directory it claimed before giving the claim up`, opens an `LmdbEnv` in a temporary directory, hands it to a node with that `dataDir`, and wraps the environment's `close` to note whether `LOCK` exists when it is first called. It stops the node twice at once (`await Promise.all([node.stop(), node.stop()])`): the file was there at the first close, it is gone once both calls have returned, and closing the environment again afterwards does not throw. `waits for whoever still reads the store before closing it, and releases the claim after`, in the same file, stops a started node with a `beforeClose` that sleeps 50 ms, loads block 1 from the node's store and notes whether `LOCK` exists: the block is read and the file is there, and the file is gone once `stop` has returned. A second node on the directory is then stopped with a `beforeClose` that rejects: `stop` rejects with that error and `LOCK` is gone all the same. A third is stopped with one that rejects with `undefined`: `stop` still rejects, with `undefined`, and `LOCK` is gone; and a fourth node opens on the directory. `does not go on starting once it is being stopped, and answers a closed store with an error` makes a node on a data directory without starting it, calls `start()` and then `stop()` without waiting for the first, and waits for both: consensus and block sync are not running, the guard has no timer, `LOCK` is gone, and `loadBlock` and `setLowestHeight` on the node's block store throw `StoreClosedError`. The wait for the executor matters for a node stopped while syncing: block sync hands the executor one block after another, and closing LMDB under a half-written one would leave the chain store and the application store at different heights, which `open` would then have to repair by replay on the next start. A verifier passed in the config is closed by neither `start` nor `stop`: the caller owns it because it is shared.
 
 `height` is the executor's `lastHeight`; `genesis` returns the config's document; `submitTx(tx)` is `mempool.addTx(tx, null)`, "as an RPC endpoint would".
 
@@ -1080,7 +1138,31 @@ The figure that matters is the old generation's, because that is where the state
 
 The use has the same problem from the other side. `used_heap_size` counts every space of the heap, the young generation's among them, and between two minor collections the young generation holds up to a semi-space of garbage, 64 MiB as `start` runs the node (`--max-semi-space-size=64`), that will be collected where it lies and never reach the old generation. Set against an old-generation limit that garbage reads as a full heap on a node with a small one: a benchmark node under a 153 MiB limit logged `critical` at "162/153 MiB", and the next sample, after a collection, read 42 MiB. So under `--max-old-space-size` the sample also carries `heapOld`, the bytes in use in every space `v8.getHeapSpaceStatistics()` lists except `new_space` and `new_large_object_space` (`oldGenerationUsed`), and **`heapInUse(stats)`** is the one place that chooses: `heapOld` when the sample has it, `heapUsed` when it does not, which is a process without the flag or a test's invented sample. The guard's levels and log fields, the scheduler's growth test, the node's `recentHeap` and `heapRoom` (above) and the CLI's status line ([chapter 14](14-wallet-cli.md)) all go through it. `heapUsed` itself is unchanged and still reported: `status` spreads the whole sample ([chapter 12](12-rpc.md)), so under a heap limit it shows both. **`MemoryLevel`** is `'ok' | 'warn' | 'pressure' | 'critical'`.
 
-**`MemoryGuard`** takes `MemoryGuardOptions`: `intervalMs` (1000), the three thresholds as fractions of the limit (`warnAt` 0.7, `pressureAt` 0.85, `criticalAt` 0.95), `hysteresis` (0.05), a `stats` source (`memoryStats` unless a test injects a function), the logger, an `onLevel` callback for every change of level and an `onSample` callback for every sample, with the level it left the guard at. The constructor refuses thresholds that do not rise or exceed 1 and takes a first sample; `start()` takes another at once and then one per interval on an unreferenced timer; `level` and `stats` read the current level and the last sample. `check()` is the whole mechanism:
+**`MemoryGuard`** takes `MemoryGuardOptions`: `intervalMs` (1000), the three thresholds as fractions of the limit (`warnAt` 0.7, `pressureAt` 0.85, `criticalAt` 0.95), `hysteresis` (0.05), a `stats` source (`memoryStats` unless a test injects a function), the logger, an `onLevel` callback for every change of level and an `onSample` callback for every sample, with the level it left the guard at. The constructor refuses thresholds that do not rise or exceed 1 and takes a first sample; `start()` takes another at once and then one per interval on an unreferenced timer; `level` and `stats` read the current level and the last sample.
+
+```ts
+  private running = false;
+
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    this.check();
+    // A listener told of the first sample may have stopped the guard: it then stays stopped.
+    if (!this.running) return;
+    this.timer = setInterval(() => this.check(), this.o.intervalMs);
+    this.timer.unref?.();
+  }
+
+  stop(): void {
+    this.running = false;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+```
+
+Whether the guard is started is a flag of its own, `running`, and not the presence of the timer, because the first sample is taken before there is a timer and a listener may act on it. A guard that finds the heap `critical` at that sample tells `onLevel`, and a listener that stops the guard there would, with the timer as the only record, have stopped nothing: `stop()` would find no timer to clear, and `start()` would go on to set one on a guard its owner believes stopped. With the flag, `stop()` clears `running` whether or not a timer exists, and `start()` reads it after the sample: "a listener told of the first sample may have stopped the guard: it then stays stopped". The test `does not go on starting once it is being stopped, and answers a closed store with an error` ends with such a guard: its injected sample is 99% of the limit, its `onLevel` calls `stop()`, and after `start()` its timer is null.
+
+`check()` is the whole mechanism:
 
 ```ts
   /** Take a sample and move the level; returns the level afterwards. */
@@ -1270,7 +1352,7 @@ The cases that exercise the node's own wiring:
 - `test/review.test.ts`, `resumes after a restart that left a signature at the current height, by skipping that round`: a one-validator node on a temporary data directory is stopped, its `priv_validator_state.bin` is overwritten to claim a signed proposal at the next height, and a new `Node` on the same directory must make progress in a later round, proving the on-disk pieces (LMDB chain store, application store, signing guard) are reopened consistently.
 - `test/review.test.ts`, `survives an aborted request body on the RPC`: an `RpcServer` on a node stays up after a client disconnects mid-body.
 - `test/review.test.ts`, `refuses a second node on a data directory that is in use`: described under the constructor; the lock is released by `stop()` and the directory can be reopened.
-- `test/review5-node.test.ts`, seven cases on the data directory. `is one directory however its path is spelled or linked to`: with a node holding `data`, a second `makeNode` on `data/.` and one on a symbolic link to it both reject with `in use by this process`, the `LOCK` file still holds this process's PID, and it is gone after `stop()`. `takes over the claim of a process that is gone and refuses that of one that runs`: a `LOCK` holding the PID of a child process that has exited is taken over, and one holding the parent's PID is refused with that PID named and left as it was. `takes a stale claim over only while holding the takeover file`: with a stale `LOCK` and a `LOCK.takeover` already in the directory, `makeNode` rejects with `LOCK.takeover may have been left by a process that stopped` and the stale `LOCK` is as it was; with `LOCK.takeover` removed the node is made, `LOCK` holds this process's PID and no `LOCK.takeover` is left. `stays claimed until the network is down, and is released after`: a transport whose `close` records whether the `LOCK` file exists sees it there, and it is gone once `stop()` returns. `closes a store it was handed for a directory it claimed before giving the claim up` and `waits for whoever still reads the store before closing it, and releases the claim after`: described under `stop()` above. `is given back, with the store, by a node that fails to open`: an application whose `initChain` throws makes `makeNode` reject with its error, no `LOCK` is left, and the same process opens a node on the directory afterwards.
+- `test/review5-node.test.ts`, eight cases on the data directory. `is one directory however its path is spelled or linked to`: with a node holding `data`, a second `makeNode` on `data/.` and one on a symbolic link to it both reject with `in use by this process`, the `LOCK` file still holds this process's PID, and it is gone after `stop()`. `takes over the claim of a process that is gone and refuses that of one that runs`: a `LOCK` holding the PID of a child process that has exited is taken over, and one holding the parent's PID is refused with that PID named and left as it was. `takes a stale claim over only while holding the takeover file`: with a stale `LOCK` and a `LOCK.takeover` already in the directory, `makeNode` rejects with `LOCK.takeover may have been left by a process that stopped` and the stale `LOCK` is as it was; with `LOCK.takeover` removed the node is made, `LOCK` holds this process's PID and no `LOCK.takeover` is left. `stays claimed until the network is down, and is released after`: a transport whose `close` records whether the `LOCK` file exists sees it there, and it is gone once `stop()` returns. `closes a store it was handed for a directory it claimed before giving the claim up` and `waits for whoever still reads the store before closing it, and releases the claim after`: described under `stop()` above. `does not go on starting once it is being stopped, and answers a closed store with an error`: a node made on a temporary directory and not started (`skipStart`) has `start()` and `stop()` called one after the other and both awaited together. Consensus and block sync are then not running and the guard's timer is null, so the start went no further than the stop let it; `LOCK` is gone; `node.store.loadBlock(1n)` throws a `StoreClosedError` and `node.store.setLowestHeight(1n)` throws `the store is closed`, a read and a write that outlived the stop. Last, a `MemoryGuard` given a sample of 99 in 100 and an `onLevel` that stops it is started, and its timer is null afterwards (under `MemoryGuard` below). `is given back, with the store, by a node that fails to open`: an application whose `initChain` throws makes `makeNode` reject with its error, no `LOCK` is left, and the same process opens a node on the directory afterwards.
 - `test/review5-node.test.ts`, `reads the evidence age from the application when asked, not at the commit before`: on a core application with an unbonding period of 2,000 ms, the executor's `evidenceAgeMs` returns that period, and three times it as soon as the application's `stakingParameters` report the longer one, with no commit in between.
 - `test/review5-node.test.ts`, `does not pool gossiped evidence that is already too old for a block`: with an evidence age of 1,500 ms and consensus stopped so that no commit prunes the pool, `acceptEvidence` leaves the pool empty for a double sign at height 1 once that height is older than the limit and for one two heights above the node's, and pools one at the node's own height.
 - `test/review5-node.test.ts`, `takes an item only from the peer it asked for it`: a transaction one node broadcasts as an `item` without announcing it is neither seen by the other's mempool nor committed three heights later, while one submitted and announced the usual way reaches the other node and a block.

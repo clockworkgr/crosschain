@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-nine files, 278 cases, about 8,940 lines counting the shared harness
+`test/**/*.test.ts`: twenty-nine files, 280 cases, about 8,990 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (277 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (279 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -27,7 +27,7 @@ the external review and the later cases of the same kind, `review2` five more th
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
 by title at the end of the suites, `review4` the nine cases for the items the first review
-noted and left, and the four `review5` files 65 cases for failures and unusual callers at the
+noted and left, and the four `review5` files 67 cases for failures and unusual callers at the
 edges of every layer: `review5-net` the peer layer, sync, consensus intake and the mempool,
 `review5-node` the node, the executor and the block store, `review5-app` the application, the
 object database and the codec, and `review5-rpc` the RPC server, the keystore, the command
@@ -2612,13 +2612,13 @@ the pool holds two.
 
 ### test/review5-node.test.ts
 
-Twenty-three tests for the node, the executor and the block store. Two helpers serve several
+Twenty-five tests for the node, the executor and the block store. Two helpers serve several
 groups: `blockAfter(state, lastCommit, evidence)` builds the block that would follow a chain
 state as far as its structure goes, with a commit of no signatures, and
 `doubleSign(net, node, height, round)` signs two prevotes of validator 0 for different hashes
 and makes evidence of them.
 
-`the data directory`, seven cases on a one-validator testnet whose node is not started
+`the data directory`, eight cases on a one-validator testnet whose node is not started
 (`skipStart: [0]`), with a temporary directory removed in `afterEach`.
 
 **`it('is one directory however its path is spelled or linked to')`**. A node is made on
@@ -2664,6 +2664,23 @@ store open nor the directory claimed. A third node is stopped with a function th
 with `undefined`: `stop` rejects with `undefined` (`rejects.toBeUndefined()`) and `LOCK` is
 gone, so the failure reaches the caller whatever value it is, nothing included. A fourth node
 is then made on the directory and stopped.
+
+**`it('does not go on starting once it is being stopped, and answers a closed store with an error')`**.
+A node made with `dataDir: tmp` has `start()` called and then, without waiting for it,
+`stop()`, and the test waits for both promises together: a stop that overtakes a start. The
+start ends where it is and the stop waits for it before it closes anything, so afterwards
+the `running` flag of the node's consensus and of its block sync is false, the memory
+guard's timer is null and there is no `LOCK`. Had the start gone on, consensus and block sync
+would have been started after the stop had passed them, on a store about to be closed. The
+test then does what work that outlived the stop would do: `node.store.loadBlock(1n)` throws
+a `StoreClosedError` and `node.store.setLowestHeight(1n)` throws `/the store is closed/`, a
+read and a write refused by the closed environment before they reach LMDB
+([chapter 10](10-store.md)). The last part is on the guard alone. A `MemoryGuard` is given a
+`stats` function whose sample has 99 of a heap limit of 100 in use, with no old-space
+figure so that the heap figure is the one read, and an `onLevel` that calls the guard's own
+`stop()`. `start()` takes the first sample, which is `critical` and calls the listener; the
+guard's timer is null afterwards, so a guard stopped from inside its first sample stays
+stopped ([chapter 8](08-node.md)).
 
 **`it('is given back, with the store, by a node that fails to open')`**. A `KvStoreApp` whose
 `initChain` throws makes `makeNode` reject with `/no genesis for you/`. No `LOCK` is left, and
@@ -2717,7 +2734,7 @@ is pruned. Every block from the lowest held to the one before the latest has a
 `validatorsHash` other than the first set's, and both sets its header names are found by
 hash; the set in use is found too.
 
-`the stores`, four cases.
+`the stores`, five cases.
 
 **`it('indexes a transaction repeated in one block where it succeeded')`**. On a
 `MemoryBlockStore`: block 3 holds a transaction at positions 0 and 2, failed at 0 and
@@ -2730,6 +2747,18 @@ it twice, succeeded then failed as a duplicate: index 0, `ok: true`. Block 5 hol
 On a `MemoryKv`, a write that puts a key and then deletes it leaves no value; one that puts,
 deletes and puts again leaves the last value; and a write that deletes and then throws leaves
 the value as it was.
+
+**`it('refuses every step of an iteration and every use of a writer once the disk environment is closed')`**.
+The one case of the group on LMDB: an `LmdbEnv` opened in a temporary directory, which the test
+removes in a `finally`. A `write` on its `chain` store puts keys 1, 2 and 3 and keeps the
+writer its callback was given in a variable. Once the `write` has returned, a `put` of key 9 on
+the kept writer throws `/after its write\(\) returned/` and `get` of key 9 is undefined: "a
+writer kept past its write() is of no use". The test then begins an iteration over the whole
+store with `range` and steps it once, which yields key 1, and awaits `env.close()`. The next
+`next()` on that iteration throws a `StoreClosedError`: the store checks before every step, not
+only the first, so an iteration begun before the close stops at the step after it. A `get`, a
+new `range` spread into an array, a `write` with an empty callback and the environment's
+`transaction` each throw `StoreClosedError` too ([chapter 10](10-store.md)).
 
 **`it('undoes the writes of a memory environment transaction that throws, in every store')`**.
 A `MemoryEnv` whose `chain` store holds key 1 with value 1. Inside one `transaction` the store
@@ -2972,7 +3001,12 @@ on the mempool. The client calls `status`, and 50 ms later the server is stopped
 `stop(0)`, which cuts the connection at once. When `stop` has returned the flag is set: the
 method ran to its end before the server counted as stopped, so whoever closes the node's
 stores next does not close them under it. The client's call was rejected, its connection
-having been cut, and the test reads that as `null`.
+having been cut, and the test reads that as `null`. The method's 300 ms are well within the
+second `stop` waits. A method that took longer than the second would still be running when
+`stop` returned, which this case does not exercise; what such a method meets when it then
+reads the store of a stopped node is the `StoreClosedError` that
+`does not go on starting once it is being stopped, and answers a closed store with an error`
+in `test/review5-node.test.ts` checks.
 
 **`it('replays a block event as it was pushed, failed count and all, and says when it holds no results to count')`**.
 A stream of `block` events is read for three records while a transfer is broadcast in commit

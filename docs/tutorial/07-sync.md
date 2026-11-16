@@ -84,7 +84,7 @@ The constructor subscribes:
 
 A new peer's height comes from its hello (`peer.height` at `onPeer`); later heights come from `status` messages, which every node broadcasts after each commit. Serving is registered here too, so a node serves blocks whether or not it is itself caught up.
 
-Public methods: `start()` sets `running` and runs `check()`; `stop()` clears the flag, the grace timer and the backfill retry timer, and does not wait for a `drain` that is under way, which applies nothing more once it sees the flag cleared; `isSyncing` is true while anything is buffered or requested; `bestPeerHeight()` is the maximum over `peerHeights`.
+Public methods: `start()` sets `running` and runs `check()`; `stop()` clears the flag, the grace timer and the backfill retry timer, and does not wait for a `drain` or a `backfill` step that is under way: a drain applies nothing more once it sees the flag cleared, and a backfill step returns after whichever wait it was in (below); `isSyncing` is true while anything is buffered or requested; `bestPeerHeight()` is the maximum over `peerHeights`.
 
 #### The decision: `check`
 
@@ -313,7 +313,23 @@ Runs only when `check` found nothing missing ahead, one block per step, down to 
   }
 ```
 
-The floor is genesis for a node that keeps everything, and the edge of the retention window for one that prunes: a node with `retain.blocks` would otherwise fetch a block below the window only for the executor's `prune` to delete it at the next commit, and the two would chase each other for as long as the node ran. When every connected peer has declined once, a single 30-second timer clears `noOldBlocks` and tries again, because a peer that was itself still syncing may hold the block by then (REVIEW-2026-10-28.md finding 46); the timer is unref'd so it never keeps a process alive on its own, and `stop()` clears it. The response is checked in four ways before anything is written:
+The floor is genesis for a node that keeps everything, and the edge of the retention window for one that prunes: a node with `retain.blocks` would otherwise fetch a block below the window only for the executor's `prune` to delete it at the next commit, and the two would chase each other for as long as the node ran. When every connected peer has declined once, a single 30-second timer clears `noOldBlocks` and tries again, because a peer that was itself still syncing may hold the block by then (REVIEW-2026-10-28.md finding 46); the timer is unref'd so it never keeps a process alive on its own, and `stop()` clears it.
+
+The step has three waits: the block request, the validator set request when the store lacks the set, and the verification of the commit. `stop()` does not wait for a step that is in one of them, and a node that stops closes its store soon after ([chapter 8](08-node.md)), so the step may resume with block sync stopped and the store closed. After each wait it therefore looks at `running` and returns before it reads or writes anything. The first is where the request comes back:
+
+```ts
+      const m = await this.d.requester.request(peer, { type: 'blockRequest', height }, 'blockResponse', (m) => m.height === height, this.d.requestTimeoutMs ?? 5000);
+      // Stopped while the request was out: the store may be closed by now, and nothing more is read or written.
+      if (!this.running) return;
+      if (!m.block || !m.commit) {
+        this.noOldBlocks.add(peer.id);
+        return;
+      }
+```
+
+"Stopped while the request was out: the store may be closed by now, and nothing more is read or written": the next statement would load the block above from the store. The checks after the set request and after `verifyCommit` are the same line, before the set is saved and before the block is. The `return` goes through the `finally` clause, which clears `backfilling` and schedules nothing, because it too asks `running` first and only then reads the lowest height. A step that got past its last check runs to its end without another wait, so its writes are done before the stop that follows can close the store; and should a call reach a closed store all the same, the store throws `StoreClosedError` ([chapter 10](10-store.md)), which the step's `catch` logs at debug level as `backfill request failed`.
+
+The response is checked in four ways before anything is written:
 
 ```ts
       const above = this.d.store.loadBlock(lowest)!;
@@ -329,6 +345,7 @@ The height must be the one asked for; the block's hash must be the `lastBlockHas
 
 ```ts
       const commitErr = await verifyCommit(this.d.chainId, set, hash, m.commit, this.d.verifier);
+      if (!this.running) return;
       if (commitErr) {
         this.d.scorePeer?.(peer.id, 50, `backfilled commit: ${commitErr}`);
         this.noOldBlocks.add(peer.id);

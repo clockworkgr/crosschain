@@ -528,6 +528,9 @@ So a place is taken only by a proposal that carries the valid signature of a val
       return;
     }
 
+    // Stopped while the signature was verified: the checks below read stored blocks, and the store may be closed.
+    if (!this.running) return;
+
     // The signature covers the header; a relay can pair it with another body. That is a corrupt message, not
     // the round's proposal: drop it without recording the round, so the real one can still arrive.
     if (!bodyMatchesHeader(p.block)) {
@@ -537,7 +540,7 @@ So a place is taken only by a proposal that carries the valid signature of a val
     }
 ```
 
-A bad signature costs the sending peer 20 points, the same as a bad vote signature: a proposal is as expensive to verify as a vote and the signer is just as well known, so there is no reason to let a peer send them for free. Then the body. `proposalSignBytes` covers the proposal's header, and the header commits to the body only through its three roots (`dataHash`, `evidenceHash`, `lastCommitHash`); a relay could keep the signed header and pair it with other transactions, other evidence or a different commit. `bodyMatchesHeader` (in `src/consensus/validate.ts`, re-exported by state sync, which needs the same check on a fetched block) recomputes the three roots and compares. A mismatch is a corrupt message rather than the round's proposal, so it is dropped *without* recording the round: if it were recorded as an invalid proposal, the `proposals.has(p.round)` filter above would then reject the genuine proposal when it arrived, and the whole round would be lost to one bad relay.
+A bad signature costs the sending peer 20 points, the same as a bad vote signature: a proposal is as expensive to verify as a vote and the signer is just as well known, so there is no reason to let a peer send them for free. Then `running` is read again. The verification is a wait on the worker pool, and the node may have been stopped during it: `stop()` clears the flag and does not wait for a proposal that is being verified, and a node that stops closes its store soon after ([chapter 8](08-node.md)). "The checks below read stored blocks, and the store may be closed": the validity checks ask for the time of an earlier block and for the validator sets of earlier heights, which come from the block store. A proposal whose verification outlasted the stop therefore ends here, having read nothing. The node's handler does not wait for `handleProposal`; it hands the promise to `detached` ([chapter 8](08-node.md)), which takes whatever the call ends with. A proposal that resumes after a stop somewhere this check does not cover, to a closed verifier pool or a closed store, therefore ends as the line `handling a proposal failed` in the log, at `debug`, and nothing more. Then the body. `proposalSignBytes` covers the proposal's header, and the header commits to the body only through its three roots (`dataHash`, `evidenceHash`, `lastCommitHash`); a relay could keep the signed header and pair it with other transactions, other evidence or a different commit. `bodyMatchesHeader` (in `src/consensus/validate.ts`, re-exported by state sync, which needs the same check on a fetched block) recomputes the three roots and compares. A mismatch is a corrupt message rather than the round's proposal, so it is dropped *without* recording the round: if it were recorded as an invalid proposal, the `proposals.has(p.round)` filter above would then reject the genuine proposal when it arrived, and the whole round would be lost to one bad relay.
 
 After the signature and the body, the block itself:
 
@@ -550,7 +553,7 @@ After the signature and the body, the block itself:
     if (!invalid) invalid = await verifyBlockSignatures(this.d.chainId, st, p.block, this.d.verifier, this.d.validatorSetAtHeight);
 ```
 
-`validateBlockStructure` gets the local clock only for a fresh proposal. Review finding 37 describes the failure this prevents: every proposal used to be checked for drift, so after a round that stalled longer than `maxClockDriftMs` the polka'd block could never be re-proposed validly, the validators locked on it prevoted nil for everything else, and the height stalled for good. Then `verifyBlockSignatures` for the `lastCommit` and evidence. Both results are strings or null. Because two awaits have passed, the handler re-checks `running`, the height, and that no proposal for the round has been stored meanwhile. Then:
+`validateBlockStructure` gets the local clock only for a fresh proposal. Review finding 37 describes the failure this prevents: every proposal used to be checked for drift, so after a round that stalled longer than `maxClockDriftMs` the polka'd block could never be re-proposed validly, the validators locked on it prevoted nil for everything else, and the height stalled for good. Then `verifyBlockSignatures` for the `lastCommit` and evidence. Both results are strings or null. Because another await has passed, the handler re-checks `running`, the height, and that no proposal for the round has been stored meanwhile; a node stopped during this second verification ends there, before anything is recorded or sent. Then:
 
 ```ts
     const hash = blockHash(p.block);

@@ -26,7 +26,8 @@ import type { Node } from '../src/node/node.ts';
 import { InvKind } from '../src/p2p/messages.ts';
 import { KvBlockStore, MemoryBlockStore } from '../src/store/blockstore.ts';
 import { MemoryEnv, MemoryKv, type KvEnv, type KvWriter } from '../src/store/kv.ts';
-import { LmdbEnv } from '../src/store/lmdb.ts';
+import { LmdbEnv, StoreClosedError } from '../src/store/lmdb.ts';
+import { MemoryGuard, memoryStats } from '../src/node/memory.ts';
 import { blockDataBytes, blockHash, commitHash, evidenceHash, txHash, type Block, type Commit, type Header } from '../src/types/block.ts';
 import { genesisFromJson, genesisToJson, MAX_BLOCK_BYTES, MIN_BLOCK_BYTES } from '../src/types/genesis.ts';
 import { MAX_FRAME } from '../src/p2p/tcp.ts';
@@ -193,6 +194,31 @@ describe('the data directory', () => {
     await expect(third.stop(() => Promise.reject(undefined))).rejects.toBeUndefined();
     expect(existsSync(lock)).toBe(false);
     await (await net.makeNode(0, { dataDir: tmp })).stop();
+  });
+
+  it('does not go on starting once it is being stopped, and answers a closed store with an error', async () => {
+    tmp = mkdtempSync(join(tmpdir(), 'r5-lock-'));
+    net = await makeTestnet({ validators: 1, skipStart: [0] });
+    const node = await net.makeNode(0, { dataDir: tmp });
+    // A stop that overtakes a start: the start ends where it is, and the stop waits for it before closing anything.
+    const starting = node.start();
+    const stopping = node.stop();
+    await Promise.all([starting, stopping]);
+    const inner = node as unknown as { consensus: { running: boolean }; blockSync: { running: boolean }; memoryGuard: { timer: unknown } };
+    expect(inner.consensus.running).toBe(false);
+    expect(inner.blockSync.running).toBe(false);
+    expect(inner.memoryGuard.timer).toBeNull();
+    expect(existsSync(join(tmp, 'LOCK'))).toBe(false);
+    // Work that outlived the stop is told the store is closed, read or write.
+    expect(() => node.store.loadBlock(1n)).toThrow(StoreClosedError);
+    expect(() => node.store.setLowestHeight(1n)).toThrow(/the store is closed/);
+
+    // A guard whose first sample makes its listener stop it stays stopped.
+    let guard: MemoryGuard | null = null;
+    const full = { ...memoryStats(), heapUsed: 99, heapLimit: 100, oldSpaceUsed: undefined } as never;
+    guard = new MemoryGuard({ log: silentLogger, stats: () => full, onLevel: () => guard!.stop() });
+    guard.start();
+    expect((guard as unknown as { timer: unknown }).timer).toBeNull();
   });
 
   it('is given back, with the store, by a node that fails to open', async () => {
@@ -435,6 +461,33 @@ describe('the stores', () => {
       }),
     ).toThrow(/stop/);
     expect(kv.get(k)).toEqual(Uint8Array.of(8));
+  });
+
+  it('refuses every step of an iteration and every use of a writer once the disk environment is closed', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'r5-lmdb-'));
+    try {
+      const env = new LmdbEnv(join(dir, 'lmdb'));
+      const kv = env.store('chain');
+      let kept: KvWriter | null = null;
+      kv.write((w) => {
+        kept = w;
+        for (let i = 1; i <= 3; i++) w.put(Uint8Array.of(i), Uint8Array.of(i));
+      });
+      // A writer kept past its write() is of no use.
+      expect(() => kept!.put(Uint8Array.of(9), Uint8Array.of(9))).toThrow(/after its write\(\) returned/);
+      expect(kv.get(Uint8Array.of(9))).toBeUndefined();
+      // An iteration begun before the close and stepped after it stops at that step.
+      const it = kv.range(Uint8Array.of(0), Uint8Array.of(255));
+      expect(it.next().value![0]).toEqual(Uint8Array.of(1));
+      await env.close();
+      expect(() => it.next()).toThrow(StoreClosedError);
+      expect(() => kv.get(Uint8Array.of(1))).toThrow(StoreClosedError);
+      expect(() => [...kv.range(Uint8Array.of(0), Uint8Array.of(255))]).toThrow(StoreClosedError);
+      expect(() => kv.write(() => {})).toThrow(StoreClosedError);
+      expect(() => env.transaction(() => {})).toThrow(StoreClosedError);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('undoes the writes of a memory environment transaction that throws, in every store', () => {

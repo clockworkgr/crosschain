@@ -316,8 +316,13 @@ a grace of one second (the caller may give another; the CLI gives none when it s
 for want of heap). A connection that is cut does not end the method its request
 called, so the stop then waits, one second at most, for the requests still being
 handled, each until its method has returned and its answer is written: a broadcast
-that was waiting on the mempool has ended before the stop returns, and whoever closes
-the node's stores afterwards does not close them under it. A request that reaches
+that was waiting on the mempool and ends within that second has ended before the stop
+returns, and whoever closes the node's stores afterwards does not close them under it.
+A method that takes longer is not cancelled, and the stop returns without it. When it
+next touches the store of a node that has stopped, the store throws `StoreClosedError`,
+`the store is closed` (every call on a closed LMDB environment does, from the moment
+its close is called), and the method's handler turns that into an error answer on a
+connection already cut. A request that reaches
 dispatch once the server is stopping is answered `-32000` with `server is stopping`
 and its method is not called.
 
@@ -715,7 +720,7 @@ CLI as a process: `start` against a directory that does not exist, for the heap 
 it keeps (`test/review3.test.ts`), and `keys add` and `keys remove`
 (`test/review4.test.ts`). `test/review5-rpc.test.ts` (ten cases) stops a server and
 finds its listener gone from the executor and a commit wait answered; stops one with a
-method still running and finds the method ended when the stop returns; replays a block
+method still running and finds the method, which ends within the stop's one-second wait, ended when the stop returns; replays a block
 event with the fields of the pushed one, and with `failed: null` when the results
 are not held; opens an account stream only for an account there is, by name or by
 id; answers `-32601` for `toString` and a malformed request under the id it carries;
@@ -753,8 +758,8 @@ vote for the next height held once however often it is sent, a proposal for the 
 validator, block requests forgotten with the height), an empty
 validator set decoded only with proposer index -1, and the mempool (one of two
 concurrent checks admitted to the last place, a place given back, a pooled
-transaction never forgotten). `test/review5-node.test.ts` (23 cases) covers the data
-directory's claim and the takeover of a stale one, a store handed in closed before the claim is given up, a store closed only once whoever still reads it is done, the evidence age read when asked, a block of which nothing is
+transaction never forgotten). `test/review5-node.test.ts` (25 cases) covers the data
+directory's claim and the takeover of a stale one, a store handed in closed before the claim is given up, a store closed only once whoever still reads it is done, a start that goes no further once a stop has begun and a closed store that answers with `StoreClosedError`, every step of an iteration and every use of a kept writer refused once the disk environment is closed, the evidence age read when asked, a block of which nothing is
 stored when the application's commit throws, pruning in one transaction with the
 set by height, a past height answered with the set as it had it, proposer included, a set by hash removed once no header held names it, a repeated transaction indexed where it succeeded, the memory store's
 write order, a memory environment's transaction undone in every store when it throws, a heap flag of zero, gossiped evidence too old to pool, an item taken

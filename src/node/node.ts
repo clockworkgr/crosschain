@@ -487,12 +487,12 @@ export class Node {
     });
     // A block fetched for the height consensus is on: it stands in for the proposal.
     this.network.on('blockResponse', (_peer, m) => {
-      if (m.block && m.height === this.consensus.height) void this.consensus.handleFetchedBlock(m.block);
+      if (m.block && m.height === this.consensus.height) this.detached(this.consensus.handleFetchedBlock(m.block), 'fetched block');
     });
 
     // Consensus messages are pushed straight through; no inventory round trip.
-    this.network.on('proposal', (peer, m) => void this.consensus.handleProposal(m.proposal, peer.id));
-    this.network.on('vote', (peer, m) => void this.consensus.handleVote(m.vote, peer.id));
+    this.network.on('proposal', (peer, m) => this.detached(this.consensus.handleProposal(m.proposal, peer.id), 'proposal'));
+    this.network.on('vote', (peer, m) => this.detached(this.consensus.handleVote(m.vote, peer.id), 'vote'));
     // A peer that just connected missed everything flooded before; catch it up on the current height.
     this.network.onPeer((peer) => {
       const { proposals, votes } = this.consensus.messagesForPeer();
@@ -600,8 +600,8 @@ export class Node {
       // An item nobody asked this peer for is dropped unread: a peer cannot push transactions or evidence past the
       // announce-and-fetch round, which is what bounds how much of either it can make this node check.
       if (!answered(peer.id, m.kind, m.kind === InvKind.Tx ? txHash(m.data) : sha256(m.data), true)) return;
-      if (m.kind === InvKind.Tx) void this.mempool.addTx(m.data, peer.id);
-      else if (m.kind === InvKind.Evidence) void this.acceptEvidence(peer.id, m.data);
+      if (m.kind === InvKind.Tx) this.detached(this.mempool.addTx(m.data, peer.id), 'transaction');
+      else if (m.kind === InvKind.Evidence) this.detached(this.acceptEvidence(peer.id, m.data), 'evidence');
     });
     this.network.on('itemNotFound', (peer, m) => void answered(peer.id, m.kind, m.hash, false));
 
@@ -639,17 +639,42 @@ export class Node {
     if (this.evidencePool.add(ev)) this.log('warn', 'evidence received from peer', { h: ev.voteA.height, validator: ev.voteA.validatorIndex });
   }
 
-  async start(): Promise<void> {
-    if (this.started) return;
+  /**
+   * Work begun for a message from a peer and not waited for. Whatever it ends with is taken here: one that was
+   * waiting on a verification when the node stopped resumes to a closed store or a closed verifier pool, and that
+   * is the end of it, not an error nobody handles. While the node runs a failure is worth a line in the log.
+   */
+  private detached(work: Promise<unknown>, what: string): void {
+    work.catch((e) => {
+      this.log(this.stopping ? 'debug' : 'warn', `handling a ${what} failed`, { err: e instanceof Error ? e.message : String(e) });
+    });
+  }
+
+  private starting: Promise<void> | null = null;
+
+  /** A start that a stop overtakes goes no further, and the stop waits for it before it closes anything. */
+  start(): Promise<void> {
+    return (this.starting ??= this.startUp());
+  }
+
+  private async startUp(): Promise<void> {
+    if (this.started || this.stopping) return;
     this.started = true;
-    if (!this.networkStarted) await this.network.start();
-    this.networkStarted = true;
+    if (!this.networkStarted) {
+      // Marked before the wait, so a stop that comes during it stops the network this is starting.
+      this.networkStarted = true;
+      await this.network.start();
+    }
+    if (this.stopping) return;
     this.blockSync.start();
     this.consensus.start();
     // Opening a store leaves garbage several times what it keeps (every stored entry read and checked), and the
     // guard's first sample would take it for a full heap and stop a node that fits: collect it first.
     await this.gcScheduler.major();
+    if (this.stopping) return;
     this.memoryGuard.start();
+    // The guard's first sample may have found the heap critical and its listener begun a stop.
+    if (this.stopping) return;
     this.gcScheduler.start();
     this.log('info', 'node started', {
       height: this.executor.state.lastHeight,
@@ -662,7 +687,7 @@ export class Node {
 
   /**
    * Stopping twice is stopping once: a second caller waits for the first, and the claim is released when that one
-   * is done. `beforeClose` is waited for once the node has stopped working and before its store is closed: whoever
+   * is done. `beforeClose` is waited for once the node has stopped what it runs and before its store is closed: whoever
    * still reads the store, an RPC server finishing its requests for one, is given until then. Only the first
    * caller's is used.
    */
@@ -683,6 +708,8 @@ export class Node {
       }
     };
     try {
+      // A start still on its way ends first: it sees the stop after each of its waits and goes no further.
+      await step(() => this.starting);
       await step(async () => {
         if (this.started) {
           this.started = false;
