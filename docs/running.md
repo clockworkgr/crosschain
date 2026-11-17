@@ -17,7 +17,7 @@ the subject of the [tutorial](tutorial/00-overview.md); design decisions are in
 ```sh
 git clone <this repository> crosschain && cd crosschain
 npm install
-npm test                 # 287 tests, about two minutes
+npm test                 # 288 tests, about two minutes
 CHAIN_SCHEME=secp256k1 npm test   # the same suite on secp256k1 keys (one ML-DSA-only case is skipped)
 INDEX_TREES=0 npm test   # the same suite with every index B+ tree dropped from the start: lookups and scans through the store
 TREES=0 npm test         # and with every Merkle tree dropped: roots and proofs from the stored chunks and nodes; the two combine
@@ -60,9 +60,10 @@ node src/cli.ts show http://127.0.0.1:26657
 export CHAIN_PASSPHRASE=testnet
 node src/cli.ts init ./testnet 4 26656                      # ML-DSA-44 signatures
 node src/cli.ts init ./testnet 4 26656 --scheme secp256k1   # or secp256k1; one scheme per chain
+node src/cli.ts init ./testnet 4 26656 --max-block-bytes 1048576   # or with blocks of 1 MiB; 4 MiB without the flag
 ```
 
-`init [dir] [validators] [basePort] [--scheme ml-dsa-44|secp256k1]` (by default `testnet`, 4 validators and base port 26656) writes:
+`init [dir] [validators] [basePort] [--scheme ml-dsa-44|secp256k1] [--max-block-bytes <n>]` (by default `testnet`, 4 validators and base port 26656) writes:
 
 | path | content |
 |---|---|
@@ -73,7 +74,11 @@ node src/cli.ts init ./testnet 4 26656 --scheme secp256k1   # or secp256k1; one 
 Ports go up in steps of two from `basePort`: node 0 listens for peers on 26656 and serves RPC on
 26657, node 1 on 26658 and 26659, and so on. `--scheme` fixes the signature scheme of every key
 and signature on the chain, ML-DSA-44 when absent (section 6); every key `init` makes, in the
-keystore and in the node directories, is of it.
+keystore and in the node directories, is of it. `--max-block-bytes` sets the chain's block size,
+`consensus.maxBlockBytes` in the genesis (section 6): a whole number from 65,536 to 16,777,216.
+Without the flag the genesis has no such field and the chain uses 4 MiB (4,194,304). The value is
+checked before anything is written, so one outside the range makes no directory: `init` prints
+`genesis: consensus.maxBlockBytes must be a whole number from 65536 to 16777216` and exits 1.
 
 ### 3.2 Start
 
@@ -188,7 +193,7 @@ account.
 
 | command | what it does |
 |---|---|
-| `init [dir=./testnet] [validators=4] [basePort=26656] [--scheme ml-dsa-44\|secp256k1]` | writes a genesis, a keystore and one directory per validator, every key of the named scheme, ML-DSA-44 when absent (section 3.1) |
+| `init [dir=./testnet] [validators=4] [basePort=26656] [--scheme ml-dsa-44\|secp256k1] [--max-block-bytes <n>]` | writes a genesis, a keystore and one directory per validator, every key of the named scheme, ML-DSA-44 when absent; `--max-block-bytes` sets the chain's block size in the genesis, 65,536 to 16,777,216, 4 MiB when absent (section 3.1) |
 | `start <nodeDir> [--heap <MiB>] [--arena <MiB>]` | runs a node with its RPC under a heap limit of three quarters of memory, or the given size in MiB (section 3.2); stops cleanly with exit code 3 when the heap nears the limit. `--arena` bounds the encoded objects kept in memory outside the heap (at least 16 MiB; all of them by default), the rest being read from the store (section 12) |
 | `join <dir> <nodeN> <seedAddr> <trustHeight> <trustHash> [basePort=26700]` | writes a directory for a node that joins by state sync from a header the operator trusts (section 9); refuses to touch a directory that already has a `config.json` |
 | `keys list` | names, schemes and addresses in the keystore (`--keystore <path>`, default `./keystore.json`, for every `keys` command) |
@@ -337,7 +342,7 @@ a fresh one. Back a node up by copying `data` while the node is stopped.
 | `validators` | the engine's initial set, used only when the application supplies none. `init` leaves it out and declares validators in the application genesis instead |
 | `consensus.maxEvidenceAgeMs` | how old evidence of double signing may be; `init` sets the unbonding period. A node running the core application follows the staking unbonding period in force instead, so the two never drift apart |
 | `consensus.version` | the protocol version every header must carry |
-| `consensus.maxBlockBytes` | the most bytes the transactions and evidence of a block may encode to (its header and last commit are not counted, so a whole block is that much larger): a whole number from 65,536 to 16,777,216, written as a JSON number; 4 MiB (4,194,304) when absent, and `init` writes none. Any other value is refused when the file is read (`genesis: consensus.maxBlockBytes must be a whole number from 65536 to 16777216`). Every node holds a block over it invalid (`block too large`), whether proposed, committed or synced, so set it before the chain starts and keep the file the same on every node. The mempool's limit on one transaction follows it: 1 MiB, or four bytes under half the block size where that is less. A proposer gives evidence at most half the limit, so an admitted transaction always fits the next block it is first in line for |
+| `consensus.maxBlockBytes` | the most bytes the transactions and evidence of a block may encode to (its header and last commit are not counted, so a whole block is that much larger): a whole number from 65,536 to 16,777,216, written as a JSON number; 4 MiB (4,194,304) when absent. `init` writes the field when it is given `--max-block-bytes` and leaves it out otherwise (section 3.1). Any other value is refused when the file is read (`genesis: consensus.maxBlockBytes must be a whole number from 65536 to 16777216`). Every node holds a block over it invalid (`block too large`), whether proposed, committed or synced, so set it before the chain starts and keep the file the same on every node. The mempool's limit on one transaction follows it: 1 MiB, or four bytes under half the block size where that is less. A proposer gives evidence at most half the limit, so an admitted transaction always fits the next block it is first in line for |
 | `appState` | the application genesis, inline |
 | `appStateFile` | instead of `appState`: a path (relative to `genesis.json`) to a file holding the application genesis. Use it for large states; the node streams the file at first start and never reads it again |
 
@@ -958,7 +963,7 @@ node's answer, unproven.
 | `signature of another scheme than the chain uses` | a transaction signed with a key of the other scheme (one added with the wrong `--scheme`); sign with a key of the chain's scheme |
 | `genesis validator key is not a secp256k1 key` (or `ml-dsa-44`) | the engine's `validators` list in `genesis.json` holds keys of another scheme than `signatureScheme` names |
 | `unknown signature scheme "x"; one of ml-dsa-44, secp256k1` | `signatureScheme` in `genesis.json`, or a `--scheme` flag, is not one of the two names |
-| `genesis: consensus.maxBlockBytes must be a whole number from 65536 to 16777216` | `consensus.maxBlockBytes` in `genesis.json` is out of range, not a whole number, or written as a string; leave the field out for 4 MiB |
+| `genesis: consensus.maxBlockBytes must be a whole number from 65536 to 16777216` | `consensus.maxBlockBytes` in `genesis.json` is out of range, not a whole number, or written as a string; leave the field out for 4 MiB. `init` prints the same for a `--max-block-bytes` it refuses, and then writes nothing |
 | `N validators exceed the limit 2000` | a validator set of more than 2,000 members: the engine's `validators` list in `genesis.json` names too many, or an embedded application returned updates that make such a set, and the node halted rather than apply them. The core application cannot: its `maxValidators` is at most 1,000 |
 | `state sync: a validator key is not a secp256k1 key; this is not the chain genesis describes` | the peers serve a chain of another scheme than the local `genesis.json` names: the wrong genesis file, or seeds on another chain |
 | `catchingUp: true` for long | the node is far behind and fetching blocks; verification runs at a few thousand transfers a second |

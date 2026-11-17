@@ -83,6 +83,26 @@ const node = await Node.create({
   },
 });
 const app = node.app as CoreApp;
+// BENCH_PAGING_NO_TX_INDEX stores blocks without their transaction index and results, to see what the index costs.
+if (process.env.BENCH_PAGING_NO_TX_INDEX) {
+  const save = node.store.saveBlock.bind(node.store);
+  node.store.saveBlock = (block, commit) => save(block, commit, undefined);
+}
+// The time inside the store's transactions (a block's writes and the application's are one), per window.
+const env = (node as unknown as { env: { transaction(fn: () => void): void } }).env;
+let storeMs = 0;
+{
+  const transaction = env.transaction.bind(env);
+  env.transaction = (fn) => {
+    const t = performance.now();
+    try {
+      transaction(fn);
+    } finally {
+      storeMs += performance.now() - t;
+    }
+  };
+}
+let lastStoreMs = 0;
 emit({ event: 'opened', ms: Math.round(performance.now() - t0), heap: MiB(heapInUse(memoryStats())), limit: MiB(memoryStats().heapLimit) });
 await node.start();
 let blocks = 0;
@@ -99,11 +119,15 @@ node.executor.onCommitted((block) => {
 let serial = 0n;
 let submitted = 0;
 let refused = 0;
-const expiration = BigInt(Date.now()) + 3_600_000n;
+/** BENCH_PAGING_EXPIRATION_S is how long after it is signed a transfer expires (an hour by default): the application keeps a record of each until then. */
+const EXPIRATION_MS = BigInt(Number(process.env.BENCH_PAGING_EXPIRATION_S ?? 3600) * 1000);
+const fixedExpiration = BigInt(Date.now()) + EXPIRATION_MS;
+let expiration = fixedExpiration;
 const rnd = () => Math.floor(Math.random() * N);
 // Keep about two blocks' worth ahead of the chain; a transfer refused while the mempool is at its lowered limit is not retried.
 const feeder = setInterval(() => {
   if (submitted - committed - refused >= AHEAD) return;
+  if (process.env.BENCH_PAGING_EXPIRATION_S) expiration = BigInt(Date.now()) + EXPIRATION_MS;
   for (let i = 0; i < 200; i++) {
     const from = rnd();
     let to = rnd();
@@ -204,6 +228,7 @@ for (let s = WINDOW_S; s <= seconds; s += WINDOW_S) {
     gcPauses: gc.collections - lastGc.collections,
     gcMs: Math.round(gc.totalMs - lastGc.totalMs),
     gcMax: Math.round(gc.maxMs * 10) / 10,
+    storeMs: Math.round(storeMs - lastStoreMs),
     ...(reader ? { reads: Object.fromEntries(READ_KINDS.map((k) => [k, spread(reads[k].window)])) } : {}),
   });
   for (const k of READ_KINDS) reads[k].window = [];
@@ -211,6 +236,7 @@ for (let s = WINDOW_S; s <= seconds; s += WINDOW_S) {
   lastTxs = committed;
   lastRefused = refused;
   lastGc = gc;
+  lastStoreMs = storeMs;
   lastAt = now;
 }
 clearInterval(feeder);
@@ -228,6 +254,23 @@ if (reader) {
   const d = app.db.memory();
   const oldest = app.lowestProvableHeight;
   emit({ event: 'proofs', height: Number(app.lastHeight), oldest: Number(oldest), window: d.historyWindow, history: d.history, inMemoryFrom: Number(app.lastHeight) - d.historyWindow, newestMs: time(app.lastHeight), oldestMs: time(oldest), middleMs: time((oldest + app.lastHeight) / 2n) });
+}
+// BENCH_PAGING_STORE_STATS tallies what the run left in the store, by the first byte of the key, and the trees' pages.
+if (process.env.BENCH_PAGING_STORE_STATS) {
+  const kvEnv = (node as unknown as { env: { store(name: string): { range(a: Uint8Array, b: Uint8Array): Iterable<[Uint8Array, Uint8Array]>; db: { getStats(): Record<string, number> } } } }).env;
+  for (const name of ['chain', 'app']) {
+    const st = kvEnv.store(name);
+    const by: Record<string, { entries: number; keyBytes: number; valueBytes: number }> = {};
+    for (const [k, v] of st.range(new Uint8Array(0), new Uint8Array(64).fill(0xff))) {
+      const tag = String.fromCharCode(k[0]!);
+      const t = (by[tag] ??= { entries: 0, keyBytes: 0, valueBytes: 0 });
+      t.entries++;
+      t.keyBytes += k.length;
+      t.valueBytes += v.length;
+    }
+    const s = st.db.getStats();
+    emit({ event: 'store', name, pageSize: s.pageSize, depth: s.treeDepth, branch: s.treeBranchPageCount, leaf: s.treeLeafPageCount, overflow: s.overflowPages, entries: s.entryCount, by });
+  }
 }
 emit({ event: 'summary', seconds: seconds1(performance.now() - runStart), blocks, txs: committed, pagedBlocks: paged.blocks, pagedTxs: paged.txs, submitted, refused, levels: levels.join(' ') });
 await node.stop();

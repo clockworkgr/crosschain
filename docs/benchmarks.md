@@ -115,6 +115,16 @@ and cached, because signing is the slow part of setting up.
   then 1,246 and 1,348 for the two window settings at 514,008 accounts. One pair agreed to a
   part in a thousand (1,689 and 1,687). So a difference of less than a tenth between two node
   runs is not read as a difference here. The suites were run once under each scheme.
+- **The batch was run again and its figures kept.** On 16 November 2026 the batch was repeated on
+  the code as it stood after the block size became the chain's and the shutdown paths were
+  closed, all but the three runs that read from a freshly mounted volume. Every node run read
+  within a tenth of its 15 November rate but one: the published run of section 4.13 read 1,308
+  transfers a second where it had read 1,771. It was the first run of the batch, started as the
+  test suite finished; run twice more it read 1,625 and 1,742. The rows of the suites moved
+  further, some by a quarter and a few by more, but a second run of the same suites on the
+  same code that evening differed from the first by as much (`saveBlock` 82 and 110 a second
+  under ML-DSA-44, 94 and 126 under secp256k1), so those differences say nothing about the
+  code. The figures in this document are the 15 November ones.
 - **A short benchmark can measure the compiler.** The empty-block row of section 4.5 read 175
   microseconds in some runs and 450 in others while it timed twenty blocks after the full
   ones: the engine was running code compiled for the full blocks, or had just discarded it and
@@ -682,7 +692,14 @@ the load, `BENCH_PAGING_BEFORE_NODE` a shell command run between building the st
 node opening it, which is how the volume the store is on (`TMPDIR` chooses it) is remounted so
 that none of the store is in the page cache, and `BENCH_PAGING_PROFILE` a directory for two
 CPU profiles of thirty seconds each, one starting 5 seconds into the run and one starting 40
-seconds before its end: 5 to 35 s and 560 to 590 s of a ten-minute run).
+seconds before its end: 5 to 35 s and 560 to 590 s of a ten-minute run). Three more switches
+belong to the node script alone (`bench/paging-node.ts`, which prints a JSON line per window
+and can be run by itself on a state the suite built and kept): `BENCH_PAGING_NO_TX_INDEX`
+stores blocks without their transaction index and results, `BENCH_PAGING_EXPIRATION_S` makes
+each transfer expire that many seconds after it is signed where they otherwise all expire an
+hour after the run starts, and `BENCH_PAGING_STORE_STATS` has the node print, at the end,
+what each store holds by the first byte of the key and the pages of its tree. Every window
+line carries `storeMs`, the time spent inside the store's transactions.
 
 The runs of this section are from the batch of 2026-11-15 and on the node's defaults,
 `indexTrees: 'store'` and a stored state opened against half the heap limit, except those
@@ -1264,10 +1281,76 @@ over the run, and a commit into the larger store costs more: about a twelfth mor
 thread's time, against a rate that falls by a tenth to a sixth between the first half minute
 and the last. The commit is the one cost the profiles show growing, and it accounts for most
 of the fall; the early profile also covers the half minute before `warn`, with the whole
-window in memory, and how much of the faster start is that was not measured. The paged rows
-decline over their ten minutes too; they were not profiled, and the same growth is the likely
-reason. The 1,366 to 1,511 the batch's run read at its end and the 1,450 to 1,640 of this one
-are the spread between two runs.
+window in memory, and how much of the faster start is that was not measured. The 1,366 to
+1,511 the batch's run read at its end and the 1,450 to 1,640 of this one are the spread
+between two runs. What grows inside the commit, and what the paged rows do, is taken up next.
+
+What makes the commit grow. Two tables are keyed by a transaction's hash: the block store's
+transaction index (one entry per transaction, kept until the block is pruned) and the
+application's record of recent transactions, by which a transaction is refused a second time
+(one object and two index entries per transaction, kept until the transaction expires; the
+load's transfers expire an hour after the run starts, so none expires in ten minutes). A hash
+lands anywhere in its table, so once a table has more leaf pages than a block has
+transactions, each transaction of a block dirties a leaf page of its own, and LMDB copies and
+writes the whole page, 16 KiB on this machine, for an entry of some 55 bytes. Entries keyed in
+the order they are written (blocks by height, the account history's log) fill one page after
+another and cost the same however large the table is. Measured on LMDB alone
+(`bench/.stress/commit/lmdb-probe.ts`: commits of 500 entries with 41-byte keys and 14-byte
+values, to a million entries), a commit of entries keyed in order takes 4.4 to 4.9 ms from the
+first hundred thousand to the last; one of entries keyed by 32 random bytes takes 8.4 ms over
+the first hundred thousand, 15.7 ms at half a million and 19.0 ms at a million, by when the
+table has 5,798 leaf pages. Smaller pages do not help here: with 4 KiB pages the same commit
+takes 46.7 ms at a million entries, and with 8 KiB pages 37.0 ms.
+
+On the node the same shows as the time spent inside the store's transactions (a block's writes
+and the application's are one), which the node of the suite now reports per window. Five more
+runs of ten minutes were made on 2026-11-16, each on a copy of one built state, with thirty-
+second windows and the two profiles: the configuration of the 2.5× row; that with blocks
+stored without their transaction index (`BENCH_PAGING_NO_TX_INDEX`), twice; that with
+transfers that also expire a minute after they are signed (`BENCH_PAGING_EXPIRATION_S=60`);
+and the last again with the node at the resident figure (595 MiB), beside a run at 595 MiB
+with nothing changed.
+
+| run (limit) | store time per block: first window, at 5 minutes, last window | transfers/s: first window, last window, whole run | native commit in the early and late profile |
+|---|---|---|---|
+| as the node is (1,488 MiB) | 45, 70, 102 ms | 1,479, 1,333, 1,516 | 3.3 s, 7.7 s |
+| no transaction index (1,488 MiB) | 37, 56, 55 ms | 1,697, 1,521, 1,583 | 3.1 s, 4.7 s |
+| no transaction index, expiry a minute (1,488 MiB) | 38, 75, 83 ms | 1,761, 1,439, 1,524 | 3.2 s, 6.7 s |
+| as the node is (595 MiB, paged) | 67, 95, 71 ms | 1,560, 1,476, 1,415 | 5.4 s, 6.0 s |
+| no transaction index, expiry a minute (595 MiB, paged) | 37, 61, 64 ms | 1,728, 1,495, 1,524 | 3.2 s, 5.2 s |
+
+With the index the store's time per block rises through the whole run, 45 ms to 102, and the
+rate falls from a highest window of 1,713 to 1,333; the run left 922,369 index entries in
+5,950 leaf pages. Without the index the store's time rises for four and a half minutes, 37 ms
+to 55, and stays at 53 to 56 ms from there to the end, the rate at 1,520 to 1,600: the index is
+about half of what a commit costs by the tenth minute, and the growth that goes on after the
+fifth minute is its growth. The first of the two runs without the index ended the same way
+(55 ms a block and 1,541 transfers a second in its last window) and had windows of 1,008 to
+1,236 between 30 and 90 seconds and of 1,220 to 1,459 between 180 and 300 that the second did
+not have; it started straight after the previous run's store was deleted, and the later runs
+waited 45 seconds. What still grows without the index is the application's table of recent
+transactions: 956,274 records by the end, each with an entry under its hash.
+
+A short expiry does not make that table cheap. With transfers expiring after a minute the
+table holds about 86,000 records and no more, yet the store's time per block is higher than
+with the table growing, 83 ms against 55 at the end, with a step from 65 to 78 ms at the
+sixth minute: every block now removes as many records as it adds, each removal at a hash of
+its own as each insertion is, and what the step at the sixth minute is was not found. A chain
+whose wallets sign with a short expiry, as the command line does (a minute), is this row and
+not the one above it.
+
+The paged rows. The node at the resident figure runs with the Merkle trees left in the store,
+so each block's root reads and writes their chunks inside the same store transaction, and its
+store time starts higher, 67 ms a block. It was 79 to 95 ms in most windows up to the sixth
+minute and fell back to 69 to 74 ms from 390 seconds to the end, after its third visit
+to `warn`; its native commit is 5.4 s of thirty early and 6.0 s late, and its rate was 1,560
+in its first window and 1,476 to 1,563 in its last four. Its lowest windows, 1,264, 1,164 and
+652 between 120 and 210 seconds, end with the second visit to `warn` (212 seconds, the heap
+filling), which is the collector and the guard's shedding, not the store. So the reading
+above this passage, that the paged rows decline for the reason the 2.5× row does, is not what
+this run shows: the paged node pays the index from the start and does not slow further over
+ten minutes. Without the index and with the short expiry the paged node's store time is 37 ms
+rising to 61 by the third minute and flat after, its rate 1,728 falling to about 1,570.
 
 The window in memory, measured directly. `retain.memoryVersions` sets how many of the provable
 versions a node keeps in memory, the store answering for the rest. The node that never reaches
@@ -1702,13 +1785,19 @@ a store is opened under, and the arena's budget.
 6. **Block space.** Larger blocks raise the network's ceiling and a shorter commit timeout its
    cadence, until admission (5,800/s per node under ML-DSA-44) binds; the network runs here
    filled one block of seven, so what either would do to the measured rate is not known.
-7. **The store's commit as the store grows.** The ten-minute run at 2.5 times the resident heap
-   fell from 1,860 to 1,400 transfers a second in this batch, where the paged runs fell by 4
-   and 9%. A profiled run made after the batch shows the store's commit taking twice the time
-   at the end that it took at the start (section 4.13). Why a commit into the larger store
-   costs that much more (deeper trees, more pages written for a block, the account history
-   log) has not been looked at, and it is the one cost measured here that makes a node slower
-   the longer it runs.
+7. **The tables keyed by transaction hash.** The ten-minute run at 2.5 times the resident heap
+   fell from 1,860 to 1,400 transfers a second in this batch, and the store's commit takes
+   twice the time at its end that it took at its start. The cause is the two tables keyed by a
+   transaction's hash, the block store's transaction index and the application's record of
+   recent transactions: every transaction dirties a 16 KiB page of each once the table is
+   large, and the index is about half of a commit's cost after ten minutes (section 4.13). It
+   is the one cost measured here that makes a node slower the longer it runs, until pruning
+   bounds the index. What would remove it is not done: a node that serves no lookups by hash
+   could run without the index, as the measurement did; an index written in segments by
+   height, each small while it is written, would keep insertions on few pages at the price of
+   a lookup probing every segment; and the record of recent transactions could be kept by
+   expiry time and searched within the open interval. Smaller pages make it worse on this
+   machine.
 
 ## 9. Adding a benchmark
 

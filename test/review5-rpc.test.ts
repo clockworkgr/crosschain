@@ -5,7 +5,7 @@
  * wrong, and trust that has run out is refused when a header is verified.
  */
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -15,7 +15,7 @@ import { signedTxBytes, withFees } from '../src/app/core/client.ts';
 import { appGenesisBytes, authorityJson, DEFAULT_FEES } from '../src/app/core/genesis.ts';
 import { TYPE } from '../src/app/core/types.ts';
 import { toHex } from '../src/crypto/hash.ts';
-import { keyPairFromSeed } from '../src/crypto/keys.ts';
+import { DEFAULT_SCHEME, keyPairFromSeed, schemeName } from '../src/crypto/keys.ts';
 import { objectId } from '../src/db/id.ts';
 import { LightClient } from '../src/light/client.ts';
 import { NodeProvider } from '../src/light/provider.ts';
@@ -275,6 +275,41 @@ describe('the command line', () => {
       child.stderr.on('data', (d) => (out += d));
       child.on('close', (status) => resolve({ status, out }));
     });
+
+  it('writes the block size it was given into the genesis, and runs a node that stops on a signal with its directory released', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'r5-cli-'));
+    const chain = join(dir, 'chain');
+    const port = 42_000 + (process.pid % 1000) * 2;
+    // A size no node would take is refused before anything is written.
+    const refused = await cli('init', chain, '1', String(port), '--max-block-bytes', '100');
+    expect(refused.status).toBe(1);
+    expect(refused.out).toMatch(/maxBlockBytes must be a whole number from 65536 to 16777216/);
+    expect(existsSync(chain)).toBe(false);
+    expect((await cli('init', chain, '1', String(port), '--scheme', schemeName(DEFAULT_SCHEME), '--max-block-bytes', '131072')).status).toBe(0);
+    expect(JSON.parse(readFileSync(join(chain, 'genesis.json'), 'utf8')).consensus.maxBlockBytes).toBe(131072);
+
+    // The node as an operator runs it: under the wrapper that sets its heap, until an interrupt.
+    const nodeDir = join(chain, 'node0');
+    const child = spawn(process.execPath, [join(import.meta.dirname, '..', 'src', 'cli.ts'), 'start', nodeDir, '--heap', '512'], { env: { ...process.env, CROSSCHAIN_CHILD: '' } });
+    let out = '';
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (out += d));
+    const exited = new Promise<number | null>((resolve) => child.on('close', (status) => resolve(status)));
+    try {
+      // The status line comes every five seconds: the node is up, serving, and has committed by then.
+      await waitFor(() => /\binfo\b.*\bstatus\b.*height=/.test(out), 30_000, () => `a status line; the node said:\n${out}`);
+      expect(existsSync(join(nodeDir, 'data', 'LOCK'))).toBe(true);
+      const second = await cli('start', nodeDir, '--heap', '512');
+      expect(second.status).toBe(1);
+      expect(second.out).toMatch(/in use by process/);
+      child.kill('SIGINT');
+      expect(await exited).toBe(0);
+    } finally {
+      child.kill('SIGKILL');
+    }
+    expect(existsSync(join(nodeDir, 'data', 'LOCK'))).toBe(false);
+    expect(out).not.toMatch(/stopping failed|start failed|the store is closed|Unhandled|Error:/);
+  });
 
   it('points at the usage for a command it does not know, with or without a target after it', async () => {
     for (const args of [[], ['frobnicate'], ['frobnicate', 'http://127.0.0.1:1'], ['frobnicate', '/no/such/directory']]) {

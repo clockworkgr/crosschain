@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-nine files, 287 cases, about 9,190 lines counting the shared harness
+`test/**/*.test.ts`: twenty-nine files, 288 cases, about 9,230 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (286 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (287 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -27,7 +27,7 @@ the external review and the later cases of the same kind, `review2` five more th
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
 by title at the end of the suites, `review4` the nine cases for the items the first review
-noted and left, and the four `review5` files 74 cases for failures and unusual callers at the
+noted and left, and the four `review5` files 75 cases for failures and unusual callers at the
 edges of every layer: `review5-net` the peer layer, sync, consensus intake and the mempool,
 `review5-node` the node, the executor and the block store, `review5-app` the application, the
 object database and the codec, and `review5-rpc` the RPC server, the keystore, the command
@@ -3042,11 +3042,11 @@ kept would be, and opening a `KvStoreApp` on it throws
 
 ### test/review5-rpc.test.ts
 
-Eleven tests for the RPC server, the keystore, the command line and the light client.
+Twelve tests for the RPC server, the keystore, the command line and the light client.
 `readEvents(res, enough)` reads the records of an event stream until `enough` says so and then
 closes it.
 
-`the rpc server`, six cases. `up()` starts four validators of the core application with
+`the rpc server`, seven cases. `up()` starts four validators of the core application with
 `engineValidators: false` and a staking genesis whose operators `op0` to `op3` are the accounts
 `3.1` to `3.4` and run the validators `7.0` to `7.3`, an `RpcServer` on node 0 with limits out
 of the way, and waits for height 3. Servers and the network are stopped in `afterEach`.
@@ -3116,9 +3116,30 @@ In a keystore created in a temporary directory, for each of `constructor`, `toSt
 the second handle `__proto__` and `toString` are removed; a third handle lists `constructor`
 and `hasOwnProperty` and has no `toString`.
 
-`the command line`, two cases. `cli(...args)` runs `src/cli.ts` in a child process and
-collects its exit status and what it wrote to both streams; the node answers from the test's
+`the command line`, three cases. `cli(...args)` runs `src/cli.ts` in a child process and
+collects its exit status and what it wrote to both streams. In the first case the node is a
+child process too, started by the command; in the third the node answers from the test's
 own process, so the command runs beside it.
+
+**`it('writes the block size it was given into the genesis, and runs a node that stops on a signal with its directory released')`**.
+In a temporary directory, with a base port taken from the process id, `init` for one validator
+with `--max-block-bytes 100` exits 1 with
+`/maxBlockBytes must be a whole number from 65536 to 16777216/` and the chain's directory does
+not exist: the size is refused before anything is written. `init` with `--scheme` naming
+`DEFAULT_SCHEME` and `--max-block-bytes 131072` exits 0, and `consensus.maxBlockBytes` in the
+`genesis.json` it wrote is 131072. Then `start` is run on `node0` with `--heap 512` as a child
+process whose environment has `CROSSCHAIN_CHILD` emptied, so that the command starts the node
+under its heap wrapper, as an operator runs it. The test waits, thirty seconds at most, for an
+`info` line `status` with a `height=`, which the command logs every five seconds: the node is
+up and has run past a tick of the status interval. The `LOCK` file is then in `node0/data`,
+and a second `start` on the same directory exits 1 with `/in use by process/`. The child is
+sent `SIGINT` and its exit code is 0 (a `SIGKILL` in `finally` ends it if an expectation
+failed first). Afterwards the `LOCK` file is gone and the output matches none of
+`stopping failed`, `start failed`, `the store is closed`, `Unhandled` and `Error:`. This is the
+suite's test of the command line's shutdown ([chapter 14](14-wallet-cli.md)): a node started
+by the command stops on a signal with a clean exit and its directory released. It does not
+make a status tick fall during the shutdown, so the clearing of the interval there is not
+what it decides.
 
 **`it('points at the usage for a command it does not know, with or without a target after it')`**.
 With no arguments, with `frobnicate`, with `frobnicate` and a URL, and with `frobnicate` and a

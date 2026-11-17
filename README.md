@@ -19,7 +19,7 @@ Requires Node 24 (it runs TypeScript directly; there is no build step).
 
 ```sh
 npm install
-npm test                      # 287 tests, about two minutes; CHAIN_SCHEME=secp256k1 runs them on secp256k1 keys, INDEX_TREES=0 or TREES=0 with the database's index or Merkle trees dropped
+npm test                      # 288 tests, about two minutes; CHAIN_SCHEME=secp256k1 runs them on secp256k1 keys, INDEX_TREES=0 or TREES=0 with the database's index or Merkle trees dropped
 node scripts/localnet.ts 4 30 # 4 validators in one process for 30 seconds, driving the app from a faucet, RPC on :26657
 ```
 
@@ -27,7 +27,7 @@ A real testnet over TCP, one terminal per node:
 
 ```sh
 export CHAIN_PASSPHRASE=testnet               # the keystore passphrase init prints
-node src/cli.ts init ./testnet 4              # genesis, keystore, 4 node directories (p2p 26656, 26658, ...; RPC one port up); --scheme secp256k1 for that scheme
+node src/cli.ts init ./testnet 4              # genesis, keystore, 4 node directories (p2p 26656, 26658, ...; RPC one port up); --scheme secp256k1 for that scheme, --max-block-bytes <n> for a block size other than 4 MiB
 node src/cli.ts start ./testnet/node0         # repeat for node1..node3; --heap <MiB> sets the heap limit (three quarters of memory otherwise), --arena <MiB> bounds the encoded objects kept in memory
 node src/cli.ts show ./testnet/node1          # status, validators and accounts over the node's RPC
 node src/cli.ts create ./testnet/node0 alice  # the faucet registers alice; her key goes into the keystore

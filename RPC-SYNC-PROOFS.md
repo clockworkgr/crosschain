@@ -687,7 +687,7 @@ node `{ versions: 10000, snapshots: 2 }`, archive: no `blocks` and as many
 | ban threshold | 100 points, 1 hour, doubling per repeat for an address the node dialed |
 | evidence per block | at most 16 pieces |
 | next-height proposals held | 8, at most 2 signed by one validator |
-| block size | `consensus.maxBlockBytes` in the genesis, 65,536 to 16,777,216 bytes; 4 MiB when absent. It bounds the encoded transactions and evidence; the header and the last commit are not counted. A proposer gives evidence at most half of it |
+| block size | `consensus.maxBlockBytes` in the genesis, 65,536 to 16,777,216 bytes; 4 MiB when absent (`init --max-block-bytes <n>` writes it). It bounds the encoded transactions and evidence; the header and the last commit are not counted. A proposer gives evidence at most half of it |
 | validators in a set | at most 2,000, so that a block of the largest size with two commits fits the 32 MiB frame |
 | transaction size (mempool) | 1 MiB, or four bytes under half the block size if that is less, so that an admitted transaction always fits the half of a block left to transactions |
 | memory guard | sampled every second; `warn` at 70% of the heap limit, `pressure` at 85%, `critical` at 95%, each left 5 points below its threshold |
@@ -723,7 +723,7 @@ bound; the codec's `u53` and `i53`; `Keystore.remove`; a peer clock read from it
 pong; and a node that makes and closes its own verifier pool. Two tests run the
 CLI as a process: `start` against a directory that does not exist, for the heap limit
 it keeps (`test/review3.test.ts`), and `keys add` and `keys remove`
-(`test/review4.test.ts`). `test/review5-rpc.test.ts` (eleven cases) stops a server and
+(`test/review4.test.ts`). `test/review5-rpc.test.ts` (twelve cases) stops a server and
 finds its listener gone from the executor and a commit wait answered; stops one with a
 method still running and finds the method, which ends within the stop's one-second wait, ended when the stop returns; replays a block
 event with the fields of the pushed one, and with `failed: null` when the results
@@ -731,7 +731,11 @@ are not held; opens an account stream only for an account there is, by name or b
 id; answers `-32601` for `toString` and a malformed request under the id it carries;
 finds a validator by its operator's account id; keeps keystore keys named
 `constructor`, `toString` and `__proto__`; checks the light client's trusting period
-at verification time on an injected clock; and runs the CLI as a process against a
+at verification time on an injected clock; runs `init` with a `--max-block-bytes` it
+refuses, which writes nothing, and with one it takes, which is then in the genesis, and
+`start` on a node of that testnet as a process, which runs past its first status line,
+holds its directory against a second `start`, and on `SIGINT` exits 0 with the `LOCK`
+file gone; and runs the CLI as a process against a
 node for an unknown command, `show` on an asset of precision 0, `verify-tx` with
 and without the block's results, and `light verify` with an anchor of another chain
 and one without a chain id. The other client commands (`transfer`, `account`,

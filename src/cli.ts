@@ -1,10 +1,12 @@
 /**
  * Command line for running nodes and talking to them over JSON-RPC.
  *
- *   node src/cli.ts init [dir=testnet] [validators=4] [basePort=26656] [--scheme ml-dsa-44|secp256k1]
+ *   node src/cli.ts init [dir=testnet] [validators=4] [basePort=26656] [--scheme ml-dsa-44|secp256k1] [--max-block-bytes <n>]
  *       Writes genesis.json with a funded faucet and one validator per node,
  *       a keystore with the faucet and operator keys, and a directory per
  *       node with its consensus key and config. Prints the keystore passphrase.
+ *       --max-block-bytes sets the chain's limit on a block's transactions and evidence
+ *       (65536 to 16777216; 4194304 when absent).
  *   node src/cli.ts start <dir>/<nodeN> [--heap <MiB>] [--arena <MiB>]
  *       Runs the node under a heap limit (three quarters of memory unless --heap says
  *       otherwise) with collections scheduled after commits; stops cleanly when the
@@ -70,7 +72,7 @@ import { commitFromJson, headerFromJson, txQueryFromJson } from './rpc/json.ts';
 import { encode } from './codec/writer.ts';
 import { RpcServer } from './rpc/server.ts';
 import { headerHash, txHash } from './types/block.ts';
-import { genesisToJson, loadGenesisFile, type Genesis } from './types/genesis.ts';
+import { checkMaxBlockBytes, genesisToJson, loadGenesisFile, type Genesis } from './types/genesis.ts';
 import { makeLogger, type LogLevel } from './util/log.ts';
 import { Keystore } from './wallet/keystore.ts';
 
@@ -145,7 +147,7 @@ async function openKeystore(path: string): Promise<Keystore> {
 
 // ---- init and start ----
 
-function init(dir: string, count: number, basePort: number, scheme: SchemeTag): void {
+function init(dir: string, count: number, basePort: number, scheme: SchemeTag, maxBlockBytes: number | null): void {
   mkdirSync(dir, { recursive: true });
   const pass = process.env.CHAIN_PASSPHRASE ?? 'testnet';
   const ks = Keystore.create(join(dir, 'keystore.json'), pass);
@@ -157,7 +159,7 @@ function init(dir: string, count: number, basePort: number, scheme: SchemeTag): 
     chainId: `chain-${toHex(generateSeed()).slice(0, 8)}`,
     signatureScheme: schemeName(scheme),
     genesisTime: BigInt(Date.now()),
-    consensus: { maxEvidenceAgeMs: BigInt(UNBONDING_MS), version: 1 },
+    consensus: { maxEvidenceAgeMs: BigInt(UNBONDING_MS), version: 1, ...(maxBlockBytes !== null ? { maxBlockBytes } : {}) },
     appState: appGenesisBytes({
       accounts: [account('faucet', faucet.publicKey, '1000000000000'), ...operators.map((k, i) => account(`op${i}`, k.publicKey, '5000000000'))],
       staking: { unbondingPeriodMs: UNBONDING_MS },
@@ -563,7 +565,8 @@ const TARGET_COMMANDS = new Set(['show', 'account', 'history', 'tx', 'verify-tx'
 async function main(): Promise<void> {
   switch (cmd) {
     case 'init':
-      init(resolve(args[0] ?? 'testnet'), Number(args[1] ?? 4), Number(args[2] ?? 26656), schemeTag(flags.get('scheme') ?? 'ml-dsa-44'));
+      // The limit is checked before anything is written: a genesis the nodes would refuse is not made.
+      init(resolve(args[0] ?? 'testnet'), Number(args[1] ?? 4), Number(args[2] ?? 26656), schemeTag(flags.get('scheme') ?? 'ml-dsa-44'), flags.has('max-block-bytes') ? checkMaxBlockBytes(Number(flags.get('max-block-bytes'))) : null);
       return;
     case 'start':
       await start(resolve(need(0, 'node directory')));
