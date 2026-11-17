@@ -47,10 +47,10 @@ import { bytesEqual, HASH_SIZE, sha256, toHex } from '../../crypto/hash.ts';
 import { schemeName, schemeOf, schemeTag, signContext, type SchemeTag } from '../../crypto/keys.ts';
 import type { Verifier, VerifyJob } from '../../crypto/verifier.ts';
 import { decodeHistory, encodeHistory, estimateTiers, ObjectDatabase, type Changes, type UndoSession } from '../../db/database.ts';
-import { idToString, type ObjectId } from '../../db/id.ts';
-import { DbError, type ObjectType } from '../../db/index.ts';
+import { idToString, objectId, type ObjectId } from '../../db/id.ts';
+import { DbError, idBytes, type ObjectType } from '../../db/index.ts';
 import { key } from '../../db/keys.ts';
-import { INDEX_PREFIX } from '../../db/indexstore.ts';
+import { entryKey, INDEX_HEADER, INDEX_PREFIX, indexHeader } from '../../db/indexstore.ts';
 import { CHUNK_PREFIX } from '../../db/merkle.ts';
 import type { KeyProof, ObjectProof } from '../../db/proof.ts';
 import { MemoryKv, prefixEnd, type KvStore } from '../../store/kv.ts';
@@ -65,7 +65,7 @@ import { HistoryLog, HistoryRecorder, type HistoryEntry } from './history.ts';
 import { applyGenesis, parseAppGenesis, type AppGenesis } from './genesis.ts';
 import { decodeTransaction, txBodyBytes, txIdOf, type Transaction } from './tx.ts';
 import { txHash } from '../../types/block.ts';
-import { AccountType, AssetType, BalanceType, CORE_TYPES, DelegationType, DYNAMIC_ID, DynamicType, GLOBAL_ID, GlobalType, ValidatorType, type Account, type ChainParameters, type DynamicProperties, type FeeSchedule, type GlobalProperties, type StakingParameters } from './types.ts';
+import { AccountType, AssetType, BalanceType, CORE_TYPES, DelegationType, DYNAMIC_ID, DynamicType, GLOBAL_ID, GlobalType, RecentTxType, TYPE, ValidatorType, type Account, type ChainParameters, type DynamicProperties, type FeeSchedule, type GlobalProperties, type StakingParameters } from './types.ts';
 
 export interface CoreAppOptions {
   genesis: Genesis;
@@ -172,6 +172,55 @@ export interface OpenOptions {
 }
 
 /**
+ * A store written when the record of recent transactions had two indices, by transaction id (position 0) and by
+ * expiration (position 1), is given the one it has now, by expiration and id at position 0: the old entries at
+ * position 0 go, the new ones are written from the objects, and the entries at position 1 go last, so that a move
+ * cut short is found by them and made again. A few thousand entries a write. Neither index is part of the state's
+ * hash, so the store is the same state before and after.
+ */
+export function migrateRecentTxIndex(kv: KvStore): void {
+  const STEP = 5000;
+  const first = indexHeader(TYPE.recentTx, 0);
+  const second = indexHeader(TYPE.recentTx, 1);
+  /** Up to STEP entries after `from` under a prefix that `keep` accepts. */
+  const take = (prefix: Uint8Array, from: Uint8Array | null, keep: (k: Uint8Array) => boolean): [Uint8Array, Uint8Array][] => {
+    const out: [Uint8Array, Uint8Array][] = [];
+    for (const e of kv.range(from ?? prefix, prefixEnd(prefix))) {
+      if (from && bytesEqual(e[0], from)) continue;
+      if (!keep(e[0])) continue;
+      out.push(e);
+      if (out.length === STEP) break;
+    }
+    return out;
+  };
+  if (take(second, null, () => true).length === 0) return;
+  for (let from: Uint8Array | null = null; ; ) {
+    const old = take(first, from, (k) => k.length === INDEX_HEADER + HASH_SIZE);
+    if (old.length === 0) break;
+    kv.write((w) => old.forEach(([k]) => w.del(k)));
+    from = old[old.length - 1]![0];
+  }
+  const objects = objectKey(objectId(TYPE.recentTx, 0)).subarray(0, 3); // 'o' and the type's two bytes
+  for (let from: Uint8Array | null = null; ; ) {
+    const batch = take(objects, from, () => true);
+    if (batch.length === 0) break;
+    kv.write((w) => {
+      for (const [k, v] of batch) {
+        const id = decode(k, (r) => (r.u8(), r.u64()));
+        const t = decode(v, (r) => RecentTxType.decode(r, id));
+        w.put(entryKey(first, key((kw) => kw.u64(t.expiration).fixed(t.txId))), idBytes(id));
+      }
+    });
+    from = batch[batch.length - 1]![0];
+  }
+  for (;;) {
+    const old = take(second, null, () => true);
+    if (old.length === 0) break;
+    kv.write((w) => old.forEach(([k]) => w.del(k)));
+  }
+}
+
+/**
  * Load a database from a store written by CoreApp, with the history inside
  * the retention window, so past heights are provable again. Null if the
  * store is empty.
@@ -180,6 +229,7 @@ export function openObjectDatabase(kv: KvStore, types: ObjectType<any>[], opts: 
   const m = kv.get(META_KEY);
   if (!m) return null;
   const meta = decode(m, (r) => ({ height: r.u64(), appHash: r.fixed(HASH_SIZE) }));
+  migrateRecentTxIndex(kv);
   const { retainVersions } = opts;
   // With a figure for the heap's room, a tier estimated not to fit is opened dropped rather than built and then
   // dropped by the memory guard, which would be too late: the index trees first, then the Merkle trees with what is left.

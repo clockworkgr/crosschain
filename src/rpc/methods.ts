@@ -387,7 +387,9 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
       costly: true,
       async fn(p) {
         const hash = parseHex(p.hash, 'hash');
-        const loc = node.store.txLocation(hash);
+        // Every block still held that carries it, oldest first, read once: a lookup by hash asks every segment of the index.
+        const all = node.store.txLocations(hash);
+        const loc = all.find((l) => l.ok === true) ?? all[all.length - 1];
         if (!loc) throw new RpcError(NOT_FOUND, 'unknown transaction');
         const { block } = stored(loc.height);
         const raw = block.txs[loc.index]!;
@@ -398,8 +400,7 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
           decoded = null;
         }
         const out: Record<string, unknown> = { hash: toHex(hash), height: loc.height.toString(), index: loc.index, ok: loc.ok, error: loc.error, tx: toHex(raw), decoded };
-        // A transaction that failed can be included again: every block still held that carries it, oldest first.
-        const all = node.store.txLocations(hash);
+        // A transaction that failed can be included again.
         if (all.length > 1) out.attempts = all.map((l) => ({ height: l.height.toString(), index: l.index, ok: l.ok, error: l.error }));
         if (bool(p, 'prove')) {
           const q = node.queryTx(hash);

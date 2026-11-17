@@ -338,7 +338,7 @@ export function applyTransaction(ctx: EvalContext, tx: Transaction, txId: Uint8A
   if (tx.operations.length === 0) throw new TxError('transaction has no operations');
   if (tx.expiration <= ctx.time) throw new TxError('transaction expired');
   if (tx.expiration > ctx.time + global.maxTxExpirationMs) throw new TxError('expiration too far in the future');
-  if (db.lookup(RecentTxType, 'byTxId', key((k) => k.fixed(txId)))) throw new TxError('duplicate transaction');
+  if (db.lookup(RecentTxType, 'byExpiration', key((k) => k.u64(tx.expiration).fixed(txId)))) throw new TxError('duplicate transaction');
   let fees = 0n;
   tx.operations.forEach((op, i) => {
     const required = calculateFee(op, global.fees);

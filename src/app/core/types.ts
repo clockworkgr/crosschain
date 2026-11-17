@@ -658,10 +658,11 @@ export const RecentTxType: ObjectType<RecentTx> = {
   decode(r, id) {
     return { id, txId: r.fixed(HASH_SIZE), expiration: r.u64() };
   },
-  indices: [
-    { name: 'byTxId', unique: true, key: (t, k) => k.fixed(t.txId) },
-    { name: 'byExpiration', unique: false, key: (t, k) => k.u64(t.expiration) },
-  ],
+  // One index serves both questions asked of the record. A transaction's id covers its expiration, so whether it
+  // was applied before is a lookup of the pair, and what has expired is the front of the index. Keyed by the id
+  // alone the entries would land anywhere in the index, a page written per transaction; keyed by the expiration
+  // first they land where the transactions signed around the same time do (docs/benchmarks.md section 4.13).
+  indices: [{ name: 'byExpiration', unique: true, key: (t, k) => k.u64(t.expiration).fixed(t.txId) }],
 };
 
 export const ValidatorKeyType: ObjectType<ValidatorKey> = {

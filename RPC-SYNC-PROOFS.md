@@ -74,8 +74,9 @@ which the mempool already uses.
 
 ### 2.3 Transaction index
 
-The chain store gains `'t' || txHash || height u64 -> (height u64, index u32, ok u8,
-error string)`, written by the executor in the same transaction as the block. A
+The chain store gains `'x' || segment u64 || txHash || height u64 -> (height u64,
+index u32, ok u8, error string)`, written by the executor in the same transaction as
+the block. The segment is the height divided by 32 (`TX_SEGMENT_BLOCKS`). A
 transaction that failed can be included again, so one hash can have several entries,
 one per block that carries it: `txLocations(hash)` lists every block still held that
 carries the transaction, oldest first, and `txLocation(hash)` is the block it
@@ -85,12 +86,27 @@ succeeded at none. So a block that carries a transaction twice, failing at the f
 position and succeeding at a later one (a proposer can build such a block; the
 mempool never offers one), is indexed at the later one, and `tx` reports the success.
 Pruning a block removes that block's
-entry only. The index was first keyed `'t' || txHash`, one entry per hash, the last
-block written winning; a store of that layout has its entries moved to the new keys
-once, when it is next opened (`migrateTxIndex`), 5,000 entries a write, and `'T'`
-records the layout last, so a move that was cut short is taken up again. A store that
-cannot be written is left as it is and read in the old layout, the short key lying
-under the same prefix. It is derived data,
+entry only.
+
+The segment comes first in the key because of what a write costs. Keyed by the hash
+first, the entries of one block land anywhere in the index, and once the index is
+large each of them is on a 16 KiB page of its own, so a block's write grows with the
+chain (docs/benchmarks.md section 4.13). Keyed by the segment first, a block's
+entries lie among those of the few blocks around it, on pages that are being written
+anyway. The price is the lookup. `txLocations(hash)` asks each segment the store
+holds for the hash: it reads from where the hash would be in a segment, and the first
+key there is either an entry of the hash or names the next segment that has anything,
+so segments with no entries are passed over. That is a read or two per segment held
+instead of one range read (0.27 ms over 4,000 blocks in a probe), so a lookup grows
+with the blocks a node keeps, and pruning bounds it.
+
+The index was first keyed `'t' || txHash`, one entry per hash, the last block written
+winning, and then `'t' || txHash || height`. Both have the height in the value. A
+store of either layout has its entries moved into the segments once, when it is next
+opened (`migrateTxIndex`), 5,000 entries a write, and `'T'` records the layout (3)
+with the last write, so a move that was cut short is taken up again. A store that
+cannot be written is left as it is and its old entries are read where they lie, under
+`'t'`. The index is derived data,
 outside the state root, and is rebuilt by replay or by backfill (section 4.2).
 
 ### 2.4 Account history
@@ -242,7 +258,7 @@ mempool's lowered limit being its throttle then.
 | delegation | delegator, validator, height?, prove? | `height`, the delegation with its tokens' worth as of `height` or null; `unbonding`, the entries pending as of `height`; the key proof at `height` when asked |
 | balance | account, asset?, height? | `height`, account id, asset id, amount as of `height` |
 | accountHistory | account, from?, limit?, reverse? | entries with sequence numbers, and the total; pagination below |
-| tx | hash, prove? | `{ hash, height, index, ok, error, tx, decoded, attempts?, proof? }`: the block the transaction succeeded in if there is one, else the newest that carries it; `attempts` lists height, index, ok and error for every block still held that carries it, oldest first, when there is more than one; `proof` holds `txProof`, the signed header, and `resultProof` with the next signed header, or nulls for those while the next block does not exist |
+| tx | hash, prove? | `{ hash, height, index, ok, error, tx, decoded, attempts?, proof? }`: the block the transaction succeeded in if there is one, else the newest that carries it; `attempts` lists height, index, ok and error for every block still held that carries it, oldest first, when there is more than one; `proof` holds `txProof`, the signed header, and `resultProof` with the next signed header, or nulls for those while the next block does not exist. The lookup by hash costs a read or two per 32-block segment of the index held (section 2.3; 0.27 ms over 4,000 blocks in a probe), so it grows with the blocks the node keeps and pruning bounds it |
 | broadcastTx | tx hex, mode? (`sync` default, or `commit`), timeoutMs? (default 30 000, at most 120 000) | `sync`: `{ hash, status }`; `commit`: `{ hash, height, index, ok, error }` once included; `-32004` while the mempool is full at a limit lowered under memory pressure, or paused |
 | accounts | after? (name cursor, exclusive), limit? | accounts by name with id and core balance |
 | parameters | | height, core asset (id, symbol, precision), maximum transaction expiration, the fee schedule and the staking parameters in force |
@@ -350,7 +366,11 @@ client has more than 1 MiB queued unread is ended; it resumes with `Last-Event-I
 No stream is opened while the node sheds load: the request is answered HTTP 503, and the
 client retries once `/health` reports `ok` or `warn`.
 `broadcastTx` in `commit` mode is implemented on the same internal listener, with at
-most 1000 waiters at once.
+most 1000 waiters at once. A call in that mode whose transaction the mempool reported
+`added` or `seen` looks the hash up in the transaction index, in case the transaction
+is already in a block, which costs a read or two per 32-block segment held (section
+2.3); one answered `invalid`, `too-large`, `full` or `paused` returns its error before
+the lookup.
 
 ### 3.5 Light client over RPC
 

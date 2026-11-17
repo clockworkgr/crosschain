@@ -337,8 +337,7 @@ The `ObjectType` constants give each type its encoding and indices. An index is 
 | `AssetType` | bySymbol | yes | yes | `str(symbol)` |
 | `BalanceType` | byOwnerAsset | yes | no | `id(owner).id(asset)` |
 | `BalanceType` | byAsset | no | no | `id(asset)` |
-| `RecentTxType` | byTxId | yes | no | `fixed(txId)` |
-| `RecentTxType` | byExpiration | no | no | `u64(expiration)` |
+| `RecentTxType` | byExpiration | yes | no | `u64(expiration).fixed(txId)` |
 | `ValidatorType` | byOperator | yes | yes | `id(operator)` |
 | `ValidatorType` | byConsensusAddress | yes | yes | `fixed(addressOf(consensusKey))` |
 | `ValidatorType` | byPower | no | no | `u64(MAX_U64 - tokens)` |
@@ -740,7 +739,7 @@ export function applyTransaction(ctx: EvalContext, tx: Transaction, txId: Uint8A
   if (tx.operations.length === 0) throw new TxError('transaction has no operations');
   if (tx.expiration <= ctx.time) throw new TxError('transaction expired');
   if (tx.expiration > ctx.time + global.maxTxExpirationMs) throw new TxError('expiration too far in the future');
-  if (db.lookup(RecentTxType, 'byTxId', key((k) => k.fixed(txId)))) throw new TxError('duplicate transaction');
+  if (db.lookup(RecentTxType, 'byExpiration', key((k) => k.u64(tx.expiration).fixed(txId)))) throw new TxError('duplicate transaction');
   let fees = 0n;
   tx.operations.forEach((op, i) => {
     const required = calculateFee(op, global.fees);
@@ -760,7 +759,9 @@ export function applyTransaction(ctx: EvalContext, tx: Transaction, txId: Uint8A
 
 Expiration, replay, then per operation: fee check, fee debit, a note to the history recorder of which operation is about to run (so a virtual entry the operation raises, such as an `unjail`, points at it), the operation, the history entry. The fees go to the pool after the last operation and the id is remembered. Everything happens inside the caller's session, so a throw anywhere leaves nothing behind; a failed transaction in a block pays no fee (`DESIGN.md` section 7 notes this is rare, since proposers only include transactions that passed the mempool, and will be revisited if there is ever a fee market).
 
-**`pruneExpiredTxs(db, time)`** scans `recentTx` by expiration from the start, collects every entry with `expiration <= time`, removes them and returns the count. The scan stops at the first entry still alive, so the cost is proportional to what is pruned.
+The replay check and the pruning below share the one index `recentTx` has, `byExpiration`, keyed by the expiration and then the transaction id. The check looks up the pair. That is exact, because the id is the hash of the transaction's body and the body holds the expiration: the same id always comes with the same expiration, so a transaction applied before is found under the pair and nowhere else. The type used to have two indices, one by id for this check and one by expiration for the pruning. Keyed by the id alone, an entry lands anywhere in the index, and once the index is large every transaction of a block writes a page of its own; keyed by the expiration first, the entries land where those of the transactions signed around the same time do ([docs/benchmarks.md](../benchmarks.md) section 4.13, the same cost the block store's transaction index had, [chapter 10](10-store.md)). The index is not authenticated, and neither of the two it replaces was, so the state hash is what it was.
+
+**`pruneExpiredTxs(db, time)`** scans `recentTx` by that index from the start, which is in order of expiration, collects every entry with `expiration <= time`, removes them and returns the count. The scan stops at the first entry still alive, so the cost is proportional to what is pruned.
 
 ### src/app/core/history.ts
 
@@ -1489,6 +1490,61 @@ export interface OpenOptions {
 }
 ```
 
+**`migrateRecentTxIndex(kv)`** is exported only so that the test can call it on a store of its own making; it is the first thing `openObjectDatabase` does with a store that has state, before the database is constructed. It brings a store written by an earlier build, when `recentTx` had an index by id at position 0 and one by expiration at position 1 (see `applyTransaction` above), to the one index the type has now:
+
+```ts
+/**
+ * A store written when the record of recent transactions had two indices, by transaction id (position 0) and by
+ * expiration (position 1), is given the one it has now, by expiration and id at position 0: the old entries at
+ * position 0 go, the new ones are written from the objects, and the entries at position 1 go last, so that a move
+ * cut short is found by them and made again. A few thousand entries a write. Neither index is part of the state's
+ * hash, so the store is the same state before and after.
+ */
+export function migrateRecentTxIndex(kv: KvStore): void {
+  const STEP = 5000;
+  const first = indexHeader(TYPE.recentTx, 0);
+  const second = indexHeader(TYPE.recentTx, 1);
+  /** Up to STEP entries after `from` under a prefix that `keep` accepts. */
+  const take = (prefix: Uint8Array, from: Uint8Array | null, keep: (k: Uint8Array) => boolean): [Uint8Array, Uint8Array][] => {
+    const out: [Uint8Array, Uint8Array][] = [];
+    for (const e of kv.range(from ?? prefix, prefixEnd(prefix))) {
+      if (from && bytesEqual(e[0], from)) continue;
+      if (!keep(e[0])) continue;
+      out.push(e);
+      if (out.length === STEP) break;
+    }
+    return out;
+  };
+  if (take(second, null, () => true).length === 0) return;
+  for (let from: Uint8Array | null = null; ; ) {
+    const old = take(first, from, (k) => k.length === INDEX_HEADER + HASH_SIZE);
+    if (old.length === 0) break;
+    kv.write((w) => old.forEach(([k]) => w.del(k)));
+    from = old[old.length - 1]![0];
+  }
+  const objects = objectKey(objectId(TYPE.recentTx, 0)).subarray(0, 3); // 'o' and the type's two bytes
+  for (let from: Uint8Array | null = null; ; ) {
+    const batch = take(objects, from, () => true);
+    if (batch.length === 0) break;
+    kv.write((w) => {
+      for (const [k, v] of batch) {
+        const id = decode(k, (r) => (r.u8(), r.u64()));
+        const t = decode(v, (r) => RecentTxType.decode(r, id));
+        w.put(entryKey(first, key((kw) => kw.u64(t.expiration).fixed(t.txId))), idBytes(id));
+      }
+    });
+    from = batch[batch.length - 1]![0];
+  }
+  for (;;) {
+    const old = take(second, null, () => true);
+    if (old.length === 0) break;
+    kv.write((w) => old.forEach(([k]) => w.del(k)));
+  }
+}
+```
+
+An entry at position 1 is the sign of an old store, since the type has no second index now; a store without one returns after a single read. The move is three passes, each 5,000 entries a write. The first removes the old entries at position 0, which are told by their length: the four-byte header and a 32-byte id, where a new entry has the 8-byte expiration between them. The second walks the type's objects under `'o'`, decodes each and writes its new entry, the expiration and the id as the key and the object's id as the value. The third removes the entries at position 1. They go last because they are what the function looks for: a move cut short at any write leaves some of them, and the next open makes it again from the start, where the first pass leaves the new entries alone and the second writes the same ones over. The function does not catch a failed write, so a store of the old layout that cannot be written is not opened; the block store, by contrast, reads such a store as it is ([chapter 10](10-store.md)). The entries the move wrote are loaded further down like any others and, with `checkIndexEntries` (the default), checked against the objects there.
+
 **`openObjectDatabase(kv, types, opts = {})`** loads a database from a store written by `CoreApp`, or returns null if the store is empty:
 
 ```ts
@@ -1970,6 +2026,7 @@ A failed `checkTx` leaves nothing behind in the pending session, and a failed tr
 
 A second group, `core application: index entries in the store`, is the application's side of STATE-PAGING.md phases two to four. Its `consistent(app, kv)` check is applied after every commit: the store's `'i'` entries equal `db.indexEntries()` and `checkIndexStore()` finds nothing to report, and the store's `'t'` and `'n'` entries equal `db.treeEntries()`.
 
+- `gives a store that kept recent transactions under two indices the one they have now, and still refuses a replay`: after three blocks the five `recentTx` objects are listed in order of expiration and one is found by the pair of its expiration and id; a copy of the store with the type's entries rewritten as the two old indices opens to the same app hash and then holds exactly the original's entries; a transaction applied before the move is refused as `duplicate transaction` after it while a new one is applied, and a block two minutes on empties the index; and for each of the move's three writes, an open that fails at that write leaves a store that the next open brings to the original's entries. Last, 12,000 synthetic records, beside an object and an entry of another type, are moved by `migrateRecentTxIndex` directly, which takes nine writes: cut short at each of the nine in turn and then finished, the store holds exactly the expected entries and the other type's entry as it was, and a store already moved is not written.
 - `writes the entries with every commit, reopens from them, and fills in a store that predates them`: the store is consistent after genesis, after three blocks of registrations, payments and a transfer, and after the recent transaction ids expire and take their entries with them; an application reopened from the store has the same hash, finds bob and his balance, and is consistent; and a copy of the store with every `'i'` key left out, as a store written before phase two would be, is opened, derives the entries from the objects once and writes them, so that it then holds exactly the entries of the original.
 - `runs blocks with the trees dropped and rebuilt on the way, with the hashes of an app that never drops them`: with `dropIndexTrees()` turned, blocks run on the paged application and on a resident twin give the same app hash and the same results, a taken name is refused in a block and, against the pending session as admission checks it, in `checkTx`; after `rebuildIndexTrees()` and a further drop the store still equals the resident twin's indices.
 - `writes the entries of a state imported from a snapshot`: a snapshot exported in chunks of three objects, imported, and written with `writeImportedState` leaves a store whose entries and trees equal the original application's, and an application opened on it has the original's hash.

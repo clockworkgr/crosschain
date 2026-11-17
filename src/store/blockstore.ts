@@ -10,16 +10,17 @@
  *
  * Key layout: 'b' height, 'h' blockHash, 'v' validatorSetHash, 'V' height
  * (the set that signs it, with its proposer priorities, for state sync),
- * 's' state, 'l' lowest height, 't' txHash and height (height, position, result), 'T' the layout of 't',
+ * 's' state, 'l' lowest height, 'x' segment, txHash and height (height, position, result), 'T' the layout of
+ * that index ('t' holds it in a store written before it was kept in segments),
  * 'r' height (the block's execution results, for result proofs), 'H' height
  * (a header kept without its block, below the lowest block a state-synced
  * node holds, as far back as evidence may reach), 'L' the lowest such height.
  */
 import { decode } from '../codec/reader.ts';
 import { encode } from '../codec/writer.ts';
-import { key } from '../db/keys.ts';
+import { key, startsWith } from '../db/keys.ts';
 import type { TxResult } from '../app/types.ts';
-import { HASH_SIZE, toHex } from '../crypto/hash.ts';
+import { compareBytes, HASH_SIZE, toHex } from '../crypto/hash.ts';
 import { blockHash, decodeBlock, decodeCommit, decodeHeader, encodeBlock, encodeCommit, encodeHeader, txHash, type Block, type Commit, type Header } from '../types/block.ts';
 import { decodeState, encodeState, type ChainState } from '../types/state.ts';
 import { ValidatorSet } from '../types/validator.ts';
@@ -89,12 +90,26 @@ const hashKey = (hash: Uint8Array) => key((k) => k.u8(0x68).fixed(hash));
 const valsetKey = (hash: Uint8Array) => key((k) => k.u8(0x76).fixed(hash));
 const valsetAtKey = (height: bigint) => key((k) => k.u8(0x56).u64(height));
 /**
- * One entry per block a transaction is in. A store written before that has one entry per hash, without the height
- * in its key; its entries are moved once, when the store is next opened (migrateTxIndex), and 'T' records that.
+ * How many blocks share a segment of the transaction index. An index keyed by the hash alone puts every
+ * transaction of a block on a page of its own once the index is large, and a block's write grows with the chain
+ * (docs/benchmarks.md section 4.13). Keyed by segment first, a block's entries go among those of the few blocks
+ * around it, on pages already being written; the price is a lookup, which asks every segment the store holds.
+ */
+export const TX_SEGMENT_BLOCKS = 32n;
+/**
+ * One entry per block a transaction is in, under its block's segment. A store written before the segments has its
+ * entries under 't', by hash and height or, older still, by hash alone; they are moved once, when the store is
+ * next opened (migrateTxIndex), and 'T' records that.
  */
 const TX_LAYOUT_KEY = Uint8Array.of(0x54);
-const txKey = (hash: Uint8Array, height: bigint) => key((k) => k.u8(0x74).fixed(hash).u64(height));
-const txPrefix = (hash: Uint8Array) => key((k) => k.u8(0x74).fixed(hash));
+const TX_LAYOUT = 3;
+const TX_PREFIX = Uint8Array.of(0x78);
+const OLD_TX_PREFIX = Uint8Array.of(0x74);
+const txKey = (hash: Uint8Array, height: bigint) => key((k) => k.u8(0x78).u64(height / TX_SEGMENT_BLOCKS).fixed(hash).u64(height));
+const txPrefix = (segment: bigint, hash: Uint8Array) => key((k) => k.u8(0x78).u64(segment).fixed(hash));
+const TX_KEY_SIZE = 1 + 8 + HASH_SIZE + 8;
+const MAX_SEGMENT = 0xffff_ffff_ffff_ffffn;
+const oldTxPrefix = (hash: Uint8Array) => key((k) => k.u8(0x74).fixed(hash));
 const encodeTx = (height: bigint, index: number, r: TxResult | null | undefined) => encode((wr) => wr.u64(height).u32(index).u8(r ? (r.ok ? 1 : 0) : 2).string(r?.error ?? ''));
 const decodeTx = (v: Uint8Array): TxLocation =>
   decode(v, (r) => {
@@ -111,6 +126,8 @@ export class KvBlockStore implements BlockStore {
   private readonly kv: KvStore;
   /** The writer of a batch in progress; every save joins it instead of opening its own transaction. */
   private open: KvWriter | null = null;
+  /** Whether entries of an older layout may still lie under 't': their move did not finish when the store was opened (the store cannot be written, or a write of the move failed). */
+  private oldTxIndex = false;
 
   constructor(kv: KvStore) {
     this.kv = kv;
@@ -118,32 +135,33 @@ export class KvBlockStore implements BlockStore {
   }
 
   /**
-   * Move a transaction index of the old layout, one entry per hash, to one entry per hash and height, a few
-   * thousand entries a write; the marker goes in last, so a move that was cut short is taken up again. A store that
-   * cannot be written (opened read-only) is left as it is: txLocations reads either layout.
+   * Move a transaction index of an older layout, under 't', into the segments, a few thousand entries a write; the
+   * marker goes in last, so a move that was cut short is taken up again. Either older layout has the height in the
+   * entry's value. A store that cannot be written (opened read-only) is left as it is, and txLocations reads the
+   * older entries where they lie.
    */
   private migrateTxIndex(): void {
-    if (this.kv.get(TX_LAYOUT_KEY)) return;
-    const end = prefixEnd(Uint8Array.of(0x74));
-    // Each pass goes on from the last entry the one before it moved, whose new key sorts right after it.
-    let from: Uint8Array = Uint8Array.of(0x74);
+    if (this.kv.get(TX_LAYOUT_KEY)?.[0] === TX_LAYOUT) return;
+    this.oldTxIndex = true;
+    const end = prefixEnd(OLD_TX_PREFIX);
     try {
       for (;;) {
+        // What a pass moved is gone from under 't', so each pass starts at the front of what is left.
         const old: [Uint8Array, Uint8Array][] = [];
-        for (const [k, v] of this.kv.range(from, end)) {
-          if (k.length === 1 + HASH_SIZE) old.push([k, v]);
+        for (const e of this.kv.range(OLD_TX_PREFIX, end)) {
+          old.push(e);
           if (old.length === 5000) break;
         }
         this.kv.write((w) => {
           for (const [k, v] of old) {
-            w.put(txKey(k.subarray(1), decodeTx(v).height), v);
+            w.put(txKey(k.subarray(1, 1 + HASH_SIZE), decodeTx(v).height), v);
             w.del(k);
           }
-          if (old.length < 5000) w.put(TX_LAYOUT_KEY, Uint8Array.of(2));
+          if (old.length < 5000) w.put(TX_LAYOUT_KEY, Uint8Array.of(TX_LAYOUT));
         });
-        if (old.length < 5000) return;
-        from = old[old.length - 1]![0];
+        if (old.length < 5000) break;
       }
+      this.oldTxIndex = false;
     } catch {
       // not writable
     }
@@ -162,6 +180,17 @@ export class KvBlockStore implements BlockStore {
         this.open = null;
       }
     });
+  }
+
+  /**
+   * Remove what a move that was cut short left under 't' for a transaction in a block: the entry by hash and
+   * height, and the one by hash alone if it names this block. The block's entry is then the one in its segment only.
+   */
+  private delOldTx(w: KvWriter, hash: Uint8Array, height: bigint): void {
+    const alone = oldTxPrefix(hash);
+    w.del(key((k) => k.u8(0x74).fixed(hash).u64(height)));
+    const v = this.kv.get(alone);
+    if (v && decodeTx(v).height === height) w.del(alone);
   }
 
   private write(fn: (w: KvWriter) => void): void {
@@ -195,7 +224,10 @@ export class KvBlockStore implements BlockStore {
           const first = seen.get(k);
           if (!first || (results && !results[first.index]?.ok && results[i]?.ok)) seen.set(k, { hash, index: i });
         });
-        for (const { hash, index } of seen.values()) w.put(txKey(hash, h), encodeTx(h, index, results?.[index]));
+        for (const { hash, index } of seen.values()) {
+          w.put(txKey(hash, h), encodeTx(h, index, results?.[index]));
+          if (this.oldTxIndex) this.delOldTx(w, hash, h);
+        }
         if (results) w.put(resultsKey(h), encode((wr) => wr.array(results, (wr, r) => wr.bool(r.ok).string(r.error ?? ''))));
       }
     });
@@ -207,8 +239,34 @@ export class KvBlockStore implements BlockStore {
   }
 
   txLocations(hash: Uint8Array): TxLocation[] {
-    const prefix = txPrefix(hash);
-    return Array.from(this.kv.range(prefix, prefixEnd(prefix)), ([, v]) => decodeTx(v)).sort((a, b) => (a.height < b.height ? -1 : a.height > b.height ? 1 : 0));
+    const found: TxLocation[] = [];
+    const end = prefixEnd(TX_PREFIX);
+    // A read or two per segment held: from where the hash would be in a segment, the first key there is either an
+    // entry of the hash, or it names the next segment that has anything, and the segments between are passed over.
+    for (let segment = 0n; ; ) {
+      const prefix = txPrefix(segment, hash);
+      let next: bigint | null = null;
+      for (const [k, v] of this.kv.range(prefix, end)) {
+        if (k.length !== TX_KEY_SIZE) continue; // not an entry of the index: nothing writes one, and it says nothing of the segments
+        if (startsWith(k, prefix)) {
+          found.push(decodeTx(v));
+          continue;
+        }
+        const at = decode(k.subarray(1, 9), (r) => r.u64());
+        // Past the hash in the segment asked: the next one may have it. A later segment's first key says the same of
+        // that segment when it sorts after the hash's entries there; otherwise that segment is asked.
+        const there = txPrefix(at, hash);
+        next = at === segment || (compareBytes(k, there) > 0 && !startsWith(k, there)) ? at + 1n : at;
+        break;
+      }
+      if (next === null || next > MAX_SEGMENT) break;
+      segment = next;
+    }
+    if (this.oldTxIndex) {
+      const prefix = oldTxPrefix(hash);
+      for (const [, v] of this.kv.range(prefix, prefixEnd(prefix))) found.push(decodeTx(v));
+    }
+    return found.sort((a, b) => (a.height < b.height ? -1 : a.height > b.height ? 1 : 0));
   }
 
   txLocation(hash: Uint8Array): TxLocation | null {
@@ -272,7 +330,11 @@ export class KvBlockStore implements BlockStore {
       // without the block the record answers nothing. Sets by hash are the executor's to remove, once no header
       // still held names them.
       w.del(valsetAtKey(height));
-      for (const tx of stored.block.txs) w.del(txKey(txHash(tx), height));
+      for (const tx of stored.block.txs) {
+        const hash = txHash(tx);
+        w.del(txKey(hash, height));
+        if (this.oldTxIndex) this.delOldTx(w, hash, height);
+      }
     });
   }
 

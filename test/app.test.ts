@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { CoreApp, openObjectDatabase } from '../src/app/core/app.ts';
+import { CoreApp, migrateRecentTxIndex, openObjectDatabase } from '../src/app/core/app.ts';
 import { makeAuthority, type Authority } from '../src/app/core/authority.ts';
 import { signedTxBytes, signTransaction, withFees } from '../src/app/core/client.ts';
 import { appGenesisBytes, authorityJson, DEFAULT_FEES } from '../src/app/core/genesis.ts';
@@ -380,6 +380,99 @@ describe('core application: index entries in the store', () => {
     expect(app.db.checkIndexStore()).toEqual([]);
     expect(storedTrees(kv)).toEqual(liveTrees(app));
   };
+
+  it('gives a store that kept recent transactions under two indices the one they have now, and still refuses a replay', async () => {
+    const kv = new MemoryKv();
+    const app = makeApp(kv);
+    await block(app, [tx([createOp('alice', makeAuthority([alice.publicKey]))]), tx([createOp('bob', makeAuthority([bob.publicKey]))])]);
+    const aliceId = app.accountByName('alice')!.id;
+    const bobId = app.accountByName('bob')!.id;
+    await block(app, [tx([transferOp(FAUCET_ID, aliceId, 5000n)]), tx([transferOp(FAUCET_ID, bobId, 5000n)], [faucet], genesisTime + 30_000n)]);
+    const paid = tx([transferOp(aliceId, bobId, 10n)], [alice], genesisTime + 45_000n);
+    await block(app, [paid]);
+    const recent = app.db.range(RecentTxType, 'byExpiration', new Uint8Array(0));
+    expect(recent.length).toBe(5);
+    // In order of expiration, then of id; and a transaction is found by the pair.
+    expect(recent.map((t) => t.expiration)).toEqual([30_000n, 45_000n, 60_000n, 60_000n, 60_000n].map((ms) => genesisTime + ms));
+    expect(app.db.lookup(RecentTxType, 'byExpiration', key((k) => k.u64(genesisTime + 45_000n).fixed(recent[1]!.txId)))?.id).toBe(recent[1]!.id);
+
+    // The same store as it was written before: the id alone at position 0, the expiration (and the object's id) at 1.
+    const headers = [indexHeader(TYPE.recentTx, 0), indexHeader(TYPE.recentTx, 1)];
+    const older = (from: MemoryKv) => {
+      const old = new MemoryKv();
+      old.write((w) => {
+        for (const [k, v] of from.range(new Uint8Array([0]), new Uint8Array([0xff]))) if (toHex(k.subarray(0, 4)) !== toHex(headers[0]!)) w.put(k, v);
+        for (const t of recent) {
+          w.put(entryKey(headers[0]!, key((k) => k.fixed(t.txId))), encode((wr) => wr.u64(t.id)));
+          w.put(entryKey(headers[1]!, key((k) => k.u64(t.expiration).u64(t.id))), new Uint8Array(0));
+        }
+      });
+      return old;
+    };
+    const old = older(kv);
+    expect(stored(old)).not.toEqual(stored(kv));
+    const migrated = makeApp(old);
+    expect(toHex(migrated.lastAppHash)).toBe(toHex(app.lastAppHash));
+    expect(stored(old)).toEqual(stored(kv));
+    consistent(migrated, old);
+    // The transaction applied before the move is refused after it, and a new one is taken; then they all expire.
+    const fresh = tx([transferOp(aliceId, bobId, 11n)], [alice]);
+    const res = await block(migrated, [paid, fresh]);
+    expect(res.txResults.map((r) => (r.ok ? 'ok' : r.error))).toEqual(['duplicate transaction', 'ok']);
+    await migrated.finalizeBlock({ height: migrated.lastHeight + 1n, time: genesisTime + 120_000n, txs: [], proposerAddress: new Uint8Array(32), lastCommitSigners: [], misbehavior: [] });
+    await migrated.commit();
+    expect(migrated.db.range(RecentTxType, 'byExpiration', new Uint8Array(0))).toEqual([]);
+    consistent(migrated, old);
+
+    // A move cut short at any of its writes is made again from the start the next time the store is opened.
+    for (let stop = 1; stop <= 3; stop++) {
+      const cut = older(kv);
+      let writes = 0;
+      const failing = { get: (k: Uint8Array) => cut.get(k), range: (a: Uint8Array, b: Uint8Array) => cut.range(a, b), write: (fn: Parameters<MemoryKv['write']>[0]) => (++writes === stop ? (() => { throw new Error('stopped'); })() : cut.write(fn)) };
+      expect(() => openObjectDatabase(failing, CORE_TYPES)).toThrow('stopped');
+      expect(stored(cut)).not.toEqual(stored(kv));
+      const again = makeApp(cut);
+      expect(stored(cut)).toEqual(stored(kv));
+      consistent(again, cut);
+    }
+
+    // More records than one write moves, cut short at every write in turn: 12,000 records are nine writes.
+    const many = Array.from({ length: 12_000 }, (_, i) => ({ id: objectId(TYPE.recentTx, i), txId: sha256(encode((w) => w.u32(i))), expiration: genesisTime + BigInt(1000 * (i % 50)) }));
+    const objectKey = (id: bigint) => key((k) => k.u8(0x6f).u64(id));
+    const big = () => {
+      const b = new MemoryKv();
+      b.write((w) => {
+        w.put(objectKey(objectId(TYPE.account, 7)), Uint8Array.of(1)); // other types' objects and entries are not touched
+        w.put(objectKey(objectId(TYPE.recentTx + 1, 0)), Uint8Array.of(2));
+        w.put(entryKey(indexHeader(TYPE.recentTx + 1, 0), Uint8Array.of(3)), Uint8Array.of(4));
+        for (const t of many) {
+          w.put(objectKey(t.id), encode((wr) => RecentTxType.encode(wr, t)));
+          w.put(entryKey(headers[0]!, key((k) => k.fixed(t.txId))), encode((wr) => wr.u64(t.id)));
+          w.put(entryKey(headers[1]!, key((k) => k.u64(t.expiration).u64(t.id))), new Uint8Array(0));
+        }
+      });
+      return b;
+    };
+    const wanted = [
+      ...many.map((t) => `${toHex(entryKey(headers[0]!, key((k) => k.u64(t.expiration).fixed(t.txId))))}=${toHex(encode((wr) => wr.u64(t.id)))}`).sort(),
+      `${toHex(entryKey(indexHeader(TYPE.recentTx + 1, 0), Uint8Array.of(3)))}=04`,
+    ];
+    const objects = (b: MemoryKv) => [...b.range(Uint8Array.of(0x6f), Uint8Array.of(0x70))].map(([k, v]) => `${toHex(k)}=${toHex(v)}`);
+    for (let stop = 1; stop <= 10; stop++) {
+      const b = big();
+      let writes = 0;
+      const failing = { get: (k: Uint8Array) => b.get(k), range: (x: Uint8Array, y: Uint8Array) => b.range(x, y), write: (fn: Parameters<MemoryKv['write']>[0]) => (++writes === stop ? (() => { throw new Error('stopped'); })() : b.write(fn)) };
+      if (stop <= 9) expect(() => migrateRecentTxIndex(failing)).toThrow('stopped');
+      else migrateRecentTxIndex(failing);
+      migrateRecentTxIndex(b);
+      expect(stored(b)).toEqual(wanted);
+      expect(objects(b)).toEqual(objects(big()));
+      // And a store already moved is read once and not written.
+      writes = 0;
+      migrateRecentTxIndex(failing);
+      expect(writes).toBe(0);
+    }
+  });
 
   it('writes the entries with every commit, reopens from them, and fills in a store that predates them', async () => {
     const kv = new MemoryKv();

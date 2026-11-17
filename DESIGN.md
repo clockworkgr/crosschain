@@ -340,7 +340,9 @@ transactions checked at once no more are let through and applied than the pool h
   has hard links. The CLI reads state through the
   RPC (section 9), never by opening the environment. One environment per node holds
   a `chain` store (blocks, commits and transaction results by height, heights by
-  block hash, the transaction index by hash and height, validator sets by hash and by the
+  block hash, the transaction index by hash and height, kept in segments of 32 blocks so
+  that a block's entries are written together (RPC-SYNC-PROOFS.md section 2.3),
+  validator sets by hash and by the
   height they sign, the lowest retained height, the headers a state-synced node
   keeps alone below its lowest block as far back as evidence may reach, chain
   state) and an `app` store (every object by id, counters, the secondary index
@@ -1009,7 +1011,7 @@ The first real application on the object database, BitShares style.
 | account | 3 | byName (unique, authenticated) | name, owner authority, active authority, registrar |
 | asset | 4 | bySymbol (unique, authenticated) | symbol, precision, issuer, max and current supply |
 | balance | 5 | byOwnerAsset (unique), byAsset | owner, asset, amount |
-| recentTx | 6 | byTxId (unique), byExpiration | a tx id kept until it expires |
+| recentTx | 6 | byExpiration (unique, by expiration and tx id) | a tx id kept until it expires |
 
 - **Accounts** are named. Names are 3 to 63 characters of lowercase letters, digits and
   hyphens in dot-separated segments that start with a letter and do not end with a
@@ -1195,7 +1197,7 @@ node must continue consensus with the exact proposer priorities.
 
 ## 10. Implementation status (2026-11-15)
 
-Everything above is implemented in TypeScript under `src/`. 288 tests in 29 files
+Everything above is implemented in TypeScript under `src/`. 290 tests in 29 files
 pass, and the whole suite passes under either signature scheme
 (`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there) and with
 either tier of state paging dropped from the start (`INDEX_TREES=0`, `TREES=0`, or

@@ -32,7 +32,7 @@ import { PeerDb } from '../src/p2p/peerdb.ts';
 import { RpcClient } from '../src/rpc/client.ts';
 import { headerFromJson } from '../src/rpc/json.ts';
 import { RpcServer } from '../src/rpc/server.ts';
-import { KvBlockStore, MemoryBlockStore } from '../src/store/blockstore.ts';
+import { KvBlockStore, MemoryBlockStore, TX_SEGMENT_BLOCKS } from '../src/store/blockstore.ts';
 import { MemoryKv, prefixEnd } from '../src/store/kv.ts';
 import { blockHash, txHash } from '../src/types/block.ts';
 import type { DuplicateVoteEvidence } from '../src/types/evidence.ts';
@@ -219,35 +219,146 @@ describe('the transaction index', () => {
     expect(store.txLocation(txHash(new Uint8Array([9])))).toBeNull();
   });
 
-  it('moves an index of the old layout, one entry per hash, when the store is opened, and reads it before that', () => {
+  it('finds a transaction in whichever segments hold it, with blocks far apart and segments missing between', () => {
+    const kv = new MemoryKv();
+    const store = new KvBlockStore(kv);
+    const other = (n: number) => encode((w) => w.u32(n));
+    // The transaction in five blocks over four segments, among blocks that do not carry it, with gaps of many segments.
+    const heights = [3n, 31n, 32n, 1000n, 70_000n];
+    for (const h of [1n, 2n, 3n, 30n, 31n, 32n, 33n, 64n, 500n, 1000n, 1001n, 69_999n, 70_000n, 90_000n]) {
+      const txs = heights.includes(h) ? [other(Number(h)), raw] : [other(Number(h)), other(Number(h) + 1_000_000)];
+      const b = block(h, txs);
+      store.saveBlock(b.b, b.commit, [{ ok: true }, { ok: false, error: `at ${h}` }]);
+    }
+    expect(store.txLocations(txHash(raw)).map((l) => [l.height, l.index, l.error])).toEqual(heights.map((h) => [h, 1, `at ${h}`]));
+    expect(store.txLocation(txHash(raw))).toMatchObject({ height: 70_000n });
+    // One that is in a single block, at either end and in the middle; and hashes that sort before and after every entry.
+    for (const h of [1n, 500n, 90_000n]) expect(store.txLocations(txHash(other(Number(h)))).map((l) => l.height)).toEqual([h]);
+    expect(store.txLocations(new Uint8Array(32))).toEqual([]);
+    expect(store.txLocations(new Uint8Array(32).fill(0xff))).toEqual([]);
+    // A lookup reads once or twice per segment held and does not walk the entries: seven segments hold these blocks.
+    let ranged = 0;
+    const counting = new KvBlockStore({ get: (k) => kv.get(k), range: (a, b) => (ranged++, kv.range(a, b)), write: (fn) => kv.write(fn) });
+    ranged = 0;
+    counting.txLocations(txHash(raw));
+    expect(ranged).toBeLessThanOrEqual(14);
+    // The entries of a block lie together: every key of the index starts with its block's segment.
+    const keys = Array.from(kv.range(Uint8Array.of(0x78), Uint8Array.of(0x79)), ([k]) => k);
+    expect(keys.length).toBe(28);
+    for (const k of keys) expect(new Reader(k.subarray(1, 9)).u64()).toBe(new Reader(k.subarray(41)).u64() / TX_SEGMENT_BLOCKS);
+    // A key under the index's prefix that is not an entry of it, before an entry or anywhere else, changes no answer.
+    kv.write((w) => {
+      w.put(key((k) => k.u8(0x78).u64(0n).fixed(txHash(raw))), Uint8Array.of(1));
+      w.put(Uint8Array.of(0x78, 0xff), Uint8Array.of(1));
+      w.put(key((k) => k.u8(0x78).u64(40n)), Uint8Array.of(1));
+    });
+    expect(store.txLocations(txHash(raw)).map((l) => l.height)).toEqual(heights);
+    expect(store.txLocations(txHash(other(90_000))).map((l) => l.height)).toEqual([90_000n]);
+    kv.write((w) => [key((k) => k.u8(0x78).u64(0n).fixed(txHash(raw))), Uint8Array.of(0x78, 0xff), key((k) => k.u8(0x78).u64(40n))].forEach((k) => w.del(k)));
+    // Pruning a block takes its entries and no others.
+    store.deleteBlock(32n);
+    store.deleteBlock(1000n);
+    expect(store.txLocations(txHash(raw)).map((l) => l.height)).toEqual([3n, 31n, 70_000n]);
+    expect(store.txLocation(txHash(other(1000)))).toBeNull();
+    expect(store.txLocation(txHash(other(1001)))).toMatchObject({ height: 1001n });
+  });
+
+  it('moves an index of either older layout into the segments when the store is opened, and reads one it cannot move', () => {
     const kv = new MemoryKv();
     const hashes = Array.from({ length: 12_000 }, (_, i) => txHash(encode((w) => w.u32(i))));
-    // The old layout: the hash alone as the key, the height in the value.
-    kv.write((w) => hashes.forEach((h, i) => w.put(key((k) => k.u8(0x74).fixed(h)), encode((wr) => wr.u64(BigInt(5 + (i % 3))).u32(i).u8(i % 2).string(i % 2 ? '' : 'too early')))));
+    const value = (height: bigint, i: number) => encode((wr) => wr.u64(height).u32(i).u8(i % 2).string(i % 2 ? '' : 'too early'));
+    const older = () => Array.from(kv.range(Uint8Array.of(0x74), prefixEnd(Uint8Array.of(0x74)))).length;
+    // The oldest layout has the hash alone as the key; the one after it the hash and the height. Both have the
+    // height in the value. Half the entries in each, over heights in many segments, and one hash in two blocks.
+    kv.write((w) => {
+      hashes.forEach((h, i) => {
+        const height = BigInt(5 + (i % 300));
+        w.put(i % 2 ? key((k) => k.u8(0x74).fixed(h).u64(height)) : key((k) => k.u8(0x74).fixed(h)), value(height, i));
+      });
+      w.put(key((k) => k.u8(0x74).fixed(txHash(raw)).u64(5n)), encode((wr) => wr.u64(5n).u32(0).u8(0).string('too early')));
+      w.put(key((k) => k.u8(0x74).fixed(txHash(raw)).u64(700n)), encode((wr) => wr.u64(700n).u32(3).u8(1).string('')));
+      w.put(Uint8Array.of(0x54), Uint8Array.of(2)); // what a store of the second layout says of itself
+    });
+    expect(older()).toBe(12_002);
     const store = new KvBlockStore(kv);
-    const oldKeys = () => Array.from(kv.range(Uint8Array.of(0x74), prefixEnd(Uint8Array.of(0x74)))).filter(([k]) => k.length === 33).length;
-    expect(oldKeys()).toBe(0);
+    expect(older()).toBe(0);
+    expect(Array.from(kv.range(Uint8Array.of(0x78), Uint8Array.of(0x79))).length).toBe(12_002);
     expect(store.txLocation(hashes[0]!)).toMatchObject({ height: 5n, index: 0, ok: false, error: 'too early' });
-    expect(store.txLocation(hashes[11_999]!)).toMatchObject({ height: 7n, index: 11_999, ok: true });
-    // The transaction lands again: both blocks are kept, and pruning one leaves the other.
-    const second = block(9n, [raw]);
-    kv.write((w) => w.put(key((k) => k.u8(0x74).fixed(txHash(raw)).u64(5n)), encode((wr) => wr.u64(5n).u32(0).u8(0).string('too early'))));
-    store.saveBlock(second.b, second.commit, [{ ok: true }]);
+    expect(store.txLocation(hashes[11_999]!)).toMatchObject({ height: BigInt(5 + (11_999 % 300)), index: 11_999, ok: true });
+    for (let i = 0; i < 12_000; i += 37) expect(store.txLocations(hashes[i]!).map((l) => [l.height, l.index])).toEqual([[BigInt(5 + (i % 300)), i]]);
     expect(store.txLocations(txHash(raw)).map((l) => [l.height, l.ok])).toEqual([
       [5n, false],
-      [9n, true],
+      [700n, true],
     ]);
+    // The transaction lands again: every block is kept, and pruning one leaves the others.
+    const second = block(9n, [raw]);
+    store.saveBlock(second.b, second.commit, [{ ok: false, error: 'again' }]);
+    expect(store.txLocations(txHash(raw)).map((l) => l.height)).toEqual([5n, 9n, 700n]);
     store.deleteBlock(9n);
-    expect(store.txLocation(txHash(raw))).toMatchObject({ height: 5n, error: 'too early' });
+    expect(store.txLocations(txHash(raw)).map((l) => l.height)).toEqual([5n, 700n]);
     // Opened again, nothing is left to move and nothing is scanned: the marker says so.
     let ranged = 0;
     new KvBlockStore({ get: (k) => kv.get(k), range: (a, b) => (ranged++, kv.range(a, b)), write: (fn) => kv.write(fn) });
     expect(ranged).toBe(0);
-    // A store that cannot be written is read in the old layout as it is.
+
+    // A move that is cut short goes on from where it stopped the next time, and until then every entry is found,
+    // moved or not.
+    const cut = new MemoryKv();
+    cut.write((w) => hashes.forEach((h, i) => w.put(i % 2 ? key((k) => k.u8(0x74).fixed(h).u64(BigInt(5 + (i % 300)))) : key((k) => k.u8(0x74).fixed(h)), value(BigInt(5 + (i % 300)), i))));
+    let writes = 0;
+    const failing = new KvBlockStore({
+      get: (k) => cut.get(k),
+      range: (a, b) => cut.range(a, b),
+      write: (fn) => {
+        if (++writes === 2) throw new Error('stopped');
+        cut.write(fn);
+      },
+    });
+    expect(Array.from(cut.range(Uint8Array.of(0x74), Uint8Array.of(0x75))).length).toBe(7000);
+    expect(cut.get(Uint8Array.of(0x54))).toBeUndefined();
+    for (let i = 0; i < 12_000; i += 41) expect(failing.txLocations(hashes[i]!).map((l) => [l.height, l.index])).toEqual([[BigInt(5 + (i % 300)), i]]);
+    // A block saved again, or pruned, while its old entry is still there: the entry is in its segment only, or gone.
+    const left = Array.from(cut.range(Uint8Array.of(0x74), Uint8Array.of(0x75)), ([k, v]) => ({ hash: k.subarray(1, 33), height: new Reader(v).u64() }));
+    const numberOf = (hash: Uint8Array) => hashes.findIndex((h) => toHex(h) === toHex(hash));
+    // Two the checks before and after do not look at (they take every forty-first).
+    const [saved, pruned, dropped] = left.filter((e) => numberOf(e.hash) % 41 !== 0);
+    const tx = (hash: Uint8Array) => encode((w) => w.u32(numberOf(hash)));
+    for (const e of [saved!, pruned!]) {
+      const b = block(e.height, [tx(e.hash)]);
+      failing.saveBlock(b.b, b.commit, [{ ok: true }]);
+      expect(failing.txLocations(e.hash).map((l) => [l.height, l.index, l.ok])).toEqual([[e.height, 0, true]]);
+    }
+    failing.deleteBlock(pruned!.height);
+    expect(failing.txLocations(pruned!.hash)).toEqual([]);
+    // And one pruned whose block was stored without touching the index: its old entry is the only one, and it goes.
+    const kept = block(dropped!.height, [tx(dropped!.hash)]);
+    failing.saveBlock(kept.b, kept.commit);
+    expect(failing.txLocations(dropped!.hash).length).toBe(1);
+    failing.deleteBlock(dropped!.height);
+    expect(failing.txLocations(dropped!.hash)).toEqual([]);
+    expect(Array.from(cut.range(Uint8Array.of(0x74), Uint8Array.of(0x75))).length).toBe(6997);
+    const resumed = new KvBlockStore(cut);
+    expect(resumed.txLocations(saved!.hash).map((l) => [l.height, l.index, l.ok])).toEqual([[saved!.height, 0, true]]);
+    expect(resumed.txLocations(pruned!.hash)).toEqual([]);
+    expect(resumed.txLocations(dropped!.hash)).toEqual([]);
+    expect(Array.from(cut.range(Uint8Array.of(0x74), Uint8Array.of(0x75))).length).toBe(0);
+    expect(cut.get(Uint8Array.of(0x54))).toEqual(Uint8Array.of(3));
+    for (let i = 0; i < 12_000; i += 41) expect(resumed.txLocations(hashes[i]!).map((l) => [l.height, l.index])).toEqual([[BigInt(5 + (i % 300)), i]]);
+
+    // A store that cannot be written is read in the older layouts as it is.
     const frozen = new MemoryKv();
-    frozen.write((w) => w.put(key((k) => k.u8(0x74).fixed(hashes[1]!)), encode((wr) => wr.u64(6n).u32(1).u8(1).string(''))));
+    frozen.write((w) => {
+      w.put(key((k) => k.u8(0x74).fixed(hashes[1]!)), encode((wr) => wr.u64(6n).u32(1).u8(1).string('')));
+      w.put(key((k) => k.u8(0x74).fixed(hashes[2]!).u64(8n)), encode((wr) => wr.u64(8n).u32(2).u8(0).string('no')));
+      w.put(key((k) => k.u8(0x74).fixed(hashes[2]!).u64(9n)), encode((wr) => wr.u64(9n).u32(0).u8(1).string('')));
+    });
     const readOnly = new KvBlockStore({ get: (k) => frozen.get(k), range: (a, b) => frozen.range(a, b), write: () => { throw new Error('read-only'); } });
     expect(readOnly.txLocation(hashes[1]!)).toMatchObject({ height: 6n, index: 1, ok: true });
+    expect(readOnly.txLocations(hashes[2]!).map((l) => [l.height, l.ok])).toEqual([
+      [8n, false],
+      [9n, true],
+    ]);
+    expect(readOnly.txLocation(hashes[3]!)).toBeNull();
   });
 });
 

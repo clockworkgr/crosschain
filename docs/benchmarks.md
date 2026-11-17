@@ -1285,7 +1285,9 @@ window in memory, and how much of the faster start is that was not measured. The
 1,511 the batch's run read at its end and the 1,450 to 1,640 of this one are the spread
 between two runs. What grows inside the commit, and what the paged rows do, is taken up next.
 
-What makes the commit grow. Two tables are keyed by a transaction's hash: the block store's
+What made the commit grow. The measurements of this passage and the next two are of the node
+before the two tables they find were changed; what was changed, and what it measured after, follows
+them. Two tables were keyed by a transaction's hash: the block store's
 transaction index (one entry per transaction, kept until the block is pruned) and the
 application's record of recent transactions, by which a transaction is refused a second time
 (one object and two index entries per transaction, kept until the transaction expires; the
@@ -1351,6 +1353,69 @@ above this passage, that the paged rows decline for the reason the 2.5× row doe
 this run shows: the paged node pays the index from the start and does not slow further over
 ten minutes. Without the index and with the short expiry the paged node's store time is 37 ms
 rising to 61 by the third minute and flat after, its rate 1,728 falling to about 1,570.
+
+What was done about it. Three remedies were measured on 2026-11-17 and two were kept. For the
+transaction index, `bench/.stress/commit/index-probe.ts` writes 500 entries a commit beside a
+block-sized value to two million entries under each layout, and then looks hashes up:
+
+| layout of the index | commit at 200,000 entries, at a million, at two million | a lookup by hash after 4,000 blocks |
+|---|---|---|
+| by hash and height (as it was) | 10.8, 19.0, 29.3 ms | 0.008 ms |
+| in the order written (no index by hash at all) | 4.2, 4.2, 3.7 ms | |
+| by segment of 8 blocks, then hash | 4.7, 4.6, 5.2 ms | 0.95 ms |
+| by segment of 32 blocks, then hash | 7.4, 5.1, 5.1 ms | 0.27 ms |
+| by segment of 128 blocks, then hash | 10.6, 11.0, 10.7 ms | 0.10 ms |
+| by hash, written once every 16 blocks | 6.2, 15.5, 52.2 ms | 0.009 ms |
+| by hash, written once every 64 blocks | 4.5, 5.6, 11.2 ms | 0.009 ms |
+
+Keyed by a segment of blocks first, the entries of a block go among those of the blocks around
+it, on pages that are being written anyway, and the commit costs what it cost on the first day
+however long the chain is; a lookup has to ask every segment, a read or two each, so it costs
+what the commit no longer does, 0.27 ms over 4,000 blocks at 32 blocks a segment and in that
+proportion some 60 ms over a million blocks kept. Holding the entries back and writing many
+blocks' worth at once only puts the growth off. The index is now kept in segments of 32 blocks
+(`TX_SEGMENT_BLOCKS`, chapter 10 of the tutorial). For the record of recent transactions the
+remedy is one index in place of two, by expiration and then id: a transaction's id covers its
+expiration, so the pair is still an exact lookup, and transactions signed around the same time
+land together.
+
+Ten-minute runs of the node at 2.5 times the resident heap, each on a copy of one built state,
+with transfers that expire thirty minutes after they are signed
+(`BENCH_PAGING_EXPIRATION_S=1800`, so that none expires during the run and the expirations move
+as the clock does). The first five were made with the two layouts behind switches, before they
+were written into the node, the last three with the node as it now is:
+
+| run | store time per block: first window, at 5 minutes, last window | transfers/s: first window, last window, whole run |
+|---|---|---|
+| as it was | 39, 70, 71 ms | 1,817, 1,544, 1,559 |
+| index in segments only | 38, 54, 80 ms | 1,829, 1,473, 1,549 |
+| recent transactions by expiration only | 62, 80, 55 ms | 1,683, 1,572, 1,557 |
+| both | 39, 43, 44 ms | 1,755, 1,622, 1,687 |
+| recent transactions by expiration, no index at all | 37, 40, 43 ms | 1,676, 1,656, 1,671 |
+| the node as it now is, first run | 61, 66, 67 ms | 1,648, 1,525, 1,479 |
+| the node as it now is, second run | 37, 44, 66 ms | 1,836, 1,614, 1,656 |
+| the node as it now is, third run | 62, 66, 67 ms | 1,657, 1,573, 1,588 |
+
+With both, the store's time per block stays where it starts for the whole run, as it does with
+no index at all, and the rate with it; either alone leaves the other table growing and changes
+little. Three things in the table are not explained. A run starts at about 38 ms a block or at
+about 62, whichever layout it has (the third, sixth and eighth rows start high), and keeps the
+difference to its end: the native commit is 3.1 to 3.3 s of the first profile's thirty seconds
+in the runs that start low and 4.8 to 5.1 s in those that start high, on copies of the same
+store. Some runs have a few slow windows after the sixth minute (the second row from 390
+seconds, the sixth at 360 to 420 seconds, where its lowest window is 604 transfers a second,
+the seventh at 360 to 420 seconds), as the run with a short expiry above had. And the seventh
+row's last window reads 66 ms where the nineteen before it read 37 to 51. The sixth row was
+made while other work ran on the machine; the seventh and eighth were not.
+
+The expirations have to move for the second remedy to do anything. The suite's own load signs
+every transfer with one expiration, an hour after the run starts, and under it the new index
+has the same expiration in front of every id and is as scattered as the old one was. The node
+as it now is, under that load: 38 ms a block in the first window, 55 at five minutes and 56 in
+the last, 1,771 transfers a second in the first window, 1,626 in the last and 1,587 over the
+run, against 45, 70 and 102 ms and 1,516 over the run before. A wallet that signs with an
+expiration a fixed time ahead, as the command line does, is the load of the table above; one
+that picks expirations at random across the hour allowed is this one.
 
 The window in memory, measured directly. `retain.memoryVersions` sets how many of the provable
 versions a node keeps in memory, the store answering for the rest. The node that never reaches
@@ -1785,19 +1850,19 @@ a store is opened under, and the arena's budget.
 6. **Block space.** Larger blocks raise the network's ceiling and a shorter commit timeout its
    cadence, until admission (5,800/s per node under ML-DSA-44) binds; the network runs here
    filled one block of seven, so what either would do to the measured rate is not known.
-7. **The tables keyed by transaction hash.** The ten-minute run at 2.5 times the resident heap
-   fell from 1,860 to 1,400 transfers a second in this batch, and the store's commit takes
-   twice the time at its end that it took at its start. The cause is the two tables keyed by a
-   transaction's hash, the block store's transaction index and the application's record of
-   recent transactions: every transaction dirties a 16 KiB page of each once the table is
-   large, and the index is about half of a commit's cost after ten minutes (section 4.13). It
-   is the one cost measured here that makes a node slower the longer it runs, until pruning
-   bounds the index. What would remove it is not done: a node that serves no lookups by hash
-   could run without the index, as the measurement did; an index written in segments by
-   height, each small while it is written, would keep insertions on few pages at the price of
-   a lookup probing every segment; and the record of recent transactions could be kept by
-   expiry time and searched within the open interval. Smaller pages make it worse on this
-   machine.
+7. **What the transaction index now costs a lookup.** The two tables that made a block's
+   write grow with the chain were changed (section 4.13): the transaction index is kept in
+   segments of 32 blocks and the record of recent transactions under one index by expiration.
+   A lookup by hash now reads every segment the node holds, a quarter of a millisecond over
+   4,000 blocks in the probe and so some 60 ms over a million; `retain.blocks` bounds it, and a
+   node that keeps every block pays it on each `tx` call and each `broadcastTx` in commit mode whose transaction
+   the mempool reported `added` or `seen`.
+   A second level of larger segments, written as the small ones close, would bound it without
+   pruning and is not done. The record of recent transactions is cheap only while expirations
+   move with the clock; transactions signed with expirations spread over the allowed hour
+   scatter it as before. Two things in the runs that measured this are not explained: runs of
+   one configuration that differ by 25 ms a block from their first window, and slow windows
+   after the sixth minute of some runs.
 
 ## 9. Adding a benchmark
 

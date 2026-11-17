@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-nine files, 288 cases, about 9,230 lines counting the shared harness
+`test/**/*.test.ts`: twenty-nine files, 290 cases, about 9,430 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (287 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (289 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -26,7 +26,7 @@ guard's dials on the object database show; `chain`, `app`, `staking`, `staking-n
 the external review and the later cases of the same kind, `review2` five more that each
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
-by title at the end of the suites, `review4` the nine cases for the items the first review
+by title at the end of the suites, `review4` the ten cases for the items the first review
 noted and left, and the four `review5` files 75 cases for failures and unusual callers at the
 edges of every layer: `review5-net` the peer layer, sync, consensus intake and the mempool,
 `review5-node` the node, the executor and the block store, `review5-app` the application, the
@@ -1333,14 +1333,14 @@ to the transfer's.
 
 ### test/app.test.ts
 
-Twenty-two unit tests on `CoreApp` ([11](11-application.md)) with no network: one genesis
+Twenty-three unit tests on `CoreApp` ([11](11-application.md)) with no network: one genesis
 validator, a faucet with one billion base units, zero inflation and no block reward, so every
 balance is predictable. `block(app, txs)` calls `finalizeBlock` then `commit` with
 `blockTime(h) = genesisTime + 1000n * h`. `tx(ops, keys, expiration)` signs with
 `DEFAULT_FEES` and an expiration a minute after genesis. `FEES` holds what the default schedule
 charges for a transfer and for registering the premium name `alice`. `withAlice()` is the common
 fixture: alice registered at height 1 and paid 5,000 at height 2. Twelve cases under
-`describe('core application')` cover the account and asset layer; five more under
+`describe('core application')` cover the account and asset layer; six more under
 `describe('core application: index entries in the store')` cover what the application writes
 for the database's index and tree tiers and how it reopens from them.
 
@@ -1448,6 +1448,37 @@ The second group shares one check, `consistent(app, kv)`: the store's `'i'` keys
 `db.indexEntries()`, `db.checkIndexStore()` reports nothing (every resident tree entry is in
 the store with its value, and the store holds no more entries under an index's prefix than the
 tree has), and the store's `'t'` and `'n'` keys equal `db.treeEntries()`.
+
+**`it('gives a store that kept recent transactions under two indices the one they have now, and still refuses a replay')`**.
+An app on a `MemoryKv` registers alice and bob in block 1, pays both from the faucet in block 2
+(the second payment expiring 30 seconds after genesis) and in block 3 applies `paid`, a transfer
+from alice to bob that expires at 45 seconds. `range(RecentTxType, 'byExpiration')` has five
+objects with expirations 30, 45, 60, 60 and 60 seconds after genesis, and a `lookup` of the pair
+of 45 seconds and the second one's id finds it. `older(kv)` makes the store as an earlier build
+wrote it: a copy with the entries at position 0 of the type replaced by the id alone (the
+object's id as the value), and entries at position 1 of the expiration and the object's id. Its
+`'i'` keys differ from the original's. An app opened on it has the original's app hash, the
+store's entries are then the original's, and it is consistent. A block carrying `paid` again and
+a new transfer gives `duplicate transaction` and `ok`; an empty block dated two minutes after
+genesis leaves the index empty, and the store is consistent. Then the move is cut short. For each
+of its three writes in turn (the old entries removed, the new ones written, position 1 removed),
+`openObjectDatabase` is called on a fresh old copy through a wrapper whose write of that number
+throws: the call throws `stopped` and the store's entries are not the original's. An app opened
+on the copy afterwards leaves exactly the original's entries and is consistent: the move was
+made again from the start.
+
+The last part moves more records than one write takes, and calls `migrateRecentTxIndex`
+directly. `big()` makes a `MemoryKv` holding 12,000 synthetic `recentTx` objects, with 50
+different expirations, and their entries in the two old indices, beside an account object, an
+object of the type after `recentTx` and an index entry of that type. 12,000 records are nine
+writes: three that remove the old entries at position 0, three that write the new ones and three
+that remove position 1. For `stop` from 1 to 9 the move is run on a fresh store through a wrapper
+whose write of that number throws, and throws `stopped`; for 10 it runs to the end. The move is
+then run again on the store itself, and the store's `'i'` keys are exactly the 12,000 expected
+entries, of expiration and transaction id with the object's id as the value, and the one entry
+of the other type, untouched; and its objects, of every type, are the ones it started with. A
+further call through the wrapper makes no write: a store already moved is
+read once and left.
 
 **`it('writes the entries with every commit, reopens from them, and fills in a store that predates them')`**
 (describe `core application: index entries in the store`). An app on a `MemoryKv` is
@@ -2349,8 +2380,9 @@ stray value cannot stop a node from starting".
 
 ### test/review4.test.ts
 
-Nine tests for the thirteen items the first review noted and left (REVIEW-2026-10-28.md,
-"Fourth pass: the judgement calls"), listed by group and title with what each sets up and
+Ten tests, nine for the thirteen items the first review noted and left (REVIEW-2026-10-28.md,
+"Fourth pass: the judgement calls") and one added when the transaction index was put in
+segments, listed by group and title with what each sets up and
 asserts.
 
 `state queries at a height, and a batch that pays for its calls`, one case on a testnet with an
@@ -2395,7 +2427,7 @@ batches of five `status` calls: the first has five answers and no `-32004`; the 
 `[0, 1, 2, 3, 4]` and four `-32004`, one call being answered with the token the first batch
 left.
 
-`the transaction index`, two cases on block stores, with a `block(height, txs)` helper that
+`the transaction index`, three cases on block stores, with a `block(height, txs)` helper that
 builds a header of zero hashes with the transactions' data hash and a commit for it.
 
 **`it('keeps every block a transaction is in, answers with the one it succeeded in, and loses only the pruned one')`**.
@@ -2407,16 +2439,53 @@ index 1, `ok: true`: the success, not the newest. After `deleteBlock(8n)` the he
 9 and `txLocation` is height 9, `ok: false`; after blocks 5 and 9 are deleted it is `null`, as
 it is for the other transaction of block 8.
 
-**`it('moves an index of the old layout, one entry per hash, when the store is opened, and reads it before that')`**.
-A `MemoryKv` is filled by hand with 12,000 entries of the old layout, the hash alone as the key
-and the height (5, 6 or 7) in the value, and a `KvBlockStore` is opened on it. No key of 33
-bytes is left under `'t'`; the first hash reads height 5, index 0, `ok: false`, `too early` and
-the last height 7, index 11,999, `ok: true`. A transaction given an entry at height 5 by hand is
-then saved in block 9 with success: `txLocations` is `[5, false]`, `[9, true]`, and after
-`deleteBlock(9n)` `txLocation` is the entry of height 5. A second `KvBlockStore` opened over the
-same data through a wrapper that counts range reads makes none, the marker saying nothing is
-left to move. And a store over a key-value store whose `write` throws, holding one entry of the
-old layout, answers `txLocation` from it: height 6, index 1, `ok: true`.
+**`it('finds a transaction in whichever segments hold it, with blocks far apart and segments missing between')`**.
+A `KvBlockStore` on a `MemoryKv` is given fourteen blocks of two transactions each, at heights
+1, 2, 3, 30, 31, 32, 33, 64, 500, 1,000, 1,001, 69,999, 70,000 and 90,000, which lie in seven
+segments of 32 blocks. Five of them (3, 31, 32, 1,000 and 70,000, in four segments) carry one
+transaction at position 1, failed with the error `at <height>`. `txLocations` of its hash is
+those five heights in order, each with index 1 and its error, and `txLocation` is height 70,000,
+the newest, since it succeeded nowhere. A transaction that is in one block only (1, 500 or
+90,000) has that one height, and a hash of 32 zero bytes and one of 32 `0xff` bytes, which sort
+before and after every entry of a segment, have none. A second store over the same data through
+a wrapper that counts range reads makes at most 14 for one `txLocations`: two per segment held,
+not one per entry. The 28 keys under `'x'` each start with their block's segment: the u64 after
+the prefix is the height at the key's end divided by `TX_SEGMENT_BLOCKS`. Three keys that are not
+entries are then put under the prefix: one of 41 bytes, segment 0 and the transaction's hash
+with no height, which sorts just before an entry of that hash; one of 2 bytes, `'x'` and `0xff`;
+and one of 9 bytes, `'x'` and segment 40. `txLocations` of the transaction is still the five
+heights and that of the transaction of block 90,000 still its one, a key of another length being
+skipped before anything is read from it; the three keys are deleted again. After
+`deleteBlock(32n)` and `deleteBlock(1000n)` the heights are 3, 31 and 70,000, the other
+transaction of block 1,000 is `null` and one of block 1,001 is still found.
+
+**`it('moves an index of either older layout into the segments when the store is opened, and reads one it cannot move')`**.
+A `MemoryKv` is filled by hand with 12,000 entries under `'t'`, the even ones in the oldest
+layout, the hash alone as the key, and the odd ones in the layout after it, the hash and the
+height. Both have the height in the value, here 5 to 304, which is ten segments. One more
+transaction has two entries by hash and height, failed at height 5 and succeeded at 700, and
+`'T'` holds 2, what a store of the second layout says of itself. A `KvBlockStore` is opened on
+it. Nothing is left under `'t'` and 12,002 keys are under `'x'`; the first hash reads height 5,
+index 0, `ok: false`, `too early`, the last height 304, index 11,999, `ok: true`, and every 37th
+hash has exactly its one location. The transaction with two entries has `[5, false]`,
+`[700, true]`; saved again in block 9 with a failure its heights are 5, 9 and 700, and after
+`deleteBlock(9n)` 5 and 700. A second `KvBlockStore` opened over the same data through a wrapper
+that counts range reads makes none, the marker saying nothing is left to move.
+
+Then a move that is cut short. The 12,000 entries are written to a second `MemoryKv`, with no
+marker, and a store is opened through a wrapper whose second `write` throws: 7,000 entries are
+left under `'t'`, there is no `'T'`, and that store finds every 41st hash at its one location,
+moved or not. Three entries still under `'t'` that the every-41st checks do not look at are
+then taken, `saved`, `pruned` and `dropped`, and for each of the first two a block at the entry's height carrying its transaction is saved through that store with
+a success: `txLocations` of the hash is one location, the height, index 0, `ok: true`, not the
+old entry beside the new one. `deleteBlock` of `pruned`'s height then leaves its hash with no
+location: `saveBlock` and `deleteBlock` each removed the old entry of the block they wrote. The
+third's block is saved without results, which leaves the index alone, so its one location is
+still the old entry; `deleteBlock` of that height removes it, and 6,997 entries are under `'t'`.
+A `KvBlockStore` opened on the data again answers the same for the three hashes, leaves nothing under `'t'`, `'T'` holds 3, and every 41st hash reads as before. Last, a store over a key-value store whose `write` always
+throws, holding one entry by hash alone and two by hash and height for another hash: the first
+answers `txLocation` with height 6, index 1, `ok: true`, the second `txLocations` with
+`[8, false]`, `[9, true]`, and a hash with no entry `null`.
 
 `snapshots, evidence, the codec`, three unit cases.
 
