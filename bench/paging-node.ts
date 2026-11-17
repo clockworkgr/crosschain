@@ -12,7 +12,7 @@
  * what each kind of read took, per window and over the run.
  */
 import './scheme.ts';
-import { writeFileSync } from 'node:fs';
+import { closeSync, fsyncSync, ftruncateSync, openSync, writeFileSync, writeSync } from 'node:fs';
 import { Session } from 'node:inspector/promises';
 import { join } from 'node:path';
 import type { CoreApp } from '../src/app/core/app.ts';
@@ -103,6 +103,26 @@ let storeMs = 0;
   };
 }
 let lastStoreMs = 0;
+// BENCH_PAGING_SYNC_PROBE times, at the end of each window, twenty synced writes of 64 KiB to a file beside the store
+// and reports the second fastest: what the device asks for a sync at that moment, whatever the node is writing.
+const syncProbe = process.env.BENCH_PAGING_SYNC_PROBE
+  ? (() => {
+      const fd = openSync(join(dir!, 'sync-probe.bin'), 'w+');
+      ftruncateSync(fd, 200 << 20);
+      const buf = Buffer.alloc(64 << 10, 7);
+      process.on('exit', () => closeSync(fd));
+      return (): number => {
+        const took: number[] = [];
+        for (let i = 0; i < 20; i++) {
+          const t = performance.now();
+          writeSync(fd, buf, 0, buf.length, Math.floor(Math.random() * 3000) * buf.length);
+          fsyncSync(fd);
+          took.push(performance.now() - t);
+        }
+        return Math.round(took.sort((a, b) => a - b)[1]! * 100) / 100;
+      };
+    })()
+  : null;
 emit({ event: 'opened', ms: Math.round(performance.now() - t0), heap: MiB(heapInUse(memoryStats())), limit: MiB(memoryStats().heapLimit) });
 await node.start();
 let blocks = 0;
@@ -229,6 +249,7 @@ for (let s = WINDOW_S; s <= seconds; s += WINDOW_S) {
     gcMs: Math.round(gc.totalMs - lastGc.totalMs),
     gcMax: Math.round(gc.maxMs * 10) / 10,
     storeMs: Math.round(storeMs - lastStoreMs),
+    ...(syncProbe ? { syncMs: syncProbe() } : {}),
     ...(reader ? { reads: Object.fromEntries(READ_KINDS.map((k) => [k, spread(reads[k].window)])) } : {}),
   });
   for (const k of READ_KINDS) reads[k].window = [];

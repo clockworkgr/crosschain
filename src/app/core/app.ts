@@ -53,7 +53,7 @@ import { key } from '../../db/keys.ts';
 import { entryKey, INDEX_HEADER, INDEX_PREFIX, indexHeader } from '../../db/indexstore.ts';
 import { CHUNK_PREFIX } from '../../db/merkle.ts';
 import type { KeyProof, ObjectProof } from '../../db/proof.ts';
-import { MemoryKv, prefixEnd, type KvStore } from '../../store/kv.ts';
+import { MemoryKv, prefixEnd, StoreReadOnlyError, type KvStore } from '../../store/kv.ts';
 import type { Genesis } from '../../types/genesis.ts';
 import { silentLogger, type Logger } from '../../util/log.ts';
 import type { Application, CheckTxOptions, CheckTxResult, FinalizeBlockRequest, FinalizeBlockResult, InitChainResult, TxResult } from '../types.ts';
@@ -194,29 +194,39 @@ export function migrateRecentTxIndex(kv: KvStore): void {
     return out;
   };
   if (take(second, null, () => true).length === 0) return;
-  for (let from: Uint8Array | null = null; ; ) {
-    const old = take(first, from, (k) => k.length === INDEX_HEADER + HASH_SIZE);
-    if (old.length === 0) break;
-    kv.write((w) => old.forEach(([k]) => w.del(k)));
-    from = old[old.length - 1]![0];
+  // The database reads the index in the layout it has now, so an old store that cannot be written cannot be read
+  // through it either: say so here, where the reason is known.
+  try {
+    move();
+  } catch (e) {
+    if (e instanceof StoreReadOnlyError) throw new Error('this store keeps recent transactions under an older index layout and is opened read-only; open it writable once, which moves the index');
+    throw e;
   }
-  const objects = objectKey(objectId(TYPE.recentTx, 0)).subarray(0, 3); // 'o' and the type's two bytes
-  for (let from: Uint8Array | null = null; ; ) {
-    const batch = take(objects, from, () => true);
-    if (batch.length === 0) break;
-    kv.write((w) => {
-      for (const [k, v] of batch) {
-        const id = decode(k, (r) => (r.u8(), r.u64()));
-        const t = decode(v, (r) => RecentTxType.decode(r, id));
-        w.put(entryKey(first, key((kw) => kw.u64(t.expiration).fixed(t.txId))), idBytes(id));
-      }
-    });
-    from = batch[batch.length - 1]![0];
-  }
-  for (;;) {
-    const old = take(second, null, () => true);
-    if (old.length === 0) break;
-    kv.write((w) => old.forEach(([k]) => w.del(k)));
+  function move(): void {
+    for (let from: Uint8Array | null = null; ; ) {
+      const old = take(first, from, (k) => k.length === INDEX_HEADER + HASH_SIZE);
+      if (old.length === 0) break;
+      kv.write((w) => old.forEach(([k]) => w.del(k)));
+      from = old[old.length - 1]![0];
+    }
+    const objects = objectKey(objectId(TYPE.recentTx, 0)).subarray(0, 3); // 'o' and the type's two bytes
+    for (let from: Uint8Array | null = null; ; ) {
+      const batch = take(objects, from, () => true);
+      if (batch.length === 0) break;
+      kv.write((w) => {
+        for (const [k, v] of batch) {
+          const id = decode(k, (r) => (r.u8(), r.u64()));
+          const t = decode(v, (r) => RecentTxType.decode(r, id));
+          w.put(entryKey(first, key((kw) => kw.u64(t.expiration).fixed(t.txId))), idBytes(id));
+        }
+      });
+      from = batch[batch.length - 1]![0];
+    }
+    for (;;) {
+      const old = take(second, null, () => true);
+      if (old.length === 0) break;
+      kv.write((w) => old.forEach(([k]) => w.del(k)));
+    }
   }
 }
 

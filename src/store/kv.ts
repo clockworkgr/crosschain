@@ -39,6 +39,14 @@ export interface KvEnv {
   close(): Promise<void>;
 }
 
+/** What write() throws on a store opened read-only: the one failure of a write that a reader of the store can go on from. */
+export class StoreReadOnlyError extends Error {
+  constructor() {
+    super('the store is read-only');
+    this.name = 'StoreReadOnlyError';
+  }
+}
+
 /** The smallest key greater than every key with this prefix. */
 export function prefixEnd(prefix: Uint8Array): Uint8Array {
   const end = prefix.slice();

@@ -9,7 +9,7 @@
  */
 import { mkdirSync } from 'node:fs';
 import { open, type Database, type RootDatabase } from 'lmdb';
-import type { KvEnv, KvStore, KvWriter } from './kv.ts';
+import { StoreReadOnlyError, type KvEnv, type KvStore, type KvWriter } from './kv.ts';
 
 function buf(b: Uint8Array): Buffer {
   return Buffer.from(b.buffer, b.byteOffset, b.byteLength);
@@ -27,10 +27,12 @@ class LmdbStore implements KvStore {
   private readonly db: Database<Buffer, Buffer>;
   /** Throws once the environment is closed: work that outlived a stop fails here, in JavaScript, and not in the native library on memory that is gone. */
   private readonly open: () => void;
+  private readonly readOnly: boolean;
 
-  constructor(db: Database<Buffer, Buffer>, open: () => void) {
+  constructor(db: Database<Buffer, Buffer>, open: () => void, readOnly: boolean) {
     this.db = db;
     this.open = open;
+    this.readOnly = readOnly;
   }
 
   get(key: Uint8Array): Uint8Array | undefined {
@@ -64,6 +66,7 @@ class LmdbStore implements KvStore {
 
   write(fn: (w: KvWriter) => void): void {
     this.open();
+    if (this.readOnly) throw new StoreReadOnlyError();
     // The writer is good for the callback and no longer: kept and used later, it would write outside a transaction.
     let live = true;
     const use = (): void => {
@@ -105,7 +108,7 @@ export class LmdbEnv implements KvEnv {
     this.assertOpen();
     const db = this.root.openDB<Buffer, Buffer>({ name, keyEncoding: 'binary', encoding: 'binary' }) as Database<Buffer, Buffer> | undefined;
     if (!db) throw new Error(`the store has no database named ${name}${this.readOnly ? ', and a read-only environment cannot create it' : ''}`);
-    return new LmdbStore(db, this.assertOpen);
+    return new LmdbStore(db, this.assertOpen, this.readOnly);
   }
 
   transaction(fn: () => void): void {

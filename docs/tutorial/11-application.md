@@ -1516,34 +1516,44 @@ export function migrateRecentTxIndex(kv: KvStore): void {
     return out;
   };
   if (take(second, null, () => true).length === 0) return;
-  for (let from: Uint8Array | null = null; ; ) {
-    const old = take(first, from, (k) => k.length === INDEX_HEADER + HASH_SIZE);
-    if (old.length === 0) break;
-    kv.write((w) => old.forEach(([k]) => w.del(k)));
-    from = old[old.length - 1]![0];
+  // The database reads the index in the layout it has now, so an old store that cannot be written cannot be read
+  // through it either: say so here, where the reason is known.
+  try {
+    move();
+  } catch (e) {
+    if (e instanceof StoreReadOnlyError) throw new Error('this store keeps recent transactions under an older index layout and is opened read-only; open it writable once, which moves the index');
+    throw e;
   }
-  const objects = objectKey(objectId(TYPE.recentTx, 0)).subarray(0, 3); // 'o' and the type's two bytes
-  for (let from: Uint8Array | null = null; ; ) {
-    const batch = take(objects, from, () => true);
-    if (batch.length === 0) break;
-    kv.write((w) => {
-      for (const [k, v] of batch) {
-        const id = decode(k, (r) => (r.u8(), r.u64()));
-        const t = decode(v, (r) => RecentTxType.decode(r, id));
-        w.put(entryKey(first, key((kw) => kw.u64(t.expiration).fixed(t.txId))), idBytes(id));
-      }
-    });
-    from = batch[batch.length - 1]![0];
-  }
-  for (;;) {
-    const old = take(second, null, () => true);
-    if (old.length === 0) break;
-    kv.write((w) => old.forEach(([k]) => w.del(k)));
+  function move(): void {
+    for (let from: Uint8Array | null = null; ; ) {
+      const old = take(first, from, (k) => k.length === INDEX_HEADER + HASH_SIZE);
+      if (old.length === 0) break;
+      kv.write((w) => old.forEach(([k]) => w.del(k)));
+      from = old[old.length - 1]![0];
+    }
+    const objects = objectKey(objectId(TYPE.recentTx, 0)).subarray(0, 3); // 'o' and the type's two bytes
+    for (let from: Uint8Array | null = null; ; ) {
+      const batch = take(objects, from, () => true);
+      if (batch.length === 0) break;
+      kv.write((w) => {
+        for (const [k, v] of batch) {
+          const id = decode(k, (r) => (r.u8(), r.u64()));
+          const t = decode(v, (r) => RecentTxType.decode(r, id));
+          w.put(entryKey(first, key((kw) => kw.u64(t.expiration).fixed(t.txId))), idBytes(id));
+        }
+      });
+      from = batch[batch.length - 1]![0];
+    }
+    for (;;) {
+      const old = take(second, null, () => true);
+      if (old.length === 0) break;
+      kv.write((w) => old.forEach(([k]) => w.del(k)));
+    }
   }
 }
 ```
 
-An entry at position 1 is the sign of an old store, since the type has no second index now; a store without one returns after a single read. The move is three passes, each 5,000 entries a write. The first removes the old entries at position 0, which are told by their length: the four-byte header and a 32-byte id, where a new entry has the 8-byte expiration between them. The second walks the type's objects under `'o'`, decodes each and writes its new entry, the expiration and the id as the key and the object's id as the value. The third removes the entries at position 1. They go last because they are what the function looks for: a move cut short at any write leaves some of them, and the next open makes it again from the start, where the first pass leaves the new entries alone and the second writes the same ones over. The function does not catch a failed write, so a store of the old layout that cannot be written is not opened; the block store, by contrast, reads such a store as it is ([chapter 10](10-store.md)). The entries the move wrote are loaded further down like any others and, with `checkIndexEntries` (the default), checked against the objects there.
+An entry at position 1 is the sign of an old store, since the type has no second index now; a store without one returns after a single read. The move is three passes, each 5,000 entries a write. The first removes the old entries at position 0, which are told by their length: the four-byte header and a 32-byte id, where a new entry has the 8-byte expiration between them. The second walks the type's objects under `'o'`, decodes each and writes its new entry, the expiration and the id as the key and the object's id as the value. The third removes the entries at position 1. They go last because they are what the function looks for: a move cut short at any write leaves some of them, and the next open makes it again from the start, where the first pass leaves the new entries alone and the second writes the same ones over. The three passes are the inner `move`, and a write that fails in it is thrown on, so a store of the old layout that cannot be written is not opened. One failure is reworded on the way: a store opened read-only throws `StoreReadOnlyError` at the first write ([chapter 10](10-store.md)), and the function throws in its place an error that says the store keeps the older layout and has to be opened writable once. The database reads the index in the layout it has now, so there is no reading such a store as it is, which the block store, by contrast, does with its own older index. The entries the move wrote are loaded further down like any others and, with `checkIndexEntries` (the default), checked against the objects there.
 
 **`openObjectDatabase(kv, types, opts = {})`** loads a database from a store written by `CoreApp`, or returns null if the store is empty:
 
@@ -2026,7 +2036,7 @@ A failed `checkTx` leaves nothing behind in the pending session, and a failed tr
 
 A second group, `core application: index entries in the store`, is the application's side of STATE-PAGING.md phases two to four. Its `consistent(app, kv)` check is applied after every commit: the store's `'i'` entries equal `db.indexEntries()` and `checkIndexStore()` finds nothing to report, and the store's `'t'` and `'n'` entries equal `db.treeEntries()`.
 
-- `gives a store that kept recent transactions under two indices the one they have now, and still refuses a replay`: after three blocks the five `recentTx` objects are listed in order of expiration and one is found by the pair of its expiration and id; a copy of the store with the type's entries rewritten as the two old indices opens to the same app hash and then holds exactly the original's entries; a transaction applied before the move is refused as `duplicate transaction` after it while a new one is applied, and a block two minutes on empties the index; and for each of the move's three writes, an open that fails at that write leaves a store that the next open brings to the original's entries. Last, 12,000 synthetic records, beside an object and an entry of another type, are moved by `migrateRecentTxIndex` directly, which takes nine writes: cut short at each of the nine in turn and then finished, the store holds exactly the expected entries and the other type's entry as it was, and a store already moved is not written.
+- `gives a store that kept recent transactions under two indices the one they have now, and still refuses a replay`: after three blocks the five `recentTx` objects are listed in order of expiration and one is found by the pair of its expiration and id; a copy of the store with the type's entries rewritten as the two old indices opens to the same app hash and then holds exactly the original's entries; a transaction applied before the move is refused as `duplicate transaction` after it while a new one is applied, and a block two minutes on empties the index; and for each of the move's three writes, an open that fails at that write leaves a store that the next open brings to the original's entries. Last, 12,000 synthetic records, beside an object and an entry of another type, are moved by `migrateRecentTxIndex` directly, which takes nine writes: cut short at each of the nine in turn and then finished, the store holds exactly the expected entries and the other type's entry as it was, and a store already moved is not written; an old store whose `write` throws `StoreReadOnlyError` is refused with an error that says to open it writable once, and one already moved is accepted through the same wrapper.
 - `writes the entries with every commit, reopens from them, and fills in a store that predates them`: the store is consistent after genesis, after three blocks of registrations, payments and a transfer, and after the recent transaction ids expire and take their entries with them; an application reopened from the store has the same hash, finds bob and his balance, and is consistent; and a copy of the store with every `'i'` key left out, as a store written before phase two would be, is opened, derives the entries from the objects once and writes them, so that it then holds exactly the entries of the original.
 - `runs blocks with the trees dropped and rebuilt on the way, with the hashes of an app that never drops them`: with `dropIndexTrees()` turned, blocks run on the paged application and on a resident twin give the same app hash and the same results, a taken name is refused in a block and, against the pending session as admission checks it, in `checkTx`; after `rebuildIndexTrees()` and a further drop the store still equals the resident twin's indices.
 - `writes the entries of a state imported from a snapshot`: a snapshot exported in chunks of three objects, imported, and written with `writeImportedState` leaves a store whose entries and trees equal the original application's, and an application opened on it has the original's hash.

@@ -1,7 +1,7 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-nine files, 290 cases, about 9,430 lines counting the shared harness
+`test/**/*.test.ts`: twenty-nine files, 290 cases, about 9,440 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
@@ -544,7 +544,8 @@ The decisive point is the aborted write: a batch that throws leaves nothing behi
 in a temporary directory, then the environment is closed and reopened and `c` still reads
 `three`; a second, read-only environment on the same path sees the deleted `a` as `undefined`,
 and asked for a store named `missing` it throws `/no database named missing/`: a read-only
-environment cannot create a database, and says so where it is asked for one.
+environment cannot create a database, and says so where it is asked for one. A `write` to its
+store `t` throws `StoreReadOnlyError`, before anything reaches the native library.
 The temporary directory is removed in `afterEach`.
 
 **`it('block store finds blocks by height and by hash on both backends')`**. For a
@@ -1478,7 +1479,10 @@ then run again on the store itself, and the store's `'i'` keys are exactly the 1
 entries, of expiration and transaction id with the object's id as the value, and the one entry
 of the other type, untouched; and its objects, of every type, are the ones it started with. A
 further call through the wrapper makes no write: a store already moved is
-read once and left.
+read once and left. Last, a store that cannot be written: `migrateRecentTxIndex` on a fresh old
+store through a wrapper whose `write` throws `StoreReadOnlyError` throws
+`/older index layout and is opened read-only/` and leaves the store's entries as they were, and
+once the store itself has been moved the same wrapper over it is accepted without a word.
 
 **`it('writes the entries with every commit, reopens from them, and fills in a store that predates them')`**
 (describe `core application: index entries in the store`). An app on a `MemoryKv` is
@@ -1904,9 +1908,13 @@ account is `null`; an unknown height is error `-32001`; an unknown method `-3260
 `peers` (3), `mempool` (count 0) and `accounts` (`['faucet']`) answer.
 
 **`it('broadcasts in sync and commit mode, finds transactions with proofs, and records history')`**.
-`broadcastTx(..., 'commit')` of alice's registration returns `ok` and the transaction's hash.
+`broadcastTx(..., 'commit')` of alice's registration returns `ok` and the transaction's hash,
+and a counter wrapped around the store's `txLocation` reads 0 after it: a transaction just
+admitted is waited for, not looked up.
 A transfer in `'sync'` mode is `'added'`; once it lands, broadcasting it again in commit mode
-returns the height it already landed at. A forged transfer (signed by alice for the faucet) is
+returns the height it already landed at, with one lookup made. (The case ends with a third
+transfer broadcast in commit mode twice at once: both calls return `ok` at one height and the
+counter has not moved, the second having found the transaction pending.) A forged transfer (signed by alice for the faucet) is
 refused with `-32002`. `rpc.tx(hash, true)` after the next height reports `ok`, a decoded
 transfer to `3.1`, and a proof that `txQueryFromJson` turns into something `verifyTxQuery`
 accepts with the sets at `H` and `H + 1`. An unknown hash is `-32001`. `accountHistory` for
@@ -2473,17 +2481,13 @@ hash has exactly its one location. The transaction with two entries has `[5, fal
 that counts range reads makes none, the marker saying nothing is left to move.
 
 Then a move that is cut short. The 12,000 entries are written to a second `MemoryKv`, with no
-marker, and a store is opened through a wrapper whose second `write` throws: 7,000 entries are
-left under `'t'`, there is no `'T'`, and that store finds every 41st hash at its one location,
-moved or not. Three entries still under `'t'` that the every-41st checks do not look at are
-then taken, `saved`, `pruned` and `dropped`, and for each of the first two a block at the entry's height carrying its transaction is saved through that store with
-a success: `txLocations` of the hash is one location, the height, index 0, `ok: true`, not the
-old entry beside the new one. `deleteBlock` of `pruned`'s height then leaves its hash with no
-location: `saveBlock` and `deleteBlock` each removed the old entry of the block they wrote. The
-third's block is saved without results, which leaves the index alone, so its one location is
-still the old entry; `deleteBlock` of that height removes it, and 6,997 entries are under `'t'`.
-A `KvBlockStore` opened on the data again answers the same for the three hashes, leaves nothing under `'t'`, `'T'` holds 3, and every 41st hash reads as before. Last, a store over a key-value store whose `write` always
-throws, holding one entry by hash alone and two by hash and height for another hash: the first
+marker, and a store is opened through a wrapper whose second `write` throws `stopped`: the
+constructor throws it, 7,000 entries are left under `'t'` and there is no `'T'`. A failed write
+is the caller's to see, and the node would not open. A second `KvBlockStore` is opened over the
+half-moved data through `refusing`, a wrapper whose `write` throws `StoreReadOnlyError`, as a
+store opened read-only does: it finds every 41st hash at its one location, moved or not.
+A `KvBlockStore` opened on the data itself then leaves nothing under `'t'`, `'T'` holds 3, and every 41st hash reads as before. Last, a store over `refusing` on a key-value store
+holding one entry by hash alone and two by hash and height for another hash: the first
 answers `txLocation` with height 6, index 1, `ok: true`, the second `txLocations` with
 `[8, false]`, `[9, true]`, and a hash with no entry `null`.
 

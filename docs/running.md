@@ -499,9 +499,12 @@ commit mode a transaction seen before that is neither pending nor committed is r
 with `-32002`, and a timeout does not remove a pending transaction from the mempool. At most
 1,000 commit waits are held at a time; beyond that the call answers `-32004` and the client
 should broadcast in sync mode and poll `tx`. A call in commit mode whose transaction the
-mempool reported `added` or `seen` also looks the hash up among the blocks, in case it is
+mempool has seen before and no longer holds looks the hash up among the blocks, in case it is
 already in one, at the cost the `tx` row gives: a read or two for every 32 blocks held. One
-answered `invalid`, `too-large`, `full` or `paused` returns its error before the lookup.
+whose transaction was just admitted, or is still pending, waits for the block that carries it
+and looks nothing up, so a transaction that failed in an earlier block and is admitted again
+is answered with the new attempt. While the mempool still remembers its hash it is not admitted
+again: the answer is `seen`, and the call returns the earlier failure.
 
 Errors carry JSON-RPC codes: `-32700` unparsable body, `-32600` malformed request (also a batch
 outside 1 to 20 requests; a malformed request is answered with its own id when that is a string, a number or null, and with `id: null` otherwise), `-32601` unknown method (a name every JavaScript object inherits, such as `toString`, included), `-32602` bad parameters, `-32001` not found (including a `height`

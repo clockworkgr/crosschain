@@ -63,6 +63,7 @@ Exports:
 
 - `interface KvWriter { put(key, value); del(key) }`: what a `write` callback receives.
 - `interface KvStore { get(key); range(start, end); write(fn) }`: one named store. `range` yields `[key, value]` pairs with `start <= key < end`, ascending.
+- `class StoreReadOnlyError extends Error`, with the message `the store is read-only`: what `write` throws on a store opened read-only, "the one failure of a write that a reader of the store can go on from".
 - `interface KvEnv { store(name); transaction(fn); close() }`: a set of named stores sharing one environment. `transaction(fn)` runs writes to several stores of the environment as one transaction: on disk they all land or none does, whatever happens in between; in memory "there is no crash to recover from, but a throw out of `fn` still undoes what the stores took inside it". `close` is the only asynchronous method, because closing LMDB is.
 - `prefixEnd(prefix)`: the exclusive upper bound of a prefix scan.
 - `class MemoryKv implements KvStore` and `class MemoryEnv implements KvEnv`.
@@ -220,10 +221,12 @@ class LmdbStore implements KvStore {
   private readonly db: Database<Buffer, Buffer>;
   /** Throws once the environment is closed: work that outlived a stop fails here, in JavaScript, and not in the native library on memory that is gone. */
   private readonly open: () => void;
+  private readonly readOnly: boolean;
 
-  constructor(db: Database<Buffer, Buffer>, open: () => void) {
+  constructor(db: Database<Buffer, Buffer>, open: () => void, readOnly: boolean) {
     this.db = db;
     this.open = open;
+    this.readOnly = readOnly;
   }
 ```
 
@@ -261,6 +264,7 @@ class LmdbStore implements KvStore {
 
   write(fn: (w: KvWriter) => void): void {
     this.open();
+    if (this.readOnly) throw new StoreReadOnlyError();
     // The writer is good for the callback and no longer: kept and used later, it would write outside a transaction.
     let live = true;
     const use = (): void => {
@@ -291,7 +295,7 @@ The check is there for work that outlives a stop. A node that stops closes its e
 
 `range` is a generator, so nothing in it runs until the first `next()`. It takes the lmdb-js iterator and steps it by hand, not with `for ... of`, so that `open` can be called "before every step, not only the first": a caller may keep an iteration across a wait, and the environment may be closed during it. An iteration begun before a close and stepped after it throws `StoreClosedError` at that step, and no cursor of the closed environment is moved. The `finally` is for an iteration left early, by a `break` or a `return()`: it gives the cursor back through the iterator's `return`, unless `open` throws first. Then the environment "went first and took it along", and nothing of the cursor is left to release.
 
-`write` checks once before it opens the transaction and again in every `put` and `del`, through `use`. The writer handed to the callback is "good for the callback and no longer": `live` is set to false in a `finally`, whether `transactionSync` returned or threw, and a `put` or `del` on a writer that was kept and used afterwards throws `a store writer was used after its write() returned`. Without the flag such a call "would write outside a transaction".
+`write` checks once before it opens the transaction and again in every `put` and `del`, through `use`. A store of an environment opened read-only then throws `StoreReadOnlyError` (`kv.ts`) before anything reaches lmdb-js. The error has a class of its own because it is the one failure of a write that a reader of the store can go on from: the block store catches it, and nothing else, when it finds an index of an older layout that it cannot move (below). The writer handed to the callback is "good for the callback and no longer": `live` is set to false in a `finally`, whether `transactionSync` returned or threw, and a `put` or `del` on a writer that was kept and used afterwards throws `a store writer was used after its write() returned`. Without the flag such a call "would write outside a transaction".
 
 `buf` wraps a `Uint8Array` as a Node `Buffer` over the same memory without copying, for lmdb-js's binary encodings:
 
@@ -318,7 +322,7 @@ Results are copied into fresh `Uint8Array`s (`new Uint8Array(v)`), which is the 
     this.assertOpen();
     const db = this.root.openDB<Buffer, Buffer>({ name, keyEncoding: 'binary', encoding: 'binary' }) as Database<Buffer, Buffer> | undefined;
     if (!db) throw new Error(`the store has no database named ${name}${this.readOnly ? ', and a read-only environment cannot create it' : ''}`);
-    return new LmdbStore(db, this.assertOpen);
+    return new LmdbStore(db, this.assertOpen, this.readOnly);
   }
 ```
 
@@ -421,7 +425,7 @@ Every save goes through a private `write` that either joins a batch in progress 
 ```ts
   /** The writer of a batch in progress; every save joins it instead of opening its own transaction. */
   private open: KvWriter | null = null;
-  /** Whether entries of an older layout may still lie under 't': their move did not finish when the store was opened (the store cannot be written, or a write of the move failed). */
+  /** Whether entries of an older layout still lie under 't': the store was opened read-only, so they could not be moved. */
   private oldTxIndex = false;
 
   constructor(kv: KvStore) {
@@ -495,17 +499,12 @@ A block and its commit are stored as one value, the block's encoding followed by
           const first = seen.get(k);
           if (!first || (results && !results[first.index]?.ok && results[i]?.ok)) seen.set(k, { hash, index: i });
         });
-        for (const { hash, index } of seen.values()) {
-          w.put(txKey(hash, h), encodeTx(h, index, results?.[index]));
-          if (this.oldTxIndex) this.delOldTx(w, hash, h);
-        }
+        for (const { hash, index } of seen.values()) w.put(txKey(hash, h), encodeTx(h, index, results?.[index]));
         if (results) w.put(resultsKey(h), encode((wr) => wr.array(results, (wr, r) => wr.bool(r.ok).string(r.error ?? ''))));
       }
 ```
 
 The location value is the height, the position, a status byte (1 ok, 0 failed, 2 not executed) and the error string. A transaction can stand in one block more than once, and the block has one index entry for it. The `seen` map chooses the position: the first one the hash appears at, replaced by a later one only while the position held failed and the later one succeeded, so the entry names the first position the transaction succeeded at, and its first position when it succeeded nowhere or the block was stored without being executed (`results` is `null`). For a block `[T, T]` where the first T succeeds and the second fails as a duplicate, the entry is position 0 with `ok`; for one where the first fails, for want of a balance that a transaction between the two supplies, and the second succeeds, it is the second position, so the RPC reports the success and the result proof is made for the position that has it. `loadResults(height)` returns every position's result, from which a result proof for any position can be built.
-
-The last line of the loop, `delOldTx`, runs only while `oldTxIndex` is set, which is while entries of an older layout may still lie under `'t'` (the move below was cut short). A block saved then may be one whose transactions still have their old entries, a block saved again with its results, say. `txLocations` reads both places while the flag is set, so without the removal the transaction would be reported twice in the one block, once from its segment and once from under `'t'`, and with whatever result the old entry had. With it the block's entry is the one in its segment only. `delOldTx` itself is shown with `deleteBlock`, which calls it too.
 
 The key carries the height after the hash, so there is one entry for every block a transaction is in. A transaction that failed has no effect and can be included again, in a later block, where it may succeed or fail once more; with one entry per hash the last block written used to win.
 
@@ -580,13 +579,13 @@ A store written before the segments has its entries under `'t'`, in one of two l
         if (old.length < 5000) break;
       }
       this.oldTxIndex = false;
-    } catch {
-      // not writable
+    } catch (e) {
+      if (!(e instanceof StoreReadOnlyError)) throw e;
     }
   }
 ```
 
-The marker `'T'` holds the layout's number, 3 for the segments; a store that says 2 (hash and height) or says nothing is moved. Each entry is rewritten under the key of its own height, which is read from the value, so the two older layouts need not be told apart: the hash is the 32 bytes after the prefix in both. The move takes 5,000 entries a write, each write deleting what it moved, and the marker goes in with the last write, so a move that was cut short is taken up again at the next open and a store that has the marker is not scanned. A new, empty store writes the marker at once, which is one write at open. While old entries may remain, `oldTxIndex` is set: it is cleared only when the move has finished. A store that cannot be written is left as it is, and so is one whose move stopped at a failed write; with the flag set `txLocations` also reads the hash's prefix under `'t'`, which finds an entry of either older layout, so every entry is found whether it was moved or not.
+The marker `'T'` holds the layout's number, 3 for the segments; a store that says 2 (hash and height) or says nothing is moved. Each entry is rewritten under the key of its own height, which is read from the value, so the two older layouts need not be told apart: the hash is the 32 bytes after the prefix in both. The move takes 5,000 entries a write, each write deleting what it moved, and the marker goes in with the last write, so a move that was cut short is taken up again at the next open and a store that has the marker is not scanned. A new, empty store writes the marker at once, which is one write at open. `oldTxIndex` is set before the first write and cleared only when the move has finished. A store opened read-only refuses the first write with `StoreReadOnlyError` (`lmdb.ts` above), which is caught: the store is left as it is, the flag stays set, and with it `txLocations` also reads the hash's prefix under `'t'`, which finds an entry of either older layout, so every entry is found whether an earlier open had moved it or not. Any other failure of a write, a full disk say, is not caught: the constructor throws it, the node does not open, and what the writes before it moved stays moved for the next open to go on from. A store whose index is half moved is therefore either being read by a process that cannot write it or not open at all, and `saveBlock` and `deleteBlock` never meet an old entry.
 
 The rest are one-key reads and writes: `heightOf(hash)`, `loadState` / `saveState` (the `ChainState` encoding from `src/types/state.ts`, whose last byte names the chain's signature scheme and is refused on read when it names none the code knows), `loadValidatorSet` / `saveValidatorSet` keyed by `set.hash()`, `loadValidatorsAt` / `saveValidatorsAt` keyed by height, `lowestHeight`, which defaults to 1 when nothing was stored, and the header records: `loadHeader` / `saveHeader` keyed by the header's own height (the `Header` encoding from `src/types/block.ts`), `deleteHeader`, and the marker of the lowest one, which unlike `lowestHeight` has no default, because a node that never state-synced has no such records:
 
@@ -615,31 +614,12 @@ Setting the marker to `null` deletes the key, which is what header pruning does 
       // without the block the record answers nothing. Sets by hash are the executor's to remove, once no header
       // still held names them.
       w.del(valsetAtKey(height));
-      for (const tx of stored.block.txs) {
-        const hash = txHash(tx);
-        w.del(txKey(hash, height));
-        if (this.oldTxIndex) this.delOldTx(w, hash, height);
-      }
+      for (const tx of stored.block.txs) w.del(txKey(txHash(tx), height));
     });
   }
 ```
 
-While `oldTxIndex` is set, both it and `saveBlock` call the private `delOldTx` for each transaction of the block:
-
-```ts
-  /**
-   * Remove what a move that was cut short left under 't' for a transaction in a block: the entry by hash and
-   * height, and the one by hash alone if it names this block. The block's entry is then the one in its segment only.
-   */
-  private delOldTx(w: KvWriter, hash: Uint8Array, height: bigint): void {
-    const alone = oldTxPrefix(hash);
-    w.del(key((k) => k.u8(0x74).fixed(hash).u64(height)));
-    const v = this.kv.get(alone);
-    if (v && decodeTx(v).height === height) w.del(alone);
-  }
-```
-
-Deleting a block removes that block's index entries only: a transaction that is also in another block still held keeps its entry there. While `oldTxIndex` is set, entries of the block's transactions may still lie under `'t'`, so `delOldTx` removes those too: the one by hash and height, and the one by hash alone if its value names this block, which takes a read of that key. An entry by hash alone that names another block is that block's and stays. The validator set stored by height (`'V'`) goes with the block of that height: it is what a peer joining at a snapshot of that height is served, and such a join needs the block too, so the record answers nothing once the block is gone. The sets of the heights still held stay, as do the two the executor has stored ahead of the latest block. Sets by hash (`'v'`), one per distinct set, are not deleted here: headers still held name them, which is what evidence at any retained height needs. They are the executor's to remove. After a pruning pass it looks for each set the removed heights carried among the headers still held and in the current state, and calls **`deleteValidatorSet(hash)`**, a single `del` of the `'v'` key, for one that nothing names (`pruneValidatorSets`, [chapter 5](05-mempool-executor.md)). The store does not check the condition itself; the interface says so: "the caller has found that no header still held and no state names it". A store pruned by an earlier build keeps the by-height records of the blocks that build deleted, below its lowest block, since `deleteBlock` returns at once for a height whose block is already gone.
+Deleting a block removes that block's index entries only: a transaction that is also in another block still held keeps its entry there. The validator set stored by height (`'V'`) goes with the block of that height: it is what a peer joining at a snapshot of that height is served, and such a join needs the block too, so the record answers nothing once the block is gone. The sets of the heights still held stay, as do the two the executor has stored ahead of the latest block. Sets by hash (`'v'`), one per distinct set, are not deleted here: headers still held name them, which is what evidence at any retained height needs. They are the executor's to remove. After a pruning pass it looks for each set the removed heights carried among the headers still held and in the current state, and calls **`deleteValidatorSet(hash)`**, a single `del` of the `'v'` key, for one that nothing names (`pruneValidatorSets`, [chapter 5](05-mempool-executor.md)). The store does not check the condition itself; the interface says so: "the caller has found that no header still held and no state names it". A store pruned by an earlier build keeps the by-height records of the blocks that build deleted, below its lowest block, since `deleteBlock` returns at once for a height whose block is already gone.
 
 ### src/store/files.ts
 
@@ -684,12 +664,12 @@ The file is either the old content or the new content, never a mix: the data goe
 `test/store.test.ts`:
 
 - "memory store orders keys bytewise and makes writes atomic": `exerciseKv` puts keys out of order, reads one back, finds a missing key undefined, scans the prefix `b` with `prefixEnd` and gets the two `b/` keys in order, scans `[a, z)` and gets four, throws inside a `write` and finds the key it put absent, and deletes a key.
-- "lmdb store does the same and survives reopening": the same exercise on an `LmdbEnv` in a temporary directory, then a reopen reads a value back, a second, read-only environment on the same directory sees the deletion, and asking that environment for a store named `missing` throws `/no database named missing/`.
+- "lmdb store does the same and survives reopening": the same exercise on an `LmdbEnv` in a temporary directory, then a reopen reads a value back, a second, read-only environment on the same directory sees the deletion, asking that environment for a store named `missing` throws `/no database named missing/`, and a `write` to its store `t` throws `StoreReadOnlyError`.
 - "block store finds blocks by height and by hash on both backends": five blocks saved on a `MemoryBlockStore` and on a `KvBlockStore` over LMDB; `loadBlock(3)` returns the block with its commit, `heightOf` finds block 4 and returns null for an unknown hash, `loadBlock(9)` and `loadState` return null.
 
 `test/review.test.ts`, "keeps per-block results so a repeated transaction proves its real outcome at each position": a block `[T, T]` with results success then failure; `txLocation` points at position 0 with `ok: true`, `loadResults` returns both, and a result proof for position 1 verifies against the results root with `ok: false` (finding 18). Its neighbour "saves everything a height needs to the block store in one transaction" subclasses `MemoryKv` to count calls to `write`: a `batch` holding `saveValidatorSet`, `saveValidatorsAt` and `setLowestHeight` costs one (counted from after the store is opened, which writes the layout of its transaction index once), the values are readable afterwards, and a `setLowestHeight` outside the batch costs another (finding 39).
 
-`test/review4.test.ts` has three cases on the transaction index. "keeps every block a transaction is in, answers with the one it succeeded in, and loses only the pruned one" saves one transaction in blocks 5 (failed), 8 (succeeded, at position 1) and 9 (failed): `txLocations` lists the three in height order, `txLocation` answers block 8, after `deleteBlock(8n)` the list is 5 and 9 and the answer block 9, and after the other two are deleted it is null. "finds a transaction in whichever segments hold it, with blocks far apart and segments missing between" saves fourteen blocks at heights from 1 to 90,000, which lie in seven segments, with one transaction in five of them: `txLocations` lists the five in height order, a transaction in a single block is found at either end and in the middle, hashes of all zero and all `0xff` bytes find nothing, one lookup makes at most 14 range reads, every key under `'x'` starts with its height divided by `TX_SEGMENT_BLOCKS`, three keys put under `'x'` that are not entries (41 bytes, sorting just before an entry of the transaction, 2 bytes and 9 bytes) change no answer, and deleting two of the five blocks leaves the other three. "moves an index of either older layout into the segments when the store is opened, and reads one it cannot move" writes 12,000 entries under `'t'`, half by hash alone and half by hash and height, over heights in ten segments, with the marker saying layout 2, and opens a `KvBlockStore` on them: nothing is left under `'t'`, the entries read back with their heights, positions and results, a transaction with entries at heights 5 and 700 that lands again at height 9 has all three and keeps the first two when block 9 is deleted, and a second store opened on the same data makes no range read. A store whose second write throws leaves 7,000 entries unmoved and no marker, finds every entry all the same, answers with one location for a block saved again while its old entry remained with none for one saved and then pruned and none for one pruned whose block was stored without touching the index, 6,997 old entries being left, and the next open finishes the move and writes the marker; and a store whose `write` always throws answers from entries of both older layouts.
+`test/review4.test.ts` has three cases on the transaction index. "keeps every block a transaction is in, answers with the one it succeeded in, and loses only the pruned one" saves one transaction in blocks 5 (failed), 8 (succeeded, at position 1) and 9 (failed): `txLocations` lists the three in height order, `txLocation` answers block 8, after `deleteBlock(8n)` the list is 5 and 9 and the answer block 9, and after the other two are deleted it is null. "finds a transaction in whichever segments hold it, with blocks far apart and segments missing between" saves fourteen blocks at heights from 1 to 90,000, which lie in seven segments, with one transaction in five of them: `txLocations` lists the five in height order, a transaction in a single block is found at either end and in the middle, hashes of all zero and all `0xff` bytes find nothing, one lookup makes at most 14 range reads, every key under `'x'` starts with its height divided by `TX_SEGMENT_BLOCKS`, three keys put under `'x'` that are not entries (41 bytes, sorting just before an entry of the transaction, 2 bytes and 9 bytes) change no answer, and deleting two of the five blocks leaves the other three. "moves an index of either older layout into the segments when the store is opened, and reads one it cannot move" writes 12,000 entries under `'t'`, half by hash alone and half by hash and height, over heights in ten segments, with the marker saying layout 2, and opens a `KvBlockStore` on them: nothing is left under `'t'`, the entries read back with their heights, positions and results, a transaction with entries at heights 5 and 700 that lands again at height 9 has all three and keeps the first two when block 9 is deleted, and a second store opened on the same data makes no range read. A store whose second write throws `stopped` throws it from the constructor and leaves 7,000 entries unmoved and no marker; a `KvBlockStore` over the same data whose `write` throws `StoreReadOnlyError` finds every entry all the same, and the next open on the data itself finishes the move and writes the marker; and a store whose `write` always throws `StoreReadOnlyError` answers from entries of both older layouts.
 
 `test/review5-node.test.ts` has seven cases on this chapter's code; two, on a closed LMDB environment, are described under `src/store/lmdb.ts` above, and the other five are these. "indexes a transaction repeated in one block where it succeeded": on a `MemoryBlockStore`, a block `[T, U, T]` with results failure, success, success is indexed at position 2 with `ok: true`; a block `[T, T]` with success then failure at position 0; one where both fail at the first of the two with its error; one saved with `null` results at position 0 with `ok: null`; and `txLocations` has one entry per block, which goes when the block is deleted. "applies the operations of one write to the memory store in the order they were made": a put followed by a delete of one key in a single `write` leaves the key absent, put, delete, put leaves the last value, and a callback that deletes and then throws leaves the store as it was. "prunes blocks and headers in one transaction each, the set by height going with its block": a one-validator node retaining two blocks runs on a `MemoryKv` that records the first byte of every key each `write` puts and deletes. Every write that deletes a block also puts the lowest-height marker, no write moves the marker alone, and each deletes as many `'V'` records as blocks; `loadValidatorsAt` is null below the lowest block and answers at it and two heights above the latest, and the genesis set is still found by hash, the chain's one validator never having changed. Two header records written below the lowest block with times older than the evidence age are then deleted, with their marker, in a single write after the next commit. The fourth, "removes a validator set by hash once no header held names it" ([chapter 5](05-mempool-executor.md)), exercises `deleteValidatorSet`: a set replaced by a `val:` transaction is gone from the store once every block that names it has been pruned, and each block still held finds both sets its header names. The fifth, "undoes the writes of a memory environment transaction that throws, in every store", puts a key in the `chain` store of a `MemoryEnv`, then in a transaction overwrites it, adds a second key, deletes the first, writes to an `app` store first asked for inside a nested transaction, and throws: the first key holds its old value, the second key and the `app` store's key are absent. A transaction that returns keeps its write, and a write made after it is not undone by a later transaction that throws. Last, an outer transaction puts the first key, runs an inner one that overwrites it, writes to a `late` store first asked for there and throws, catches the error and puts the second key: afterwards the first key holds the outer transaction's value, the second key its new one, and the `late` store has nothing.
 

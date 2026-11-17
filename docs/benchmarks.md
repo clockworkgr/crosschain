@@ -692,13 +692,16 @@ the load, `BENCH_PAGING_BEFORE_NODE` a shell command run between building the st
 node opening it, which is how the volume the store is on (`TMPDIR` chooses it) is remounted so
 that none of the store is in the page cache, and `BENCH_PAGING_PROFILE` a directory for two
 CPU profiles of thirty seconds each, one starting 5 seconds into the run and one starting 40
-seconds before its end: 5 to 35 s and 560 to 590 s of a ten-minute run). Three more switches
+seconds before its end: 5 to 35 s and 560 to 590 s of a ten-minute run). Four more switches
 belong to the node script alone (`bench/paging-node.ts`, which prints a JSON line per window
 and can be run by itself on a state the suite built and kept): `BENCH_PAGING_NO_TX_INDEX`
 stores blocks without their transaction index and results, `BENCH_PAGING_EXPIRATION_S` makes
 each transfer expire that many seconds after it is signed where they otherwise all expire an
 hour after the run starts, and `BENCH_PAGING_STORE_STATS` has the node print, at the end,
-what each store holds by the first byte of the key and the pages of its tree. Every window
+what each store holds by the first byte of the key and the pages of its tree, and
+`BENCH_PAGING_SYNC_PROBE` has it time, at the end of each window, twenty synced writes of
+64 KiB to a file beside the store and report the second fastest as `syncMs`: what the device
+asks for a sync at that moment, whatever the node is writing. Every window
 line carries `storeMs`, the time spent inside the store's transactions.
 
 The runs of this section are from the batch of 2026-11-15 and on the node's defaults,
@@ -1398,15 +1401,45 @@ were written into the node, the last three with the node as it now is:
 
 With both, the store's time per block stays where it starts for the whole run, as it does with
 no index at all, and the rate with it; either alone leaves the other table growing and changes
-little. Three things in the table are not explained. A run starts at about 38 ms a block or at
-about 62, whichever layout it has (the third, sixth and eighth rows start high), and keeps the
-difference to its end: the native commit is 3.1 to 3.3 s of the first profile's thirty seconds
-in the runs that start low and 4.8 to 5.1 s in those that start high, on copies of the same
-store. Some runs have a few slow windows after the sixth minute (the second row from 390
-seconds, the sixth at 360 to 420 seconds, where its lowest window is 604 transfers a second,
-the seventh at 360 to 420 seconds), as the run with a short expiry above had. And the seventh
-row's last window reads 66 ms where the nineteen before it read 37 to 51. The sixth row was
-made while other work ran on the machine; the seventh and eighth were not.
+little. Three things in the table were not explained when it was made. A run starts at about
+38 ms a block or at about 62, whichever layout it has (the third, sixth and eighth rows start
+high), and keeps the difference to its end: the native commit is 3.1 to 3.3 s of the first
+profile's thirty seconds in the runs that start low and 4.8 to 5.1 s in those that start high,
+on copies of the same store. Some runs have a few slow windows after the sixth minute (the
+second row from 390 seconds, the sixth at 360 to 420 seconds, where its lowest window is 604
+transfers a second, the seventh at 360 to 420 seconds), as the run with a short expiry above
+had. And the seventh row's last window reads 66 ms where the nineteen before it read 37 to 51.
+The sixth row was made while other work ran on the machine; the seventh and eighth were not.
+
+The two levels are the machine's, not the node's. Ten runs of 62 seconds were made one after
+another, each on a fresh copy of the state, with a hundred synced writes of 64 KiB timed before
+and after each. The first run read 36 and 38 ms a block in its two windows. The second read 38
+in its first window and 62 in its second, and the eight runs after it read 60 to 65 in every
+window: the level changed once, in the middle of a run, and stayed for every copy made
+afterwards. The synced writes changed with it. Their fastest tenth took 3.05 ms before the
+change and 3.9 to 4.0 ms after it, in the copy's directory and in a file that no run touched;
+a commit of the node, which syncs megabytes where the probe syncs 64 KiB, lost 24 ms. What
+puts the device (an internal SSD, 95% full) in one state or the other was not found, and
+nothing the node does selects it. So a store time is comparable between two runs only where
+the device was in the same state, the seventh row's last window is such a change and not the
+index, and a run that begins low and ends high has to be read window by window.
+`BENCH_PAGING_SYNC_PROBE` (among the node script's switches at the head of this section) puts the probe in every window for that.
+It is a sample of twenty writes at the window's end, and a single window's figure can read
+high with the store time unmoved; a run of windows that read alike is the sign.
+
+With the probe in each window, the node before these two changes and the node after them, ten
+minutes each, one after the other:
+
+| run | windows with `syncMs` near 3.9 | windows with `syncMs` near 3.0 | transfers/s over the run |
+|---|---|---|---|
+| before | 0 to 180 s: 67, 79, 83, 86, 88, 88 ms a block | 180 to 600 s: 63, 62, 63, 66, 67, 67, 68, 68, 69, 71, 73, 71, 71, 73 ms | 1,550 |
+| after | (three windows, 210 to 300 s, read 3.7 to 3.9 with the store time unmoved) | 36, 38, 39, 41, 42, 40, 42, 42, 42, 43, 42, 47, 42, 44, 43, 43, 43, 43, 42, 42 ms | 1,724 |
+
+In the same state of the device the store's time before the change climbs from 39 ms (the
+first row of the table above) through 62 at four minutes to 73 at ten, and after it stays
+between 39 and 44 after the first minute, but for one window of 47 at 360 seconds; the last window commits 1,514 transfers a second
+before and 1,814 after. The slow windows after the sixth minute did not appear in either run
+(the lowest window after the change is 1,565 at 360 seconds) and are still not explained.
 
 The expirations have to move for the second remedy to do anything. The suite's own load signs
 every transfer with one expiration, an hour after the run starts, and under it the new index
@@ -1855,14 +1888,16 @@ a store is opened under, and the arena's budget.
    segments of 32 blocks and the record of recent transactions under one index by expiration.
    A lookup by hash now reads every segment the node holds, a quarter of a millisecond over
    4,000 blocks in the probe and so some 60 ms over a million; `retain.blocks` bounds it, and a
-   node that keeps every block pays it on each `tx` call and each `broadcastTx` in commit mode whose transaction
-   the mempool reported `added` or `seen`.
+   node that keeps every block pays it on each `tx` call and on a `broadcastTx` in commit mode of a
+   transaction the mempool has seen before and no longer holds; a broadcast of one it has just
+   admitted, or still holds, waits for the block and looks nothing up.
    A second level of larger segments, written as the small ones close, would bound it without
    pruning and is not done. The record of recent transactions is cheap only while expirations
    move with the clock; transactions signed with expirations spread over the allowed hour
-   scatter it as before. Two things in the runs that measured this are not explained: runs of
-   one configuration that differ by 25 ms a block from their first window, and slow windows
-   after the sixth minute of some runs.
+   scatter it as before. Runs of one configuration that differ by 25 ms a block from their
+   first window turned out to be two states of the machine's disk (section 4.13;
+   `BENCH_PAGING_SYNC_PROBE` labels each window with it), and what puts the disk in either was
+   not found. The slow windows after the sixth minute of some runs are not explained.
 
 ## 9. Adding a benchmark
 

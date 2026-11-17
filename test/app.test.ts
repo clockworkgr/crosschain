@@ -16,7 +16,7 @@ import { InlineVerifier } from '../src/crypto/verifier.ts';
 import { objectId } from '../src/db/id.ts';
 import { key } from '../src/db/keys.ts';
 import { keyProofToBytes, proofToBytes, verifyKeyProof, verifyObjectProof } from '../src/db/proof.ts';
-import { MemoryKv, prefixEnd } from '../src/store/kv.ts';
+import { MemoryKv, prefixEnd, StoreReadOnlyError } from '../src/store/kv.ts';
 import { entryKey, indexHeader } from '../src/db/indexstore.ts';
 import { chunkKey } from '../src/db/merkle.ts';
 import { nodeHeader } from '../src/db/smt.ts';
@@ -472,6 +472,13 @@ describe('core application: index entries in the store', () => {
       migrateRecentTxIndex(failing);
       expect(writes).toBe(0);
     }
+    // An old store that cannot be written says what to do, and one already moved is opened as it is.
+    const refusing = (b: MemoryKv) => ({ get: (k: Uint8Array) => b.get(k), range: (x: Uint8Array, y: Uint8Array) => b.range(x, y), write: () => { throw new StoreReadOnlyError(); } });
+    const frozen = big();
+    expect(() => migrateRecentTxIndex(refusing(frozen))).toThrow(/older index layout and is opened read-only/);
+    expect(stored(frozen)).toEqual(stored(big()));
+    migrateRecentTxIndex(frozen);
+    migrateRecentTxIndex(refusing(frozen));
   });
 
   it('writes the entries with every commit, reopens from them, and fills in a store that predates them', async () => {

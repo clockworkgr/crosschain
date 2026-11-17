@@ -427,10 +427,15 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
           if (r.status === 'full' && node.memoryLevel !== 'ok') throw new RpcError(RATE_LIMITED, r.error ?? 'mempool full');
           if (r.status === 'invalid' || r.status === 'too-large' || r.status === 'full') throw new RpcError(CHECK_FAILED, `${r.status}${r.error ? `: ${r.error}` : ''}`);
           if (!waiter) return { hash: toHex(hash), status: r.status };
-          const seen = node.store.txLocation(hash);
-          if (seen) return { hash: toHex(hash), height: seen.height.toString(), index: seen.index, ok: seen.ok, error: seen.error };
-          // Seen before but neither pending nor committed: it was rejected or dropped, and waiting would not change that.
-          if (r.status === 'seen' && !node.mempool.has(hash)) throw new RpcError(CHECK_FAILED, 'seen before and not pending; submit a fresh transaction');
+          // Pending, just admitted or admitted before: the waiter was there before the pool was asked, so the block that
+          // carries it is not missed. Only a transaction seen before and no longer pending is looked up, which on a
+          // node that keeps every block is a walk of the whole index (blockstore.ts) and not one to make per broadcast.
+          if (r.status === 'seen' && !node.mempool.has(hash)) {
+            const seen = node.store.txLocation(hash);
+            if (seen) return { hash: toHex(hash), height: seen.height.toString(), index: seen.index, ok: seen.ok, error: seen.error };
+            // Neither pending nor committed: it was rejected or dropped, and waiting would not change that.
+            throw new RpcError(CHECK_FAILED, 'seen before and not pending; submit a fresh transaction');
+          }
           const done = await waiter.promise;
           if (!done) throw new RpcError(TIMEOUT, 'transaction was not included before the timeout');
           return { hash: toHex(hash), height: done.height.toString(), index: done.index, ok: done.ok, error: done.error };

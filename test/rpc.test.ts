@@ -84,15 +84,23 @@ describe('json-rpc', () => {
     const { rpc, node, chainId } = await up();
     const expiration = () => BigInt(Date.now()) + 60_000n;
     const create = signedTxBytes(chainId, { expiration: expiration(), operations: withFees([{ type: 'accountCreate', registrar: FAUCET_ID, name: 'alice', owner: makeAuthority([alice.publicKey]), active: makeAuthority([alice.publicKey]) }], DEFAULT_FEES) }, [faucet]);
+    // A transaction the pool has just admitted is waited for, not looked up: the index is walked only for one seen
+    // before and no longer pending.
+    let lookups = 0;
+    const txLocation = node.store.txLocation.bind(node.store);
+    node.store.txLocation = (h) => (lookups++, txLocation(h));
     const r1 = await rpc.broadcastTx(toHex(create), 'commit');
     expect(r1.ok).toBe(true);
+    expect(lookups).toBe(0);
     expect(r1.hash).toBe(toHex(txHash(create)));
     const aliceId = objectId(TYPE.account, 1);
     const pay = signedTxBytes(chainId, { expiration: expiration(), operations: withFees([{ type: 'transfer', from: FAUCET_ID, to: aliceId, asset: objectId(TYPE.asset, 0), amount: 5000n }], DEFAULT_FEES) }, [faucet]);
     const r2 = await rpc.broadcastTx(toHex(pay), 'sync');
     expect(r2.status).toBe('added');
     await waitFor(() => node.store.txLocation(txHash(pay)) !== null, 15_000, 'transfer to land');
+    const before = lookups;
     const again = await rpc.broadcastTx(toHex(pay), 'commit');
+    expect(lookups).toBe(before + 1);
     expect(again.height).toBe(node.store.txLocation(txHash(pay))!.height.toString());
     // A bad transaction is refused with the application's reason.
     const forged = signedTxBytes(chainId, { expiration: expiration(), operations: withFees([{ type: 'transfer', from: FAUCET_ID, to: aliceId, asset: objectId(TYPE.asset, 0), amount: 1n }], DEFAULT_FEES) }, [alice]);
@@ -115,6 +123,13 @@ describe('json-rpc', () => {
     expect(hist.entries[1].data.amount).toBe('5000');
     expect((await rpc.call('balance', { account: 'alice' })).amount).toBe('5000');
     expect(await rpc.call('delegation', { delegator: 'alice', validator: '7.0' }).catch((e: RpcClientError) => e.code)).toBe(-32001);
+    // Broadcast twice at once, the second call finds it seen and still pending (or is the one that adds it): both
+    // wait for the block, and neither looks it up.
+    const settled = lookups;
+    const twice = signedTxBytes(chainId, { expiration: expiration(), operations: withFees([{ type: 'transfer', from: FAUCET_ID, to: aliceId, asset: objectId(TYPE.asset, 0), amount: 7n }], DEFAULT_FEES) }, [faucet]);
+    const [one, two] = await Promise.all([rpc.broadcastTx(toHex(twice), 'commit'), rpc.broadcastTx(toHex(twice), 'commit')]);
+    expect([one.ok, two.ok, two.height]).toEqual([true, true, one.height]);
+    expect(lookups).toBe(settled);
   });
 
   it('streams events, replays blocks from Last-Event-ID, and enforces the limits', async () => {

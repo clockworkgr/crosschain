@@ -104,9 +104,9 @@ The index was first keyed `'t' || txHash`, one entry per hash, the last block wr
 winning, and then `'t' || txHash || height`. Both have the height in the value. A
 store of either layout has its entries moved into the segments once, when it is next
 opened (`migrateTxIndex`), 5,000 entries a write, and `'T'` records the layout (3)
-with the last write, so a move that was cut short is taken up again. A store that
-cannot be written is left as it is and its old entries are read where they lie, under
-`'t'`. The index is derived data,
+with the last write, so a move that was cut short is taken up again. A store opened
+read-only is left as it is and its old entries are read where they lie, under
+`'t'`; any other failure of a write of the move stops the store from opening. The index is derived data,
 outside the state root, and is rebuilt by replay or by backfill (section 4.2).
 
 ### 2.4 Account history
@@ -367,10 +367,10 @@ No stream is opened while the node sheds load: the request is answered HTTP 503,
 client retries once `/health` reports `ok` or `warn`.
 `broadcastTx` in `commit` mode is implemented on the same internal listener, with at
 most 1000 waiters at once. A call in that mode whose transaction the mempool reported
-`added` or `seen` looks the hash up in the transaction index, in case the transaction
-is already in a block, which costs a read or two per 32-block segment held (section
-2.3); one answered `invalid`, `too-large`, `full` or `paused` returns its error before
-the lookup.
+`seen` and no longer holds looks the hash up in the transaction index, in case the
+transaction is already in a block, which costs a read or two per 32-block segment held
+(section 2.3); one whose transaction is pending, just admitted or admitted before, waits
+for the block and makes no lookup.
 
 ### 3.5 Light client over RPC
 

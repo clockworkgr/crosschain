@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { toHex, ZERO_HASH } from '../src/crypto/hash.ts';
 import { KvBlockStore, MemoryBlockStore } from '../src/store/blockstore.ts';
-import { MemoryKv, prefixEnd, type KvStore } from '../src/store/kv.ts';
+import { MemoryKv, prefixEnd, StoreReadOnlyError, type KvStore } from '../src/store/kv.ts';
 import { LmdbEnv } from '../src/store/lmdb.ts';
 import { blockHash, type Block, type Commit } from '../src/types/block.ts';
 
@@ -73,6 +73,8 @@ describe('key-value stores', () => {
     expect(ro.store('t').get(new TextEncoder().encode('a'))).toBeUndefined();
     // A read-only environment cannot create a database, and says so where it is asked for one.
     expect(() => ro.store('missing')).toThrow(/no database named missing/);
+    // And a write to it is refused by name, before anything reaches the native library.
+    expect(() => ro.store('t').write((w) => w.put(Uint8Array.of(1), Uint8Array.of(1)))).toThrow(StoreReadOnlyError);
     await ro.close();
     await again.close();
   });

@@ -24,7 +24,7 @@ import { compareBytes, HASH_SIZE, toHex } from '../crypto/hash.ts';
 import { blockHash, decodeBlock, decodeCommit, decodeHeader, encodeBlock, encodeCommit, encodeHeader, txHash, type Block, type Commit, type Header } from '../types/block.ts';
 import { decodeState, encodeState, type ChainState } from '../types/state.ts';
 import { ValidatorSet } from '../types/validator.ts';
-import { MemoryKv, prefixEnd, type KvStore } from './kv.ts';
+import { MemoryKv, prefixEnd, StoreReadOnlyError, type KvStore } from './kv.ts';
 import type { KvWriter } from './kv.ts';
 
 /** Where a transaction landed. `ok` is null for a block stored without executing it. */
@@ -126,7 +126,7 @@ export class KvBlockStore implements BlockStore {
   private readonly kv: KvStore;
   /** The writer of a batch in progress; every save joins it instead of opening its own transaction. */
   private open: KvWriter | null = null;
-  /** Whether entries of an older layout may still lie under 't': their move did not finish when the store was opened (the store cannot be written, or a write of the move failed). */
+  /** Whether entries of an older layout still lie under 't': the store was opened read-only, so they could not be moved. */
   private oldTxIndex = false;
 
   constructor(kv: KvStore) {
@@ -137,8 +137,8 @@ export class KvBlockStore implements BlockStore {
   /**
    * Move a transaction index of an older layout, under 't', into the segments, a few thousand entries a write; the
    * marker goes in last, so a move that was cut short is taken up again. Either older layout has the height in the
-   * entry's value. A store that cannot be written (opened read-only) is left as it is, and txLocations reads the
-   * older entries where they lie.
+   * entry's value. A store opened read-only is left as it is, and txLocations reads the older entries where they
+   * lie; any other failure of a write is the caller's to see, and the store is not opened.
    */
   private migrateTxIndex(): void {
     if (this.kv.get(TX_LAYOUT_KEY)?.[0] === TX_LAYOUT) return;
@@ -162,8 +162,8 @@ export class KvBlockStore implements BlockStore {
         if (old.length < 5000) break;
       }
       this.oldTxIndex = false;
-    } catch {
-      // not writable
+    } catch (e) {
+      if (!(e instanceof StoreReadOnlyError)) throw e;
     }
   }
 
@@ -180,17 +180,6 @@ export class KvBlockStore implements BlockStore {
         this.open = null;
       }
     });
-  }
-
-  /**
-   * Remove what a move that was cut short left under 't' for a transaction in a block: the entry by hash and
-   * height, and the one by hash alone if it names this block. The block's entry is then the one in its segment only.
-   */
-  private delOldTx(w: KvWriter, hash: Uint8Array, height: bigint): void {
-    const alone = oldTxPrefix(hash);
-    w.del(key((k) => k.u8(0x74).fixed(hash).u64(height)));
-    const v = this.kv.get(alone);
-    if (v && decodeTx(v).height === height) w.del(alone);
   }
 
   private write(fn: (w: KvWriter) => void): void {
@@ -224,10 +213,7 @@ export class KvBlockStore implements BlockStore {
           const first = seen.get(k);
           if (!first || (results && !results[first.index]?.ok && results[i]?.ok)) seen.set(k, { hash, index: i });
         });
-        for (const { hash, index } of seen.values()) {
-          w.put(txKey(hash, h), encodeTx(h, index, results?.[index]));
-          if (this.oldTxIndex) this.delOldTx(w, hash, h);
-        }
+        for (const { hash, index } of seen.values()) w.put(txKey(hash, h), encodeTx(h, index, results?.[index]));
         if (results) w.put(resultsKey(h), encode((wr) => wr.array(results, (wr, r) => wr.bool(r.ok).string(r.error ?? ''))));
       }
     });
@@ -330,11 +316,7 @@ export class KvBlockStore implements BlockStore {
       // without the block the record answers nothing. Sets by hash are the executor's to remove, once no header
       // still held names them.
       w.del(valsetAtKey(height));
-      for (const tx of stored.block.txs) {
-        const hash = txHash(tx);
-        w.del(txKey(hash, height));
-        if (this.oldTxIndex) this.delOldTx(w, hash, height);
-      }
+      for (const tx of stored.block.txs) w.del(txKey(txHash(tx), height));
     });
   }
 
