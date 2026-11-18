@@ -428,8 +428,8 @@ export function makeMethods(node: Node, events: RpcEvents): Record<string, RpcMe
           if (r.status === 'invalid' || r.status === 'too-large' || r.status === 'full') throw new RpcError(CHECK_FAILED, `${r.status}${r.error ? `: ${r.error}` : ''}`);
           if (!waiter) return { hash: toHex(hash), status: r.status };
           // Pending, just admitted or admitted before: the waiter was there before the pool was asked, so the block that
-          // carries it is not missed. Only a transaction seen before and no longer pending is looked up, which on a
-          // node that keeps every block is a walk of the whole index (blockstore.ts) and not one to make per broadcast.
+          // carries it is not missed, and it is that block the caller is told of. Only a transaction seen before and
+          // no longer pending is looked up: it is in a block already, or it was dropped.
           if (r.status === 'seen' && !node.mempool.has(hash)) {
             const seen = node.store.txLocation(hash);
             if (seen) return { hash: toHex(hash), height: seen.height.toString(), index: seen.index, ok: seen.ok, error: seen.error };

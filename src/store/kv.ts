@@ -22,8 +22,13 @@ export interface KvStore {
   get(key: Uint8Array): Uint8Array | undefined;
   /** Entries with start <= key < end, ascending. */
   range(start: Uint8Array, end: Uint8Array): IterableIterator<[Uint8Array, Uint8Array]>;
-  /** All writes made in the callback land together, or not at all. */
+  /**
+   * All writes made in the callback land together, or not at all. A read made inside the callback sees what the
+   * callback has written so far.
+   */
   write(fn: (w: KvWriter) => void): void;
+  /** Whether the key is there, without its value being read; a store without it is asked with get. */
+  has?(key: Uint8Array): boolean;
 }
 
 /** A set of named stores sharing one environment, so a node keeps one directory. */
@@ -66,23 +71,68 @@ export class MemoryKv implements KvStore {
     return this.tree.get(key)?.slice(); // a copy, as LMDB gives one: the store's bytes are not the caller's to change
   }
 
+  has(key: Uint8Array): boolean {
+    return this.tree.has(key);
+  }
+
+  /** Counts the changes made to the tree, so that a range in progress knows to find its place again. */
+  private version = 0;
+
   *range(start: Uint8Array, end: Uint8Array): IterableIterator<[Uint8Array, Uint8Array]> {
-    for (const e of this.tree.entriesFrom(start)) {
-      if (compareBytes(e[0], end) >= 0) return;
-      yield [e[0].slice(), e[1].slice()];
+    // The caller may write between two steps, as it may on LMDB, and the tree's own iteration does not survive a
+    // change to the tree. So after a step during which the tree changed, the place is found again from the last
+    // key given, and what was put or deleted ahead of it is seen as it now is.
+    for (let from = start; ; ) {
+      const version = this.version;
+      let last: Uint8Array | null = null;
+      for (const e of this.tree.entriesFrom(from)) {
+        if (compareBytes(e[0], end) >= 0) return;
+        last = e[0]; // the tree's own key, which nothing changes
+        yield [e[0].slice(), e[1].slice()];
+        if (this.version !== version) break;
+        last = null;
+      }
+      if (!last) return;
+      from = new Uint8Array(last.length + 1); // the smallest key after the last one given
+      from.set(last);
     }
   }
 
+  /** The environment this store is one of, if any: a write to the store is then a transaction of the environment. */
+  private readonly env: Pick<KvEnv, 'transaction'> | null;
+
+  constructor(env: Pick<KvEnv, 'transaction'> | null = null) {
+    this.env = env;
+  }
+
   write(fn: (w: KvWriter) => void): void {
-    // Buffer the writes so a throw inside fn leaves the store untouched; applied in the order made, as LMDB does,
-    // so a key put and then deleted in one write ends deleted.
-    const ops: [Uint8Array, Uint8Array | null][] = [];
-    fn({ put: (k, v) => void ops.push([k.slice(), v.slice()]), del: (k) => void ops.push([k.slice(), null]) });
-    for (const [k, v] of ops) {
-      // Inside an environment's transaction, what each key held before is kept so the transaction can be undone.
-      this.undo?.push([k, this.tree.get(k) ?? null]);
-      if (v) this.tree.set(k, v);
-      else this.tree.delete(k);
+    // On LMDB a write to one store is a transaction of the whole environment: whatever is written to the other
+    // stores while it runs, by a transaction begun inside it say, is undone with it. So it is here.
+    if (this.env) this.env.transaction(() => this.apply(fn));
+    else this.apply(fn);
+  }
+
+  private apply(fn: (w: KvWriter) => void): void {
+    // Each write is applied as it is made, so that a read inside the callback sees it, as on LMDB, and what the key
+    // held before is kept: a throw inside fn puts everything back. Inside an environment's transaction the same
+    // record lets the transaction be undone.
+    const outer = this.undo;
+    const undo = outer ?? (this.undo = []);
+    const mark = undo.length;
+    const set = (k: Uint8Array, v: Uint8Array | null): void => {
+      const key = k.slice();
+      undo.push([key, this.tree.get(key) ?? null]);
+      this.version++;
+      if (v) this.tree.set(key, v.slice());
+      else this.tree.delete(key);
+    };
+    try {
+      fn({ put: (k, v) => set(k, v), del: (k) => set(k, null) });
+    } catch (e) {
+      this.rollbackTo(mark);
+      throw e;
+    } finally {
+      if (!outer) this.undo = null;
     }
   }
 
@@ -104,6 +154,7 @@ export class MemoryKv implements KvStore {
     if (!undo) return;
     for (let i = undo.length - 1; i >= mark; i--) {
       const [k, v] = undo[i]!;
+      this.version++;
       if (v) this.tree.set(k, v);
       else this.tree.delete(k);
     }
@@ -127,7 +178,7 @@ export class MemoryEnv implements KvEnv {
   store(name: string): KvStore {
     let s = this.stores.get(name);
     if (!s) {
-      this.stores.set(name, (s = new MemoryKv()));
+      this.stores.set(name, (s = new MemoryKv(this)));
       if (this.depth > 0) s.begin(); // first asked for inside a transaction: part of it
     }
     return s;

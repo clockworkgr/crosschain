@@ -15,7 +15,7 @@ import { makeAuthority } from '../src/app/core/authority.ts';
 import { signedTxBytes, withFees } from '../src/app/core/client.ts';
 import { appGenesisBytes, authorityJson, DEFAULT_FEES } from '../src/app/core/genesis.ts';
 import { TYPE } from '../src/app/core/types.ts';
-import { Reader } from '../src/codec/reader.ts';
+import { decode, Reader } from '../src/codec/reader.ts';
 import { encode } from '../src/codec/writer.ts';
 import { EvidencePool, evidenceId } from '../src/consensus/evidence.ts';
 import { fromHex, toHex } from '../src/crypto/hash.ts';
@@ -32,10 +32,11 @@ import { PeerDb } from '../src/p2p/peerdb.ts';
 import { RpcClient } from '../src/rpc/client.ts';
 import { headerFromJson } from '../src/rpc/json.ts';
 import { RpcServer } from '../src/rpc/server.ts';
-import { KvBlockStore, MemoryBlockStore, TX_SEGMENT_BLOCKS } from '../src/store/blockstore.ts';
+import { KvBlockStore, MemoryBlockStore, TX_FANOUT, TX_SEGMENT_BLOCKS } from '../src/store/blockstore.ts';
 import { MemoryKv, prefixEnd, StoreReadOnlyError, type KvStore } from '../src/store/kv.ts';
 import { blockHash, txHash } from '../src/types/block.ts';
 import type { DuplicateVoteEvidence } from '../src/types/evidence.ts';
+import { genesisState } from '../src/types/state.ts';
 import { decodeProposal } from '../src/types/proposal.ts';
 import { txsRoot } from '../src/types/txproof.ts';
 import { VoteType } from '../src/types/vote.ts';
@@ -236,16 +237,22 @@ describe('the transaction index', () => {
     for (const h of [1n, 500n, 90_000n]) expect(store.txLocations(txHash(other(Number(h)))).map((l) => l.height)).toEqual([h]);
     expect(store.txLocations(new Uint8Array(32))).toEqual([]);
     expect(store.txLocations(new Uint8Array(32).fill(0xff))).toEqual([]);
-    // A lookup reads once or twice per segment held and does not walk the entries: seven segments hold these blocks.
+    // A lookup reads once or twice per segment held, and once more in each of the eleven levels above, and does
+    // not walk the entries: seven segments held these blocks when they were saved.
     let ranged = 0;
     const counting = new KvBlockStore({ get: (k) => kv.get(k), range: (a, b) => (ranged++, kv.range(a, b)), write: (fn) => kv.write(fn) });
     ranged = 0;
     counting.txLocations(txHash(raw));
-    expect(ranged).toBeLessThanOrEqual(14);
-    // The entries of a block lie together: every key of the index starts with its block's segment.
+    expect(ranged).toBeLessThanOrEqual(14 + 11);
+    // The entries of a block lie together: every key of the index starts with its block's segment, of 32 blocks
+    // under 'x' and of 1,024 or 32,768 under 'y' and level 1 or 2, where the blocks far behind the latest have gone.
     const keys = Array.from(kv.range(Uint8Array.of(0x78), Uint8Array.of(0x79)), ([k]) => k);
-    expect(keys.length).toBe(28);
     for (const k of keys) expect(new Reader(k.subarray(1, 9)).u64()).toBe(new Reader(k.subarray(41)).u64() / TX_SEGMENT_BLOCKS);
+    const above = Array.from(kv.range(Uint8Array.of(0x79), Uint8Array.of(0x7a)), ([k]) => k);
+    for (const k of above) expect([1, 2]).toContain(k[1]);
+    for (const k of above) expect(new Reader(k.subarray(2, 10)).u64()).toBe(new Reader(k.subarray(42)).u64() / (TX_SEGMENT_BLOCKS * TX_FANOUT ** BigInt(k[1]!)));
+    expect(new Set([...keys, ...above].map((k) => toHex(k.subarray(k.length - 40)))).size).toBe(28);
+    expect(above.length).toBeGreaterThanOrEqual(22);
     // A key under the index's prefix that is not an entry of it, before an entry or anywhere else, changes no answer.
     kv.write((w) => {
       w.put(key((k) => k.u8(0x78).u64(0n).fixed(txHash(raw))), Uint8Array.of(1));
@@ -261,6 +268,227 @@ describe('the transaction index', () => {
     expect(store.txLocations(txHash(raw)).map((l) => l.height)).toEqual([3n, 31n, 70_000n]);
     expect(store.txLocation(txHash(other(1000)))).toBeNull();
     expect(store.txLocation(txHash(other(1001)))).toMatchObject({ height: 1001n });
+  });
+
+  it('moves entries into larger segments behind the latest block, and a lookup asks a few segments however long the chain', () => {
+    const kv = new MemoryKv();
+    const store = new KvBlockStore(kv);
+    const one = (h: bigint) => encode((w) => w.u32(Number(h)));
+    const save = (to: KvBlockStore, h: bigint, ok = true) => {
+      // `raw` is in every 700th block as well as the block's own transaction.
+      const b = block(h, h % 700n === 0n ? [one(h), raw] : [one(h)]);
+      to.saveBlock(b.b, b.commit, h % 700n === 0n ? [{ ok }, { ok: false, error: `at ${h}` }] : [{ ok }]);
+    };
+    const count = (level: number) => Array.from(kv.range(level === 0 ? Uint8Array.of(0x78) : Uint8Array.of(0x79, level), level === 0 ? Uint8Array.of(0x79) : Uint8Array.of(0x79, level + 1))).length;
+    const segments = (level: number) => new Set(Array.from(kv.range(level === 0 ? Uint8Array.of(0x78) : Uint8Array.of(0x79, level), level === 0 ? Uint8Array.of(0x79) : Uint8Array.of(0x79, level + 1)), ([k]) => toHex(k.subarray(0, level === 0 ? 9 : 10)))).size;
+    const TOP = 34_000n;
+    // A second store saves the same blocks with every seventh save failing after it has written everything, the
+    // step of the move included, and saved again.
+    const other = new MemoryKv();
+    let writes = 0;
+    const stopping = new KvBlockStore({
+      get: (k) => other.get(k),
+      range: (a, b) => other.range(a, b),
+      write: (fn) =>
+        other.write((w) => {
+          fn(w);
+          if (++writes % 7 === 0) throw new Error('stopped');
+        }),
+    });
+    for (let h = 1n; h <= TOP; h++) {
+      save(store, h);
+      try {
+        save(stopping, h);
+      } catch {
+        save(stopping, h);
+      }
+      // Before the first 1,024 blocks are all behind the latest, nothing has moved.
+      if (h === 1023n) expect([count(0), count(1)]).toEqual([1024, 0]);
+    }
+    const all = (k: MemoryKv) => Array.from(k.range(Uint8Array.of(0x78), Uint8Array.of(0x7a)), ([a, b]) => `${toHex(a)}=${toHex(b)}`);
+    expect(all(other)).toEqual(all(kv));
+    // Heights below 32,768 are in the one segment of level 2; the 1,024 after them are in one of level 1, or on
+    // their way there; the rest are where they were written. No level holds more than a few dozen segments.
+    const entries = Number(TOP) + Math.floor(Number(TOP) / 700);
+    expect(count(2)).toBe(32_767 + 46);
+    expect(count(0) + count(1) + count(2)).toBeGreaterThanOrEqual(entries);
+    expect(count(0) + count(1) + count(2)).toBeLessThan(entries + 600);
+    expect(segments(2)).toBe(1);
+    expect(segments(1)).toBeLessThanOrEqual(2);
+    expect(segments(0)).toBeLessThanOrEqual(40);
+    // Every transaction is found where it is, and one that is in 48 blocks in all of them.
+    for (let h = 1n; h <= TOP; h += 97n) expect(store.txLocations(txHash(one(h))).map((l) => [l.height, l.index, l.ok])).toEqual([[h, 0, true]]);
+    expect(store.txLocations(txHash(raw)).map((l) => [l.height, l.error])).toEqual(Array.from({ length: 48 }, (_, i) => [BigInt(700 * (i + 1)), `at ${700 * (i + 1)}`]));
+    let ranged = 0;
+    const counting = new KvBlockStore({ get: (k) => kv.get(k), range: (a, b) => (ranged++, kv.range(a, b)), write: (fn) => kv.write(fn) });
+    ranged = 0;
+    counting.txLocations(txHash(one(20_000n)));
+    expect(ranged).toBeLessThanOrEqual(2 * 40 + 2 * 2 + 2 + 9);
+
+    // A block saved again with another result, long after its entry moved up: the answer is the new one at once,
+    // and after the blocks that follow the copy above holds it and nothing is left below.
+    save(store, 5n, false);
+    expect(store.txLocations(txHash(one(5n))).map((l) => [l.height, l.ok])).toEqual([[5n, false]]);
+    for (let h = TOP + 1n; h <= TOP + 8n; h++) save(store, h);
+    expect(store.txLocations(txHash(one(5n))).map((l) => [l.height, l.ok])).toEqual([[5n, false]]);
+    expect(Array.from(kv.range(Uint8Array.of(0x78), key((k) => k.u8(0x78).u64(1n)))).length).toBe(0);
+    // A block removed from the middle is not answered with, though its copy is still above.
+    store.deleteBlock(1400n);
+    expect(store.txLocations(txHash(raw)).length).toBe(47);
+    expect(store.txLocation(txHash(one(1400n)))).toBeNull();
+    // Pruned to height 33,000: nothing below is answered with, and the blocks that follow drop the segments that
+    // lie wholly below it, the one of level 2 among them, and keep the one the lowest height is in.
+    store.batch(() => {
+      for (let h = 1n; h < 33_000n; h++) store.deleteBlock(h);
+      store.setLowestHeight(33_000n);
+    });
+    expect(store.txLocations(txHash(raw)).map((l) => l.height)).toEqual([33_600n]);
+    for (let h = TOP + 9n; h <= TOP + 80n; h++) save(store, h);
+    expect(count(2)).toBe(0);
+    expect(count(1)).toBe(1024 + 2); // heights 32,768 to 33,791, and `raw` at 32,900 and 33,600
+    for (let h = 33_000n; h <= TOP + 80n; h += 53n) expect(store.txLocations(txHash(one(h))).map((l) => l.height)).toEqual([h]);
+    expect(store.txLocation(txHash(one(32_999n)))).toBeNull();
+  }, 120_000);
+
+  it('keeps a result saved while its entry is on the way up, moves a crowded block and backfilled ones, and asks for no block to answer', () => {
+    const one = (h: bigint, i = 0) => encode((w) => w.u32(Number(h)).u32(i));
+    const level0 = (kv: MemoryKv) => Array.from(kv.range(Uint8Array.of(0x78), Uint8Array.of(0x79)), ([k]) => new Reader(k.subarray(41)).u64());
+    const stateOf = (kv: MemoryKv) => {
+      const v = kv.get(Uint8Array.of(0x6d, 0));
+      return v ? decode(v, (r) => ({ parent: r.u64(), removing: r.bool(), cursor: r.bytes() })) : null;
+    };
+    for (const batched of [false, true]) {
+      // Blocks of one transaction until the first 1,024 are being removed from the small segments, and not yet block 5's.
+      const kv = new MemoryKv();
+      const store = new KvBlockStore(kv);
+      const save = (h: bigint, ok = true) => {
+        const b = block(h, [one(h)]);
+        store.saveBlock(b.b, b.commit, [ok ? { ok } : { ok, error: 'later' }]);
+      };
+      let h = 1n;
+      for (; !stateOf(kv)?.removing; h++) save(h);
+      expect(level0(kv)).toContain(900n);
+      // Block 900 saved again with another result, alone or in one transaction with the next block: the new result
+      // is the answer then and after the removal has passed it, when the larger segment holds it.
+      if (batched) store.batch(() => (save(900n, false), save(h++)));
+      else save(900n, false);
+      expect(store.txLocations(txHash(one(900n))).map((l) => [l.height, l.ok, l.error])).toEqual([[900n, false, 'later']]);
+      for (const stop = h + 8n; h < stop; h++) save(h);
+      expect(level0(kv).filter((x) => x < 1024n)).toEqual([]);
+      expect(store.txLocations(txHash(one(900n))).map((l) => [l.height, l.ok, l.error])).toEqual([[900n, false, 'later']]);
+      expect(store.txLocations(txHash(one(899n))).map((l) => [l.height, l.ok])).toEqual([[899n, true]]);
+    }
+
+    // One block of 5,000 transactions among empty ones: all of them in one of the 32 segments. Thirty blocks after
+    // the 1,024th they have moved; a step that took a fixed share from each segment would need over three hundred.
+    {
+      const kv = new MemoryKv();
+      const store = new KvBlockStore(kv);
+      for (let h = 1n; h <= 1054n; h++) {
+        const txs = h === 10n ? Array.from({ length: 5000 }, (_, i) => one(h, i)) : [];
+        const b = block(h, txs);
+        store.saveBlock(b.b, b.commit, txs.map(() => ({ ok: true })));
+      }
+      expect(level0(kv).length).toBe(0);
+      expect(Array.from(kv.range(Uint8Array.of(0x79, 1), Uint8Array.of(0x79, 2))).length).toBe(5000);
+      expect(store.txLocation(txHash(one(10n, 4999)))).toMatchObject({ height: 10n, index: 4999, ok: true });
+      // A lookup asks whether a block is held without reading it.
+      let blocksRead = 0;
+      const counting = new KvBlockStore({ get: (k) => (k[0] === 0x62 && blocksRead++, kv.get(k)), has: (k) => kv.has(k), range: (a, b) => kv.range(a, b), write: (fn) => kv.write(fn) });
+      expect(counting.txLocation(txHash(one(10n, 7)))).toMatchObject({ height: 10n, index: 7 });
+      expect(blocksRead).toBe(0);
+    }
+
+    // A node that joined at height 3,000 applies a block of one transaction for every 100 blocks of ten that it
+    // backfills downward: the backfilled entries move up with the saves that bring them, a thousand to an applied
+    // block, where steps made for applied blocks alone would move a quarter of that.
+    {
+      const kv = new MemoryKv();
+      const store = new KvBlockStore(kv);
+      const put = (h: bigint, applied: boolean) => {
+        const b = block(h, applied ? [one(h)] : Array.from({ length: 10 }, (_, i) => one(h, i)));
+        store.saveBlock(b.b, b.commit, applied ? [{ ok: true }] : null);
+      };
+      store.batch(() => (put(3000n, false), store.setLowestHeight(3000n)));
+      let tip = 3000n;
+      for (let low = 3000n; low > 1n; ) {
+        put(++tip, true);
+        const to = low - 100n < 1n ? 1n : low - 100n;
+        store.batch(() => {
+          for (let x = low - 1n; x >= to; x--) put(x, false);
+          store.setLowestHeight(to);
+        });
+        low = to;
+      }
+      expect(tip).toBe(3030n);
+      // Heights 1,024 to 2,047 have gone up already; the first 1,024 could not before the lowest height was 1, and
+      // go with the next few blocks; the 1,024 after them wait for block 3,072.
+      expect(level0(kv).filter((x) => x >= 1024n && x < 2048n)).toEqual([]);
+      for (let i = 0; i < 45; i++) put(++tip, true);
+      expect(level0(kv).filter((x) => x < 2048n)).toEqual([]);
+      expect(level0(kv).length).toBe(953 * 10 + 75);
+      for (let x = 1n; x <= tip; x += 71n) expect(store.txLocations(txHash(one(x, x > 3000n ? 0 : 3))).map((l) => [l.height, l.index, l.ok])).toEqual([[x, x > 3000n ? 0 : 3, x > 3000n ? true : null]]);
+    }
+  });
+
+  it('fills the larger segments on a store that never recorded its latest block, and past keys that are not entries', () => {
+    const one = (h: bigint) => encode((w) => w.u32(Number(h)));
+    const level0 = (kv: MemoryKv) => Array.from(kv.range(Uint8Array.of(0x78), Uint8Array.of(0x79)), ([k]) => k).filter((k) => k.length === 49).map((k) => new Reader(k.subarray(41)).u64());
+    const level1 = (kv: MemoryKv) => Array.from(kv.range(Uint8Array.of(0x79, 1), Uint8Array.of(0x79, 2))).length;
+    const put = (store: KvBlockStore, h: bigint, applied: boolean) => {
+      const b = block(h, [one(h)]);
+      store.saveBlock(b.b, b.commit, applied ? [{ ok: true }] : null);
+    };
+    // A store as the version before the larger segments left it: blocks 2,000 to 2,100 applied, the lowest height
+    // 2,000, the chain state saying 2,100, entries under 'x' and no marker of the latest block. Only a backfill
+    // follows, no block is applied: the marker is taken from the chain state, and the backfilled blocks move up.
+    {
+      const kv = new MemoryKv();
+      const store = new KvBlockStore(kv);
+      store.setLowestHeight(2000n);
+      for (let h = 2000n; h <= 2100n; h++) put(store, h, true);
+      const state = genesisState({ chainId: 'r4', signatureScheme: schemeName(DEFAULT_SCHEME), genesisTime: 0n, appState: new Uint8Array(), validators: [{ publicKey: faucet.publicKey, power: 1n }] }, new Uint8Array(32));
+      store.saveState({ ...state, lastHeight: 2100n });
+      kv.write((w) => w.del(Uint8Array.of(0x4d)));
+      for (let low = 2000n; low > 1n; low -= 1n) {
+        store.batch(() => {
+          put(store, low - 1n, false);
+          store.setLowestHeight(low - 1n);
+        });
+      }
+      expect(new Reader(kv.get(Uint8Array.of(0x4d))!).u64()).toBe(2100n);
+      // Heights 1,024 to 2,047 went up once the lowest height was 1,024, with the 1,024 saves that followed.
+      expect(level0(kv).filter((x) => x >= 1024n && x < 2048n)).toEqual([]);
+      expect(level1(kv)).toBeGreaterThanOrEqual(1024);
+      expect(store.txLocations(txHash(one(1500n))).map((l) => [l.height, l.ok])).toEqual([[1500n, null]]);
+      expect(store.txLocations(txHash(one(2050n))).map((l) => [l.height, l.ok])).toEqual([[2050n, true]]);
+    }
+    // Seventy keys under 'x' that are not entries, before every entry, and seventy more put among the small
+    // segments once their removal has begun: the steps remove them as they meet them and go on.
+    {
+      const kv = new MemoryKv();
+      const store = new KvBlockStore(kv);
+      const junk = (segment: bigint, i: number) => key((k) => k.u8(0x78).u64(segment).u8(i));
+      kv.write((w) => {
+        for (let i = 0; i < 70; i++) w.put(junk(0n, i), Uint8Array.of(1));
+      });
+      let h = 1n;
+      for (; h <= 1020n; h++) put(store, h, true);
+      const removing = () => {
+        const v = kv.get(Uint8Array.of(0x6d, 0));
+        return v !== undefined && decode(v, (r) => ({ parent: r.u64(), removing: r.bool(), cursor: r.bytes() })).removing;
+      };
+      for (; !removing(); h++) put(store, h, true);
+      expect(h).toBeLessThan(1035n);
+      kv.write((w) => {
+        for (let i = 0; i < 70; i++) w.put(junk(20n, i), Uint8Array.of(1));
+      });
+      for (const stop = h + 12n; h < stop; h++) put(store, h, true);
+      expect(Array.from(kv.range(Uint8Array.of(0x78), Uint8Array.of(0x79))).filter(([k]) => k.length !== 49)).toEqual([]);
+      expect(level0(kv).filter((x) => x < 1024n)).toEqual([]);
+      expect(level1(kv)).toBe(1023);
+      for (let x = 1n; x < h; x += 37n) expect(store.txLocations(txHash(one(x))).map((l) => l.height)).toEqual([x]);
+    }
   });
 
   it('moves an index of either older layout into the segments when the store is opened, and reads one it cannot move', () => {

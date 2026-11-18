@@ -62,7 +62,7 @@ Purpose: the interface, the in-memory implementation, and the prefix helper.
 Exports:
 
 - `interface KvWriter { put(key, value); del(key) }`: what a `write` callback receives.
-- `interface KvStore { get(key); range(start, end); write(fn) }`: one named store. `range` yields `[key, value]` pairs with `start <= key < end`, ascending.
+- `interface KvStore { get(key); range(start, end); write(fn); has?(key) }`: one named store. `range` yields `[key, value]` pairs with `start <= key < end`, ascending. A read made inside a `write` callback sees what the callback has written so far. `has` says whether a key is there without reading its value; it is optional, and a store without it is asked with `get`.
 - `class StoreReadOnlyError extends Error`, with the message `the store is read-only`: what `write` throws on a store opened read-only, "the one failure of a write that a reader of the store can go on from".
 - `interface KvEnv { store(name); transaction(fn); close() }`: a set of named stores sharing one environment. `transaction(fn)` runs writes to several stores of the environment as one transaction: on disk they all land or none does, whatever happens in between; in memory "there is no crash to recover from, but a throw out of `fn` still undoes what the stores took inside it". `close` is the only asynchronous method, because closing LMDB is.
 - `prefixEnd(prefix)`: the exclusive upper bound of a prefix scan.
@@ -85,41 +85,88 @@ export function prefixEnd(prefix: Uint8Array): Uint8Array {
 
 For the prefix `68` (the history records of the application store) the end is `69`; for `62 ff` it is the single byte `63`. The trailing `ff` is dropped rather than zeroed because of how a shorter key sorts: `63` is less than `63 00`, so a range ending at `63 00` would include the one-byte key `63`, which does not start with `62 ff`. Any byte left after the incremented one has the same effect, which is what the comment in the loop says, so the end is cut at the carry. A prefix of nothing but `0xff` bytes has no key above it and is refused rather than silently scanning to the end. The copy at the top means the caller's prefix is never modified.
 
-`MemoryKv` is a `BPlusTree<Uint8Array>` from `src/db/bptree.ts`, the same tree the secondary indices use. `get` is the tree's `get` with the value copied; `range` is `entriesFrom` cut off at `end`, with every key and value copied on the way out:
+`MemoryKv` is a `BPlusTree<Uint8Array>` from `src/db/bptree.ts`, the same tree the secondary indices use. `get` is the tree's `get` with the value copied, `has` the tree's `has`; `range` is `entriesFrom` cut off at `end`, with every key and value copied on the way out:
 
 ```ts
   get(key: Uint8Array): Uint8Array | undefined {
     return this.tree.get(key)?.slice(); // a copy, as LMDB gives one: the store's bytes are not the caller's to change
   }
 
+  has(key: Uint8Array): boolean {
+    return this.tree.has(key);
+  }
+
+  /** Counts the changes made to the tree, so that a range in progress knows to find its place again. */
+  private version = 0;
+
   *range(start: Uint8Array, end: Uint8Array): IterableIterator<[Uint8Array, Uint8Array]> {
-    for (const e of this.tree.entriesFrom(start)) {
-      if (compareBytes(e[0], end) >= 0) return;
-      yield [e[0].slice(), e[1].slice()];
+    // The caller may write between two steps, as it may on LMDB, and the tree's own iteration does not survive a
+    // change to the tree. So after a step during which the tree changed, the place is found again from the last
+    // key given, and what was put or deleted ahead of it is seen as it now is.
+    for (let from = start; ; ) {
+      const version = this.version;
+      let last: Uint8Array | null = null;
+      for (const e of this.tree.entriesFrom(from)) {
+        if (compareBytes(e[0], end) >= 0) return;
+        last = e[0]; // the tree's own key, which nothing changes
+        yield [e[0].slice(), e[1].slice()];
+        if (this.version !== version) break;
+        last = null;
+      }
+      if (!last) return;
+      from = new Uint8Array(last.length + 1); // the smallest key after the last one given
+      from.set(last);
     }
   }
 ```
 
 The copies are what make the memory store a faithful stand-in for LMDB. The tree holds its keys and values by reference, so handing them out would let a caller change the store's own bytes in place, and a key mutated after it was returned would corrupt the tree's order. LMDB copies every value out of its map (see below), so a caller can never do that on disk; without the copies here, code that mutated what it read would pass every test on the memory store and fail on a real node. Reading is the common operation and the copies cost a little, but the two backends behaving the same is worth more than the allocation.
 
-`write` buffers:
+`range` goes on with the tree's iteration only while the tree is as it was. A caller may write between two steps of a range, inside a `write` callback, and the tree's iteration does not survive a change to the tree: it walks leaves and a stack of parents that an insert or a delete may split or merge. `version` counts the changes (`write` and `rollbackTo` raise it). After each `yield` the range compares it, and if the tree changed it finds its place again from the key after the last one given, which is that key with a zero byte appended. So what was put, replaced or deleted ahead of the range is given as it is when the range gets there, which is what a cursor on LMDB does, and `test/store.test.ts` checks the two alike. `last` is the tree's own key, not the copy handed out, so a caller that changes the bytes it was given does not move the range.
+
+`write` applies each put and delete as it is made and keeps what the key held before. A store that belongs to a `MemoryEnv` first makes the write a transaction of the environment:
 
 ```ts
+  /** The environment this store is one of, if any: a write to the store is then a transaction of the environment. */
+  private readonly env: Pick<KvEnv, 'transaction'> | null;
+
+  constructor(env: Pick<KvEnv, 'transaction'> | null = null) {
+    this.env = env;
+  }
+
   write(fn: (w: KvWriter) => void): void {
-    // Buffer the writes so a throw inside fn leaves the store untouched; applied in the order made, as LMDB does,
-    // so a key put and then deleted in one write ends deleted.
-    const ops: [Uint8Array, Uint8Array | null][] = [];
-    fn({ put: (k, v) => void ops.push([k.slice(), v.slice()]), del: (k) => void ops.push([k.slice(), null]) });
-    for (const [k, v] of ops) {
-      // Inside an environment's transaction, what each key held before is kept so the transaction can be undone.
-      this.undo?.push([k, this.tree.get(k) ?? null]);
-      if (v) this.tree.set(k, v);
-      else this.tree.delete(k);
+    // On LMDB a write to one store is a transaction of the whole environment: whatever is written to the other
+    // stores while it runs, by a transaction begun inside it say, is undone with it. So it is here.
+    if (this.env) this.env.transaction(() => this.apply(fn));
+    else this.apply(fn);
+  }
+
+  private apply(fn: (w: KvWriter) => void): void {
+    // Each write is applied as it is made, so that a read inside the callback sees it, as on LMDB, and what the key
+    // held before is kept: a throw inside fn puts everything back. Inside an environment's transaction the same
+    // record lets the transaction be undone.
+    const outer = this.undo;
+    const undo = outer ?? (this.undo = []);
+    const mark = undo.length;
+    const set = (k: Uint8Array, v: Uint8Array | null): void => {
+      const key = k.slice();
+      undo.push([key, this.tree.get(key) ?? null]);
+      this.version++;
+      if (v) this.tree.set(key, v.slice());
+      else this.tree.delete(key);
+    };
+    try {
+      fn({ put: (k, v) => set(k, v), del: (k) => set(k, null) });
+    } catch (e) {
+      this.rollbackTo(mark);
+      throw e;
+    } finally {
+      if (!outer) this.undo = null;
     }
   }
 ```
 
-Keys and values are copied on the way in as well as on the way out, so a caller that reuses a buffer after `put` cannot corrupt the store, and the B+ tree, which stores keys by reference, is safe. The atomicity test in `test/store.test.ts` relies on the buffering: a callback that puts `d` and then throws leaves `d` absent, because nothing is applied until the callback returns. The puts and deletes go into one list and are applied in the order the callback made them, which is the order LMDB applies them in: a `put(k)` followed by `del(k)` in one `write` leaves `k` absent on both backends, and a `del(k)` followed by `put(k)` leaves it present. The application's commit relies on the second for an index key that changed hands within the block, its change list putting the removal first.
+Keys and values are copied on the way in as well as on the way out, so a caller that reuses a buffer after `put` cannot corrupt the store, and the B+ tree, which stores keys by reference, is safe. A read inside the callback therefore sees the callback's writes, as it does on LMDB, where a read inside a transaction is made in that transaction. An earlier version buffered the writes and applied them when the callback returned, and a read inside saw none of them; the block store's move of index entries (below) reads what earlier steps of the same transaction wrote, and with the two backends differing it went wrong on this one and not on disk. The atomicity test in `test/store.test.ts` relies on the undo: a callback that puts `d` and then throws leaves `d` absent, because `rollbackTo` puts back, newest first, what every key held before the callback touched it. Inside an environment's transaction (`this.undo` already there) the same list serves the transaction; a store made on its own, with no environment, keeps a list for the write alone and drops it when the write ends. The puts and deletes are applied in the order the callback made them, which is the order LMDB applies them in: a `put(k)` followed by `del(k)` in one `write` leaves `k` absent on both backends, and a `del(k)` followed by `put(k)` leaves it present. The application's commit relies on the second for an index key that changed hands within the block, its change list putting the removal first.
 
 `size` is the entry count, which `test/app.test.ts` uses as a cheap "something was persisted" check. `MemoryEnv.store(name)` creates a store on first use and returns the same one afterwards, and `close` does nothing. `transaction(fn)` keeps the promise the disk environment makes, all the stores' writes inside `fn` or none of them if it throws:
 
@@ -142,6 +189,7 @@ Keys and values are copied on the way in as well as on the way out, so a caller 
     if (!undo) return;
     for (let i = undo.length - 1; i >= mark; i--) {
       const [k, v] = undo[i]!;
+      this.version++;
       if (v) this.tree.set(k, v);
       else this.tree.delete(k);
     }
@@ -191,7 +239,7 @@ Keys and values are copied on the way in as well as on the way out, so a caller 
   }
 ```
 
-The first block is `MemoryKv`'s, the second `MemoryEnv`'s. While a transaction is open each store has an undo list, and the line in `write` above, `this.undo?.push([k, this.tree.get(k) ?? null])`, notes what each key held just before it is changed, `null` for a key that was absent. `rollbackTo(mark)` walks the list from its newest entry down to entry `mark`, puts each value back or deletes the key, and cuts the list to `mark`, so a key written several times ends with what it held before the first of the writes undone. `mark()` is the length of the list at that moment, "a place a transaction inside this one can go back to". `end(true)` is `rollbackTo(0)`, everything since `begin`, and then drops the list; `end(false)` only drops it. The environment begins every store it has when the outermost transaction starts and ends them all in a `finally`, with `failed` still true if `fn` threw. Two cases are covered beside the plain one. A store first asked for inside the transaction is begun as it is created (`if (this.depth > 0) s.begin()` in `store`), so its writes are undone with the rest. A transaction inside a transaction is part of the one already open: its writes go onto the same undo lists, and a throw out of the outer one undoes them too, as LMDB's child transactions are aborted with their parent. If the inner one itself throws, "its own writes are undone there and then": before it calls `fn` it takes a mark in every store the environment has, and its `catch` rolls each store back to its mark and throws the error on. A store first asked for inside the inner transaction has no mark and is rolled back to 0, which is everything it holds, since it was begun when it was created. An outer transaction that catches the error and goes on therefore keeps only what it wrote itself, before the inner one and after it, which is what an LMDB child transaction that aborts leaves its parent. A `MemoryKv` used on its own, outside any environment, has no undo list and its `write` is as before; its `mark()` is 0 and its `rollbackTo` returns at once. This is what makes a failed application commit leave nothing of the block on the memory backend as it does on LMDB ([chapter 5](05-mempool-executor.md)).
+The first block is `MemoryKv`'s, the second `MemoryEnv`'s. While a transaction is open each store has an undo list, and `write` above notes in it what each key held just before it is changed, `null` for a key that was absent. `rollbackTo(mark)` walks the list from its newest entry down to entry `mark`, puts each value back or deletes the key, and cuts the list to `mark`, so a key written several times ends with what it held before the first of the writes undone. `mark()` is the length of the list at that moment, "a place a transaction inside this one can go back to". `end(true)` is `rollbackTo(0)`, everything since `begin`, and then drops the list; `end(false)` only drops it. The environment begins every store it has when the outermost transaction starts and ends them all in a `finally`, with `failed` still true if `fn` threw. A `write` to one of the environment's stores is itself such a transaction (`MemoryKv.write` calls `env.transaction` around its work), as it is on LMDB, where a write to one named store is a transaction of the whole environment. So a transaction begun inside a write, by a block store's `batch` say, is a transaction inside a transaction, and when the write throws afterwards everything goes: what the write put, what the inner transaction put, and what either put in the environment's other stores. Two cases are covered beside the plain one. A store first asked for inside the transaction is begun as it is created (`if (this.depth > 0) s.begin()` in `store`), so its writes are undone with the rest. A transaction inside a transaction is part of the one already open: its writes go onto the same undo lists, and a throw out of the outer one undoes them too, as LMDB's child transactions are aborted with their parent. If the inner one itself throws, "its own writes are undone there and then": before it calls `fn` it takes a mark in every store the environment has, and its `catch` rolls each store back to its mark and throws the error on. A store first asked for inside the inner transaction has no mark and is rolled back to 0, which is everything it holds, since it was begun when it was created. An outer transaction that catches the error and goes on therefore keeps only what it wrote itself, before the inner one and after it, which is what an LMDB child transaction that aborts leaves its parent. A `MemoryKv` used on its own, outside any environment, has an undo list only while a `write` of it is running: the outermost write makes it, a write inside that one shares it, and it is dropped when the outermost ends. Between writes its `mark()` is 0 and its `rollbackTo` returns at once. This is what makes a failed application commit leave nothing of the block on the memory backend as it does on LMDB ([chapter 5](05-mempool-executor.md)).
 
 The in-memory store is what most engine and application tests run on (the recovery and restart cases use LMDB in a temporary directory), and what `Node` uses when no data directory is configured.
 
@@ -230,13 +278,22 @@ class LmdbStore implements KvStore {
   }
 ```
 
-`open` is a function the environment hands each of its stores, its own `assertOpen` (below). It returns while the environment is open and throws `StoreClosedError` once its close has been called. Each of the three methods calls it first. `get` is then one call into lmdb-js; `range` and `write` call it again as they go:
+`open` is a function the environment hands each of its stores, its own `assertOpen` (below). It returns while the environment is open and throws `StoreClosedError` once its close has been called. Each method calls it first. `get` is then one call into lmdb-js. `has` asks for the first key at or after the one given, with `getKeys`, a cursor that reads no value, and compares: lmdb-js's own `doesExist` reads the value to tell, and the block store asks `has` of keys that hold whole blocks (1.4 microseconds against 780 for a `get` of a 4 MiB value); `range` and `write` call it again as they go:
 
 ```ts
   get(key: Uint8Array): Uint8Array | undefined {
     this.open();
     const v = this.db.get(buf(key));
     return v === undefined ? undefined : new Uint8Array(v);
+  }
+
+  has(key: Uint8Array): boolean {
+    this.open();
+    // The first key at or after this one, by a cursor that reads no value: lmdb-js's doesExist reads the value to
+    // tell, and the block store asks this of keys that hold whole blocks.
+    const k = buf(key);
+    for (const found of this.db.getKeys({ start: k, limit: 1 })) return k.equals(found);
+    return false;
   }
 
   *range(start: Uint8Array, end: Uint8Array): IterableIterator<[Uint8Array, Uint8Array]> {
@@ -388,7 +445,8 @@ const valsetAtKey = (height: bigint) => key((k) => k.u8(0x56).u64(height));
  * How many blocks share a segment of the transaction index. An index keyed by the hash alone puts every
  * transaction of a block on a page of its own once the index is large, and a block's write grows with the chain
  * (docs/benchmarks.md section 4.13). Keyed by segment first, a block's entries go among those of the few blocks
- * around it, on pages already being written; the price is a lookup, which asks every segment the store holds.
+ * around it, on pages already being written; the price is a lookup, which asks every segment that holds
+ * something, and the larger segments below (TX_FANOUT) keep those few.
  */
 export const TX_SEGMENT_BLOCKS = 32n;
 /**
@@ -401,9 +459,32 @@ const TX_LAYOUT = 3;
 const TX_PREFIX = Uint8Array.of(0x78);
 const OLD_TX_PREFIX = Uint8Array.of(0x74);
 const txKey = (hash: Uint8Array, height: bigint) => key((k) => k.u8(0x78).u64(height / TX_SEGMENT_BLOCKS).fixed(hash).u64(height));
-const txPrefix = (segment: bigint, hash: Uint8Array) => key((k) => k.u8(0x78).u64(segment).fixed(hash));
-const TX_KEY_SIZE = 1 + 8 + HASH_SIZE + 8;
 const MAX_SEGMENT = 0xffff_ffff_ffff_ffffn;
+/**
+ * Behind the segments of 32 blocks come larger ones, so that a lookup does not grow with the chain. A segment of
+ * level L holds 32 of level L - 1, level 0 being the segments blocks are written to: 32 blocks, 1,024, 32,768 and
+ * so on. Once the 32 are all behind the latest block their entries are copied into the one above, in the order of
+ * its keys and a few blocks' worth with each block saved, and then removed (mergeTxLevel). A lookup asks each
+ * level, and in each only the segments that hold something, of which a level keeps a few dozen. Level 0 is under
+ * 'x', level L under 'y' and the level's number; the rest of the key is the same.
+ */
+export const TX_FANOUT = 32n;
+/** The last level: its segments are 32^12 blocks, and sixteen of them hold every height there is. */
+const TX_TOP_LEVEL = 11;
+const txSpan = (level: number) => TX_SEGMENT_BLOCKS * TX_FANOUT ** BigInt(level);
+const txLevelHead = (level: number) => (level === 0 ? TX_PREFIX : Uint8Array.of(0x79, level));
+/** Where a segment of a level starts, or the level's end for a segment past the last a u64 names. */
+const txSegment = (level: number, segment: bigint) => (segment > MAX_SEGMENT ? prefixEnd(txLevelHead(level)) : key((k) => k.fixed(txLevelHead(level)).u64(segment)));
+/** The highest block saved with its results, which is the latest the node applied: the larger segments fill behind it. */
+const TX_TIP_KEY = Uint8Array.of(0x4d);
+/** What follows the segment in a key: the hash and the height. */
+const TX_SUFFIX = HASH_SIZE + 8;
+const concat = (a: Uint8Array, b: Uint8Array) => {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a);
+  out.set(b, a.length);
+  return out;
+};
 const oldTxPrefix = (hash: Uint8Array) => key((k) => k.u8(0x74).fixed(hash));
 const encodeTx = (height: bigint, index: number, r: TxResult | null | undefined) => encode((wr) => wr.u64(height).u32(index).u8(r ? (r.ok ? 1 : 0) : 2).string(r?.error ?? ''));
 const decodeTx = (v: Uint8Array): TxLocation =>
@@ -418,7 +499,7 @@ const headerKey = (h: bigint) => key((k) => k.u8(0x48).u64(h));
 const LOWEST_HEADER_KEY = key((k) => k.u8(0x4c));
 ```
 
-In ASCII: `'s'` state, `'l'` lowest height, `'b'` block by height, `'h'` height by block hash, `'v'` validator set by hash, `'V'` validator set by the height it signs, `'x'` transaction location by segment, hash and height, `'T'` the layout of that index (`'t'` held it before it was kept in segments), `'r'` results by height, `'H'` a header kept without its block, `'L'` the lowest height with such a header. Because heights are big-endian u64, the blocks sort by height and a range over `'b'` walks the chain in order. The prefixes are the same letters the application store uses for different things (`'h'` is a block hash here and a history version there); that is fine because the two live in different named stores.
+In ASCII: `'s'` state, `'l'` lowest height, `'b'` block by height, `'h'` height by block hash, `'v'` validator set by hash, `'V'` validator set by the height it signs, `'x'` transaction location by segment, hash and height, `'y'` the same entries once they have moved into larger segments (the level's number, the segment, hash and height), `'m'` and a level's number where that move stands, `'M'` the highest block saved with its results, `'T'` the layout of that index (`'t'` held it before it was kept in segments), `'r'` results by height, `'H'` a header kept without its block, `'L'` the lowest height with such a header. Because heights are big-endian u64, the blocks sort by height and a range over `'b'` walks the chain in order. The prefixes are the same letters the application store uses for different things (`'h'` is a block hash here and a history version there); that is fine because the two live in different named stores.
 
 Every save goes through a private `write` that either joins a batch in progress or opens its own transaction:
 
@@ -462,7 +543,7 @@ and `write` hands a save that writer, or a transaction of its own:
   }
 ```
 
-The invariant: while a batch is open, every save of this store joins its transaction, and a nested `batch` call joins the outer one instead of opening a second (the inner call just runs `fn`; only the outermost call holds the writer and clears it in `finally`, so a throw anywhere inside aborts the one transaction and leaves `open` null for the next caller). Outside a batch each save is its own transaction, as before. Reads (`loadBlock`, `loadState` and the rest) go to the store directly, not through the open writer; on the memory store, whose `write` buffers, a read inside a batch does not see the batch's own writes, and no caller relies on it either way (`deleteBlock` inside the pruning batch loads the block it is about to delete, which no earlier step of that batch wrote). The executor's `doApply` in `src/node/executor.ts` is the batch user:
+The invariant: while a batch is open, every save of this store joins its transaction, and a nested `batch` call joins the outer one instead of opening a second (the inner call just runs `fn`; only the outermost call holds the writer and clears it in `finally`, so a throw anywhere inside aborts the one transaction and leaves `open` null for the next caller). Outside a batch each save is its own transaction, as before. Reads (`loadBlock`, `loadState` and the rest) go to the store directly, not through the open writer, and see what the batch has written so far, on the memory store as on LMDB. The executor's `doApply` in `src/node/executor.ts` is the batch user:
 
 ```ts
     // Block, commit, results, the next set and the new state land together or not at all.
@@ -501,6 +582,16 @@ A block and its commit are stored as one value, the block's encoding followed by
         });
         for (const { hash, index } of seen.values()) w.put(txKey(hash, h), encodeTx(h, index, results?.[index]));
         if (results) w.put(resultsKey(h), encode((wr) => wr.array(results, (wr, r) => wr.bool(r.ok).string(r.error ?? ''))));
+        // What lies far enough behind the latest block applied here moves up a level. Each entry is copied and
+        // later removed, so a step that handles three times what the block added keeps pace with the blocks,
+        // those a backfill stores included, and spreads the work over most of them.
+        const applied = this.kv.get(TX_TIP_KEY);
+        // A store written before the marker was kept has none: its chain state knows the latest block.
+        const before = applied ? decode(applied, (r) => r.u64()) : (this.loadState()?.lastHeight ?? 0n);
+        const tip = results && h > before ? h : before;
+        if (tip > 0n && (!applied || tip > before)) w.put(TX_TIP_KEY, encode((wr) => wr.u64(tip)));
+        const lowest = this.lowestHeight();
+        for (let level = 0; level < TX_TOP_LEVEL; level++) this.mergeTxLevel(w, level, tip, lowest, Math.max(512, 3 * seen.size));
       }
 ```
 
@@ -510,49 +601,250 @@ The key carries the height after the hash, so there is one entry for every block
 
 Before the hash the key carries the block's segment, the height divided by `TX_SEGMENT_BLOCKS`, 32. The reason is what a write costs. A hash is uniformly spread, so in an index keyed by the hash first the entries of one block land anywhere, and once the index is large each is on a 16 KiB page of its own: a block then rewrites about as many pages of the index as it has transactions, and its write grows with the chain ([docs/benchmarks.md](../benchmarks.md) section 4.13). Keyed by the segment first, the entries of a block lie among those of the 32 blocks around it, on pages that are being written anyway. Worked example: block 1,000 is in segment 31 (1000 / 32, rounded down), with blocks 992 to 1,023; block 70,000 is in segment 2,187.
 
-The price is the lookup, which no longer knows where to look: the hash does not say which block has it. `txLocations(hash)` asks every segment the store holds, and `txLocation(hash)` picks one of the answers:
+The price is the lookup, which no longer knows where to look: the hash does not say which block has it. `txLocations(hash)` asks every segment that holds something, level by level (the levels are the larger segments, below), and `txLocation(hash)` picks one of the answers:
 
 ```ts
   txLocations(hash: Uint8Array): TxLocation[] {
+    // One location a height. A level-0 entry is the block's own; one in a larger segment is a copy, which outlives
+    // a block that was removed until its whole segment is dropped, and yields to an entry further down.
+    const found = new Map<bigint, TxLocation>();
+    for (const l of this.txLocationsAt(0, hash)) found.set(l.height, l);
+    for (let level = 1; level <= TX_TOP_LEVEL; level++) {
+      for (const l of this.txLocationsAt(level, hash)) if (!found.has(l.height) && this.holds(blockKey(l.height))) found.set(l.height, l);
+    }
+    if (this.oldTxIndex) {
+      const prefix = oldTxPrefix(hash);
+      for (const [, v] of this.kv.range(prefix, prefixEnd(prefix))) {
+        const l = decodeTx(v);
+        if (!found.has(l.height)) found.set(l.height, l);
+      }
+    }
+    return [...found.values()].sort((a, b) => (a.height < b.height ? -1 : a.height > b.height ? 1 : 0));
+  }
+
+  private holds(k: Uint8Array): boolean {
+    return this.kv.has ? this.kv.has(k) : this.kv.get(k) !== undefined;
+  }
+
+  /** The hash's entries in the segments of one level. */
+  private txLocationsAt(level: number, hash: Uint8Array): TxLocation[] {
     const found: TxLocation[] = [];
-    const end = prefixEnd(TX_PREFIX);
-    // A read or two per segment held: from where the hash would be in a segment, the first key there is either an
-    // entry of the hash, or it names the next segment that has anything, and the segments between are passed over.
+    const head = txLevelHead(level);
+    const end = prefixEnd(head);
+    // A read or two per segment that holds something: from where the hash would be in a segment, the first key
+    // there is either an entry of the hash, or it names the next segment that has anything, and the segments
+    // between are passed over.
     for (let segment = 0n; ; ) {
-      const prefix = txPrefix(segment, hash);
+      const prefix = concat(txSegment(level, segment), hash);
       let next: bigint | null = null;
       for (const [k, v] of this.kv.range(prefix, end)) {
-        if (k.length !== TX_KEY_SIZE) continue; // not an entry of the index: nothing writes one, and it says nothing of the segments
+        if (k.length !== head.length + 8 + TX_SUFFIX) continue; // not an entry of the index: nothing writes one, and it says nothing of the segments
         if (startsWith(k, prefix)) {
           found.push(decodeTx(v));
           continue;
         }
-        const at = decode(k.subarray(1, 9), (r) => r.u64());
+        const at = decode(k.subarray(head.length, head.length + 8), (r) => r.u64());
         // Past the hash in the segment asked: the next one may have it. A later segment's first key says the same of
         // that segment when it sorts after the hash's entries there; otherwise that segment is asked.
-        const there = txPrefix(at, hash);
+        const there = concat(txSegment(level, at), hash);
         next = at === segment || (compareBytes(k, there) > 0 && !startsWith(k, there)) ? at + 1n : at;
         break;
       }
       if (next === null || next > MAX_SEGMENT) break;
       segment = next;
     }
-    if (this.oldTxIndex) {
-      const prefix = oldTxPrefix(hash);
-      for (const [, v] of this.kv.range(prefix, prefixEnd(prefix))) found.push(decodeTx(v));
-    }
-    return found.sort((a, b) => (a.height < b.height ? -1 : a.height > b.height ? 1 : 0));
+    return found;
   }
+```
 
+`txLocationsAt` is the walk of one level. Its loop reads from where the hash would be in a segment to the end of the level. A key whose length is not an entry's is skipped before anything is read from it: nothing writes one, and it is neither an entry to decode nor a key whose bytes name a segment. Entries of the hash in that segment come first and are collected. The first key that is not one ends the read, and it says where to go next. If it is in the segment asked, the hash's entries there are finished and the next segment is asked. If it is in a later segment, the segments between hold nothing and are passed over, and the key itself tells whether that later segment can hold the hash: a key that sorts after the hash's entries there means it cannot, and the segment after it is asked; otherwise that segment is. A read that finds no key at all ends the loop. That is one or two reads per segment that has entries and none for a segment that has none. `MAX_SEGMENT` stops the loop at the last segment a u64 can name rather than let `at + 1n` overflow the key.
+
+`txLocations` asks level 0 first and then the eleven above it, and keeps one location for a height. Level 0 holds each block's own entries, which `deleteBlock` removes with the block. An entry in a larger segment is a copy, and two things follow from that. A copy is not removed with its block, since that would be a write at a hash's own place in a large segment for every transaction pruned, the cost the segments were made to avoid; it stays until its whole segment lies below the lowest height and is dropped. So a location from a level above 0 is answered with only if `blockKey` of its height is still there, which `holds` asks with the store's `has` where it has one, without reading the block. And a block saved again with other results writes a new entry at level 0 while an older copy may sit above; the lower level is asked first and its answer stands.
+
+```ts
   txLocation(hash: Uint8Array): TxLocation | null {
     const all = this.txLocations(hash);
     return all.find((l) => l.ok === true) ?? all[all.length - 1] ?? null;
   }
 ```
 
-The loop reads from where the hash would be in a segment to the end of the index. A key whose length is not an entry's, `TX_KEY_SIZE`, is skipped before anything is read from it: nothing writes one, and it is neither an entry to decode nor a key whose bytes name a segment. Entries of the hash in that segment come first and are collected. The first key that is not one ends the read, and it says where to go next. If it is in the segment asked, the hash's entries there are finished and the next segment is asked. If it is in a later segment, the segments between hold nothing and are passed over, and the key itself tells whether that later segment can hold the hash: a key that sorts after the hash's entries there means it cannot, and the segment after it is asked; otherwise that segment is. A read that finds no key at all ends the loop. That is one or two reads per segment that has entries and none for a segment that has none, where the old layout made one range read: a lookup grows with the blocks a node keeps, and pruning bounds it. A probe over 4,000 blocks measured 0.27 ms. `MAX_SEGMENT` stops the loop at the last segment a u64 can name rather than let `at + 1n` overflow the key.
-
 `txLocations` is every block still held that carries the transaction, oldest first; `txLocation` is the block it succeeded in if there is one, otherwise the newest. `decodeTx` turns the status byte back into `ok`, null for 2.
+
+With segments of 32 blocks alone, a lookup would grow with the chain: one or two reads for every 32 blocks a node holds, some 60 ms over a million blocks, on every `tx` call. So behind the segments come larger ones:
+
+```ts
+/**
+ * Behind the segments of 32 blocks come larger ones, so that a lookup does not grow with the chain. A segment of
+ * level L holds 32 of level L - 1, level 0 being the segments blocks are written to: 32 blocks, 1,024, 32,768 and
+ * so on. Once the 32 are all behind the latest block their entries are copied into the one above, in the order of
+ * its keys and a few blocks' worth with each block saved, and then removed (mergeTxLevel). A lookup asks each
+ * level, and in each only the segments that hold something, of which a level keeps a few dozen. Level 0 is under
+ * 'x', level L under 'y' and the level's number; the rest of the key is the same.
+ */
+export const TX_FANOUT = 32n;
+/** The last level: its segments are 32^12 blocks, and sixteen of them hold every height there is. */
+const TX_TOP_LEVEL = 11;
+const txSpan = (level: number) => TX_SEGMENT_BLOCKS * TX_FANOUT ** BigInt(level);
+const txLevelHead = (level: number) => (level === 0 ? TX_PREFIX : Uint8Array.of(0x79, level));
+/** Where a segment of a level starts, or the level's end for a segment past the last a u64 names. */
+const txSegment = (level: number, segment: bigint) => (segment > MAX_SEGMENT ? prefixEnd(txLevelHead(level)) : key((k) => k.fixed(txLevelHead(level)).u64(segment)));
+/** The highest block saved with its results, which is the latest the node applied: the larger segments fill behind it. */
+const TX_TIP_KEY = Uint8Array.of(0x4d);
+/** What follows the segment in a key: the hash and the height. */
+const TX_SUFFIX = HASH_SIZE + 8;
+```
+
+A segment of level 1 covers 1,024 blocks, one of level 2 covers 32,768, one of level 3 a little over a million. Worked example: block 70,000 is written to segment 2,187 of level 0; it belongs to segment 68 of level 1 (70,000 / 1,024), which covers blocks 69,632 to 70,655, and to segment 2 of level 2, which covers 65,536 to 98,303. Its entries may start moving to level 1 once block 70,656 has been applied, and to level 2 once block 98,304 has; the move itself takes the saves that follow, a few hundred for a full segment of level 1. A chain of a million blocks, once the moves that are due have been made, has heights 1 to 983,039 in thirty segments of level 2, the next 16,384 in sixteen of level 1 and the last 577 in nineteen of level 0, and a lookup asks those and not the 31,251 small segments the blocks were written to. While a move is under way its entries are in both places, and a lookup counts a height once. A probe (`docs/benchmarks.md` section 4.13) over 20,000 blocks of 500 transactions measured 632 reads and 1.42 ms for a lookup with the small segments alone and 44 reads and 0.11 ms with the larger ones behind them.
+
+`saveBlock` calls `mergeTxLevel` for each level with every block whose transactions it indexes, as its last lines above show. The latest block is the highest one saved with a results array, which is a block the node applied, and is kept under `'M'` (a store written before the marker was kept takes it, once, from its chain state): a block that a backfill stores, far below it, makes the same steps behind the same latest block, so that a history arriving by backfill moves up as it arrives. The budget is three times what the block added, 512 at least: every entry is copied once and removed once on its way up a level, so twice the block's entries would just keep pace, and three times does it over two blocks in three. The method begins with what is to be dropped and with where the work stands:
+
+```ts
+  /**
+   * One step of moving a level's entries into the segments above it, made with each block saved. The first segment
+   * of the level that holds anything names the larger segment to fill. That one is filled only once the blocks it
+   * covers are all behind the latest and none is below the lowest held, and the levels further down have nothing
+   * left for it. Its 32 segments are first copied into it, a step taking the entries that come next in the order
+   * of hash and height whichever of the 32 they are in, so that the segment above is written in the order of its
+   * keys; then they are emptied front to back, an entry the segment above holds being removed and one it does
+   * not hold, or holds with another value, being written there first. Where the work stands is kept under 'm' and
+   * the level, written with the entries it speaks of. Entries of the level above in segments wholly below the
+   * lowest height are removed here too; they are copies of blocks that were pruned.
+   */
+  private mergeTxLevel(w: KvWriter, level: number, tip: bigint, lowest: bigint, budget: number): void {
+    const head = txLevelHead(level);
+    const end = prefixEnd(head);
+    const size = head.length + 8 + TX_SUFFIX;
+    const span = txSpan(level + 1);
+    const pruned: Uint8Array[] = [];
+    for (const [k] of this.kv.range(txLevelHead(level + 1), txSegment(level + 1, lowest / span))) {
+      pruned.push(k);
+      if (pruned.length === budget) break;
+    }
+    for (const k of pruned) w.del(k);
+    const stateKey = Uint8Array.of(0x6d, level);
+    const stored = this.kv.get(stateKey);
+    let state = stored ? decode(stored, (r) => ({ parent: r.u64(), removing: r.bool(), cursor: r.bytes() })) : null;
+    const save = (st: NonNullable<typeof state>) => w.put(stateKey, encode((wr) => wr.u64(st.parent).bool(st.removing).bytes(st.cursor)));
+    if (state && lowest > (state.parent === 0n ? 1n : state.parent * span)) {
+      // Pruning reached the segment being filled: what is left of it below goes with its blocks.
+      w.del(stateKey);
+      state = null;
+    }
+    // A key under the index's prefixes that is not an entry of it is removed where a step meets one, 64 in a step
+    // at most: nothing writes one, and left where it is it would be met again by every step.
+    let strays = 0;
+    const stray = (k: Uint8Array): boolean => {
+      w.del(k);
+      return ++strays === 64;
+    };
+```
+
+The first loop removes entries of the level above that lie in segments wholly below the lowest height: they are the copies of pruned blocks, and they go a budget's worth a step, front to back. The state of the level is read from the store, key `'m'` and the level, and not kept in the object: it is written in the same transaction as the entries it speaks of, so the two cannot disagree, whatever becomes of the transaction. If pruning has reached the segment being filled, the work on it is given up. Of what it leaves, the entries still at level 0 are removed by `deleteBlock` as their blocks go; those at a level above, in the segments being emptied or already copied into the one being filled, are copies that `deleteBlock` does not touch: a lookup does not answer with them once their block is gone, and the first loop above removes each segment of them when it lies wholly below the lowest height. `stray` is for a key under the index's prefixes that is not an entry of it. Nothing writes one. A step removes those it meets, 64 at most, and then stops where it is: no step reads without bound, and the next one, which no longer meets them, goes on from there.
+
+With no work under way, the step looks for some:
+
+```ts
+    if (!state) {
+      let parent: bigint | null = null;
+      for (let from: Uint8Array = head, tries = 0; tries < 4 && parent === null; tries++) {
+        let first: Uint8Array | null = null;
+        for (const [k] of this.kv.range(from, end)) {
+          if (k.length === size) first = k;
+          if (first || stray(k)) break;
+        }
+        if (!first) return;
+        const p = decode(first.subarray(head.length, head.length + 8), (r) => r.u64()) / TX_FANOUT;
+        if ((p + 1n) * span > tip) return; // not all behind the latest block, and no later one is
+        if (lowest <= (p === 0n ? 1n : p * span)) parent = p;
+        else from = txSegment(level, (p + 1n) * TX_FANOUT); // partly pruned, or not yet backfilled: left as it is
+      }
+      if (parent === null) return;
+      for (let l = 0; l < level; l++) {
+        for (const [k] of this.kv.range(txSegment(l, (parent * span) / txSpan(l)), txSegment(l, ((parent + 1n) * span) / txSpan(l)))) {
+          if (k.length === txLevelHead(l).length + 8 + TX_SUFFIX || stray(k)) return; // more is on its way up
+        }
+      }
+      state = { parent, removing: false, cursor: new Uint8Array(0) };
+    }
+```
+
+The first key of the level names the first segment that holds anything, and that segment's number divided by 32 is the larger segment it belongs to, the `parent`. Three conditions. Every block the parent covers must be behind the latest, or entries would still be arriving below; the first parent that fails this ends the step, since no later one can pass. No block it covers may be below the lowest height: such a parent is partly pruned, or, on a node that joined from a snapshot, not yet backfilled, and the search goes on after it, four parents at most in a step. (`p === 0n ? 1n` is for the first parent, which covers heights from 0, and the chain starts at 1.) And the levels further down must hold nothing in the parent's range, so that a parent is not copied upward while entries for it are still on their way.
+
+The copy comes first, and all of it before anything is removed:
+
+```ts
+    // The entries that come next after the cursor, whichever of the 32 they are in: the first of each is held, the
+    // smallest is taken and the one after it in its segment takes its place.
+    const cursors: Iterator<[Uint8Array, Uint8Array]>[] = [];
+    const next = (it: Iterator<[Uint8Array, Uint8Array]>): [Uint8Array, Uint8Array] | null => {
+      for (;;) {
+        const step = it.next();
+        if (step.done) return null;
+        if (step.value[0].length === size) return step.value;
+        if (strays >= 64 || stray(step.value[0])) return null;
+      }
+    };
+    // Held in descending order of what follows the segment, so the smallest is the last.
+    const held: { suffix: Uint8Array; value: Uint8Array; from: number }[] = [];
+    const hold = (e: [Uint8Array, Uint8Array] | null, from: number): void => {
+      if (!e) return;
+      const suffix = e[0].subarray(head.length + 8);
+      let lo = 0;
+      for (let hi = held.length; lo < hi; ) {
+        const mid = (lo + hi) >> 1;
+        if (compareBytes(held[mid]!.suffix, suffix) > 0) lo = mid + 1;
+        else hi = mid;
+      }
+      held.splice(lo, 0, { suffix, value: e[1], from });
+    };
+    const taken: { suffix: Uint8Array; value: Uint8Array }[] = [];
+    try {
+      for (let c = first; c < first + TX_FANOUT; c++) {
+        const from = state.cursor.length ? concat(concat(txSegment(level, c), state.cursor), Uint8Array.of(0)) : txSegment(level, c);
+        cursors.push(this.kv.range(from, txSegment(level, c + 1n))[Symbol.iterator]());
+        hold(next(cursors[cursors.length - 1]!), cursors.length - 1);
+      }
+      while (taken.length < budget && held.length > 0) {
+        const least = held.pop()!;
+        taken.push(least);
+        hold(next(cursors[least.from]!), least.from);
+      }
+    } finally {
+      for (const it of cursors) it.return?.();
+    }
+    for (const e of taken) w.put(concat(target, e.suffix), e.value);
+    // Nothing after the cursor: the copy is done. Unless the step stopped at keys that are not entries, in which
+    // case there may be more behind them, and the next step, which no longer meets them, will say.
+    if (taken.length > 0) save({ parent: state.parent, removing: false, cursor: taken[taken.length - 1]!.suffix });
+    else if (strays < 64) save({ parent: state.parent, removing: true, cursor: new Uint8Array(0) });
+```
+
+The 32 small segments are each in the order of hash and height, and so is the parent, so writing the parent in its own order means merging the 32. A range is opened on each, after the cursor, and its first entry is held. `held` is kept in descending order of what follows the segment in the key, so the smallest is its last element: the step pops it, takes it, and puts in its place, by a binary search, the next entry of the segment it came from. That goes on until the budget is spent or nothing is held. The entries taken are in the parent's order, whichever segments they came from and however unevenly the segments are filled: a block of five thousand transactions among empty ones has all its entries in one segment, and the step takes its whole budget from that one. They are written after the ranges are closed, and the cursor moves to the last of them. The parent is thus written front to back, a dozen pages a step, where copying one small segment after another would write all over it. A step that finds nothing after the cursor turns the state to removing, unless it stopped at stray keys, behind which there may be more.
+
+```ts
+    const target = txSegment(level + 1, state.parent);
+    const first = state.parent * TX_FANOUT;
+    if (state.removing) {
+      const rows: [Uint8Array, Uint8Array][] = [];
+      for (const e of this.kv.range(txSegment(level, first), txSegment(level, first + TX_FANOUT))) {
+        if (e[0].length === size) rows.push(e);
+        else if (stray(e[0])) break;
+        if (rows.length === budget) break;
+      }
+      for (const [k, v] of rows) {
+        // Not above, or not with this value: it reached its segment after the copy had passed its place.
+        const above = concat(target, k.subarray(head.length + 8));
+        if (!bytesEqual(this.kv.get(above) ?? null, v)) w.put(above, v);
+        w.del(k);
+      }
+      if (rows.length < budget && strays < 64) w.del(stateKey);
+      return;
+    }
+```
+
+Removal goes through the 32 segments front to back, which empties whole pages and frees them. An earlier version removed each stretch of keys right after copying it, a few entries from the front of all 32 segments at every block; that rewrote 32 pages a block and took a node's store time from 44 ms a block to 58 and more while a move ran (`docs/benchmarks.md` section 4.13). As it is, copying adds about 3 ms to a block's save and removing about 5. For each entry the parent is asked for its key, one read. If the parent holds it with the same value, the entry is removed. If not, the entry reached its segment after the copy had passed its place, or was written again since: a block saved again with results, long after it was first saved, is the one way. It is then written to the parent first and removed after, in the same transaction, so nothing leaves the small segments that is not above. When a step finds fewer entries than its budget, the 32 are empty and the state is deleted; the next step looks for the next parent.
+
+A step takes the store as it finds it. The reads see what the transaction has written so far, on both stores, so several blocks saved in one batch each make their own step from where the last one left off, and a block's own entries, written a few lines earlier in `saveBlock`, are there to be read. A transaction that is undone takes the state back with the entries.
 
 A store written before the segments has its entries under `'t'`, in one of two layouts: by hash and height, or, older still, by hash alone, one entry per hash. Both have the height in the value. The constructor calls the private `migrateTxIndex`, which moves them once:
 
@@ -600,7 +892,7 @@ The rest are one-key reads and writes: `heightOf(hash)`, `loadState` / `saveStat
   }
 ```
 
-Setting the marker to `null` deletes the key, which is what header pruning does once the last record is older than the evidence window and what backfill does once a block has replaced the record the marker pointed at. `deleteBlock(height)` is what retention and pruning use; it loads the block first so it can remove the hash index entry and every transaction entry in the same transaction, with the block's results and the validator set stored for its height:
+Setting the marker to `null` deletes the key, which is what header pruning does once the last record is older than the evidence window and what backfill does once a block has replaced the record the marker pointed at. `deleteBlock(height)` is what retention and pruning use; it loads the block first so it can remove the hash index entry and the block's transaction entries at level 0 in the same transaction, with the block's results and the validator set stored for its height:
 
 ```ts
   deleteBlock(height: bigint): void {
@@ -619,7 +911,7 @@ Setting the marker to `null` deletes the key, which is what header pruning does 
   }
 ```
 
-Deleting a block removes that block's index entries only: a transaction that is also in another block still held keeps its entry there. The validator set stored by height (`'V'`) goes with the block of that height: it is what a peer joining at a snapshot of that height is served, and such a join needs the block too, so the record answers nothing once the block is gone. The sets of the heights still held stay, as do the two the executor has stored ahead of the latest block. Sets by hash (`'v'`), one per distinct set, are not deleted here: headers still held name them, which is what evidence at any retained height needs. They are the executor's to remove. After a pruning pass it looks for each set the removed heights carried among the headers still held and in the current state, and calls **`deleteValidatorSet(hash)`**, a single `del` of the `'v'` key, for one that nothing names (`pruneValidatorSets`, [chapter 5](05-mempool-executor.md)). The store does not check the condition itself; the interface says so: "the caller has found that no header still held and no state names it". A store pruned by an earlier build keeps the by-height records of the blocks that build deleted, below its lowest block, since `deleteBlock` returns at once for a height whose block is already gone.
+Deleting a block removes that block's index entries only: a transaction that is also in another block still held keeps its entry there. It removes them where blocks write them, at level 0. Copies of them that have moved into a larger segment stay until that segment lies wholly below the lowest height (`mergeTxLevel` above); `txLocations` passes over a copy whose block is no longer held. The validator set stored by height (`'V'`) goes with the block of that height: it is what a peer joining at a snapshot of that height is served, and such a join needs the block too, so the record answers nothing once the block is gone. The sets of the heights still held stay, as do the two the executor has stored ahead of the latest block. Sets by hash (`'v'`), one per distinct set, are not deleted here: headers still held name them, which is what evidence at any retained height needs. They are the executor's to remove. After a pruning pass it looks for each set the removed heights carried among the headers still held and in the current state, and calls **`deleteValidatorSet(hash)`**, a single `del` of the `'v'` key, for one that nothing names (`pruneValidatorSets`, [chapter 5](05-mempool-executor.md)). The store does not check the condition itself; the interface says so: "the caller has found that no header still held and no state names it". A store pruned by an earlier build keeps the by-height records of the blocks that build deleted, below its lowest block, since `deleteBlock` returns at once for a height whose block is already gone.
 
 ### src/store/files.ts
 
@@ -663,13 +955,15 @@ The file is either the old content or the new content, never a mix: the data goe
 
 `test/store.test.ts`:
 
-- "memory store orders keys bytewise and makes writes atomic": `exerciseKv` puts keys out of order, reads one back, finds a missing key undefined, scans the prefix `b` with `prefixEnd` and gets the two `b/` keys in order, scans `[a, z)` and gets four, throws inside a `write` and finds the key it put absent, and deletes a key.
+- "memory store orders keys bytewise and makes writes atomic": `exerciseKv` puts keys out of order, reads one back, finds a missing key undefined, scans the prefix `b` with `prefixEnd` and gets the two `b/` keys in order, scans `[a, z)` and gets four, throws inside a `write` and finds the key it put absent, and deletes a key; then, inside one write, it reads back a key the write put, ranges over 200 keys while deleting every other one, checks `has`, and puts, replaces and deletes keys ahead of a range under way, which gives them as they then are; and a write that deletes, changes and throws leaves both keys as they were.
 - "lmdb store does the same and survives reopening": the same exercise on an `LmdbEnv` in a temporary directory, then a reopen reads a value back, a second, read-only environment on the same directory sees the deletion, asking that environment for a store named `missing` throws `/no database named missing/`, and a `write` to its store `t` throws `StoreReadOnlyError`.
 - "block store finds blocks by height and by hash on both backends": five blocks saved on a `MemoryBlockStore` and on a `KvBlockStore` over LMDB; `loadBlock(3)` returns the block with its commit, `heightOf` finds block 4 and returns null for an unknown hash, `loadBlock(9)` and `loadState` return null.
+- "undoes an environment transaction made inside a write that then throws, on both backends": on a `MemoryEnv` and on LMDB, a batch of the block store saves a block, an environment transaction inside it saves another and writes to two other stores, one of them first asked for there, and the batch throws: neither block nor its index entry is left, a key the batch changed holds what it held before and the other stores hold nothing; and an environment transaction that throws inside a batch that goes on takes back only its own block.
+- "block store on lmdb moves index entries into larger segments within the transactions that save the blocks": 2,304 blocks of twenty transactions saved 64 to a batch on LMDB, where each step of the move reads what the one before wrote in the same transaction; every transaction looked up is found with its result, the entries of heights 1 to 2,047 are in level 1 and the rest under `'x'`, and the answers are the same after the environment is closed and reopened.
 
 `test/review.test.ts`, "keeps per-block results so a repeated transaction proves its real outcome at each position": a block `[T, T]` with results success then failure; `txLocation` points at position 0 with `ok: true`, `loadResults` returns both, and a result proof for position 1 verifies against the results root with `ok: false` (finding 18). Its neighbour "saves everything a height needs to the block store in one transaction" subclasses `MemoryKv` to count calls to `write`: a `batch` holding `saveValidatorSet`, `saveValidatorsAt` and `setLowestHeight` costs one (counted from after the store is opened, which writes the layout of its transaction index once), the values are readable afterwards, and a `setLowestHeight` outside the batch costs another (finding 39).
 
-`test/review4.test.ts` has three cases on the transaction index. "keeps every block a transaction is in, answers with the one it succeeded in, and loses only the pruned one" saves one transaction in blocks 5 (failed), 8 (succeeded, at position 1) and 9 (failed): `txLocations` lists the three in height order, `txLocation` answers block 8, after `deleteBlock(8n)` the list is 5 and 9 and the answer block 9, and after the other two are deleted it is null. "finds a transaction in whichever segments hold it, with blocks far apart and segments missing between" saves fourteen blocks at heights from 1 to 90,000, which lie in seven segments, with one transaction in five of them: `txLocations` lists the five in height order, a transaction in a single block is found at either end and in the middle, hashes of all zero and all `0xff` bytes find nothing, one lookup makes at most 14 range reads, every key under `'x'` starts with its height divided by `TX_SEGMENT_BLOCKS`, three keys put under `'x'` that are not entries (41 bytes, sorting just before an entry of the transaction, 2 bytes and 9 bytes) change no answer, and deleting two of the five blocks leaves the other three. "moves an index of either older layout into the segments when the store is opened, and reads one it cannot move" writes 12,000 entries under `'t'`, half by hash alone and half by hash and height, over heights in ten segments, with the marker saying layout 2, and opens a `KvBlockStore` on them: nothing is left under `'t'`, the entries read back with their heights, positions and results, a transaction with entries at heights 5 and 700 that lands again at height 9 has all three and keeps the first two when block 9 is deleted, and a second store opened on the same data makes no range read. A store whose second write throws `stopped` throws it from the constructor and leaves 7,000 entries unmoved and no marker; a `KvBlockStore` over the same data whose `write` throws `StoreReadOnlyError` finds every entry all the same, and the next open on the data itself finishes the move and writes the marker; and a store whose `write` always throws `StoreReadOnlyError` answers from entries of both older layouts.
+`test/review4.test.ts` has six cases on the transaction index. "keeps every block a transaction is in, answers with the one it succeeded in, and loses only the pruned one" saves one transaction in blocks 5 (failed), 8 (succeeded, at position 1) and 9 (failed): `txLocations` lists the three in height order, `txLocation` answers block 8, after `deleteBlock(8n)` the list is 5 and 9 and the answer block 9, and after the other two are deleted it is null. "finds a transaction in whichever segments hold it, with blocks far apart and segments missing between" saves fourteen blocks at heights from 1 to 90,000, which lie in seven segments, with one transaction in five of them: `txLocations` lists the five in height order, a transaction in a single block is found at either end and in the middle, hashes of all zero and all `0xff` bytes find nothing, one lookup makes at most 25 range reads, every key under `'x'` starts with its height divided by `TX_SEGMENT_BLOCKS` and every key under `'y'` with level 1 or 2 and its height divided by 1,024 or 32,768, three keys put under `'x'` that are not entries (41 bytes, sorting just before an entry of the transaction, 2 bytes and 9 bytes) change no answer, and deleting two of the five blocks leaves the other three. "moves entries into larger segments behind the latest block, and a lookup asks a few segments however long the chain" saves 34,000 blocks, and the same blocks on a second store whose every seventh write fails after everything was written and is made again: the two end with the same index, heights below 32,768 are in one segment of level 2, no level holds more than a few dozen segments, every transaction looked up is found, and a lookup makes at most 95 range reads where the small segments alone would have taken over a thousand; a block saved again with another result long after its entry moved up is answered with the new result at once and has it copied up, a block deleted from the middle is no longer answered with, and after pruning to height 33,000 the segment of level 2 is dropped and the segment of level 1 that the lowest height is in is kept. "keeps a result saved while its entry is on the way up, moves a crowded block and backfilled ones, and asks for no block to answer" saves blocks until the first 1,024 are being removed from the small segments and then saves block 900 again with another result, alone and in one batch with the next block: the new result is the answer at once and after the removal has passed it; a block of 5,000 transactions among empty ones has moved up thirty blocks after the 1,024th; a lookup of a transaction in a larger segment asks `has` and reads no block; and a store that starts at height 3,000 and backfills a hundred blocks of ten transactions for every block it applies has heights 1,024 to 2,047 moved up by the time the backfill ends, and the first 1,024 forty-five applied blocks later. "fills the larger segments on a store that never recorded its latest block, and past keys that are not entries" takes a store as the version before the larger segments left it (blocks 2,000 to 2,100 applied, the chain state saying so, no `'M'`) through a backfill to height 1 with no block applied: `'M'` is 2,100 afterwards and heights 1,024 to 2,047 have moved up; and a store with seventy keys under `'x'` that are not entries before its first entry, and seventy more put among the small segments once their removal has begun, has none of them left twelve blocks later, the first 1,023 blocks' entries in level 1 and every transaction looked up found. "moves an index of either older layout into the segments when the store is opened, and reads one it cannot move" writes 12,000 entries under `'t'`, half by hash alone and half by hash and height, over heights in ten segments, with the marker saying layout 2, and opens a `KvBlockStore` on them: nothing is left under `'t'`, the entries read back with their heights, positions and results, a transaction with entries at heights 5 and 700 that lands again at height 9 has all three and keeps the first two when block 9 is deleted, and a second store opened on the same data makes no range read. A store whose second write throws `stopped` throws it from the constructor and leaves 7,000 entries unmoved and no marker; a `KvBlockStore` over the same data whose `write` throws `StoreReadOnlyError` finds every entry all the same, and the next open on the data itself finishes the move and writes the marker; and a store whose `write` always throws `StoreReadOnlyError` answers from entries of both older layouts.
 
 `test/review5-node.test.ts` has seven cases on this chapter's code; two, on a closed LMDB environment, are described under `src/store/lmdb.ts` above, and the other five are these. "indexes a transaction repeated in one block where it succeeded": on a `MemoryBlockStore`, a block `[T, U, T]` with results failure, success, success is indexed at position 2 with `ok: true`; a block `[T, T]` with success then failure at position 0; one where both fail at the first of the two with its error; one saved with `null` results at position 0 with `ok: null`; and `txLocations` has one entry per block, which goes when the block is deleted. "applies the operations of one write to the memory store in the order they were made": a put followed by a delete of one key in a single `write` leaves the key absent, put, delete, put leaves the last value, and a callback that deletes and then throws leaves the store as it was. "prunes blocks and headers in one transaction each, the set by height going with its block": a one-validator node retaining two blocks runs on a `MemoryKv` that records the first byte of every key each `write` puts and deletes. Every write that deletes a block also puts the lowest-height marker, no write moves the marker alone, and each deletes as many `'V'` records as blocks; `loadValidatorsAt` is null below the lowest block and answers at it and two heights above the latest, and the genesis set is still found by hash, the chain's one validator never having changed. Two header records written below the lowest block with times older than the evidence age are then deleted, with their marker, in a single write after the next commit. The fourth, "removes a validator set by hash once no header held names it" ([chapter 5](05-mempool-executor.md)), exercises `deleteValidatorSet`: a set replaced by a `val:` transaction is gone from the store once every block that names it has been pruned, and each block still held finds both sets its header names. The fifth, "undoes the writes of a memory environment transaction that throws, in every store", puts a key in the `chain` store of a `MemoryEnv`, then in a transaction overwrites it, adds a second key, deletes the first, writes to an `app` store first asked for inside a nested transaction, and throws: the first key holds its old value, the second key and the `app` store's key are absent. A transaction that returns keeps its write, and a write made after it is not undone by a later transaction that throws. Last, an outer transaction puts the first key, runs an inner one that overwrites it, writes to a `late` store first asked for there and throws, catches the error and puts the second key: afterwards the first key holds the outer transaction's value, the second key its new one, and the `late` store has nothing.
 

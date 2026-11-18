@@ -96,9 +96,34 @@ entries lie among those of the few blocks around it, on pages that are being wri
 anyway. The price is the lookup. `txLocations(hash)` asks each segment the store
 holds for the hash: it reads from where the hash would be in a segment, and the first
 key there is either an entry of the hash or names the next segment that has anything,
-so segments with no entries are passed over. That is a read or two per segment held
-instead of one range read (0.27 ms over 4,000 blocks in a probe), so a lookup grows
-with the blocks a node keeps, and pruning bounds it.
+so segments with no entries are passed over. That is a read or two per segment that holds something
+instead of one range read.
+
+With segments of 32 blocks alone a lookup would grow with the blocks a node keeps,
+some 60 ms over a million. So behind them come larger segments, each holding 32 of
+the level below: level 1 is 1,024 blocks, level 2 is 32,768, and so on to level 11,
+under `'y' || level u8 || segment u64 || txHash || height u64` with the same value.
+Once the 32 segments of a larger one are all behind the latest block, and none of its
+blocks is below the lowest height, their entries are copied into it and then removed
+(`mergeTxLevel`), a step with each block whose transactions are indexed, of three
+times the block's entries or 512. The latest block is the highest one saved with its
+results (`'M'`), so the blocks a backfill stores make their steps too, behind the
+block the node last applied. The copy merges the 32: it takes the entries that come
+next in the order of hash and height, whichever of the 32 they are in, so the larger
+segment is written in the order of its keys. The removal goes through the 32 front to
+back; an entry the larger segment holds with the same value is removed, and one it
+does not (it arrived, or was written again, after the copy had passed its place) is
+written there first. Where the work stands is under `'m' || level u8`, written with
+the entries. A segment's move takes the blocks that follow its becoming due, a few
+hundred for a full segment of level 1, and until it is done its entries are found
+where they still are.
+A lookup asks level 0 and then each level above, a few dozen segments a level: 44
+reads and 0.11 ms over 20,000 blocks of 500 transactions in a probe, where the small
+segments alone took 632 reads and 1.42 ms. A node pays for it with 3 to 5
+milliseconds of a block's save while a move is under way (docs/benchmarks.md section
+4.13). An entry above level 0 is a copy: it is not removed with its block but dropped
+with its whole segment once that lies below the lowest height, and a lookup answers
+with one only if the block of its height is still held.
 
 The index was first keyed `'t' || txHash`, one entry per hash, the last block written
 winning, and then `'t' || txHash || height`. Both have the height in the value. A
@@ -258,7 +283,7 @@ mempool's lowered limit being its throttle then.
 | delegation | delegator, validator, height?, prove? | `height`, the delegation with its tokens' worth as of `height` or null; `unbonding`, the entries pending as of `height`; the key proof at `height` when asked |
 | balance | account, asset?, height? | `height`, account id, asset id, amount as of `height` |
 | accountHistory | account, from?, limit?, reverse? | entries with sequence numbers, and the total; pagination below |
-| tx | hash, prove? | `{ hash, height, index, ok, error, tx, decoded, attempts?, proof? }`: the block the transaction succeeded in if there is one, else the newest that carries it; `attempts` lists height, index, ok and error for every block still held that carries it, oldest first, when there is more than one; `proof` holds `txProof`, the signed header, and `resultProof` with the next signed header, or nulls for those while the next block does not exist. The lookup by hash costs a read or two per 32-block segment of the index held (section 2.3; 0.27 ms over 4,000 blocks in a probe), so it grows with the blocks the node keeps and pruning bounds it |
+| tx | hash, prove? | `{ hash, height, index, ok, error, tx, decoded, attempts?, proof? }`: the block the transaction succeeded in if there is one, else the newest that carries it; `attempts` lists height, index, ok and error for every block still held that carries it, oldest first, when there is more than one; `proof` holds `txProof`, the signed header, and `resultProof` with the next signed header, or nulls for those while the next block does not exist. The lookup by hash costs a read or two for each segment of the index that holds something, a few dozen a level however many blocks the node keeps (section 2.3; 0.11 ms over 20,000 blocks of 500 transactions in a probe) |
 | broadcastTx | tx hex, mode? (`sync` default, or `commit`), timeoutMs? (default 30 000, at most 120 000) | `sync`: `{ hash, status }`; `commit`: `{ hash, height, index, ok, error }` once included; `-32004` while the mempool is full at a limit lowered under memory pressure, or paused |
 | accounts | after? (name cursor, exclusive), limit? | accounts by name with id and core balance |
 | parameters | | height, core asset (id, symbol, precision), maximum transaction expiration, the fee schedule and the staking parameters in force |
@@ -368,7 +393,7 @@ client retries once `/health` reports `ok` or `warn`.
 `broadcastTx` in `commit` mode is implemented on the same internal listener, with at
 most 1000 waiters at once. A call in that mode whose transaction the mempool reported
 `seen` and no longer holds looks the hash up in the transaction index, in case the
-transaction is already in a block, which costs a read or two per 32-block segment held
+transaction is already in a block, at the cost of a `tx` lookup
 (section 2.3); one whose transaction is pending, just admitted or admitted before, waits
 for the block and makes no lookup.
 

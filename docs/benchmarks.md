@@ -1375,7 +1375,8 @@ Keyed by a segment of blocks first, the entries of a block go among those of the
 it, on pages that are being written anyway, and the commit costs what it cost on the first day
 however long the chain is; a lookup has to ask every segment, a read or two each, so it costs
 what the commit no longer does, 0.27 ms over 4,000 blocks at 32 blocks a segment and in that
-proportion some 60 ms over a million blocks kept. Holding the entries back and writing many
+proportion some 60 ms over a million blocks kept (larger segments behind the small ones were
+added afterwards to bound it; "The lookup, bounded" below). Holding the entries back and writing many
 blocks' worth at once only puts the growth off. The index is now kept in segments of 32 blocks
 (`TX_SEGMENT_BLOCKS`, chapter 10 of the tutorial). For the record of recent transactions the
 remedy is one index in place of two, by expiration and then id: a transaction's id covers its
@@ -1440,6 +1441,51 @@ first row of the table above) through 62 at four minutes to 73 at ten, and after
 between 39 and 44 after the first minute, but for one window of 47 at 360 seconds; the last window commits 1,514 transfers a second
 before and 1,814 after. The slow windows after the sixth minute did not appear in either run
 (the lowest window after the change is 1,565 at 360 seconds) and are still not explained.
+
+The lookup, bounded. The segments made a lookup by hash cost what the commit no longer did: a
+read or two for every 32 blocks held, some 60 ms over a million. Behind them the store now
+keeps larger segments, each holding 32 of the level below (1,024 blocks, 32,768, and so on),
+and moves a segment's entries up once the 32 are all behind the latest block: copied in the
+order of the larger segment's keys, then removed (`mergeTxLevel`, chapter 10 of the tutorial).
+A probe of the layout on LMDB alone, 20,000 blocks of 500 entries (10 million), one commit a
+block:
+
+| | commit a block, by stretches of 2,000 blocks | a lookup by hash at the end | leaf pages |
+|---|---|---|---|
+| segments of 32 blocks alone | 5.4 to 7.5 ms | 632 reads, 1.42 ms | 67,262 |
+| with the larger segments behind them | 6.2 to 7.8 ms | 44 reads, 0.11 ms | 46,117 |
+
+The probe is not the store's code. It copied in larger steps than the store does, a larger
+segment in some 85 blocks, and removed its small ones in 170, so its averages over 2,000 blocks
+hide what a block pays while that goes on. The block store itself, as it now is against as it
+was, saving 2,400 blocks of 600 transactions of 430 bytes on LMDB with nothing else in the
+environment, three runs of each one after the other, a hundred blocks to a figure. Its budget
+is 1,800 entries a block here, so the first larger segment (613,800 entries, heights 1 to 1,023) is copied in the
+341 blocks after block 1,024 and its small ones are removed in the 341 after that:
+
+| | blocks 1 to 1,000 | 1,001 to 1,400 (copying) | 1,401 to 1,700 (removing) | 1,701 to 2,000 | 2,001 to 2,400 (copying the next) |
+|---|---|---|---|---|---|
+| segments alone | 6.2 to 7.6 ms a block | 6.1 to 7.3 | 6.1 to 7.2 | 6.1 to 7.2 | 6.3 to 7.2 |
+| with the larger segments | 6.6 to 7.5 | 8.8 to 10.4 | 11.1 to 12.5 | 6.5 to 8.3 | 8.2 to 10.3 |
+
+Copying adds about 3 ms to a block's save and removing about 5, for two blocks in three, and a
+block with nothing to move pays a few tenths for asking each level whether it has. A profile
+puts the cost in the calls into LMDB, a range read and a put for each entry copied, a range
+read, a point read and a delete for each removed, and not in the commit. A first version
+removed each stretch of keys right after copying it, a few entries from the front of all 32
+small segments at every block, which rewrote 32 pages a block: a node's store time went from
+44 ms a block to 58 and more once the first 1,024 blocks were behind it, and the removal was
+changed to go through the small segments front to back, which frees whole pages. With that,
+one ten-minute run of the node read 45 to 52 ms a block in the six windows after block 1,024
+(1,483 to 1,695 transfers a second), against 44 to 46 in the same windows of a run without the
+larger segments (1,520 to 1,791). Other work was running on the machine through the node runs
+(the first seven minutes of that one read up to 171 ms a block, before any entry had moved,
+and a second pair was lost to it altogether), and they were made before the step was given
+its present form (it now takes the entries that come next from whichever small segments have
+them, where it took an equal share from each, and writes above what it finds missing there
+when removing, where it began the copy again). So the node figures are an indication and the
+store's own, above, are the measurement: three to five milliseconds of a block's 44 while a
+move is under way.
 
 The expirations have to move for the second remedy to do anything. The suite's own load signs
 every transfer with one expiration, an hour after the run starts, and under it the new index
@@ -1886,13 +1932,15 @@ a store is opened under, and the arena's budget.
 7. **What the transaction index now costs a lookup.** The two tables that made a block's
    write grow with the chain were changed (section 4.13): the transaction index is kept in
    segments of 32 blocks and the record of recent transactions under one index by expiration.
-   A lookup by hash now reads every segment the node holds, a quarter of a millisecond over
-   4,000 blocks in the probe and so some 60 ms over a million; `retain.blocks` bounds it, and a
-   node that keeps every block pays it on each `tx` call and on a `broadcastTx` in commit mode of a
+   A lookup by hash read every segment the node held, a quarter of a millisecond over
+   4,000 blocks in the probe and so some 60 ms over a million. Larger segments behind the small
+   ones now bound it (section 4.13): 44 reads and 0.11 ms over 20,000 blocks, a few dozen
+   segments a level however long the chain, for 3 to 5 ms of a block's save while entries are
+   being moved up. A `tx` call makes the lookup, and a `broadcastTx` in commit mode of a
    transaction the mempool has seen before and no longer holds; a broadcast of one it has just
-   admitted, or still holds, waits for the block and looks nothing up.
-   A second level of larger segments, written as the small ones close, would bound it without
-   pruning and is not done. The record of recent transactions is cheap only while expirations
+   admitted, or still holds, waits for the block and looks nothing up. The node runs that
+   measured the cost of moving the entries were made on a busy machine and want repeating on a
+   quiet one. The record of recent transactions is cheap only while expirations
    move with the clock; transactions signed with expirations spread over the allowed hour
    scatter it as before. Runs of one configuration that differ by 25 ms a block from their
    first window turned out to be two states of the machine's disk (section 4.13;

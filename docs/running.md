@@ -17,7 +17,7 @@ the subject of the [tutorial](tutorial/00-overview.md); design decisions are in
 ```sh
 git clone <this repository> crosschain && cd crosschain
 npm install
-npm test                 # 290 tests, about two minutes
+npm test                 # 295 tests, about two minutes
 CHAIN_SCHEME=secp256k1 npm test   # the same suite on secp256k1 keys (one ML-DSA-only case is skipped)
 INDEX_TREES=0 npm test   # the same suite with every index B+ tree dropped from the start: lookups and scans through the store
 TREES=0 npm test         # and with every Merkle tree dropped: roots and proofs from the stored chunks and nodes; the two combine
@@ -466,7 +466,7 @@ mixes them with requests is answered for the requests alone. `GET /health` answe
 | `delegation` | `delegator`, `validator`, `height?`, `prove?` | the delegation (shares and their token value as of the height), with a key proof; `unbonding`, the entries pending as of the height | yes |
 | `balance` | `account`, `asset?`, `height?` | one balance as of the height | yes |
 | `accountHistory` | `account`, `from?`, `limit?` (default 20, max 100), `reverse?` | the account's id, the `total` of its entries, and history entries with sequence numbers, oldest first from sequence `from`; with `reverse`, newest first, and `from` counts entries back from the newest | yes |
-| `tx` | `hash`, `prove?` | where the transaction landed (the block it succeeded in if there is one, else the newest that carries it), its result, the decoded operations, and inclusion and result proofs; `attempts`, the height, position and result in every block still held that carries it, oldest first, when there is more than one. The lookup by hash costs a read or two for every 32 blocks the node holds (0.27 ms over 4,000 blocks in a probe), so it grows with the blocks kept, and `retain.blocks` bounds it | yes |
+| `tx` | `hash`, `prove?` | where the transaction landed (the block it succeeded in if there is one, else the newest that carries it), its result, the decoded operations, and inclusion and result proofs; `attempts`, the height, position and result in every block still held that carries it, oldest first, when there is more than one. The lookup by hash costs a read or two for each segment of the index that holds something, and the index keeps those to a few dozen a level by moving entries into larger segments behind the latest block (0.11 ms over 20,000 blocks of 500 transactions in a probe), so it does not grow with the blocks kept | yes |
 | `broadcastTx` | `tx` (hex), `mode?` (`sync`, the default, or `commit`), `timeoutMs?` (default 30,000, at most 120,000) | `sync`: the mempool's verdict, `added` or `seen`; `commit`: waits for inclusion and returns height, position and result; `-32004` when the mempool is full at a limit lowered because memory is short | yes |
 | `accounts` | `limit?` (default 50, max 200), `after?` | accounts by name with their core balance, paged by name; `after` is the last name of the previous page and is not repeated | yes |
 | `parameters` | | the height, the core asset, `maxTxExpirationMs`, the fee schedule and the staking parameters in force | |
@@ -500,7 +500,7 @@ with `-32002`, and a timeout does not remove a pending transaction from the memp
 1,000 commit waits are held at a time; beyond that the call answers `-32004` and the client
 should broadcast in sync mode and poll `tx`. A call in commit mode whose transaction the
 mempool has seen before and no longer holds looks the hash up among the blocks, in case it is
-already in one, at the cost the `tx` row gives: a read or two for every 32 blocks held. One
+already in one, at the cost the `tx` row gives. One
 whose transaction was just admitted, or is still pending, waits for the block that carries it
 and looks nothing up, so a transaction that failed in an earlier block and is admitted again
 is answered with the new attempt. While the mempool still remembers its hash it is not admitted

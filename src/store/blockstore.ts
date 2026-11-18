@@ -10,7 +10,10 @@
  *
  * Key layout: 'b' height, 'h' blockHash, 'v' validatorSetHash, 'V' height
  * (the set that signs it, with its proposer priorities, for state sync),
- * 's' state, 'l' lowest height, 'x' segment, txHash and height (height, position, result), 'T' the layout of
+ * 's' state, 'l' lowest height, 'x' segment, txHash and height (height, position, result), 'y' level, segment,
+ * txHash and height (the same entries once moved into larger segments), 'm' level (where that move stands),
+ * 'M' the highest block saved with results (what the move stays behind),
+ * 'T' the layout of
  * that index ('t' holds it in a store written before it was kept in segments),
  * 'r' height (the block's execution results, for result proofs), 'H' height
  * (a header kept without its block, below the lowest block a state-synced
@@ -20,7 +23,7 @@ import { decode } from '../codec/reader.ts';
 import { encode } from '../codec/writer.ts';
 import { key, startsWith } from '../db/keys.ts';
 import type { TxResult } from '../app/types.ts';
-import { compareBytes, HASH_SIZE, toHex } from '../crypto/hash.ts';
+import { bytesEqual, compareBytes, HASH_SIZE, toHex } from '../crypto/hash.ts';
 import { blockHash, decodeBlock, decodeCommit, decodeHeader, encodeBlock, encodeCommit, encodeHeader, txHash, type Block, type Commit, type Header } from '../types/block.ts';
 import { decodeState, encodeState, type ChainState } from '../types/state.ts';
 import { ValidatorSet } from '../types/validator.ts';
@@ -93,7 +96,8 @@ const valsetAtKey = (height: bigint) => key((k) => k.u8(0x56).u64(height));
  * How many blocks share a segment of the transaction index. An index keyed by the hash alone puts every
  * transaction of a block on a page of its own once the index is large, and a block's write grows with the chain
  * (docs/benchmarks.md section 4.13). Keyed by segment first, a block's entries go among those of the few blocks
- * around it, on pages already being written; the price is a lookup, which asks every segment the store holds.
+ * around it, on pages already being written; the price is a lookup, which asks every segment that holds
+ * something, and the larger segments below (TX_FANOUT) keep those few.
  */
 export const TX_SEGMENT_BLOCKS = 32n;
 /**
@@ -106,9 +110,32 @@ const TX_LAYOUT = 3;
 const TX_PREFIX = Uint8Array.of(0x78);
 const OLD_TX_PREFIX = Uint8Array.of(0x74);
 const txKey = (hash: Uint8Array, height: bigint) => key((k) => k.u8(0x78).u64(height / TX_SEGMENT_BLOCKS).fixed(hash).u64(height));
-const txPrefix = (segment: bigint, hash: Uint8Array) => key((k) => k.u8(0x78).u64(segment).fixed(hash));
-const TX_KEY_SIZE = 1 + 8 + HASH_SIZE + 8;
 const MAX_SEGMENT = 0xffff_ffff_ffff_ffffn;
+/**
+ * Behind the segments of 32 blocks come larger ones, so that a lookup does not grow with the chain. A segment of
+ * level L holds 32 of level L - 1, level 0 being the segments blocks are written to: 32 blocks, 1,024, 32,768 and
+ * so on. Once the 32 are all behind the latest block their entries are copied into the one above, in the order of
+ * its keys and a few blocks' worth with each block saved, and then removed (mergeTxLevel). A lookup asks each
+ * level, and in each only the segments that hold something, of which a level keeps a few dozen. Level 0 is under
+ * 'x', level L under 'y' and the level's number; the rest of the key is the same.
+ */
+export const TX_FANOUT = 32n;
+/** The last level: its segments are 32^12 blocks, and sixteen of them hold every height there is. */
+const TX_TOP_LEVEL = 11;
+const txSpan = (level: number) => TX_SEGMENT_BLOCKS * TX_FANOUT ** BigInt(level);
+const txLevelHead = (level: number) => (level === 0 ? TX_PREFIX : Uint8Array.of(0x79, level));
+/** Where a segment of a level starts, or the level's end for a segment past the last a u64 names. */
+const txSegment = (level: number, segment: bigint) => (segment > MAX_SEGMENT ? prefixEnd(txLevelHead(level)) : key((k) => k.fixed(txLevelHead(level)).u64(segment)));
+/** The highest block saved with its results, which is the latest the node applied: the larger segments fill behind it. */
+const TX_TIP_KEY = Uint8Array.of(0x4d);
+/** What follows the segment in a key: the hash and the height. */
+const TX_SUFFIX = HASH_SIZE + 8;
+const concat = (a: Uint8Array, b: Uint8Array) => {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a);
+  out.set(b, a.length);
+  return out;
+};
 const oldTxPrefix = (hash: Uint8Array) => key((k) => k.u8(0x74).fixed(hash));
 const encodeTx = (height: bigint, index: number, r: TxResult | null | undefined) => encode((wr) => wr.u64(height).u32(index).u8(r ? (r.ok ? 1 : 0) : 2).string(r?.error ?? ''));
 const decodeTx = (v: Uint8Array): TxLocation =>
@@ -215,6 +242,16 @@ export class KvBlockStore implements BlockStore {
         });
         for (const { hash, index } of seen.values()) w.put(txKey(hash, h), encodeTx(h, index, results?.[index]));
         if (results) w.put(resultsKey(h), encode((wr) => wr.array(results, (wr, r) => wr.bool(r.ok).string(r.error ?? ''))));
+        // What lies far enough behind the latest block applied here moves up a level. Each entry is copied and
+        // later removed, so a step that handles three times what the block added keeps pace with the blocks,
+        // those a backfill stores included, and spreads the work over most of them.
+        const applied = this.kv.get(TX_TIP_KEY);
+        // A store written before the marker was kept has none: its chain state knows the latest block.
+        const before = applied ? decode(applied, (r) => r.u64()) : (this.loadState()?.lastHeight ?? 0n);
+        const tip = results && h > before ? h : before;
+        if (tip > 0n && (!applied || tip > before)) w.put(TX_TIP_KEY, encode((wr) => wr.u64(tip)));
+        const lowest = this.lowestHeight();
+        for (let level = 0; level < TX_TOP_LEVEL; level++) this.mergeTxLevel(w, level, tip, lowest, Math.max(512, 3 * seen.size));
       }
     });
   }
@@ -225,34 +262,179 @@ export class KvBlockStore implements BlockStore {
   }
 
   txLocations(hash: Uint8Array): TxLocation[] {
+    // One location a height. A level-0 entry is the block's own; one in a larger segment is a copy, which outlives
+    // a block that was removed until its whole segment is dropped, and yields to an entry further down.
+    const found = new Map<bigint, TxLocation>();
+    for (const l of this.txLocationsAt(0, hash)) found.set(l.height, l);
+    for (let level = 1; level <= TX_TOP_LEVEL; level++) {
+      for (const l of this.txLocationsAt(level, hash)) if (!found.has(l.height) && this.holds(blockKey(l.height))) found.set(l.height, l);
+    }
+    if (this.oldTxIndex) {
+      const prefix = oldTxPrefix(hash);
+      for (const [, v] of this.kv.range(prefix, prefixEnd(prefix))) {
+        const l = decodeTx(v);
+        if (!found.has(l.height)) found.set(l.height, l);
+      }
+    }
+    return [...found.values()].sort((a, b) => (a.height < b.height ? -1 : a.height > b.height ? 1 : 0));
+  }
+
+  private holds(k: Uint8Array): boolean {
+    return this.kv.has ? this.kv.has(k) : this.kv.get(k) !== undefined;
+  }
+
+  /** The hash's entries in the segments of one level. */
+  private txLocationsAt(level: number, hash: Uint8Array): TxLocation[] {
     const found: TxLocation[] = [];
-    const end = prefixEnd(TX_PREFIX);
-    // A read or two per segment held: from where the hash would be in a segment, the first key there is either an
-    // entry of the hash, or it names the next segment that has anything, and the segments between are passed over.
+    const head = txLevelHead(level);
+    const end = prefixEnd(head);
+    // A read or two per segment that holds something: from where the hash would be in a segment, the first key
+    // there is either an entry of the hash, or it names the next segment that has anything, and the segments
+    // between are passed over.
     for (let segment = 0n; ; ) {
-      const prefix = txPrefix(segment, hash);
+      const prefix = concat(txSegment(level, segment), hash);
       let next: bigint | null = null;
       for (const [k, v] of this.kv.range(prefix, end)) {
-        if (k.length !== TX_KEY_SIZE) continue; // not an entry of the index: nothing writes one, and it says nothing of the segments
+        if (k.length !== head.length + 8 + TX_SUFFIX) continue; // not an entry of the index: nothing writes one, and it says nothing of the segments
         if (startsWith(k, prefix)) {
           found.push(decodeTx(v));
           continue;
         }
-        const at = decode(k.subarray(1, 9), (r) => r.u64());
+        const at = decode(k.subarray(head.length, head.length + 8), (r) => r.u64());
         // Past the hash in the segment asked: the next one may have it. A later segment's first key says the same of
         // that segment when it sorts after the hash's entries there; otherwise that segment is asked.
-        const there = txPrefix(at, hash);
+        const there = concat(txSegment(level, at), hash);
         next = at === segment || (compareBytes(k, there) > 0 && !startsWith(k, there)) ? at + 1n : at;
         break;
       }
       if (next === null || next > MAX_SEGMENT) break;
       segment = next;
     }
-    if (this.oldTxIndex) {
-      const prefix = oldTxPrefix(hash);
-      for (const [, v] of this.kv.range(prefix, prefixEnd(prefix))) found.push(decodeTx(v));
+    return found;
+  }
+
+  /**
+   * One step of moving a level's entries into the segments above it, made with each block saved. The first segment
+   * of the level that holds anything names the larger segment to fill. That one is filled only once the blocks it
+   * covers are all behind the latest and none is below the lowest held, and the levels further down have nothing
+   * left for it. Its 32 segments are first copied into it, a step taking the entries that come next in the order
+   * of hash and height whichever of the 32 they are in, so that the segment above is written in the order of its
+   * keys; then they are emptied front to back, an entry the segment above holds being removed and one it does
+   * not hold, or holds with another value, being written there first. Where the work stands is kept under 'm' and
+   * the level, written with the entries it speaks of. Entries of the level above in segments wholly below the
+   * lowest height are removed here too; they are copies of blocks that were pruned.
+   */
+  private mergeTxLevel(w: KvWriter, level: number, tip: bigint, lowest: bigint, budget: number): void {
+    const head = txLevelHead(level);
+    const end = prefixEnd(head);
+    const size = head.length + 8 + TX_SUFFIX;
+    const span = txSpan(level + 1);
+    const pruned: Uint8Array[] = [];
+    for (const [k] of this.kv.range(txLevelHead(level + 1), txSegment(level + 1, lowest / span))) {
+      pruned.push(k);
+      if (pruned.length === budget) break;
     }
-    return found.sort((a, b) => (a.height < b.height ? -1 : a.height > b.height ? 1 : 0));
+    for (const k of pruned) w.del(k);
+    const stateKey = Uint8Array.of(0x6d, level);
+    const stored = this.kv.get(stateKey);
+    let state = stored ? decode(stored, (r) => ({ parent: r.u64(), removing: r.bool(), cursor: r.bytes() })) : null;
+    const save = (st: NonNullable<typeof state>) => w.put(stateKey, encode((wr) => wr.u64(st.parent).bool(st.removing).bytes(st.cursor)));
+    if (state && lowest > (state.parent === 0n ? 1n : state.parent * span)) {
+      // Pruning reached the segment being filled: what is left of it below goes with its blocks.
+      w.del(stateKey);
+      state = null;
+    }
+    // A key under the index's prefixes that is not an entry of it is removed where a step meets one, 64 in a step
+    // at most: nothing writes one, and left where it is it would be met again by every step.
+    let strays = 0;
+    const stray = (k: Uint8Array): boolean => {
+      w.del(k);
+      return ++strays === 64;
+    };
+    if (!state) {
+      let parent: bigint | null = null;
+      for (let from: Uint8Array = head, tries = 0; tries < 4 && parent === null; tries++) {
+        let first: Uint8Array | null = null;
+        for (const [k] of this.kv.range(from, end)) {
+          if (k.length === size) first = k;
+          if (first || stray(k)) break;
+        }
+        if (!first) return;
+        const p = decode(first.subarray(head.length, head.length + 8), (r) => r.u64()) / TX_FANOUT;
+        if ((p + 1n) * span > tip) return; // not all behind the latest block, and no later one is
+        if (lowest <= (p === 0n ? 1n : p * span)) parent = p;
+        else from = txSegment(level, (p + 1n) * TX_FANOUT); // partly pruned, or not yet backfilled: left as it is
+      }
+      if (parent === null) return;
+      for (let l = 0; l < level; l++) {
+        for (const [k] of this.kv.range(txSegment(l, (parent * span) / txSpan(l)), txSegment(l, ((parent + 1n) * span) / txSpan(l)))) {
+          if (k.length === txLevelHead(l).length + 8 + TX_SUFFIX || stray(k)) return; // more is on its way up
+        }
+      }
+      state = { parent, removing: false, cursor: new Uint8Array(0) };
+    }
+    const target = txSegment(level + 1, state.parent);
+    const first = state.parent * TX_FANOUT;
+    if (state.removing) {
+      const rows: [Uint8Array, Uint8Array][] = [];
+      for (const e of this.kv.range(txSegment(level, first), txSegment(level, first + TX_FANOUT))) {
+        if (e[0].length === size) rows.push(e);
+        else if (stray(e[0])) break;
+        if (rows.length === budget) break;
+      }
+      for (const [k, v] of rows) {
+        // Not above, or not with this value: it reached its segment after the copy had passed its place.
+        const above = concat(target, k.subarray(head.length + 8));
+        if (!bytesEqual(this.kv.get(above) ?? null, v)) w.put(above, v);
+        w.del(k);
+      }
+      if (rows.length < budget && strays < 64) w.del(stateKey);
+      return;
+    }
+    // The entries that come next after the cursor, whichever of the 32 they are in: the first of each is held, the
+    // smallest is taken and the one after it in its segment takes its place.
+    const cursors: Iterator<[Uint8Array, Uint8Array]>[] = [];
+    const next = (it: Iterator<[Uint8Array, Uint8Array]>): [Uint8Array, Uint8Array] | null => {
+      for (;;) {
+        const step = it.next();
+        if (step.done) return null;
+        if (step.value[0].length === size) return step.value;
+        if (strays >= 64 || stray(step.value[0])) return null;
+      }
+    };
+    // Held in descending order of what follows the segment, so the smallest is the last.
+    const held: { suffix: Uint8Array; value: Uint8Array; from: number }[] = [];
+    const hold = (e: [Uint8Array, Uint8Array] | null, from: number): void => {
+      if (!e) return;
+      const suffix = e[0].subarray(head.length + 8);
+      let lo = 0;
+      for (let hi = held.length; lo < hi; ) {
+        const mid = (lo + hi) >> 1;
+        if (compareBytes(held[mid]!.suffix, suffix) > 0) lo = mid + 1;
+        else hi = mid;
+      }
+      held.splice(lo, 0, { suffix, value: e[1], from });
+    };
+    const taken: { suffix: Uint8Array; value: Uint8Array }[] = [];
+    try {
+      for (let c = first; c < first + TX_FANOUT; c++) {
+        const from = state.cursor.length ? concat(concat(txSegment(level, c), state.cursor), Uint8Array.of(0)) : txSegment(level, c);
+        cursors.push(this.kv.range(from, txSegment(level, c + 1n))[Symbol.iterator]());
+        hold(next(cursors[cursors.length - 1]!), cursors.length - 1);
+      }
+      while (taken.length < budget && held.length > 0) {
+        const least = held.pop()!;
+        taken.push(least);
+        hold(next(cursors[least.from]!), least.from);
+      }
+    } finally {
+      for (const it of cursors) it.return?.();
+    }
+    for (const e of taken) w.put(concat(target, e.suffix), e.value);
+    // Nothing after the cursor: the copy is done. Unless the step stopped at keys that are not entries, in which
+    // case there may be more behind them, and the next step, which no longer meets them, will say.
+    if (taken.length > 0) save({ parent: state.parent, removing: false, cursor: taken[taken.length - 1]!.suffix });
+    else if (strays < 64) save({ parent: state.parent, removing: true, cursor: new Uint8Array(0) });
   }
 
   txLocation(hash: Uint8Array): TxLocation | null {

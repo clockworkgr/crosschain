@@ -41,6 +41,15 @@ class LmdbStore implements KvStore {
     return v === undefined ? undefined : new Uint8Array(v);
   }
 
+  has(key: Uint8Array): boolean {
+    this.open();
+    // The first key at or after this one, by a cursor that reads no value: lmdb-js's doesExist reads the value to
+    // tell, and the block store asks this of keys that hold whole blocks.
+    const k = buf(key);
+    for (const found of this.db.getKeys({ start: k, limit: 1 })) return k.equals(found);
+    return false;
+  }
+
   *range(start: Uint8Array, end: Uint8Array): IterableIterator<[Uint8Array, Uint8Array]> {
     this.open();
     const it = this.db.getRange({ start: buf(start), end: buf(end) })[Symbol.iterator]();

@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-nine files, 290 cases, about 9,440 lines counting the shared harness
+`test/**/*.test.ts`: twenty-nine files, 295 cases, about 9,790 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (289 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (294 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -529,12 +529,18 @@ faucet's seed under ML-DSA-44, relabelled with the faucet's secp256k1 address, w
 
 ### test/store.test.ts
 
-Three tests on `src/store` ([the store chapter](10-store.md)): the in-memory and LMDB
+Five tests on `src/store` ([the store chapter](10-store.md)): the in-memory and LMDB
 key-value stores and the block store on top of either. `exerciseKv` is a shared routine: it
 writes four keys in one batch, reads one back, finds a missing key `undefined`, ranges over the
 prefix `b` with `prefixEnd` and gets `['one', 'two']` in byte order, counts four entries between
 `a` and `z`, throws from inside a write and checks the key it put is not there, then deletes a
-key. The `block(height)` helper builds a header of zero hashes with the height written into the
+key. Then, inside one write, it puts 200 keys and reads one of them back, ranges over them
+deleting every other one as it goes and still counts 200, finds the first gone and a hundred
+left, and asks `has` for one that is there and one that is not. Still inside that write, a
+range over the keys from `n/1` puts `n/102`, replaces `n/103` and deletes `n/105` when it is
+given `n/101`, and its next three are `n/102=put`, `n/103=replaced` and `n/107`: what lies
+ahead of a range is given as it is when the range gets there, on both stores. And a write that
+deletes a key, changes another and throws leaves both as they were. The `block(height)` helper builds a header of zero hashes with the height written into the
 app hash.
 
 **`it('memory store orders keys bytewise and makes writes atomic')`**. `exerciseKv(new MemoryKv())`.
@@ -553,6 +559,26 @@ The temporary directory is removed in `afterEach`.
 and check the commit's `blockHash` equals `blockHash(block)`, resolve the hash of block 4 to
 height 4, resolve an unknown hash to `null`, find height 9 `null`, and find no saved chain state
 (`loadState()` is `null`).
+
+**`it('undoes an environment transaction made inside a write that then throws, on both backends')`**.
+For a `MemoryEnv` and an LMDB environment, with a `KvBlockStore` on the store `chain` holding a
+key `kept` with the value `before`: a `batch` saves block 1, changes `kept`, runs an
+`env.transaction` that saves block 2, writes to the store `app` and, in a transaction of its
+own, to a store `late` first asked for there, sees block 2 and the key in `app`, and throws.
+Afterwards neither block is there, the blocks' transaction has no location, `kept` holds
+`before`, and `app` and `late` hold nothing. A batch is a write to the store `chain`, and a
+write to one store is a transaction of the environment on LMDB; the memory environment makes
+it one too, where it used to undo the one store and leave the others. Then a batch that saves block 1 and catches the error of
+an environment transaction that saved block 2 and threw: block 1 is there and block 2 is not.
+
+**`it('block store on lmdb moves index entries into larger segments within the transactions that save the blocks')`**.
+A `KvBlockStore` over an LMDB store saves 2,304 blocks of twenty transactions, 64 blocks to a
+`batch`, odd positions failed with `no <height>`. Inside a batch each step of the move
+reads what the steps before it wrote. Every 13th block's
+transactions at positions 7 and 0 are found with their height, position, result and error, and
+one of block 2,305 is not. Level 1 holds 40,940 entries, those of heights 1 to 2,047, and `'x'`
+holds 5,140, those of 2,048 to 2,304. The environment is closed and opened again, and the same
+lookups give the same answers.
 
 ### test/arena.test.ts
 
@@ -2435,7 +2461,7 @@ batches of five `status` calls: the first has five answers and no `-32004`; the 
 `[0, 1, 2, 3, 4]` and four `-32004`, one call being answered with the token the first batch
 left.
 
-`the transaction index`, three cases on block stores, with a `block(height, txs)` helper that
+`the transaction index`, six cases on block stores, with a `block(height, txs)` helper that
 builds a header of zero hashes with the transactions' data hash and a commit for it.
 
 **`it('keeps every block a transaction is in, answers with the one it succeeded in, and loses only the pruned one')`**.
@@ -2456,9 +2482,13 @@ those five heights in order, each with index 1 and its error, and `txLocation` i
 the newest, since it succeeded nowhere. A transaction that is in one block only (1, 500 or
 90,000) has that one height, and a hash of 32 zero bytes and one of 32 `0xff` bytes, which sort
 before and after every entry of a segment, have none. A second store over the same data through
-a wrapper that counts range reads makes at most 14 for one `txLocations`: two per segment held,
-not one per entry. The 28 keys under `'x'` each start with their block's segment: the u64 after
-the prefix is the height at the key's end divided by `TX_SEGMENT_BLOCKS`. Three keys that are not
+a wrapper that counts range reads makes at most 25 for one `txLocations`: two per segment held
+and one for each of the eleven levels above, not one per entry. By then most of the entries
+have moved: saving block 69,999 found the first 1,024 blocks all behind it, and the last saves
+took them on to level 2. Every key under `'x'` starts with its block's segment, the u64 after
+the prefix being the height at the key's end divided by `TX_SEGMENT_BLOCKS`; every key under
+`'y'` is of level 1 or 2 and names the height divided by 1,024 or 32,768; at least 22 are under
+`'y'`, and the keys of both hold 28 different pairs of hash and height. Three keys that are not
 entries are then put under the prefix: one of 41 bytes, segment 0 and the transaction's hash
 with no height, which sorts just before an entry of that hash; one of 2 bytes, `'x'` and `0xff`;
 and one of 9 bytes, `'x'` and segment 40. `txLocations` of the transaction is still the five
@@ -2466,6 +2496,81 @@ heights and that of the transaction of block 90,000 still its one, a key of anot
 skipped before anything is read from it; the three keys are deleted again. After
 `deleteBlock(32n)` and `deleteBlock(1000n)` the heights are 3, 31 and 70,000, the other
 transaction of block 1,000 is `null` and one of block 1,001 is still found.
+
+**`it('moves entries into larger segments behind the latest block, and a lookup asks a few segments however long the chain')`**.
+A `KvBlockStore` on a `MemoryKv` is given 34,000 blocks one after another, each with one
+transaction of its own and every 700th with `raw` as well, failed with `at <height>`. A second
+store over another `MemoryKv` is given the same blocks through a wrapper whose every seventh
+`write` throws after the callback has written everything, the step of the move included, each
+failed save being made again. At block 1,023 the first store has 1,024
+entries under `'x'` and none above: no segment of 1,024 blocks is yet all behind the latest. At
+the end the two stores hold the same keys and values under `'x'` and `'y'`: a step that was
+undone and made again leaves what one made once leaves. Level 2 holds 32,813 entries, heights 1
+to 32,767 and `raw` in 46 of them, in one segment; level 1 holds at most two segments and
+level 0 at most forty, and the three levels together hold every entry once, or twice for the
+fewer than 600 that are copied and not yet removed. Every 97th block's transaction has its one
+location, `raw` its 48 with their errors, and one `txLocations` through a wrapper that counts
+range reads makes at most 95, where the 1,063 small segments the blocks were written to would
+have taken one or two each. Then a block saved again: block 5 with its result failed, long
+after its entry went up. `txLocations` answers `[5, false]` at once, from level 0, and after
+eight more blocks still does, with nothing left in segment 0 of level 0: the entry was copied
+over the old value above and removed below.
+`deleteBlock(1400n)`, a block in the middle, leaves `raw` with 47 locations and block 1,400's
+own transaction with none, though their copies are still in level 2. Last, pruning: one batch
+deletes heights 1 to 32,999 and sets the lowest height to 33,000. `raw` is at once found at
+33,600 only. After 72 more blocks level 2 is empty, its one segment lying wholly below the
+lowest height, and level 1 holds 1,026 entries, the segment the lowest height is in: heights
+32,768 to 33,791 and `raw` at 32,900 and 33,600. Every 53rd block from 33,000 on has its
+location, and block 32,999 has none.
+
+**`it('keeps a result saved while its entry is on the way up, moves a crowded block and backfilled ones, and asks for no block to answer')`**.
+Four things in one case, each on a `KvBlockStore` over a fresh `MemoryKv`. First, twice over:
+blocks of one transaction are saved until the state under `'m'` and level 0 says the first
+1,024 are being removed, at which point block 900's entry is still in its small segment. Block
+900 is then saved again with its result failed and the error `later`, the first time alone and
+the second time in one `batch` with the next block. `txLocations` of its transaction is
+`[900, false, 'later']` at once, and again after eight more blocks, when nothing below height
+1,024 is left in level 0; block 899's is still `[899, true]`. A removal that did not compare
+values would have removed the new entry and left the old copy to answer; without reads that see
+the transaction's own writes the memory store did exactly that.
+
+Second, 1,054 blocks of which only block 10 has transactions, 5,000 of them. All 5,000 are in
+one of the 32 segments. After block 1,054 level 0 is empty and level 1 holds 5,000 entries: a
+step takes its budget of 512 from whichever segments have entries, ten steps to copy and ten to
+remove. Third, on that store, a lookup through a wrapper that counts `get` calls for keys
+under `'b'` and passes `has` through: the transaction is found in level 1 and no block is
+read.
+
+Fourth, a node that joined at height 3,000. Block 3,000 is saved with `null` results and the
+lowest height set to it; then, thirty times, one block is applied (one transaction, results
+given) and a batch backfills the hundred blocks below the lowest, ten transactions each with
+`null` results, and lowers the lowest height. When the backfill reaches height 1 the latest
+block is 3,030 and no height from 1,024 to 2,047 is left in level 0: those 10,240 entries moved
+up in the saves that brought the blocks below them, where thirty steps of 512 made for applied
+blocks alone could not have moved them. The first 1,024 could not move before the lowest height
+was 1; after 45 more applied blocks they have, and level 0 holds 9,605 entries, the 953
+backfilled blocks from 2,048 and the 75 applied ones, whose larger segment became due at block
+3,072 and is being copied. Every 71st block's transaction has its one location, with `ok` null
+for a backfilled block and true for an applied one.
+
+**`it('fills the larger segments on a store that never recorded its latest block, and past keys that are not entries')`**.
+Two stores. The first is made as the version before the larger segments left one: the lowest
+height set to 2,000, blocks 2,000 to 2,100 saved with results, a chain state with `lastHeight`
+2,100 saved (`genesisState` with one validator, the height replaced), and the key `'M'`
+deleted. Then only a backfill: 1,999 batches, each saving the block below the lowest height
+with `null` results and lowering the lowest height, and no block applied. Afterwards `'M'`
+holds 2,100, taken from the chain state by the first save that found it missing; no height
+from 1,024 to 2,047 is left in level 0 and level 1 holds at least 1,024 entries; block 1,500's
+transaction is found with `ok` null and block 2,050's with `ok` true. Without the marker every
+step would have taken the latest block to be 0 and moved nothing.
+
+The second store has seventy keys under `'x'` that are not entries (the prefix, segment 0 and
+one byte) before its first entry. Blocks of one transaction are saved to 1,020 and then until
+the state under `'m'` says the small segments are being emptied into the first segment of level 1, which is before block
+1,035: the steps removed the seventy, 64 in one step and six in the next, and went on. Seventy
+more are then put in segment 20, among entries the removal has not reached. Twelve blocks later
+no key under `'x'` has a length other than an entry's, no height below 1,024 is in level 0,
+level 1 holds 1,023 entries and every 37th block's transaction has its one location.
 
 **`it('moves an index of either older layout into the segments when the store is opened, and reads one it cannot move')`**.
 A `MemoryKv` is filled by hand with 12,000 entries under `'t'`, the even ones in the oldest
