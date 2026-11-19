@@ -7,7 +7,7 @@
  */
 import { fromHex, toHex } from '../crypto/hash.ts';
 import { idFromString, idToString } from '../db/id.ts';
-import { PRIORITIES_VERSION, type Commit, type Header } from '../types/block.ts';
+import type { Commit, Header } from '../types/block.ts';
 import { ValidatorSet } from '../types/validator.ts';
 import type { TxQueryResult } from '../light/verify.ts';
 import { resultProofFromBytes, resultProofToBytes, txProofFromBytes, txProofToBytes } from '../types/txproof.ts';
@@ -71,7 +71,7 @@ export function headerFromJson(j: any): Header {
     appHash: parseFixedHex(j.appHash, HASH_SIZE, 'appHash'),
     evidenceHash: parseFixedHex(j.evidenceHash, HASH_SIZE, 'evidenceHash'),
     proposerAddress: parseFixedHex(j.proposerAddress, HASH_SIZE, 'proposerAddress'),
-    ...(version >= PRIORITIES_VERSION ? { prioritiesHash: parseFixedHex(j.prioritiesHash, HASH_SIZE, 'prioritiesHash') } : {}),
+    prioritiesHash: parseFixedHex(j.prioritiesHash, HASH_SIZE, 'prioritiesHash'),
   };
 }
 

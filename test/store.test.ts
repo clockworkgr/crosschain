@@ -23,6 +23,7 @@ function block(height: bigint): { block: Block; commit: Commit } {
     appHash: new Uint8Array(32).fill(Number(height)),
     evidenceHash: ZERO_HASH,
     proposerAddress: new Uint8Array(32),
+    prioritiesHash: new Uint8Array(32),
   };
   const b: Block = { header, txs: [new Uint8Array([1, 2, 3])], lastCommit: null, evidence: [] };
   return { block: b, commit: { height, round: 0, blockHash: blockHash(b), signatures: [null] } };

@@ -35,7 +35,7 @@ import { RpcServer } from '../src/rpc/server.ts';
 import { KvBlockStore, MemoryBlockStore, TX_FANOUT, TX_SEGMENT_BLOCKS } from '../src/store/blockstore.ts';
 import { MemoryKv, prefixEnd, StoreReadOnlyError, type KvStore } from '../src/store/kv.ts';
 import { blockHash, txHash } from '../src/types/block.ts';
-import type { DuplicateVoteEvidence } from '../src/types/evidence.ts';
+import { evidenceHeight, type DuplicateVoteEvidence } from '../src/types/evidence.ts';
 import { genesisState } from '../src/types/state.ts';
 import { decodeProposal } from '../src/types/proposal.ts';
 import { txsRoot } from '../src/types/txproof.ts';
@@ -190,7 +190,7 @@ describe('state queries at a height, and a batch that pays for its calls', () =>
 describe('the transaction index', () => {
   const raw = new Uint8Array([1, 2, 3]);
   const block = (height: bigint, txs: Uint8Array[]) => {
-    const header = { chainId: 'r4', version: 1, height, time: height, lastBlockHash: new Uint8Array(32), lastCommitHash: new Uint8Array(32), dataHash: txsRoot(txs), lastResultsHash: new Uint8Array(32), validatorsHash: new Uint8Array(32), nextValidatorsHash: new Uint8Array(32), appHash: new Uint8Array(32), evidenceHash: new Uint8Array(32), proposerAddress: new Uint8Array(32) };
+    const header = { chainId: 'r4', version: 1, height, time: height, lastBlockHash: new Uint8Array(32), lastCommitHash: new Uint8Array(32), dataHash: txsRoot(txs), lastResultsHash: new Uint8Array(32), validatorsHash: new Uint8Array(32), nextValidatorsHash: new Uint8Array(32), appHash: new Uint8Array(32), evidenceHash: new Uint8Array(32), proposerAddress: new Uint8Array(32), prioritiesHash: new Uint8Array(32) };
     const b = { header, txs, lastCommit: null, evidence: [] };
     return { b, commit: { height, round: 0, blockHash: blockHash(b), signatures: [null] } };
   };
@@ -603,8 +603,8 @@ describe('snapshots, evidence, the codec', () => {
 
   it('lets go of pending and committed evidence and its inventory once it is too old, and bounds what waits', () => {
     const ev = (height: bigint, validatorIndex = 0): DuplicateVoteEvidence => {
-      const vote = (b: number) => ({ type: VoteType.Prevote, height, round: 0, blockHash: new Uint8Array(32).fill(b), validatorIndex, signature: new Uint8Array(4) });
-      return { voteA: vote(1), voteB: vote(2) };
+      const vote = (b: number) => ({ type: VoteType.Prevote, height, round: 0, blockHash: new Uint8Array(32).fill(b), polRound: -1, validatorIndex, signature: new Uint8Array(4) });
+      return { kind: 'duplicateVote', voteA: vote(1), voteB: vote(2) };
     };
     const pool = new EvidencePool();
     expect(pool.add(ev(3n))).toBe(true);
@@ -614,7 +614,7 @@ describe('snapshots, evidence, the codec', () => {
     expect(pool.held).toEqual({ pending: 1, committed: 2, inventory: 3 });
     expect(pool.add(ev(5n))).toBe(false);
     expect(pool.hasHash(evidenceId(ev(5n)))).toBe(true);
-    pool.pruneIf((e) => e.voteA.height <= 4n);
+    pool.pruneIf((e) => evidenceHeight(e) <= 4n);
     expect(pool.held).toEqual({ pending: 0, committed: 1, inventory: 1 });
     expect(pool.hasHash(evidenceId(ev(3n)))).toBe(false);
     pool.pruneIf(() => true);

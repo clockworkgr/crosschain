@@ -32,8 +32,9 @@ export interface TxResult {
   error?: string;
 }
 
-/** A validator proven to have double-signed, for the app to slash. */
+/** A validator proven at fault by evidence in the block, for the app to slash: two votes in one place, or a lock forgotten. */
 export interface Misbehavior {
+  kind: 'duplicateVote' | 'amnesia';
   address: Uint8Array;
   height: bigint;
 }

@@ -164,6 +164,8 @@ export interface StakingParameters {
   fixedRewardPerBlock: bigint;
   proposerBonusBps: number;
   doubleSignSlashBps: number;
+  /** The slash for a lock forgotten (amnesia evidence); the rest of the punishment is a double sign's. */
+  amnesiaSlashBps: number;
   downtimeWindow: number;
   downtimeMinSignedBps: number;
   downtimeJailMs: bigint;
@@ -186,6 +188,7 @@ export function encodeStakingParameters(w: Writer, p: StakingParameters): void {
     .u64(p.fixedRewardPerBlock)
     .u32(p.proposerBonusBps)
     .u32(p.doubleSignSlashBps)
+    .u32(p.amnesiaSlashBps)
     .u32(p.downtimeWindow)
     .u32(p.downtimeMinSignedBps)
     .u64(p.downtimeJailMs)
@@ -209,6 +212,7 @@ export function decodeStakingParameters(r: Reader): StakingParameters {
     fixedRewardPerBlock: r.u64(),
     proposerBonusBps: r.u32(),
     doubleSignSlashBps: r.u32(),
+    amnesiaSlashBps: r.u32(),
     downtimeWindow: r.u32(),
     downtimeMinSignedBps: r.u32(),
     downtimeJailMs: r.u64(),
@@ -251,6 +255,7 @@ export function checkStakingParameters(p: StakingParameters): string | null {
     ['commissionBps', p.commissionBps],
     ['proposerBonusBps', p.proposerBonusBps],
     ['doubleSignSlashBps', p.doubleSignSlashBps],
+    ['amnesiaSlashBps', p.amnesiaSlashBps],
     ['downtimeMinSignedBps', p.downtimeMinSignedBps],
     ['downtimeSlashBps', p.downtimeSlashBps],
     ['goalBondedBps', p.goalBondedBps],
@@ -277,6 +282,7 @@ export const STAKING_FIELDS: (keyof StakingParameters)[] = [
   'fixedRewardPerBlock',
   'proposerBonusBps',
   'doubleSignSlashBps',
+  'amnesiaSlashBps',
   'downtimeWindow',
   'downtimeMinSignedBps',
   'downtimeJailMs',

@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: thirty files, 299 cases, about 10,000 lines counting the shared harness
+`test/**/*.test.ts`: thirty-one files, 306 cases, about 10,400 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (298 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (305 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -23,7 +23,8 @@ memory guard and the collection scheduler, its node case on the core application
 guard's dials on the object database show; `chain`, `app`, `staking`, `staking-net`, `fees` and
 `genesis` cover the core application, and `history` the log its account history is stored in; `txproof`, `light`, `rpc` and
 `sync` cover proofs, clients and catching up, and `priorities` the proposer priorities a header
-commits to, from the two hashes of a validator set to a join from a snapshot; `review` holds one regression test per finding of
+commits to, from the two hashes of a validator set to a join from a snapshot; `amnesia` covers a
+validator's lock, from the round a prevote signs to a forgotten lock punished on a network; `review` holds one regression test per finding of
 the external review and the later cases of the same kind, `review2` five more that each
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
@@ -1651,7 +1652,7 @@ ones.
 
 ### test/staking.test.ts
 
-Twelve unit tests that walk the staking rules of [STAKING.md](../../STAKING.md) and the
+Thirteen unit tests that walk the staking rules of [STAKING.md](../../STAKING.md) and the
 application chapter ([11](11-application.md)) one block at a time. The genesis has a faucet,
 three operator accounts `op-a`, `op-b`, `op-c`, a community pool of 1,000 tokens, and two
 genesis validators: A with a self-bond of 200 and B with 100, so A alone holds exactly two thirds
@@ -1742,6 +1743,17 @@ whose total is at most A's tokens less 5%; the pool grew by at least the slash l
 reward; the update is `[0n]`. Delegating to A is `/tombstoned/`. A second report of the same
 infraction changes nothing. After the unbonding period every entry is paid out and `op-a`'s
 balance grew.
+
+**`it('tombstones a validator that forgot a lock like a double signer, at the rate of its own parameter')`**.
+The genesis sets `amnesiaSlashBps` to 2,000 beside the 500 of a double sign, so the rate applied
+shows. The same sequence as the case before (a delegation, half of it leaving after the
+infraction height) ends with a block whose misbehaviour entry has the kind `amnesia`: the
+validator is tombstoned with no tokens and power 0, the entry that left after the infraction
+has lost a fifth, the delegators' forced entries hold at most four fifths of the stake and no
+less than that by a token, and the pool grew by a fifth of it. Evidence of the other kind for
+the same validator a block later moves less than a token, the block reward: a tombstoned
+validator is punished once. The supply balances, and a genesis with the rate at 10,001 is
+refused (`/amnesiaSlashBps must be 0 to 10000/`).
 
 **`it('mints toward the bonded goal and never past the max supply')`**. Inflation between 7% and
 20%. The initial rate is 700 bps (`700n * 100_000n` parts per billion). After a one-hour block,
@@ -2058,44 +2070,36 @@ fetching the block its peers precommitted to, not by block sync.
 
 ### test/priorities.test.ts
 
-Four tests on proposer priorities and the header's commitment to them ([03](03-types.md),
+Three tests on proposer priorities and the header's commitment to them ([03](03-types.md),
 [07](07-sync.md)). The helper `shifted(set)` copies a set and moves one unit of priority between
 two validators that are not proposing: the members, their powers and the proposer of the moment
-are the same, so `hash()` and the proposer check of a version 1 join cannot tell the copy from
-the original, and the sets pick different proposers a few heights on.
+are the same, so `hash()` cannot tell the copy from the original, nor could a check of which
+proposer each height had, and the sets pick different proposers a few heights on. `reindexed(set)`
+keeps every priority and marks another validator as the proposer, by changing the last field of
+the set's stored form.
 
-**`it('hashes a set by its members and its priorities apart, and commits a header to the priorities from version 2')`**.
+**`it('hashes a set by its members and its priorities apart, and commits a header to the priorities')`**.
 A set of three validators with powers 3, 2 and 1 and a copy advanced one round have the same
 `hash()` and different `prioritiesHash()`; a plain copy has the same; `shifted` has the same
-proposer and another hash; `reindexed`, a second helper that keeps every priority and marks
-another validator as the proposer (the set's stored form with its last field changed), has
-the same `hash()` and again another `prioritiesHash()`, so the index is committed to and not
-only the numbers; a set read back from its stored encoding has the same. The header's
-hash over two sets differs with their order. Then two headers that differ only in version: the
-version 2 one, with `prioritiesHash`, encodes 32 bytes longer; each decodes to what was encoded,
-and the version 1 one has no such property at all; `headerHash` throws `/needs a prioritiesHash/`
-for version 2 without the field and `/has no prioritiesHash/` for version 1 with it; a header
-changed in that hash alone has another block hash; and `headerFromJson(jsonify(h))` gives both
-back, refusing a version 2 header whose JSON lacks the field.
+proposer and another hash; `reindexed` has the same `hash()` and the same priorities and again
+another `prioritiesHash()`, so the index is committed to and not only the numbers; a set read
+back from its stored encoding has the same. The header's hash over two sets differs with their
+order. A header with the field decodes to what was encoded, the hash is its last 32 bytes, a
+header changed in that hash alone has another block hash, and `headerFromJson(jsonify(h))` gives
+it back and refuses JSON that lacks the field.
 
-**`it('starts a chain under version 1 or 2 and no other, and refuses a block whose header commits to other priorities')`**.
-`genesisState` gives version 2 for a genesis that names none and 1 for one that names 1, and
-throws `/protocol version 3/` and `/protocol version 0/`. `check` builds the state of a genesis
-and a bare block of height 1 from it and runs `validateBlockStructure`. On version 2 the block
-as built passes the hashes of the sets; with `prioritiesHash` of the two sets in the wrong
-order, of the first set alone, of the first set `shifted`, or absent, the answer is
-`'wrong prioritiesHash'`. On version 1 the block as built gets the same answer as the good one
-of version 2, and a header of the other version is refused for its version either way
-(`/protocol version 2, expected 1/`), before the field is looked at.
-
-**`it('runs a chain of version 1 with headers as they were')`**. Four validators on the toy
-application with `consensus: { version: 1 }` in the genesis reach height 4; every node's state
-says version 1 and none of the first three headers has a `prioritiesHash`.
+**`it('starts a chain under the one protocol version, and refuses a block whose header commits to other priorities')`**.
+`genesisState` gives version 1 for a genesis that names none or names 1, and throws
+`/protocol version 2; this node runs 1/` and `/protocol version 0/`. `check` builds a bare block
+of height 1 on the genesis state with a given `prioritiesHash` and runs
+`validateBlockStructure`. With the hash of the state's two sets the block passes the hashes of
+the sets; with that of the two sets in the wrong order, of the first set alone, of the first set
+`shifted` or of the first set `reindexed`, the answer is `'wrong prioritiesHash'`.
 
 **`it('commits every header to the priorities its node holds, and joins from a snapshot only with the sets the headers commit to')`**.
 Four core-application validators, two of them taking snapshots every 6 blocks, run to height 9,
 and two validators are stopped so the snapshot at 6 stays the latest. On every node, for
-heights 1 to 8, the header is of version 2 and its `prioritiesHash` is the hash of the sets the
+heights 1 to 8, the header's `prioritiesHash` is the hash of the sets the
 store keeps by height for that height and the next: what a proposer writes and what a node
 serves a joiner are the same thing. A bare `Network` then joins through `stateSync` with a
 fresh store each time, and the two sources are made to lie by replacing their store's
@@ -2106,7 +2110,98 @@ source 0 lying about 8 and source 1 about 7, no peer has a pair for header 7: th
 with `/no peer serves the validator sets of heights 7 and 8/` and each source's score has risen
 by more than 40 (one charge of 50, less a moment of decay). With both lying about 6, source 0 this
 time with a `reindexed` set, it rejects with `/no peer serves the validator set of height 6/`. Turning the check off in `stateSync` fails the
-first of these: the joiner takes the shifted set, which is what a version 1 chain would let it do.
+first of these: the joiner takes the shifted set.
+
+### test/amnesia.test.ts
+
+Seven tests on a validator's lock and on the evidence of one forgotten ([03](03-types.md),
+[04](04-consensus.md)), in two groups. The helpers sign votes with a fixed key for height 7:
+`precommit(round, hash)` and `prevote(round, hash, polRound)`, and `block(n)` is a hash of 32
+bytes `n`.
+
+**`it('signs into a prevote the proof-of-lock round it relies on, and counts two votes that differ in it alone as a double sign')`**.
+`checkPolRound` allows a prevote for a block in round 3 to name -1, 0 or 2 and refuses 3, -2 and
+0.5, and refuses any round in a prevote for nil or in a precommit. The sign bytes differ with the
+round named. A vote comes back from its encoding with the round, and `decodeVote` throws for one
+that names its own round or a precommit that names any. In a `VoteSet` the same prevote twice is
+added once, and the same prevote naming another round is returned as a conflict with the first.
+`makeDuplicateVoteEvidence` of the two puts the lower round first; its shape is good, the two in
+the other order are not canonical, the same vote twice is `/the same/`, both signatures verify,
+and the signature made for one round does not verify on the vote naming the other.
+
+**`it('writes the lock with the precommit that takes it, and signs a prevote for another block only on a proof of lock from that round on')`**.
+A `PrivValidator` on a `FileSignStateStore` in a temporary directory. A prevote and a precommit
+for nil lock nothing. A precommit for block 1 in round 1 does, and the file's record holds the
+lock beside the precommit's step; a second `PrivValidator` opened on the file has it. A prevote
+for block 2 in round 2 naming nothing or round 0 throws `DoubleSignError`
+(`/locked in round 1/`) and leaves the last signed step where it was; one naming its own round is
+refused by `checkPolRound`. Nil and a precommit for nil are signed and the lock stays at round
+1; the locked block is refused naming round 0 or nothing and signed naming round 1. A prevote for block 2 naming round 1 is signed, the
+precommit for block 2 in round 4 moves the lock there, and block 1 naming round 3 is then
+refused. A proposal keeps the lock in the file; the first vote of height 8 writes `null`. Then a lock
+that moves: a second validator precommits block 1 in round 1, prevotes nil and precommits
+block 2 in round 2, and is asked to prevote block 2 in round 3 on the majority of round 0.
+`isAmnesia` says that prevote with the first precommit would be evidence; the guard refuses it,
+and the same naming nothing, and signs it naming round 2, which is evidence with neither
+precommit. A guard on a `MemorySignStateStore` refuses the same.
+
+**`it('proves a forgotten lock with a precommit and a later prevote for another block that names no round from the lock on')`**.
+A precommit for block 1 in round 2 with a prevote for block 2 in round 5 naming round 1, or in
+round 3 naming none, is evidence by `checkEvidenceShape` and `isAmnesia`. Eleven pairs are not,
+each with its reason: the prevote names round 2 or round 4; it is for the same block; either
+vote is for nil; the prevote is of the precommit's round or an earlier one; the heights or the
+validators differ; both are prevotes or both precommits. `evidenceKey` is `amnesia/7/0` for any
+pair of that validator and height and `7/5/1/0` for a double prevote in round 5. Both kinds
+round-trip through the codec under tags 2 and 1, and tag 3 is refused. `verifyEvidence` passes
+the good pair and reports `/bad signature/` for a prevote whose round was changed after
+signing, a prevote signed by another key and another chain id, `/unknown validator/` for index
+4 in a set of one, and the shape's own message for a pair that is no evidence.
+
+**`it('takes its lock up again after a restart in the same height, and commits nothing else there')`**.
+One validator on disk runs to height 3 and is stopped. Its sign-state file is overwritten with
+a precommit record for the next height, round 0, holding a lock on `block(9)`, a block nobody
+has. Restarted, its consensus has `lockedRound` 0 and `lockedHash` that hash, and `status()`
+shows it. It then proposes a fresh block each round and prevotes none: after three rounds its
+height has not moved and the store has no block for the next height. Without the lock it
+commits the first of those proposals, which is the test failing as it should.
+
+**`it('finds a forgotten lock in the votes it holds, whichever came last, and has every application punish it as one')`**.
+Four validators on the toy application. `give` signs votes with a validator's key for the
+height after the one a node is in, hands them to that node's `handleVote`, where they are held
+until the height starts, and waits for the height to pass. Validator 3: a precommit in round 4
+and a prevote for another block in round 6 naming round 2. Validator 2, at another node: the
+prevote first, naming nothing, then the precommit. Validator 1: a pair whose prevote names
+round 5. Every application ends with exactly two slashes, of kind `amnesia`, for validators 3
+and 2 at their heights; the chain's blocks hold two pieces of evidence, both `amnesia`, with
+the keys of those two; and nothing was made of validator 1. One validator at a time, because
+votes of more than a third of the power in a later round take every node to that round, where
+their own honest votes would then stand beside the made-up ones.
+
+**`it('counts for its block only once the majority it names is held, however the votes arrive')`**.
+A `HeightVoteSet` over four equal validators. Three prevotes for X in round 3 naming round 1,
+with nothing held of round 1: `hasQuorumAny` is true, `roundPower` 3, `hasQuorumFor(X)` false
+and `quorumValue` undefined. Two prevotes of round 1 change nothing; the third gives round 1
+its majority and round 3 its own in the same call. A fourth round-3 prevote counts as it comes,
+and `has` tells it from the same vote naming round 0. A line of three rounds added latest
+first (round 5 on 3, round 3 on 1) has no majority anywhere until the last vote of round 1,
+then all three. A majority for Y in round 1 and for X in round 2 back nothing that names round
+1 for X. Prevotes for nil and precommits count at once. A round with two counted votes and
+one waiting has its majority when the waiting one is released. And of two prevotes one
+validator signed for the same block in one round, one naming a majority that never was and one
+naming nothing, the set keeps the one that counts whichever arrived first, and reports the
+conflict both times.
+
+**`it('decides a block proposed again in the next round on prevotes that name the first round, and slashes nobody')`**.
+Four validators. For one height a message filter keeps the round-0 proposal from one
+validator (it prevotes nil) and keeps the round-0 prevote of round 1's proposer from the
+other two (they see two prevotes for the block and one for nil, and precommit nil). Round 1's
+proposer sees all three prevotes for the block, locks and precommits alone: its `lockedRound`
+is 0 when round 1 begins. The filter is lifted; round 1's proposal is the same block with
+`polRound` 0. The block is committed in round 1 with the header of round 0's proposer, every
+round-1 prevote for a block seen on the wire names round 0, every node stores the same block,
+and no node holds evidence or has slashed anyone. The two validators that lacked a prevote of
+round 0 got it from the gossip tick, without which their copies of the round-1 prevotes would
+wait.
 
 ### test/review.test.ts
 

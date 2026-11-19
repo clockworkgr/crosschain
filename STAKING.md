@@ -21,6 +21,7 @@ of a block reward is computed on the stake before the proposer bonus is paid.
 | commission | one fixed rate for all validators, a parameter (10%) |
 | unbonding | 7 days by block time, automatic release, still slashable; redelegation allowed with Cosmos rules |
 | double sign | slash 5%, tombstone, slash unbonding and redelegation entries created after the infraction, auto-unbond delegators |
+| forgotten lock | amnesia evidence (a precommit for one block and a later prevote for another naming no polka since): punished as a double sign, at a rate of its own (5%) |
 | downtime | engine commits made fuller first; then window 1000 blocks, jail when under 50% signed, 10 minutes, slash 0.01%, explicit unjail |
 | minimums | self-bond 10 000, delegation 10, validator creation fee 1 000 into the pool (whole tokens) |
 | power | bonded tokens in whole units (stake divided by 10^precision) |
@@ -129,6 +130,7 @@ genesis:
 | fixedRewardPerBlock | 1 | paid from the pool; skipped when the pool holds less |
 | proposerBonusBps | 500 (5%) | of the block reward |
 | doubleSignSlashBps | 500 (5%) | |
+| amnesiaSlashBps | 500 (5%) | the slash for a lock forgotten; the rest of the punishment is a double sign's |
 | downtimeWindow | 1 000 | blocks |
 | downtimeMinSignedBps | 5 000 (50%) | jailed when signed blocks in the window fall below this |
 | downtimeJailMs | 600 000 (10 min) | |
@@ -255,8 +257,9 @@ Before transactions, in this order:
    by downtimeSlashBps, set status jailed and `jailedUntil = time + downtimeJailMs`,
    reset the window. Jailed and tombstoned validators are not tracked, and nothing
    is tracked at height 1.
-6. Misbehavior. For each `{ address, height }`: find the validator by consensus
-   address; if not tombstoned: slash `tokens` by doubleSignSlashBps; slash every
+6. Misbehavior. For each `{ kind, address, height }`: find the validator by consensus
+   address; if not tombstoned: slash `tokens` by doubleSignSlashBps, or by
+   amnesiaSlashBps when the kind is `amnesia`; slash every
    unbonding entry and every redelegation entry from this validator whose
    `creationHeight >= height - 1` by the same fraction (the two-height delay before an update
    lands, review finding 10; for redelegations, the slash is
@@ -396,7 +399,7 @@ has no validator list starts from the app's set.
 Application, one block at a time: create validator and genesis set; delegate and
 exchange rate after rewards; commission minting; undelegate with queue maturity and
 the entry cap; redelegate with the no-chain rule and source slashing; downtime jail,
-unjail with cooldown and self-bond check; double-sign slash, tombstone, forced
+unjail with cooldown and self-bond check; double-sign slash, the forgotten-lock slash at its own rate, tombstone, forced
 unbonding and the post-infraction entry slash; mint rate movement and the supply cap;
 proposal lifecycle; set computation and diff; the supply invariant at the end of
 each of these scenarios; a delegation to a validator slashed of its whole stake is

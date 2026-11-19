@@ -124,6 +124,7 @@ export const DEFAULT_STAKING: StakingParametersJson = {
   fixedRewardPerBlock: 1,
   proposerBonusBps: 500,
   doubleSignSlashBps: 500,
+  amnesiaSlashBps: 500,
   downtimeWindow: 1_000,
   downtimeMinSignedBps: 5_000,
   downtimeJailMs: 10 * 60_000,

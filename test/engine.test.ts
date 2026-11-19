@@ -34,7 +34,7 @@ describe('engine changes for staking', () => {
     const set = node.executor.state.lastValidators;
     const idx = set.indexOf(late.address);
     expect(before.signatures[idx]).toBeNull();
-    const unsigned = { type: VoteType.Precommit, height: h, round: before.round, blockHash: before.blockHash, validatorIndex: idx };
+    const unsigned = { type: VoteType.Precommit, height: h, round: before.round, blockHash: before.blockHash, polRound: -1, validatorIndex: idx };
     const vote: Vote = { ...unsigned, signature: sign(voteSignBytes(chainId, unsigned), late.secretKey, signContext(chainId, 'vote')) };
     await node.consensus.handleVote(vote, 'late');
     const after = node.store.loadBlock(h)!.commit;
@@ -54,7 +54,7 @@ describe('engine changes for staking', () => {
     const victim = keyPairFromSeed(net.validatorSeed(3));
     const forge = (height: bigint, fill: number): Vote => {
       const set = node.executor.validatorSetAtHeight(height)!;
-      const unsigned = { type: VoteType.Prevote, height, round: 0, blockHash: new Uint8Array(32).fill(fill), validatorIndex: set.indexOf(victim.address) };
+      const unsigned = { type: VoteType.Prevote, height, round: 0, blockHash: new Uint8Array(32).fill(fill), polRound: -1, validatorIndex: set.indexOf(victim.address) };
       return { ...unsigned, signature: sign(voteSignBytes(chainId, unsigned), victim.secretKey, signContext(chainId, 'vote')) };
     };
     const stale = makeDuplicateVoteEvidence(forge(2n, 1), forge(2n, 2));

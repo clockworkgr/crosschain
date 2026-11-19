@@ -66,7 +66,7 @@ function doubleSign(net: Testnet, node: Node, height: bigint, round = 0): Duplic
   const chainId = net.genesis.chainId;
   const key = keyPairFromSeed(net.validatorSeed(0));
   const vote = (fill: number): Vote => {
-    const unsigned = { type: VoteType.Prevote, height, round, blockHash: new Uint8Array(32).fill(fill), validatorIndex: node.executor.validatorSetAtHeight(height)!.indexOf(key.address) };
+    const unsigned = { type: VoteType.Prevote, height, round, blockHash: new Uint8Array(32).fill(fill), polRound: -1, validatorIndex: node.executor.validatorSetAtHeight(height)!.indexOf(key.address) };
     return { ...unsigned, signature: sign(voteSignBytes(chainId, unsigned), key.secretKey, signContext(chainId, 'vote')) };
   };
   return makeDuplicateVoteEvidence(vote(1), vote(2));
@@ -449,7 +449,7 @@ describe('the stores', () => {
     const raw = new Uint8Array([1, 2, 3]);
     const other = new Uint8Array([9]);
     const block = (height: bigint, txs: Uint8Array[]) => {
-      const header = { chainId: 'r5', version: 1, height, time: height, lastBlockHash: new Uint8Array(32), lastCommitHash: new Uint8Array(32), dataHash: txsRoot(txs), lastResultsHash: new Uint8Array(32), validatorsHash: new Uint8Array(32), nextValidatorsHash: new Uint8Array(32), appHash: new Uint8Array(32), evidenceHash: new Uint8Array(32), proposerAddress: new Uint8Array(32) };
+      const header = { chainId: 'r5', version: 1, height, time: height, lastBlockHash: new Uint8Array(32), lastCommitHash: new Uint8Array(32), dataHash: txsRoot(txs), lastResultsHash: new Uint8Array(32), validatorsHash: new Uint8Array(32), nextValidatorsHash: new Uint8Array(32), appHash: new Uint8Array(32), evidenceHash: new Uint8Array(32), proposerAddress: new Uint8Array(32), prioritiesHash: new Uint8Array(32) };
       const b = { header, txs, lastCommit: null, evidence: [] };
       return { b, commit: { height, round: 0, blockHash: blockHash(b), signatures: [null] } };
     };

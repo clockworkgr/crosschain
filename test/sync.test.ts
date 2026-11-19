@@ -133,7 +133,7 @@ describe('sync', () => {
     const victim = keyPairFromSeed(n.validatorSeed(3));
     const set = joiner.executor.validatorSetAtHeight(3n)!;
     const forge = (fill: number): Vote => {
-      const unsigned = { type: VoteType.Prevote, height: 3n, round: 0, blockHash: new Uint8Array(32).fill(fill), validatorIndex: set.indexOf(victim.address) };
+      const unsigned = { type: VoteType.Prevote, height: 3n, round: 0, blockHash: new Uint8Array(32).fill(fill), polRound: -1, validatorIndex: set.indexOf(victim.address) };
       return { ...unsigned, signature: sign(voteSignBytes(chainId, unsigned), victim.secretKey, signContext(chainId, 'vote')) };
     };
     expect(node.evidencePool.add(makeDuplicateVoteEvidence(forge(1), forge(2)))).toBe(true);
@@ -207,7 +207,7 @@ describe('sync', () => {
     const height = watcher.height;
     const set = watcher.executor.validatorSetAtHeight(height)!;
     const forge = (fill: number): Vote => {
-      const unsigned = { type: VoteType.Prevote, height, round: 0, blockHash: new Uint8Array(32).fill(fill), validatorIndex: set.indexOf(victim.address) };
+      const unsigned = { type: VoteType.Prevote, height, round: 0, blockHash: new Uint8Array(32).fill(fill), polRound: -1, validatorIndex: set.indexOf(victim.address) };
       return { ...unsigned, signature: sign(voteSignBytes(chainId, unsigned), victim.secretKey, signContext(chainId, 'vote')) };
     };
     expect(watcher.evidencePool.add(makeDuplicateVoteEvidence(forge(1), forge(2)))).toBe(true);

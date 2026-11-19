@@ -290,7 +290,7 @@ describe('block sync', () => {
   const zero = new Uint8Array(32);
   const blockAt = (height: bigint): { block: Block; commit: Commit } => {
     const block: Block = {
-      header: { chainId: 'r5', version: 0, height, time: height, lastBlockHash: zero, lastCommitHash: zero, dataHash: zero, lastResultsHash: zero, validatorsHash: zero, nextValidatorsHash: zero, appHash: zero, evidenceHash: zero, proposerAddress: zero },
+      header: { chainId: 'r5', version: 0, height, time: height, lastBlockHash: zero, lastCommitHash: zero, dataHash: zero, lastResultsHash: zero, validatorsHash: zero, nextValidatorsHash: zero, appHash: zero, evidenceHash: zero, proposerAddress: zero, prioritiesHash: zero },
       txs: [],
       lastCommit: null,
       evidence: [],
@@ -504,7 +504,7 @@ describe('consensus intake', () => {
     expect(consensus.height).toBe(1n);
 
     // A bad signature costs its sender points when it is verified; a vote dropped first costs nothing.
-    const vote = (round: number): Vote => ({ type: VoteType.Prevote, height: 1n, round, blockHash: null, validatorIndex: 0, signature: new Uint8Array(64) });
+    const vote = (round: number): Vote => ({ type: VoteType.Prevote, height: 1n, round, blockHash: null, polRound: -1, validatorIndex: 0, signature: new Uint8Array(64) });
     await consensus.handleVote(vote(consensus.round + MAX_ROUND_AHEAD + 1), 'far');
     expect(node.network.scoreOf('far')).toBe(0);
     await consensus.handleVote(vote(consensus.round + 1), 'near');
@@ -515,7 +515,7 @@ describe('consensus intake', () => {
     const key0 = keyPairFromSeed(net.validatorSeed(0));
     const index = node.executor.validatorSetAtHeight(2n)!.indexOf(key0.address);
     const signedVote = (fill: number): Vote => {
-      const unsigned = { type: VoteType.Prevote, height: 2n, round: 0, blockHash: new Uint8Array(32).fill(fill), validatorIndex: index };
+      const unsigned = { type: VoteType.Prevote, height: 2n, round: 0, blockHash: new Uint8Array(32).fill(fill), polRound: -1, validatorIndex: index };
       return { ...unsigned, signature: sign(voteSignBytes(net!.genesis.chainId, unsigned), key0.secretKey, signContext(net!.genesis.chainId, 'vote')) };
     };
     for (let i = 0; i < 5; i++) await consensus.handleVote(signedVote(1), 'repeater');
@@ -530,7 +530,7 @@ describe('consensus intake', () => {
     // The block is not one height 2 would accept, so each is dropped once that height starts; the rounds are late
     // ones, so none stands where a real proposal will.
     const proposal = (round: number, proposer: number, signer = proposer): Proposal => {
-      const header = { chainId: net!.genesis.chainId, version: 1, height: 2n, time: 1n, lastBlockHash: zero, lastCommitHash: zero, dataHash: zero, lastResultsHash: zero, validatorsHash: zero, nextValidatorsHash: zero, appHash: zero, evidenceHash: zero, proposerAddress: keys[proposer]!.address };
+      const header = { chainId: net!.genesis.chainId, version: 1, height: 2n, time: 1n, lastBlockHash: zero, lastCommitHash: zero, dataHash: zero, lastResultsHash: zero, validatorsHash: zero, nextValidatorsHash: zero, appHash: zero, evidenceHash: zero, proposerAddress: keys[proposer]!.address, prioritiesHash: zero };
       const unsigned = { height: 2n, round, polRound: -1, block: { header, txs: [], lastCommit: null, evidence: [] } as Block };
       return { ...unsigned, signature: sign(proposalSignBytes(net!.genesis.chainId, unsigned), keys[signer]!.secretKey, signContext(net!.genesis.chainId, 'proposal')) };
     };

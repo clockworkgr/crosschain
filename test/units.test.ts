@@ -132,7 +132,7 @@ describe('validator set', () => {
 describe('private validator', () => {
   it('refuses to sign backwards or conflicting content, allows identical re-signs', () => {
     const pv = new PrivValidator(keyPairFromSeed(seedFor('pv')), new MemorySignStateStore(), 'c');
-    const base = { type: VoteType.Prevote, height: 5n, round: 1, blockHash: null, validatorIndex: 0 };
+    const base = { type: VoteType.Prevote, height: 5n, round: 1, blockHash: null, polRound: -1, validatorIndex: 0 };
     const sig = pv.signVote('c', base);
     expect(bytesEqual(pv.signVote('c', base), sig)).toBe(true);
     expect(() => pv.signVote('c', { ...base, blockHash: new Uint8Array(32) })).toThrow(DoubleSignError);

@@ -27,6 +27,7 @@ import { schemeName, schemeTag } from '../crypto/keys.ts';
 import type { Application, FinalizeBlockRequest, Misbehavior, TxResult } from '../app/types.ts';
 import { StaleHeightError } from '../consensus/consensus.ts';
 import type { EvidencePool } from '../consensus/evidence.ts';
+import { evidenceHeight, evidenceValidator } from '../types/evidence.ts';
 import type { Mempool } from '../mempool.ts';
 import type { BlockStore } from '../store/blockstore.ts';
 import { blockHash, type Block, type Commit, type Header } from '../types/block.ts';
@@ -187,11 +188,12 @@ export class BlockExecutor {
     for (const ev of block.evidence) {
       // Every node must hand the application the same offender, so a set this node cannot find is a halt with a
       // reason, never a silent omission that would leave it computing a different state from everyone else.
-      const set = this.validatorSetAtHeight(ev.voteA.height);
-      if (!set) throw new Error(`block ${h} carries evidence for height ${ev.voteA.height}, whose validator set this node does not hold; its history does not reach that far`);
-      const val = set.byIndex(ev.voteA.validatorIndex);
-      if (!val) throw new Error(`block ${h} carries evidence naming validator ${ev.voteA.validatorIndex}, outside the set of height ${ev.voteA.height}`);
-      misbehavior.push({ address: val.address, height: ev.voteA.height });
+      const at = evidenceHeight(ev);
+      const set = this.validatorSetAtHeight(at);
+      if (!set) throw new Error(`block ${h} carries evidence for height ${at}, whose validator set this node does not hold; its history does not reach that far`);
+      const val = set.byIndex(evidenceValidator(ev));
+      if (!val) throw new Error(`block ${h} carries evidence naming validator ${evidenceValidator(ev)}, outside the set of height ${at}`);
+      misbehavior.push({ kind: ev.kind, address: val.address, height: at });
     }
     return { height: h, time: block.header.time, txs: block.txs, proposerAddress: block.header.proposerAddress, lastCommitSigners, misbehavior };
   }
@@ -245,7 +247,7 @@ export class BlockExecutor {
     const age = this.d.evidenceAgeMs?.();
     if (age !== undefined) {
       this.d.evidencePool.pruneIf((ev) => {
-        const at = ev.voteA.height === newState.lastHeight ? newState.lastBlockTime : this.blockTimeAt(ev.voteA.height);
+        const at = evidenceHeight(ev) === newState.lastHeight ? newState.lastBlockTime : this.blockTimeAt(evidenceHeight(ev));
         return at === null || newState.lastBlockTime - at > age;
       });
     }

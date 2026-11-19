@@ -40,6 +40,7 @@ describe('second review: representation and parameters', () => {
       appHash: new Uint8Array(32).fill(7),
       evidenceHash: new Uint8Array(32).fill(8),
       proposerAddress: new Uint8Array(32).fill(9),
+      prioritiesHash: new Uint8Array(32).fill(10),
     };
     const j = jsonify(header) as Record<string, string>;
     expect(headerHash(headerFromJson(j))).toEqual(headerHash(header));

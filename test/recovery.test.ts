@@ -119,7 +119,7 @@ describe('persistence and recovery', () => {
     const idx = set.indexOf(victim.address);
     const ctx = signContext(net.genesis.chainId, 'vote');
     const forge = (hash: Uint8Array): Vote => {
-      const unsigned = { type: VoteType.Prevote, height, round: 0, blockHash: hash, validatorIndex: idx };
+      const unsigned = { type: VoteType.Prevote, height, round: 0, blockHash: hash, polRound: -1, validatorIndex: idx };
       return { ...unsigned, signature: sign(voteSignBytes(net!.genesis.chainId, unsigned), victim.secretKey, ctx) };
     };
     const a = forge(new Uint8Array(32).fill(1));

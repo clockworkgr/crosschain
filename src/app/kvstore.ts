@@ -16,7 +16,7 @@ import { fromHex, sha256 , toHex } from '../crypto/hash.ts';
 import { isPublicKey, schemeName, schemeOf } from '../crypto/keys.ts';
 import type { Genesis } from '../types/genesis.ts';
 import { MAX_TOTAL_POWER, MAX_VALIDATORS, type ValidatorUpdate } from '../types/validator.ts';
-import type { Application, CheckTxResult, FinalizeBlockRequest, FinalizeBlockResult, InitChainResult } from './types.ts';
+import type { Application, CheckTxResult, FinalizeBlockRequest, FinalizeBlockResult, InitChainResult, Misbehavior } from './types.ts';
 
 interface Snapshot {
   height: string;
@@ -35,7 +35,7 @@ export class KvStoreApp implements Application {
   private validators = new Map<string, bigint>();
   private readonly file: string | null;
   /** Misbehaviour seen, for tests and demos. */
-  readonly slashed: { address: Uint8Array; height: bigint }[] = [];
+  readonly slashed: Misbehavior[] = [];
 
   constructor(file: string | null = null) {
     this.file = file;

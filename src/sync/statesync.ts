@@ -27,18 +27,11 @@ import type { Requester } from '../p2p/request.ts';
 import type { BlockStore } from '../store/blockstore.ts';
 import type { KvStore } from '../store/kv.ts';
 import { bodyMatchesHeader } from '../consensus/validate.ts';
-import { PRIORITIES_VERSION, headerHash, type Block, type Commit, type Header } from '../types/block.ts';
+import { headerHash, type Block, type Commit, type Header } from '../types/block.ts';
 import { verifyCommit } from '../consensus/validate.ts';
 
 export { bodyMatchesHeader } from '../consensus/validate.ts';
 
-/** The address a set with these priorities picks for a round. */
-export function proposerForRound(set: ValidatorSet, round: number): Uint8Array {
-  if (round === 0) return set.proposer().address;
-  const copy = set.copy();
-  copy.incrementProposerPriority(round);
-  return copy.proposer().address;
-}
 import type { ChainState } from '../types/state.ts';
 import { prioritiesHash, type ValidatorSet } from '../types/validator.ts';
 import type { Logger } from '../util/log.ts';
@@ -227,11 +220,10 @@ export async function stateSync(o: StateSyncOptions): Promise<{ height: bigint }
     const m = await o.requester.request(p, { type: 'validatorsRequest', height }, 'validatorsResponse', (m) => m.height === height, timeout);
     return m.set && bytesEqual(m.set.hash(), expectedHash) ? m.set : null;
   };
-  // The set hash covers members and powers. From version PRIORITIES_VERSION a header also commits to the proposer
-  // priorities of its own set and the next, and a peer whose sets differ from that is marked and the next one asked.
+  // The set hash covers members and powers. A header also commits to the proposer priorities of its own set and the
+  // next, and a peer whose sets differ from that is marked and the next one asked.
   const committed = (p: Peer, header: Header, set: ValidatorSet, nextSet: ValidatorSet): boolean => {
-    if (header.version < PRIORITIES_VERSION) return true;
-    if (header.prioritiesHash && bytesEqual(header.prioritiesHash, prioritiesHash(set, nextSet))) return true;
+    if (bytesEqual(header.prioritiesHash, prioritiesHash(set, nextSet))) return true;
     o.network.score(p.id, 50, `state sync: validator sets with priorities header ${header.height} does not commit to`);
     return false;
   };
@@ -267,13 +259,6 @@ export async function stateSync(o: StateSyncOptions): Promise<{ height: bigint }
     return { block: m.block, commit: m.commit };
   });
   if (!block) throw new Error(`state sync: no peer served block ${H} with a valid commit`);
-  // A chain of version 1 commits to no priorities; there, at least the proposers the chain actually used must agree
-  // with them. A block decided in round r may have been first proposed in an earlier round (a re-proposal keeps that proposer's name).
-  for (const [set, header, commit] of next.version >= PRIORITIES_VERSION ? [] : [[lastValidators, atH.header, block.commit], [validators, next, verified.commit]] as [ValidatorSet, Header, Commit][]) {
-    let named = false;
-    for (let r = 0; r <= commit.round && !named; r++) named = bytesEqual(proposerForRound(set, r), header.proposerAddress);
-    if (!named) throw new Error(`state sync: validator set for height ${header.height} names a proposer the chain did not use`);
-  }
 
   // Headers below H, as far back as evidence may reach. A block after H may carry evidence of a double sign at any
   // height within the evidence age, and applying it takes the validator set (named by the header) and the time of that

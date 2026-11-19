@@ -62,7 +62,7 @@ A *Merkle root* is a single hash computed from a list of values by hashing pairs
 
 ### Evidence
 
-The one fault this chain punishes on evidence is a validator signing two different votes of the same type at the same height and round (`DESIGN.md` section 1: "Slashable faults: duplicate vote"). Tendermint calls this `DuplicateVoteEvidence`, and it has the pleasant property of being self-contained: the two signed votes are the whole proof. The other Tendermint fault, amnesia (voting against a lock), is deferred. The core application also slashes and jails a validator for downtime ([chapter 11](11-application.md)); that needs no evidence type, because the application counts missed signatures itself from each block's `lastCommitSigners`.
+Two faults are punished on evidence. The first is a validator signing two different votes of the same type at the same height and round. Tendermint calls this `DuplicateVoteEvidence`, and it has the pleasant property of being self-contained: the two signed votes are the whole proof. The second is amnesia, voting against a lock: a precommit for one block and, in a later round, a prevote for another that no polka since the precommit justifies. CometBFT dropped its amnesia evidence because two such votes prove nothing by themselves (the polka may exist); here the prevote signs the round of the polka it relies on, so a prevote that names too old a round is a confession, and the pair is as self-contained as a duplicate vote ([chapter 4](04-consensus.md) has the whole argument). The core application also slashes and jails a validator for downtime ([chapter 11](11-application.md)); that needs no evidence type, because the application counts missed signatures itself from each block's `lastCommitSigners`.
 
 ### Proposals
 
@@ -155,7 +155,7 @@ Because the order is canonical, two sets with the same members and powers hash a
   }
 ```
 
-The priorities are written in the set's order, which `hash()` has already fixed, and the proposer's index after them. Priorities cannot be recomputed from the members: they come out of every increment, rescale and update since genesis, so a node that did not run that history, one joining from a snapshot ([chapter 7](07-sync.md)), has to be handed them. Under protocol version 1 nothing a validator signed said what they were. Review finding 8 made that an attack on state sync: a peer supplies genuine keys and powers with altered priorities, and the joiner then expects other proposers than the rest of the chain. The mitigation was to check that the sets it was given pick the proposers the chain actually used at two heights, which a careful liar passes. From version 2 the header commits to them, with the function at the end of the file, **`prioritiesHash(validators, nextValidators)`**:
+The priorities are written in the set's order, which `hash()` has already fixed, and the proposer's index after them. Priorities cannot be recomputed from the members: they come out of every increment, rescale and update since genesis, so a node that did not run that history, one joining from a snapshot ([chapter 7](07-sync.md)), has to be handed them. At first nothing a validator signed said what they were. Review finding 8 made that an attack on state sync: a peer supplies genuine keys and powers with altered priorities, and the joiner then expects other proposers than the rest of the chain. The first answer was to check that the sets it was given pick the proposers the chain actually used at two heights, which a careful liar passes. Now the header commits to them, with the function at the end of the file, **`prioritiesHash(validators, nextValidators)`**:
 
 ```ts
 /**
@@ -264,6 +264,8 @@ export interface Vote {
   round: number;
   /** null means a vote for "nil": no block this round. */
   blockHash: Uint8Array | null;
+  /** In a prevote for a block, a round below the vote's own, or -1. Always -1 in a prevote for nil and in a precommit. */
+  polRound: number;
   validatorIndex: number;
   signature: Uint8Array;
 }
@@ -271,7 +273,9 @@ export interface Vote {
 export type UnsignedVote = Omit<Vote, 'signature'>;
 ```
 
-**`voteSignBytes(chainId, v)`** is the signed encoding: chain id, type, height, round, optional block hash. The validator index is *not* signed; the signature is bound to the key, so which slot the key sits in is routing information:
+`polRound` is what makes a forgotten lock provable, and the comment above the interface says how: a prevote for a block names the earlier round whose +2/3 prevotes for that block its signer relies on, which is the `polRound` of the proposal it answers (`src/types/proposal.ts`, below), or -1 for a block proposed fresh. A validator that precommitted another block before may sign such a prevote only when the round it names is the round of that precommit or a later one ([chapter 4](04-consensus.md)), so a prevote naming an older round, or none, beside the precommit is a fault that the two votes prove by themselves.
+
+**`voteSignBytes(chainId, v)`** is the signed encoding: chain id, type, height, round, optional block hash, and `polRound` as an i64. The validator index is *not* signed; the signature is bound to the key, so which slot the key sits in is routing information:
 
 ```ts
 /** The bytes a validator signs. Chain id is also in the signing context, but repeating it here costs nothing. */
@@ -282,19 +286,38 @@ export function voteSignBytes(chainId: string, v: UnsignedVote): Uint8Array {
     w.u64(v.height);
     w.u32(v.round);
     w.option(v.blockHash, (w, h) => w.fixed(h));
+    w.i64(BigInt(v.polRound));
   });
 }
 ```
 
 The chain id appears both here and in the signing context from [chapter 2](02-crypto.md); the comment acknowledges the redundancy. `src/consensus/privval.ts` signs these bytes with the `vote` context, and `src/consensus/consensus.ts` and `src/consensus/evidence.ts` rebuild them to verify.
 
-**`encodeVote(w, v)`** writes type, height, round, optional hash, `u32(validatorIndex)` and the signature with `fixed`, tag included. **`decodeVote(r)`** reads the same, taking the signature through `decodeSignature` so that its length comes from the tag, and rejects a type other than 1 or 2 with `bad vote type N`, where `N` is the byte it read; it does not bound `round` or `validatorIndex`, leaving that to consensus (which ignores votes more than 1000 rounds ahead and checks the index against the set in its vote set).
+**`checkPolRound(v)`** and **`sameVoteContent(a, b)`** are the two rules about the field:
+
+```ts
+/** What a vote may say of a proof of lock. Returns an error string or null. */
+export function checkPolRound(v: UnsignedVote): string | null {
+  if (!Number.isInteger(v.polRound)) return 'polRound is not a whole number';
+  if (v.type === VoteType.Precommit || v.blockHash === null) return v.polRound === -1 ? null : 'only a prevote for a block names a proof-of-lock round';
+  return v.polRound >= -1 && v.polRound < v.round ? null : 'polRound must be -1 or a round before the vote\'s own';
+}
+
+/** Whether two votes say the same thing; two of one validator, height, round and type that do not are a double sign. */
+export function sameVoteContent(a: UnsignedVote, b: UnsignedVote): boolean {
+  return bytesEqual(a.blockHash, b.blockHash) && a.polRound === b.polRound;
+}
+```
+
+Only a prevote for a block has something to name, and it can only name a round before its own; every other vote carries -1, so that there is one encoding of each. Because the round is signed, two prevotes of one validator in one round for the same block that name different rounds are two different statements in one place: `sameVoteContent` is what the vote set and the evidence check use to tell a repeat from a double sign, and it compares the round with the hash.
+
+**`encodeVote(w, v)`** writes type, height, round, optional hash, `i64(polRound)`, `u32(validatorIndex)` and the signature with `fixed`, tag included. **`decodeVote(r)`** reads the same, taking the signature through `decodeSignature` so that its length comes from the tag, rejects a type other than 1 or 2 with `bad vote type N`, where `N` is the byte it read, and throws what `checkPolRound` reports, so a vote that names a round it may not is malformed like any other and never reaches consensus; it does not bound `round` or `validatorIndex`, leaving that to consensus (which ignores votes more than 1000 rounds ahead and checks the index against the set in its vote set).
 
 **`blockHashKey(h)`** turns a nullable hash into a `Map` key, `'nil'` or hex. The vote set in `src/consensus/votes.ts` tallies power per block with it.
 
 ### src/types/block.ts
 
-**`interface Header`** has thirteen fields under every protocol version, in encoding order: `chainId`, `version`, `height`, `time` (unix milliseconds set by the proposer), `lastBlockHash`, `lastCommitHash`, `dataHash`, `lastResultsHash`, `validatorsHash`, `nextValidatorsHash`, `appHash`, `evidenceHash`, `proposerAddress`; and from version 2 (`PRIORITIES_VERSION`) a fourteenth, `prioritiesHash`. The source comment on the interface is the deferred-execution rule: "`appHash` and `lastResultsHash` describe the state and the transaction results after executing the *previous* block, because this block is proposed before anyone has run it."
+**`interface Header`** has fourteen fields, in encoding order: `chainId`, `version`, `height`, `time` (unix milliseconds set by the proposer), `lastBlockHash`, `lastCommitHash`, `dataHash`, `lastResultsHash`, `validatorsHash`, `nextValidatorsHash`, `appHash`, `evidenceHash`, `proposerAddress`, `prioritiesHash`. The source comment on the interface is the deferred-execution rule: "`appHash` and `lastResultsHash` describe the state and the transaction results after executing the *previous* block, because this block is proposed before anyone has run it."
 
 Each field is checked by `validateBlockStructure` in `src/consensus/validate.ts` against the chain state or the block body, and reading that function is the best way to learn what each one means:
 
@@ -313,20 +336,11 @@ Each field is checked by `validateBlockStructure` in `src/consensus/validate.ts`
 | `lastCommitHash` | `commitHash(block.lastCommit)` |
 | `time` | after `state.lastBlockTime`; for a fresh proposal also within `maxClockDriftMs` of local time (a re-proposal, a fetched block and a synced block are not held to the clock, [chapter 4](04-consensus.md)) |
 | `proposerAddress` | present in `state.validators` |
-| `prioritiesHash` | from version 2, `prioritiesHash(state.validators, state.nextValidators)` (`'wrong prioritiesHash'`); under version 1 there is none |
+| `prioritiesHash` | `prioritiesHash(state.validators, state.nextValidators)` (`'wrong prioritiesHash'`) |
 
 `version` was added in the proofs round (`RPC-SYNC-PROOFS.md` section 2.1): "validation rejects a header whose version differs from the state's. The first version with this header is 1."
 
-Version 2 added `prioritiesHash`, the hash of the proposer priorities of the two sets the header already names by their members (`src/types/validator.ts`, above). It is optional in the interface because a version 1 header has none, and it belongs to the version, not to the caller: `encodeHeader` ends
-
-```ts
-  if (h.version >= PRIORITIES_VERSION) {
-    if (!h.prioritiesHash) throw new Error(`a version ${h.version} header needs a prioritiesHash`);
-    w.fixed(h.prioritiesHash);
-  } else if (h.prioritiesHash) throw new Error(`a version ${h.version} header has no prioritiesHash`);
-```
-
-so neither a version 2 header without the field nor a version 1 header with it has an encoding, and with no encoding it has no hash. `decodeHeader` reads `chainId` and `version` first and the field only from version 2. A chain started under version 1 therefore keeps its headers, its block hashes and its stored blocks byte for byte, and `validateBlockStructure` checks the field only on a chain whose version has it; the version itself was compared with the state's a few lines earlier, so a header cannot choose.
+`prioritiesHash` is the hash of the proposer priorities of the two sets the header already names by their members (`src/types/validator.ts`, above). It is the last field written, 32 bytes like the other hashes.
 
 **`interface Commit`** is the set of precommits that finalized a block:
 
@@ -343,7 +357,7 @@ export interface Commit {
 
 **`interface Block`** is `header`, `txs: Uint8Array[]` (opaque to the engine), `lastCommit: Commit | null` ("null only at height 1") and `evidence: DuplicateVoteEvidence[]`.
 
-**`encodeHeader`** and **`decodeHeader`** write and read the thirteen fields, and from version 2 the fourteenth; the decoder limits `chainId` to 256 bytes and reads every hash as `fixed(HASH_SIZE)` and the proposer as `fixed(ADDRESS_SIZE)`. **`headerHash(h)`** and **`blockHash(b)`**:
+**`encodeHeader`** and **`decodeHeader`** write and read the fourteen fields; the decoder limits `chainId` to 256 bytes and reads every hash as `fixed(HASH_SIZE)` and the proposer as `fixed(ADDRESS_SIZE)`. **`headerHash(h)`** and **`blockHash(b)`**:
 
 ```ts
 /** The block hash is the header hash. The header commits to everything else. */
@@ -364,26 +378,70 @@ export function blockHash(b: Block): Uint8Array {
 
 ### src/types/evidence.ts
 
-**`interface DuplicateVoteEvidence`** is `{ voteA: Vote; voteB: Vote }`. **`makeDuplicateVoteEvidence(a, b)`** puts the votes in canonical order, "the vote with the lower block hash (nil lowest) comes first", using the private `compareHashes`, which orders `null` before any array and otherwise defers to `compareBytes`. Canonical order means the same pair of votes always encodes to the same bytes, so two nodes that observed the same double-sign produce identical evidence with an identical hash.
+**`type Evidence`** is a union of the two faults this chain punishes on evidence, told apart by a `kind` field. Each is two votes signed by one validator at one height, so anyone holding both signatures can prove it and the proof needs nothing else.
 
-**`checkDuplicateVoteShape(ev)`** is the structural check, returning an error string or `null`:
+**`interface DuplicateVoteEvidence`** is `{ kind: 'duplicateVote'; voteA: Vote; voteB: Vote }`: two different votes of the same type at the same height and round. **`makeDuplicateVoteEvidence(a, b)`** puts the votes in canonical order, "the vote with the lower block hash (nil lowest) comes first, then the lower polRound", using the private `compareVotes` and `compareHashes`; the latter orders `null` before any array and otherwise defers to `compareBytes`. Canonical order means the same pair of votes always encodes to the same bytes, so two nodes that observed the same double-sign produce identical evidence with an identical hash.
+
+**`interface AmnesiaEvidence`** is `{ kind: 'amnesia'; precommit: Vote; prevote: Vote }`: a lock forgotten. A validator that precommits a block is locked on it for the rest of the height. In a later round it may prevote another block only if that block had +2/3 prevotes in the round of the lock or after it, and its prevote names that round. So a precommit for one block and a prevote for another in a later round, naming a round before the precommit's or none, are a fault whatever else happened: the validator said itself that it knew of nothing that could release it. **`isAmnesia(precommit, prevote)`** is that condition, which consensus asks of every such pair of votes it holds:
 
 ```ts
-export function checkDuplicateVoteShape(ev: DuplicateVoteEvidence): string | null {
+export function isAmnesia(precommit: Vote, prevote: Vote): boolean {
+  return (
+    precommit.type === VoteType.Precommit &&
+    prevote.type === VoteType.Prevote &&
+    precommit.height === prevote.height &&
+    precommit.validatorIndex === prevote.validatorIndex &&
+    precommit.blockHash !== null &&
+    prevote.blockHash !== null &&
+    !bytesEqual(precommit.blockHash, prevote.blockHash) &&
+    prevote.round > precommit.round &&
+    prevote.polRound < precommit.round
+  );
+}
+```
+
+Every clause is needed. A vote for nil forgets nothing, since a locked validator may always prevote nil and a precommit for nil takes no lock. The same block is the lock kept. A prevote of the same round was signed before the precommit. And `prevote.polRound < precommit.round` is the fault itself: with a round at or after the precommit's named, the validator claims a release the rules allow, and whether the claim is true is a question two votes cannot answer. Chapter 4 says what is done about a false claim (nobody counts the prevote).
+
+**`checkEvidenceShape(ev)`** is the structural check of either kind, returning an error string or `null`:
+
+```ts
+/** Structural check only; signatures are verified separately. Returns an error string or null. */
+export function checkEvidenceShape(ev: Evidence): string | null {
+  if (ev.kind === 'amnesia') {
+    const { precommit: c, prevote: p } = ev;
+    if (c.type !== VoteType.Precommit || p.type !== VoteType.Prevote) return 'amnesia evidence is a precommit and a prevote';
+    if (c.height !== p.height) return 'heights differ';
+    if (c.validatorIndex !== p.validatorIndex) return 'validators differ';
+    if (c.blockHash === null || p.blockHash === null) return 'a vote for nil forgets no lock';
+    if (bytesEqual(c.blockHash, p.blockHash)) return 'votes are for the same block';
+    if (p.round <= c.round) return 'the prevote is not after the precommit';
+    if (p.polRound >= c.round) return 'the prevote names a proof of lock at or after the precommit';
+    return null;
+  }
   const { voteA: a, voteB: b } = ev;
   if (a.height !== b.height) return 'heights differ';
   if (a.round !== b.round) return 'rounds differ';
   if (a.type !== b.type) return 'vote types differ';
   if (a.validatorIndex !== b.validatorIndex) return 'validators differ';
-  if (bytesEqual(a.blockHash, b.blockHash)) return 'votes are for the same block';
-  if (compareHashes(a.blockHash, b.blockHash) > 0) return 'votes not in canonical order';
+  if (sameVoteContent(a, b)) return 'votes are the same';
+  if (compareVotes(a, b) > 0) return 'votes not in canonical order';
   return null;
 }
 ```
 
-Same height, round, type and validator; different block (a nil vote and a block vote count as different); canonical order. Signatures are deliberately not checked here; `verifyDuplicateVoteEvidence` in `src/consensus/evidence.ts` runs this check and then verifies both signatures against the public key at `validatorIndex` in the set of that height, through the `Verifier` from [chapter 2](02-crypto.md). The split keeps this file free of asynchronous code and of the validator set.
+For a double sign: same height, round, type and validator; different content (a nil vote and a block vote differ, and so do two votes for one block that name different rounds); canonical order. For a forgotten lock: the clauses of `isAmnesia`, each with its own message. Signatures are deliberately not checked here; `verifyEvidence` in `src/consensus/evidence.ts` runs this check and then verifies both signatures against the public key at the accused's index in the set of that height, through the `Verifier` from [chapter 2](02-crypto.md). The split keeps this file free of asynchronous code and of the validator set.
 
-**`evidenceKey(ev)`** is `` `${height}/${round}/${type}/${validatorIndex}` `` from `voteA`. The evidence pool keys its pending map by it, so one validator can be reported at most once per (height, round, type) however many conflicting votes it signed. **`encodeEvidence`**/**`decodeEvidence`** are two votes back to back.
+**`evidenceVotes(ev)`** gives the two votes in the order they are written, **`evidenceHeight(ev)`** the height of the fault (whose validator set the votes are checked against and whose time the evidence is aged by) and **`evidenceValidator(ev)`** the accused's index; the rest of the node uses these and never looks inside a kind. **`evidenceKey(ev)`** is one key for one offence:
+
+```ts
+export function evidenceKey(ev: Evidence): string {
+  if (ev.kind === 'amnesia') return `amnesia/${ev.precommit.height}/${ev.precommit.validatorIndex}`;
+  const v = ev.voteA;
+  return `${v.height}/${v.round}/${v.type}/${v.validatorIndex}`;
+}
+```
+
+The evidence pool keys its maps by it, so one validator can be reported at most once per (height, round, type) for a double sign however many conflicting votes it signed, and once per height for a forgotten lock whichever of its votes show it. **`encodeEvidence`** writes a tag byte, 1 for a double sign and 2 for a forgotten lock, and the two votes back to back; **`decodeEvidence`** refuses any other tag with `unknown evidence kind N`.
 
 ### src/types/proposal.ts
 
@@ -418,7 +476,7 @@ Signing the hash keeps the sign bytes small and lets a re-proposal of a locked b
 
 ### src/types/state.ts
 
-**`PROTOCOL_VERSION = 2`** is the version a chain runs unless its genesis says otherwise; the private `VERSIONS` lists the two this code runs, 1, whose headers say nothing of proposer priorities, and 2, whose headers commit to them. The version is the chain's for good: it is read from the genesis once and kept in the chain state, so a store written under version 1 goes on under version 1 whatever the default has become. **`interface ChainState`**:
+**`PROTOCOL_VERSION = 1`** is the one version this code runs, and the version a chain has when its genesis names none. A change to what is signed or stored goes into it directly while the chain is unreleased; the field is there so that a later change has a number to take. **`interface ChainState`**:
 
 ```ts
 export interface ChainState {
@@ -450,7 +508,7 @@ export function genesisState(genesis: Genesis, appHash: Uint8Array, validatorsOv
   const scheme = schemeTag(genesis.signatureScheme ?? 'ml-dsa-44');
   for (const v of entries) if (schemeOf(v.publicKey) !== scheme) throw new Error(`genesis validator key is not a ${schemeName(scheme)} key`);
   const version = genesis.consensus?.version ?? PROTOCOL_VERSION;
-  if (!VERSIONS.includes(version)) throw new Error(`genesis asks for protocol version ${version}; this node runs ${VERSIONS.join(' and ')}`);
+  if (version !== PROTOCOL_VERSION) throw new Error(`genesis asks for protocol version ${version}; this node runs ${PROTOCOL_VERSION}`);
   const validators = ValidatorSet.create(entries.map((v) => ({ publicKey: v.publicKey, power: v.power })));
   const nextValidators = validators.copy();
   nextValidators.incrementProposerPriority(1);
@@ -470,7 +528,7 @@ export function genesisState(genesis: Genesis, appHash: Uint8Array, validatorsOv
 }
 ```
 
-The version is checked before any set is built: a genesis asking for one this code does not run fails with `genesis asks for protocol version 3; this node runs 1 and 2`, since the node could neither build nor check that chain's headers. `create` already performed one increment, so `validators` has the proposer for height 1; the copy advanced once more has the proposer for height 2. `lastValidators` is a copy of the same set although nothing signed height 0. `lastResultsHash` starts at the Merkle `EMPTY` value, not `ZERO_HASH`: `RPC-SYNC-PROOFS.md` section 2.1 says "Height 1 carries the empty value", and header validation compares it with `txsRoot([])`-style roots, which are `EMPTY`. This is why the file imports from `src/db/merkle.ts`. The scheme check runs before `ValidatorSet.create` sees the keys, so a genesis that names `secp256k1` but lists ML-DSA-44 validators fails with `genesis validator key is not a secp256k1 key` rather than with a message about key sizes, and a secp256k1 key under the default scheme fails the same way with `ml-dsa-44`.
+The version is checked before any set is built: a genesis asking for one this code does not run fails with `genesis asks for protocol version 2; this node runs 1`, since the node could neither build nor check that chain's headers. `create` already performed one increment, so `validators` has the proposer for height 1; the copy advanced once more has the proposer for height 2. `lastValidators` is a copy of the same set although nothing signed height 0. `lastResultsHash` starts at the Merkle `EMPTY` value, not `ZERO_HASH`: `RPC-SYNC-PROOFS.md` section 2.1 says "Height 1 carries the empty value", and header validation compares it with `txsRoot([])`-style roots, which are `EMPTY`. This is why the file imports from `src/db/merkle.ts`. The scheme check runs before `ValidatorSet.create` sees the keys, so a genesis that names `secp256k1` but lists ML-DSA-44 validators fails with `genesis validator key is not a secp256k1 key` rather than with a message about key sizes, and a secp256k1 key under the default scheme fails the same way with `ml-dsa-44`.
 
 **`nextState(state, block, updates, appHash, resultsHash)`** is the state transition the executor applies after each commit:
 
@@ -634,7 +692,9 @@ A hash prints as its first six bytes, a `bigint` height as a number, a nil block
 
 **`test/engine.test.ts`.** `rejects a block from another protocol version` bumps `header.version` on a real block and asserts `validateBlockStructure` reports `/protocol version/`, and that the node's state version is `PROTOCOL_VERSION`. `refuses a genesis with no validators from either side` calls `genesisState` with no genesis validators and no override, and with an empty override, expecting `/no validators/`. `drops evidence older than the configured age by block time, and keeps young evidence` forges two conflicting prevotes with `voteSignBytes` and `signContext(chainId, 'vote')`, wraps them with `makeDuplicateVoteEvidence`, and checks that stale evidence is discarded and young evidence reaches every application.
 
-**`test/priorities.test.ts`.** `hashes a set by its members and its priorities apart, and commits a header to the priorities from version 2` advances a copy of a three-validator set once and finds `hash()` unchanged and `prioritiesHash()` changed, moves one unit of priority between the two validators that are not proposing (same proposer, another hash), reads a set back from its stored form with the same `prioritiesHash()`, and finds the header's hash different for the two sets in the other order; a version 2 header is 32 bytes longer than the same header under version 1, both come back from `decodeHeader` and from `headerFromJson` as they went in, and `headerHash` throws for a version 2 header without the field and a version 1 header with it. `starts a chain under version 1 or 2 and no other, and refuses a block whose header commits to other priorities` calls `genesisState` with no version (2), with 1, and with 3 and 0 (`/protocol version 3/`), then hands `validateBlockStructure` a block of height 1 whose `prioritiesHash` is that of the two sets in the wrong order, of one set alone, of a set with the same members and shifted priorities, or missing: each is `'wrong prioritiesHash'`.
+**`test/priorities.test.ts`.** `hashes a set by its members and its priorities apart, and commits a header to the priorities` advances a copy of a three-validator set once and finds `hash()` unchanged and `prioritiesHash()` changed, moves one unit of priority between the two validators that are not proposing (same proposer, another hash), marks another validator as proposer over the same priorities (another hash again), reads a set back from its stored form with the same `prioritiesHash()`, and finds the header's hash different for the two sets in the other order; a header comes back from `decodeHeader` and from `headerFromJson` as it went in, with the hash as its last 32 bytes. `starts a chain under the one protocol version, and refuses a block whose header commits to other priorities` calls `genesisState` with no version and with 1 (both 1), and with 2 and 0 (`/protocol version 2; this node runs 1/`), then hands `validateBlockStructure` a block of height 1 whose `prioritiesHash` is that of the two sets in the wrong order, of one set alone, or of a set with the same members and shifted priorities or another proposer: each is `'wrong prioritiesHash'`.
+
+**`test/amnesia.test.ts`.** `signs into a prevote the proof-of-lock round it relies on, and counts two votes that differ in it alone as a double sign` runs `checkPolRound` over every case, shows the sign bytes change with the round, that `decodeVote` refuses a vote naming a round it may not, and that two prevotes for one block naming different rounds are a conflict in a `VoteSet` and valid duplicate-vote evidence, the lower round first. `proves a forgotten lock with a precommit and a later prevote for another block that names no round from the lock on` checks `checkEvidenceShape` and `isAmnesia` on a good pair and on eleven pairs that are no evidence, each with its reason, then the keys, the codec of both kinds (tag bytes 1 and 2, tag 3 refused) and `verifyEvidence` with a vote altered after signing, another signer, another chain id and an index outside the set.
 
 **`test/schemes.test.ts`.** `refuses a genesis whose validator keys are not of the scheme it names` calls `genesisState` with an ML-DSA-44 key under `signatureScheme: 'secp256k1'` and with a secp256k1 key under no scheme at all, expecting `/not a secp256k1 key/` and `/not a ml-dsa-44 key/`, and checks that the matching cases set `state.scheme`. `runs on secp256k1 keys end to end and refuses keys and signatures of the other scheme` runs a four-validator testnet on secp256k1 and reads a stored commit back with 65-byte signatures, which is `signatureSize(Scheme.secp256k1)`.
 
@@ -652,8 +712,8 @@ A hash prints as its first six bytes, a `bigint` height as a number, a nil block
 
 Known simplifications:
 
-- `ValidatorSet.hash()` excludes priorities and the proposer index, and on a chain of protocol version 1 no header covers them (`DESIGN.md` section 10): a node state-syncing onto such a chain checks that the sets it receives pick the proposers the chain actually used, and nothing more; review finding 8 records the residual risk. A chain of version 2 commits every header to them with `prioritiesHash`.
-- Only duplicate-vote evidence exists. Amnesia evidence is deferred (`DESIGN.md` section 10).
+- `ValidatorSet.hash()` excludes priorities and the proposer index; the header's `prioritiesHash` covers them instead, which costs a state-syncing node one more check and the store nothing.
+- Evidence is two votes of one validator at one height. A prevote that names a polka which never formed is not punishable, only never counted ([chapter 4](04-consensus.md)).
 - Votes carry no timestamp, so there is no BFT time; block time is the proposer's word, bounded by validation's clock-drift window.
 - Proposals carry whole blocks; there are no block parts, so a block must fit in one p2p frame. The bounds on a block's transactions and evidence (16 MiB) and on a validator set (2,000) are what make it fit.
 - `decodeVote` and `decodeProposal` do not range-check `round`, `validatorIndex` or `polRound`, beyond refusing a `polRound` too large to hold exactly; consensus does, after decoding.
@@ -667,7 +727,7 @@ Exercises:
 2. Implement `proposerForRound(set, r)` as a pure function and test it against `Consensus.proposerAt` for rounds 0 to 50.
 3. The header's `prioritiesHash` is one hash over two sets, which is why state sync asks one peer for the sets of H+1 and H+2 together. Replace it with two fields, one per set, and work out what that changes in `stateSync`, in the header's size, and in what a peer can be charged for. Then consider the other design: priorities folded into `hash()` itself. What would the store's record by hash and the light client have to do?
 4. Add a `timestamp` to `Vote` and `voteSignBytes`, collect the precommit timestamps in a commit, and compute Tendermint's BFT time (the power-weighted median). Decide what the header's `time` should then be.
-5. Define an amnesia evidence type (a precommit for a block in round R from a validator that had prevoted nil in R while locked), with a canonical form, a shape check and a codec, mirroring `src/types/evidence.ts`.
+5. A proposer that signs two different proposals for one round is not reported. Define that evidence (two proposals of one height and round with different blocks or `polRound`), with a canonical form, a shape check and a codec, mirroring `src/types/evidence.ts`, and decide whether it should cost what a double vote costs.
 6. Make the transaction count provable: put it in the header, or into the leaf value, give `TxProof` a `count` that is checked against it, and update `pathMatches` and the tests.
 7. Give `genesisFromJson` a schema check with clear messages and a test file of bad documents.
 8. Make `makeLogger` emit JSON lines when `out` is not a terminal, keeping `fmt`'s rules for hashes and `bigint`s.

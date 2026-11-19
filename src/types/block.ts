@@ -2,7 +2,7 @@ import type { Reader } from '../codec/reader.ts';
 import { Writer, encode } from '../codec/writer.ts';
 import { HASH_SIZE, ZERO_HASH, sha256 } from '../crypto/hash.ts';
 import { ADDRESS_SIZE, decodeSignature } from '../crypto/keys.ts';
-import { decodeEvidence, encodeEvidence, type DuplicateVoteEvidence } from './evidence.ts';
+import { decodeEvidence, encodeEvidence, type Evidence } from './evidence.ts';
 import { MAX_VALIDATORS } from './validator.ts';
 
 /**
@@ -32,15 +32,9 @@ export interface Header {
   appHash: Uint8Array;
   evidenceHash: Uint8Array;
   proposerAddress: Uint8Array;
-  /**
-   * Hash of the proposer priorities of this height's set and the next height's (types/validator.ts). In every
-   * header from protocol version PRIORITIES_VERSION on, and in none before.
-   */
-  prioritiesHash?: Uint8Array;
+  /** Hash of the proposer priorities of this height's set and the next height's (types/validator.ts): with the two set hashes, the header names both sets exactly. */
+  prioritiesHash: Uint8Array;
 }
-
-/** The protocol version from which a header carries prioritiesHash. A chain started under an earlier version keeps its headers as they were. */
-export const PRIORITIES_VERSION = 2;
 
 /**
  * The precommit signatures that finalised a block. `signatures[i]` belongs
@@ -60,7 +54,7 @@ export interface Block {
   txs: Uint8Array[];
   /** Commit for the previous block. null only at height 1. */
   lastCommit: Commit | null;
-  evidence: DuplicateVoteEvidence[];
+  evidence: Evidence[];
 }
 
 export function encodeHeader(w: Writer, h: Header): void {
@@ -77,18 +71,13 @@ export function encodeHeader(w: Writer, h: Header): void {
   w.fixed(h.appHash);
   w.fixed(h.evidenceHash);
   w.fixed(h.proposerAddress);
-  if (h.version >= PRIORITIES_VERSION) {
-    if (!h.prioritiesHash) throw new Error(`a version ${h.version} header needs a prioritiesHash`);
-    w.fixed(h.prioritiesHash);
-  } else if (h.prioritiesHash) throw new Error(`a version ${h.version} header has no prioritiesHash`);
+  w.fixed(h.prioritiesHash);
 }
 
 export function decodeHeader(r: Reader): Header {
-  const chainId = r.string(256);
-  const version = r.u32();
   return {
-    chainId,
-    version,
+    chainId: r.string(256),
+    version: r.u32(),
     height: r.u64(),
     time: r.u64(),
     lastBlockHash: r.fixed(HASH_SIZE),
@@ -100,7 +89,7 @@ export function decodeHeader(r: Reader): Header {
     appHash: r.fixed(HASH_SIZE),
     evidenceHash: r.fixed(HASH_SIZE),
     proposerAddress: r.fixed(ADDRESS_SIZE),
-    ...(version >= PRIORITIES_VERSION ? { prioritiesHash: r.fixed(HASH_SIZE) } : {}),
+    prioritiesHash: r.fixed(HASH_SIZE),
   };
 }
 
@@ -139,7 +128,7 @@ export function commitHash(c: Commit | null): Uint8Array {
   return sha256(encode((w) => encodeCommit(w, c)));
 }
 
-export function evidenceHash(evs: DuplicateVoteEvidence[]): Uint8Array {
+export function evidenceHash(evs: Evidence[]): Uint8Array {
   if (evs.length === 0) return ZERO_HASH;
   return sha256(encode((w) => w.array(evs, encodeEvidence)));
 }

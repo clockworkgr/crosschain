@@ -12,7 +12,7 @@ A node is the consensus engine, the mempool, the network, block sync, state sync
 
 **Three gossip policies in one node.** Consensus messages are pushed straight through to every peer (`broadcastProposal`, `broadcastVote`), with no inventory round trip; a peer that connects in the middle of a height is handed everything held for that height, plus an announcement of any evidence still waiting for a block. Transactions and evidence use announce and fetch (`inv`, `fetch`, `item`, `itemNotFound`), with a seen-cache on each side so nothing loops. Committed blocks are announced by height in a `status` message after every commit, and pulled through block sync. DESIGN.md section 3 explains the split: inventory for items where a round trip is cheap, push where it would delay a consensus phase.
 
-**Evidence from peers.** A duplicate-vote evidence record arriving by gossip is checked for age and then verified against the validator set of its height before it enters the pool (`acceptEvidence`), and a peer serving malformed or invalid evidence is charged 20 points. RPC-SYNC-PROOFS.md section 4.4: "Evidence becomes an inventory item kind next to transactions: announce by key, fetch, verify against the validator set at its height, add to the pool, pass on."
+**Evidence from peers.** An evidence record arriving by gossip, of a double sign or of a forgotten lock, is checked for age and then verified against the validator set of its height before it enters the pool (`acceptEvidence`), and a peer serving malformed or invalid evidence is charged 20 points. RPC-SYNC-PROOFS.md section 4.4: "Evidence becomes an inventory item kind next to transactions: announce by key, fetch, verify against the validator set at its height, add to the pool, pass on."
 
 **Evidence age follows the unbonding period.** A block may carry evidence only for an infraction no older than `maxEvidenceAgeMs` by block time: `evidenceAgeOk` refuses an age greater than the limit and accepts one equal to it (STAKING.md section 2.2). That check is made on blocks, and on evidence arriving by gossip before it is pooled (`acceptEvidence`, below). With staking, that limit must equal the unbonding period, or a validator could be punished after its stake was released, or escape punishment while still bonded. Governance can change the unbonding period, so the limit is not a figure fixed at genesis: the node's `evidenceAge()` reads `stakingParameters().unbondingPeriodMs` from the application each time it is asked, unless the operator set `limits.maxEvidenceAgeMs`, and writes it into the shared `limits` object. It is asked as soon as the executor has opened the application, after every commit, and by the executor whenever it prunes, which is after a block is applied and before the commit listeners run, so the blocks behind a block that changed the period are pruned by the new figure. This works because `Consensus` keeps a reference to that object and merges it with the defaults on every read (its private `limits` getter), rather than copying it once at construction.
 
@@ -736,15 +736,15 @@ Handlers registered by the node and by the two objects it constructs. The networ
     // commit let it go. Measured at the last block's time, which is the earliest the next block's can be. The peer
     // is not marked for it: it may be ahead of this node, or hold history this node has pruned.
     const state = this.executor.state;
-    if (evidenceAgeOk(ev.voteA.height, state.lastHeight + 1n, state.lastBlockTime, state, this.limits, (h) => this.executor.blockTimeAt(h))) return;
-    const set = this.executor.validatorSetAtHeight(ev.voteA.height);
+    if (evidenceAgeOk(evidenceHeight(ev), state.lastHeight + 1n, state.lastBlockTime, state, this.limits, (h) => this.executor.blockTimeAt(h))) return;
+    const set = this.executor.validatorSetAtHeight(evidenceHeight(ev));
     if (!set) return;
-    const err = await verifyDuplicateVoteEvidence(this.chainId, ev, set, this.verifier);
+    const err = await verifyEvidence(this.chainId, ev, set, this.verifier);
     if (err) {
       this.network.score(peerId, 20, `invalid evidence: ${err}`);
       return;
     }
-    if (this.evidencePool.add(ev)) this.log('warn', 'evidence received from peer', { h: ev.voteA.height, validator: ev.voteA.validatorIndex });
+    if (this.evidencePool.add(ev)) this.log('warn', 'evidence received from peer', { h: evidenceHeight(ev), kind: ev.kind, validator: evidenceValidator(ev) });
   }
 ```
 

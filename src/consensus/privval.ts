@@ -9,17 +9,36 @@
  * storage before the signature is handed back, so a crash and restart can
  * never produce a conflicting vote. This is the single most common bug in
  * new consensus implementations and the one that gets validators slashed.
+ *
+ * The record also holds the validator's lock. A precommit for a block locks
+ * the validator on it for the rest of the height, and the lock is written in
+ * the same record as that precommit's signature, so it is durable before the
+ * precommit can leave. A prevote for a block is then signed only if it names
+ * a proof of lock from the round of the lock or a later one: for another
+ * block that is the majority that releases the lock, and for the locked block
+ * it is the majority the lock was taken on. A prevote that names an older
+ * round or none could stand as evidence beside an earlier precommit of the
+ * height, for the lock may have moved since. Consensus keeps the same rule, and reads the lock back from here after a restart; a
+ * process that forgot its lock would otherwise prevote whatever was proposed
+ * next, which is the fault amnesia evidence punishes (types/evidence.ts).
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { decode } from '../codec/reader.ts';
 import { encode } from '../codec/writer.ts';
-import { bytesEqual } from '../crypto/hash.ts';
+import { HASH_SIZE, bytesEqual } from '../crypto/hash.ts';
 import { sign, signContext, type KeyPair } from '../crypto/keys.ts';
 import { writeAtomic } from '../store/files.ts';
 import { proposalSignBytes, type UnsignedProposal } from '../types/proposal.ts';
-import { VoteType, voteSignBytes, type UnsignedVote } from '../types/vote.ts';
+import { VoteType, checkPolRound, voteSignBytes, type UnsignedVote } from '../types/vote.ts';
 
 export const SignStep = { Propose: 1, Prevote: 2, Precommit: 3 } as const;
+
+/** The block a validator precommitted, and the round it did so in: the latest such round of the height. */
+export interface Lock {
+  height: bigint;
+  round: number;
+  blockHash: Uint8Array;
+}
 
 export interface LastSigned {
   height: bigint;
@@ -27,6 +46,7 @@ export interface LastSigned {
   step: number;
   signBytes: Uint8Array;
   signature: Uint8Array;
+  lock: Lock | null;
 }
 
 export interface SignStateStore {
@@ -58,6 +78,7 @@ export class FileSignStateStore implements SignStateStore {
       step: r.u8(),
       signBytes: r.bytes(),
       signature: r.bytes(),
+      lock: r.option((r) => ({ height: r.u64(), round: r.u32(), blockHash: r.fixed(HASH_SIZE) })),
     }));
   }
   save(s: LastSigned): void {
@@ -69,6 +90,7 @@ export class FileSignStateStore implements SignStateStore {
         w.u8(s.step);
         w.bytes(s.signBytes);
         w.bytes(s.signature);
+        w.option(s.lock, (w, l) => w.u64(l.height).u32(l.round).fixed(l.blockHash));
       }),
     );
   }
@@ -105,16 +127,34 @@ export class PrivValidator {
     return this.last ? { height: this.last.height, round: this.last.round, step: this.last.step } : null;
   }
 
+  /** The lock held for a height, for consensus to take up after a restart. */
+  lockAt(height: bigint): Lock | null {
+    const lock = this.last?.lock;
+    return lock && lock.height === height ? lock : null;
+  }
+
   signVote(chainId: string, v: UnsignedVote): Uint8Array {
-    const step = v.type === VoteType.Prevote ? SignStep.Prevote : SignStep.Precommit;
-    return this.guardedSign(v.height, v.round, step, voteSignBytes(chainId, v), this.voteCtx);
+    const bad = checkPolRound(v);
+    if (bad) throw new DoubleSignError(`refusing to sign a vote at ${v.height}/${v.round}: ${bad}`);
+    const held = this.lockAt(v.height);
+    if (v.type === VoteType.Prevote) {
+      // Locked: a prevote for a block names a majority from the round of the lock or later, which for another block
+      // is what releases the lock and for the locked block is what the lock stands on.
+      if (held && v.blockHash !== null && v.polRound < held.round) {
+        throw new DoubleSignError(`refusing to prevote a block at ${v.height}/${v.round}: locked in round ${held.round}, and the proof of lock named is from round ${v.polRound}`);
+      }
+      return this.guardedSign(v.height, v.round, SignStep.Prevote, voteSignBytes(chainId, v), this.voteCtx, held);
+    }
+    const lock = v.blockHash !== null ? { height: v.height, round: v.round, blockHash: v.blockHash } : held;
+    return this.guardedSign(v.height, v.round, SignStep.Precommit, voteSignBytes(chainId, v), this.voteCtx, lock);
   }
 
   signProposal(chainId: string, p: UnsignedProposal): Uint8Array {
-    return this.guardedSign(p.height, p.round, SignStep.Propose, proposalSignBytes(chainId, p), this.proposalCtx);
+    return this.guardedSign(p.height, p.round, SignStep.Propose, proposalSignBytes(chainId, p), this.proposalCtx, this.lockAt(p.height));
   }
 
-  private guardedSign(height: bigint, round: number, step: number, signBytes: Uint8Array, ctx: Uint8Array): Uint8Array {
+  /** `lock` is the lock as it stands once this is signed; it is written with the signature. */
+  private guardedSign(height: bigint, round: number, step: number, signBytes: Uint8Array, ctx: Uint8Array, lock: Lock | null): Uint8Array {
     const last = this.last;
     if (last) {
       const cmp = height !== last.height ? (height < last.height ? -1 : 1) : round !== last.round ? round - last.round : step - last.step;
@@ -125,7 +165,7 @@ export class PrivValidator {
       }
     }
     const signature = sign(signBytes, this.key.secretKey, ctx);
-    const record: LastSigned = { height, round, step, signBytes, signature };
+    const record: LastSigned = { height, round, step, signBytes, signature, lock };
     // Durable before anyone can broadcast it.
     this.store.save(record);
     this.last = record;

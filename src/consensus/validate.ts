@@ -6,12 +6,13 @@
 import { bytesEqual } from '../crypto/hash.ts';
 import { signContext } from '../crypto/keys.ts';
 import type { Verifier } from '../crypto/verifier.ts';
-import { blockDataBytes, blockHash, commitHash, evidenceHash, PRIORITIES_VERSION, type Block, type Commit } from '../types/block.ts';
+import { blockDataBytes, blockHash, commitHash, evidenceHash, type Block, type Commit } from '../types/block.ts';
 import { txsRoot } from '../types/txproof.ts';
 import type { ChainState } from '../types/state.ts';
 import { prioritiesHash, type ValidatorSet } from '../types/validator.ts';
 import { VoteType, voteSignBytes } from '../types/vote.ts';
-import { verifyDuplicateVoteEvidence } from './evidence.ts';
+import { verifyEvidence } from './evidence.ts';
+import { evidenceHeight } from '../types/evidence.ts';
 
 export interface ValidationLimits {
   /** The most bytes a block's transactions and evidence may encode to. A rule of the chain, read from the genesis: every node must hold the same figure. */
@@ -57,8 +58,7 @@ export function validateBlockStructure(state: ChainState, block: Block, limits: 
   if (!bytesEqual(h.lastBlockHash, state.lastBlockHash)) return 'wrong lastBlockHash';
   if (!bytesEqual(h.validatorsHash, state.validators.hash())) return 'wrong validatorsHash';
   if (!bytesEqual(h.nextValidatorsHash, state.nextValidators.hash())) return 'wrong nextValidatorsHash';
-  // The version is the chain's (checked above), so a header has the field exactly when this chain's headers do.
-  if (h.version >= PRIORITIES_VERSION && !(h.prioritiesHash && bytesEqual(h.prioritiesHash, prioritiesHash(state.validators, state.nextValidators)))) return 'wrong prioritiesHash';
+  if (!bytesEqual(h.prioritiesHash, prioritiesHash(state.validators, state.nextValidators))) return 'wrong prioritiesHash';
   if (!bytesEqual(h.appHash, state.appHash)) return 'wrong appHash';
   if (!bytesEqual(h.dataHash, txsRoot(block.txs))) return 'wrong dataHash';
   if (!bytesEqual(h.lastResultsHash, state.lastResultsHash)) return 'wrong lastResultsHash';
@@ -81,7 +81,7 @@ export function validateBlockStructure(state: ChainState, block: Block, limits: 
   }
   if (block.evidence.length > MAX_EVIDENCE_PER_BLOCK) return 'too much evidence';
   for (const ev of block.evidence) {
-    const age = evidenceAgeOk(ev.voteA.height, h.height, h.time, state, limits, blockTimeAt);
+    const age = evidenceAgeOk(evidenceHeight(ev), h.height, h.time, state, limits, blockTimeAt);
     if (age) return age;
   }
   if (blockDataBytes(block) > limits.maxBlockBytes) return 'block too large';
@@ -112,7 +112,7 @@ export async function verifyCommit(
     power += val.power;
     jobs.push({
       sig,
-      msg: voteSignBytes(chainId, { type: VoteType.Precommit, height: commit.height, round: commit.round, blockHash: hash, validatorIndex: i }),
+      msg: voteSignBytes(chainId, { type: VoteType.Precommit, height: commit.height, round: commit.round, blockHash: hash, polRound: -1, validatorIndex: i }),
       publicKey: val.publicKey,
       context: ctx,
     });
@@ -136,9 +136,9 @@ export async function verifyBlockSignatures(
     if (err) return `lastCommit: ${err}`;
   }
   for (const ev of block.evidence) {
-    const set = validatorSetAtHeight(ev.voteA.height);
-    if (!set) return `no validator set for evidence height ${ev.voteA.height}`;
-    const err = await verifyDuplicateVoteEvidence(chainId, ev, set, verifier);
+    const set = validatorSetAtHeight(evidenceHeight(ev));
+    if (!set) return `no validator set for evidence height ${evidenceHeight(ev)}`;
+    const err = await verifyEvidence(chainId, ev, set, verifier);
     if (err) return `evidence: ${err}`;
   }
   return null;

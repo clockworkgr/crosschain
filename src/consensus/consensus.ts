@@ -22,8 +22,12 @@
  *
  * Safety comes from locking: once a validator precommits a block it will
  * only prevote that block in later rounds, unless it sees a polka for a
- * different block in a later round (the proposal's polRound). Liveness
- * comes from the timeouts, which grow with the round number.
+ * different block in the round of its lock or a later one (the proposal's
+ * polRound, which its prevote then names). The lock is kept by hash and
+ * written by the private validator with the precommit, so a restart in the
+ * same height takes it up again. A validator whose votes show a lock
+ * forgotten is reported like one that signed twice (types/evidence.ts).
+ * Liveness comes from the timeouts, which grow with the round number.
  *
  * Signature verification is asynchronous (it runs in worker threads), so
  * the handlers for incoming messages await it and then re-check that the
@@ -33,9 +37,9 @@
 import { bytesEqual, toHex } from '../crypto/hash.ts';
 import { signContext } from '../crypto/keys.ts';
 import type { Verifier } from '../crypto/verifier.ts';
-import { blockDataBytes, blockHash, commitHash, evidenceHash, PRIORITIES_VERSION, type Block, type Commit, type Header } from '../types/block.ts';
+import { blockDataBytes, blockHash, commitHash, evidenceHash, type Block, type Commit, type Header } from '../types/block.ts';
 import { txsRoot } from '../types/txproof.ts';
-import { makeDuplicateVoteEvidence } from '../types/evidence.ts';
+import { evidenceHeight, isAmnesia, makeDuplicateVoteEvidence, type AmnesiaEvidence } from '../types/evidence.ts';
 import { zeroSignature } from '../crypto/keys.ts';
 import { proposalSignBytes, type Proposal } from '../types/proposal.ts';
 import type { ChainState } from '../types/state.ts';
@@ -87,8 +91,8 @@ export const MAX_ROUND_AHEAD = 1000;
 const MAX_NEXT_HEIGHT_PROPOSALS = 8;
 const MAX_NEXT_HEIGHT_PROPOSALS_PER_VALIDATOR = 2;
 
-/** What tells one held vote for the next height from another: a conflicting vote differs in its block hash and is held too. */
-const nextHeightVoteKey = (v: Vote): string => `${v.round}:${v.type}:${v.validatorIndex}:${v.blockHash ? toHex(v.blockHash) : ''}`;
+/** What tells one held vote for the next height from another: a conflicting vote differs in its block hash or in the round it names, and is held too. */
+const nextHeightVoteKey = (v: Vote): string => `${v.round}:${v.type}:${v.validatorIndex}:${v.blockHash ? toHex(v.blockHash) : ''}:${v.polRound}`;
 
 export class StaleHeightError extends Error {
   constructor(msg: string) {
@@ -137,7 +141,8 @@ export class Consensus {
   height = 0n;
   round = 0;
   step: Step = 'propose';
-  lockedBlock: Block | null = null;
+  /** The block this validator precommitted last, by hash: after a restart the block itself may not be at hand. */
+  lockedHash: Uint8Array | null = null;
   lockedRound = -1;
   validBlock: Block | null = null;
   validRound = -1;
@@ -233,8 +238,10 @@ export class Consensus {
     this.precommitTimeoutScheduled.clear();
     this.polkaHandled.clear();
     this.fetchRequested.clear(); // the hashes asked for belong to the height that is over
-    this.lockedBlock = null;
-    this.lockedRound = -1;
+    // The lock of this height, if the validator precommitted a block in it before a restart.
+    const lock = this.d.privValidator?.lockAt(this.height) ?? null;
+    this.lockedHash = lock ? lock.blockHash : null;
+    this.lockedRound = lock ? lock.round : -1;
     this.validBlock = null;
     this.validRound = -1;
     this.decided = false;
@@ -332,7 +339,7 @@ export class Consensus {
     let time = this.now();
     if (time <= st.lastBlockTime) time = st.lastBlockTime + 1n;
     // Evidence a validator would reject as too old must not go into the block, and is dropped for good.
-    this.d.evidencePool.pruneIf((ev) => evidenceAgeOk(ev.voteA.height, st.lastHeight + 1n, time, st, this.limits, this.d.blockTimeAt) !== null);
+    this.d.evidencePool.pruneIf((ev) => evidenceAgeOk(evidenceHeight(ev), st.lastHeight + 1n, time, st, this.limits, this.d.blockTimeAt) !== null);
     let evidence = this.d.evidencePool.list(MAX_EVIDENCE_PER_BLOCK);
     // The limit is on the transactions and the evidence. Evidence is picked by count and may have half the limit:
     // by bytes it may be more under a small one, and the last record is left for the next block until it fits.
@@ -357,7 +364,7 @@ export class Consensus {
         appHash: st.appHash,
         evidenceHash: evidenceHash(evidence),
         proposerAddress: pv.address,
-        ...(st.version >= PRIORITIES_VERSION ? { prioritiesHash: prioritiesHash(st.validators, st.nextValidators) } : {}),
+        prioritiesHash: prioritiesHash(st.validators, st.nextValidators),
       },
       txs,
       lastCommit,
@@ -504,9 +511,14 @@ export class Consensus {
       if (this.d.evidencePool.add(ev)) {
         this.log('warn', 'double sign detected', { h: v.height, r: v.round, type: voteTypeName(v.type), validator: v.validatorIndex });
       }
+      // The vote set keeps whichever of the two counts for its block, so a majority may have formed.
+      if (!this.decided) this.evaluateRules();
       return;
     }
     if (!added) return;
+    for (const ev of this.forgottenLocks(v)) {
+      if (this.d.evidencePool.add(ev)) this.log('warn', 'forgotten lock detected', { h: v.height, validator: v.validatorIndex, precommit: ev.precommit.round, prevote: ev.prevote.round, polRound: ev.prevote.polRound });
+    }
     this.log('debug', 'got vote', { h: v.height, r: v.round, type: voteTypeName(v.type), i: v.validatorIndex, block: v.blockHash });
     this.d.broadcastVote(v, fromPeer);
     if (this.decided) {
@@ -520,14 +532,31 @@ export class Consensus {
     this.evaluateRules();
   }
 
+  /**
+   * What a vote just added proves with the votes already held from the same validator: a precommit for one block
+   * and a prevote for another in a later round that names no proof of lock from the precommit's round or after.
+   * Either vote may arrive last.
+   */
+  private forgottenLocks(v: Vote): AmnesiaEvidence[] {
+    if (v.blockHash === null) return [];
+    const out: AmnesiaEvidence[] = [];
+    for (const r of this.hvs.roundNumbers()) {
+      const other = v.type === VoteType.Prevote ? this.hvs.precommits(r).get(v.validatorIndex) : this.hvs.prevotes(r).get(v.validatorIndex);
+      if (!other) continue;
+      const [precommit, prevote] = v.type === VoteType.Prevote ? [other, v] : [v, other];
+      if (isAmnesia(precommit, prevote)) out.push({ kind: 'amnesia', precommit, prevote });
+    }
+    return out;
+  }
+
   // ------------------------------------------------------------------- voting
 
-  private signAndAddVote(type: VoteType, hash: Uint8Array | null): void {
+  private signAndAddVote(type: VoteType, hash: Uint8Array | null, polRound = -1): void {
     const pv = this.d.privValidator;
     if (!pv) return;
     const idx = this.validators.indexOf(pv.address);
     if (idx < 0) return;
-    const unsigned = { type, height: this.height, round: this.round, blockHash: hash, validatorIndex: idx };
+    const unsigned = { type, height: this.height, round: this.round, blockHash: hash, polRound, validatorIndex: idx };
     let signature: Uint8Array;
     try {
       signature = pv.signVote(this.d.chainId, unsigned);
@@ -542,8 +571,17 @@ export class Consensus {
     this.addVote({ ...unsigned, signature }, null);
   }
 
-  private prevote(hash: Uint8Array | null): void {
-    this.signAndAddVote(VoteType.Prevote, hash);
+  /**
+   * `polRound` is the proposal's, and is named only in a prevote for its block. A prevote for the block this
+   * validator is locked on names the round of the lock if that is later: the lock was taken on +2/3 prevotes for the
+   * block in that round, so the claim is true, and it is the one that answers for every earlier precommit of the
+   * height. Naming the proposal's older round there would read, beside a precommit for another block in between,
+   * as a lock forgotten.
+   */
+  private prevote(hash: Uint8Array | null, polRound = -1): void {
+    if (hash === null) return this.signAndAddVote(VoteType.Prevote, null, -1);
+    const locked = this.lockedHash !== null && bytesEqual(this.lockedHash, hash);
+    this.signAndAddVote(VoteType.Prevote, hash, locked ? Math.max(polRound, this.lockedRound) : polRound);
   }
 
   private precommit(hash: Uint8Array | null): void {
@@ -572,8 +610,22 @@ export class Consensus {
             if (v) this.d.broadcastVote(v, null);
           }
         }
-        // The prevotes behind our valid block, for a peer that missed that polka: without them it cannot accept a re-proposal.
-        if (this.validRound >= 0 && this.validRound !== this.round) for (const v of this.hvs.prevotes(this.validRound).all()) this.d.broadcastVote(v, null);
+        // The prevotes behind our valid block, for a peer that missed that polka: without them it cannot accept a
+        // re-proposal. And the prevotes behind those: one that names an earlier round counts at a peer only once the
+        // peer holds that round's majority too, so the whole line back to the first polka is sent.
+        if (this.validBlock && this.validRound >= 0) {
+          const valid = blockHash(this.validBlock);
+          const rounds = [this.validRound];
+          const seen = new Set<number>();
+          for (let r = rounds.pop(); r !== undefined; r = rounds.pop()) {
+            if (seen.has(r)) continue;
+            seen.add(r);
+            for (const v of this.hvs.prevotes(r).all()) {
+              if (r !== this.round) this.d.broadcastVote(v, null);
+              if (v.polRound >= 0 && bytesEqual(v.blockHash, valid)) rounds.push(v.polRound);
+            }
+          }
+        }
         // The round's proposer re-sends the round's proposal, whether it built the block or re-proposed another's.
         const prop = this.proposals.get(this.round);
         if (prop && prop.valid && !prop.fetched && bytesEqual(this.proposerAt(this.round), pv.address)) this.d.broadcastProposal(prop.proposal, null);
@@ -698,7 +750,7 @@ export class Consensus {
     // Line 22: a fresh proposal while we are in propose.
     if (this.step === 'propose' && prop && prop.proposal.polRound === -1) {
       this.step = 'prevote';
-      const unlockedOrSame = this.lockedRound === -1 || (this.lockedBlock !== null && bytesEqual(blockHash(this.lockedBlock), prop.hash));
+      const unlockedOrSame = this.lockedRound === -1 || (this.lockedHash !== null && bytesEqual(this.lockedHash, prop.hash));
       this.prevote(prop.valid && unlockedOrSame ? prop.hash : null);
       return true;
     }
@@ -708,8 +760,8 @@ export class Consensus {
       const vr = prop.proposal.polRound;
       if (this.hvs.prevotes(vr).hasQuorumFor(prop.hash)) {
         this.step = 'prevote';
-        const canUnlock = this.lockedRound <= vr || (this.lockedBlock !== null && bytesEqual(blockHash(this.lockedBlock), prop.hash));
-        this.prevote(prop.valid && canUnlock ? prop.hash : null);
+        const canUnlock = this.lockedRound <= vr || (this.lockedHash !== null && bytesEqual(this.lockedHash, prop.hash));
+        this.prevote(prop.valid && canUnlock ? prop.hash : null, vr);
         return true;
       }
     }
@@ -725,7 +777,7 @@ export class Consensus {
     if (prop && prop.valid && STEP_ORDER[this.step] >= STEP_ORDER.prevote && prevotes.hasQuorumFor(prop.hash) && !this.polkaHandled.has(r)) {
       this.polkaHandled.add(r);
       if (this.step === 'prevote') {
-        this.lockedBlock = prop.proposal.block;
+        this.lockedHash = prop.hash;
         this.lockedRound = r;
         this.step = 'precommit';
         this.precommit(prop.hash);
@@ -809,7 +861,7 @@ export class Consensus {
       height: this.height,
       round: this.round,
       step: this.step,
-      locked: this.lockedBlock ? toHex(blockHash(this.lockedBlock)).slice(0, 12) : null,
+      locked: this.lockedHash ? toHex(this.lockedHash).slice(0, 12) : null,
       valid: this.validBlock ? toHex(blockHash(this.validBlock)).slice(0, 12) : null,
       decisions: this.decisionCount,
     };

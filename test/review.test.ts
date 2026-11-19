@@ -83,7 +83,7 @@ const makeApp = () => new CoreApp({ genesis: genesis(), verifier: new InlineVeri
 
 async function block(app: CoreApp, txs: Uint8Array[] = [], misbehavior: { address: Uint8Array; height: bigint }[] = [], dt = 1000n) {
   const height = app.lastHeight + 1n;
-  const res = await app.finalizeBlock({ height, time: app.dynamic().time + dt, txs, proposerAddress: consA.address, lastCommitSigners: height === 1n ? [] : [consA.address], misbehavior });
+  const res = await app.finalizeBlock({ height, time: app.dynamic().time + dt, txs, proposerAddress: consA.address, lastCommitSigners: height === 1n ? [] : [consA.address], misbehavior: misbehavior.map((m) => ({ kind: 'duplicateVote' as const, ...m })) });
   await app.commit();
   return res;
 }
@@ -346,7 +346,7 @@ describe('review regressions', () => {
   it('keeps per-block results so a repeated transaction proves its real outcome at each position', () => {
     const store = new MemoryBlockStore();
     const raw = new Uint8Array([1, 2, 3]);
-    const header = { chainId, version: 1, height: 5n, time: 1n, lastBlockHash: new Uint8Array(32), lastCommitHash: new Uint8Array(32), dataHash: txsRoot([raw, raw]), lastResultsHash: new Uint8Array(32), validatorsHash: new Uint8Array(32), nextValidatorsHash: new Uint8Array(32), appHash: new Uint8Array(32), evidenceHash: new Uint8Array(32), proposerAddress: new Uint8Array(32) };
+    const header = { chainId, version: 1, height: 5n, time: 1n, lastBlockHash: new Uint8Array(32), lastCommitHash: new Uint8Array(32), dataHash: txsRoot([raw, raw]), lastResultsHash: new Uint8Array(32), validatorsHash: new Uint8Array(32), nextValidatorsHash: new Uint8Array(32), appHash: new Uint8Array(32), evidenceHash: new Uint8Array(32), proposerAddress: new Uint8Array(32), prioritiesHash: new Uint8Array(32) };
     const b = { header, txs: [raw, raw], lastCommit: null, evidence: [] };
     const results = [{ ok: true }, { ok: false, error: 'duplicate transaction' }];
     store.saveBlock(b, { height: 5n, round: 0, blockHash: blockHash(b), signatures: [null] }, results);
@@ -498,7 +498,7 @@ describe('review regressions on a network', () => {
     await node.stop();
     // Pretend the node had already signed a proposal for the next height before dying.
     const store = new FileSignStateStore(join(tmp, 'priv_validator_state.bin'));
-    store.save({ height: h + 1n, round: 0, step: SignStep.Propose, signBytes: new Uint8Array([1]), signature: zeroSignature(DEFAULT_SCHEME) });
+    store.save({ height: h + 1n, round: 0, step: SignStep.Propose, signBytes: new Uint8Array([1]), signature: zeroSignature(DEFAULT_SCHEME), lock: null });
     const restarted = await net.makeNode(0);
     net.nodes[0] = restarted;
     await restarted.start();

@@ -368,9 +368,11 @@ function trackDowntime(db: ObjectDatabase, req: FinalizeBlockRequest, params: St
   }
 }
 
-/** A double sign at `height`: slash, slash what left afterwards, tombstone, and send every delegator into unbonding. */
-export function punishDoubleSign(db: ObjectDatabase, v: Validator, height: bigint, time: bigint, params: StakingParameters, history: HistoryRecorder | null = null): void {
-  const bps = params.doubleSignSlashBps;
+/**
+ * A fault proven by evidence at `height`, a double sign or a forgotten lock: slash by `bps`, slash what left afterwards,
+ * tombstone, and send every delegator into unbonding. The two faults differ in the rate alone.
+ */
+export function punishEvidence(db: ObjectDatabase, v: Validator, height: bigint, time: bigint, params: StakingParameters, bps: number, history: HistoryRecorder | null = null): void {
   let current = slash(db, v, bps);
   history?.virtual(v.operator, HistoryKind.slash, virtualData.slash(v.id, v.tokens - current.tokens, true));
   history?.virtual(v.operator, HistoryKind.tombstone, virtualData.validator(v.id));
@@ -422,8 +424,9 @@ export function beginBlock(db: ObjectDatabase, req: FinalizeBlockRequest, log: L
   for (const m of req.misbehavior) {
     const v = validatorByAddress(db, m.address);
     if (!v || v.status === ValidatorStatus.tombstoned) continue;
-    punishDoubleSign(db, v, m.height, req.time, params, history);
-    log('warn', 'validator tombstoned for double signing', { validator: idToString(v.id), height: m.height });
+    const amnesia = m.kind === 'amnesia';
+    punishEvidence(db, v, m.height, req.time, params, amnesia ? params.amnesiaSlashBps : params.doubleSignSlashBps, history);
+    log('warn', amnesia ? 'validator tombstoned for forgetting a lock' : 'validator tombstoned for double signing', { validator: idToString(v.id), height: m.height });
   }
   // Last, so that stake whose liability ends in this very block is still there to be punished.
   matureQueues(db, req.time, g.coreAsset, history);

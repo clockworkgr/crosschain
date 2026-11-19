@@ -1,7 +1,6 @@
 /**
- * Proposer priorities and the header's commitment to them: what the two hashes of a validator set cover, which
- * headers carry the commitment, what block validation and a node joining from a snapshot do with it, and a chain
- * of protocol version 1 that has none.
+ * Proposer priorities and the header's commitment to them: what the two hashes of a validator set cover, and what
+ * block validation and a node joining from a snapshot do with it.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { CoreApp } from '../src/app/core/app.ts';
@@ -19,7 +18,7 @@ import { headerFromJson, jsonify } from '../src/rpc/json.ts';
 import { MemoryBlockStore } from '../src/store/blockstore.ts';
 import { MemoryKv } from '../src/store/kv.ts';
 import { stateSync } from '../src/sync/statesync.ts';
-import { PRIORITIES_VERSION, decodeHeader, encodeHeader, headerHash, type Block, type Header } from '../src/types/block.ts';
+import { decodeHeader, encodeHeader, headerHash, type Block, type Header } from '../src/types/block.ts';
 import { PROTOCOL_VERSION, genesisState } from '../src/types/state.ts';
 import { ValidatorSet, prioritiesHash } from '../src/types/validator.ts';
 import { makeTestnet, seedFor, verifier, waitFor, waitForHeight, type Testnet } from './helpers.ts';
@@ -52,7 +51,7 @@ describe('proposer priorities', () => {
     net = null;
   });
 
-  it('hashes a set by its members and its priorities apart, and commits a header to the priorities from version 2', () => {
+  it('hashes a set by its members and its priorities apart, and commits a header to the priorities', () => {
     const set = ValidatorSet.create(keys);
     const later = set.copy();
     later.incrementProposerPriority(1);
@@ -76,68 +75,43 @@ describe('proposer priorities', () => {
     // The header's hash is over the two sets in order.
     expect(prioritiesHash(set, later)).not.toEqual(prioritiesHash(later, set));
 
-    expect(PROTOCOL_VERSION).toBe(PRIORITIES_VERSION);
     const zero = new Uint8Array(32);
-    const v1: Header = { chainId: 'p', version: 1, height: 1n, time: 1n, lastBlockHash: zero, lastCommitHash: zero, dataHash: zero, lastResultsHash: zero, validatorsHash: zero, nextValidatorsHash: zero, appHash: zero, evidenceHash: zero, proposerAddress: zero };
-    const v2: Header = { ...v1, version: 2, prioritiesHash: prioritiesHash(set, later) };
-    const bytes1 = encode((w) => encodeHeader(w, v1));
-    const bytes2 = encode((w) => encodeHeader(w, v2));
-    expect(bytes2.length).toBe(bytes1.length + 32);
-    expect(decodeHeader(new Reader(bytes1))).toEqual(v1);
-    expect(decodeHeader(new Reader(bytes2))).toEqual(v2);
-    expect('prioritiesHash' in decodeHeader(new Reader(bytes1))).toBe(false);
-    // The field belongs to the version: neither a version 2 header without it nor a version 1 header with it has an encoding.
-    expect(() => headerHash({ ...v1, version: 2 })).toThrow(/needs a prioritiesHash/);
-    expect(() => headerHash({ ...v2, version: 1 })).toThrow(/has no prioritiesHash/);
-    // A header changed in that hash alone is another block.
-    expect(headerHash({ ...v2, prioritiesHash: prioritiesHash(later, set) })).not.toEqual(headerHash(v2));
-    // And over the RPC.
-    expect(headerFromJson(jsonify(v2))).toEqual(v2);
-    expect(headerFromJson(jsonify(v1))).toEqual(v1);
-    expect(() => headerFromJson({ ...(jsonify(v2) as object), prioritiesHash: undefined })).toThrow(/prioritiesHash/);
+    const header: Header = { chainId: 'p', version: PROTOCOL_VERSION, height: 1n, time: 1n, lastBlockHash: zero, lastCommitHash: zero, dataHash: zero, lastResultsHash: zero, validatorsHash: zero, nextValidatorsHash: zero, appHash: zero, evidenceHash: zero, proposerAddress: zero, prioritiesHash: prioritiesHash(set, later) };
+    const bytes = encode((w) => encodeHeader(w, header));
+    expect(decodeHeader(new Reader(bytes))).toEqual(header);
+    // The hash is the header's last 32 bytes, and a header changed in it alone is another block.
+    expect(bytes.subarray(bytes.length - 32)).toEqual(header.prioritiesHash);
+    expect(headerHash({ ...header, prioritiesHash: prioritiesHash(later, set) })).not.toEqual(headerHash(header));
+    // And over the RPC, where a header without it is none.
+    expect(headerFromJson(jsonify(header))).toEqual(header);
+    expect(() => headerFromJson({ ...(jsonify(header) as object), prioritiesHash: undefined })).toThrow(/prioritiesHash/);
   });
 
-  it('starts a chain under version 1 or 2 and no other, and refuses a block whose header commits to other priorities', () => {
+  it('starts a chain under the one protocol version, and refuses a block whose header commits to other priorities', () => {
     const genesis = (version?: number) => ({ chainId: 'p', genesisTime: 1n, signatureScheme: schemeName(DEFAULT_SCHEME), validators: keys, appState: new Uint8Array(0), ...(version === undefined ? {} : { consensus: { version } }) });
-    expect(genesisState(genesis(), new Uint8Array(32)).version).toBe(2);
+    expect(genesisState(genesis(), new Uint8Array(32)).version).toBe(1);
     expect(genesisState(genesis(1), new Uint8Array(32)).version).toBe(1);
-    expect(() => genesisState(genesis(3), new Uint8Array(32))).toThrow(/protocol version 3/);
+    expect(() => genesisState(genesis(2), new Uint8Array(32))).toThrow(/protocol version 2; this node runs 1/);
     expect(() => genesisState(genesis(0), new Uint8Array(32))).toThrow(/protocol version 0/);
 
-    const check = (version: number, change: (h: Header) => Header) => {
-      const state = genesisState(genesis(version), new Uint8Array(32));
+    const state = genesisState(genesis(), new Uint8Array(32));
+    const check = (hash: Uint8Array) => {
       const zero = new Uint8Array(32);
-      const base: Header = {
-        chainId: 'p', version, height: 1n, time: 2n, lastBlockHash: state.lastBlockHash, lastCommitHash: zero, dataHash: zero, lastResultsHash: state.lastResultsHash,
+      const header: Header = {
+        chainId: 'p', version: state.version, height: 1n, time: 2n, lastBlockHash: state.lastBlockHash, lastCommitHash: zero, dataHash: zero, lastResultsHash: state.lastResultsHash,
         validatorsHash: state.validators.hash(), nextValidatorsHash: state.nextValidators.hash(), appHash: state.appHash, evidenceHash: zero,
-        proposerAddress: state.validators.proposer().address,
-        ...(version >= PRIORITIES_VERSION ? { prioritiesHash: prioritiesHash(state.validators, state.nextValidators) } : {}),
+        proposerAddress: state.validators.proposer().address, prioritiesHash: hash,
       };
-      const block: Block = { header: change(base), txs: [], lastCommit: null, evidence: [] };
-      const error = validateBlockStructure(state, block, DEFAULT_LIMITS, null, () => null);
-      // Whatever else these bare blocks lack, the hashes of the sets are checked first.
-      return { state, error };
+      const block: Block = { header, txs: [], lastCommit: null, evidence: [] };
+      return validateBlockStructure(state, block, DEFAULT_LIMITS, null, () => null);
     };
-    const good = check(2, (h) => h);
-    expect(good.error).not.toMatch(/prioritiesHash|validatorsHash/);
+    // Whatever else this bare block lacks, the hashes of the sets are checked first.
+    expect(check(prioritiesHash(state.validators, state.nextValidators))).not.toMatch(/prioritiesHash|validatorsHash/);
     // The sets of the state in the wrong order, the priorities of one of them alone, and those of a set with the same members.
-    expect(check(2, (h) => ({ ...h, prioritiesHash: prioritiesHash(good.state.nextValidators, good.state.validators) })).error).toBe('wrong prioritiesHash');
-    expect(check(2, (h) => ({ ...h, prioritiesHash: good.state.validators.prioritiesHash() })).error).toBe('wrong prioritiesHash');
-    expect(check(2, (h) => ({ ...h, prioritiesHash: prioritiesHash(shifted(good.state.validators), good.state.nextValidators) })).error).toBe('wrong prioritiesHash');
-    expect(check(2, (h) => ({ ...h, prioritiesHash: undefined })).error).toBe('wrong prioritiesHash');
-    // A version 1 chain checks none, and a header of the other version is refused for its version.
-    expect(check(1, (h) => h).error).toBe(good.error);
-    expect(check(1, (h) => ({ ...h, version: 2, prioritiesHash: new Uint8Array(32) })).error).toMatch(/protocol version 2, expected 1/);
-    expect(check(2, (h) => ({ ...h, version: 1, prioritiesHash: undefined })).error).toMatch(/protocol version 1, expected 2/);
-  });
-
-  it('runs a chain of version 1 with headers as they were', async () => {
-    net = await makeTestnet({ validators: 4, consensus: { version: 1 } });
-    await waitForHeight(net.nodes, 4n);
-    for (const node of net.nodes) {
-      expect(node.executor.state.version).toBe(1);
-      for (let h = 1n; h <= 3n; h++) expect(node.store.loadBlock(h)!.block.header.prioritiesHash).toBeUndefined();
-    }
+    expect(check(prioritiesHash(state.nextValidators, state.validators))).toBe('wrong prioritiesHash');
+    expect(check(state.validators.prioritiesHash())).toBe('wrong prioritiesHash');
+    expect(check(prioritiesHash(shifted(state.validators), state.nextValidators))).toBe('wrong prioritiesHash');
+    expect(check(prioritiesHash(reindexed(state.validators), state.nextValidators))).toBe('wrong prioritiesHash');
   });
 
   it('commits every header to the priorities its node holds, and joins from a snapshot only with the sets the headers commit to', async () => {
@@ -156,7 +130,6 @@ describe('proposer priorities', () => {
     for (const node of net.nodes) {
       for (let h = 1n; h <= 8n; h++) {
         const header = node.store.loadBlock(h)!.block.header;
-        expect(header.version).toBe(2);
         expect(header.prioritiesHash).toEqual(prioritiesHash(node.store.loadValidatorsAt(h)!, node.store.loadValidatorsAt(h + 1n)!));
       }
     }
@@ -170,7 +143,7 @@ describe('proposer priorities', () => {
       stateSync({ chainId: net!.genesis.chainId, network, requester, verifier, chainStore, appKv: new MemoryKv(), types: CORE_TYPES, log: () => {}, trustHeight: 2n, trustHash: headerHash(sources[0]!.store.loadBlock(2n)!.block.header), scheme: DEFAULT_SCHEME, evidenceAgeMs: () => 0n, requestTimeoutMs: 2000 });
 
     // A source that hands out its sets with the priorities shifted: the members' hash is right and so is the proposer
-    // each height had, which is all a joiner could check before the header said more.
+    // each height had, which is all a joiner could check if the header said nothing of priorities.
     const honest = sources.map((n) => n.store.loadValidatorsAt.bind(n.store));
     const lie = (i: number, heights: bigint[], how = shifted) => {
       sources[i]!.store.loadValidatorsAt = (h) => {

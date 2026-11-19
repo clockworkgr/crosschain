@@ -116,7 +116,7 @@ Every exported symbol:
 - **`CheckTxOptions`**: one optional field, `admit?: () => string | null`. It is "Asked after the check's last wait, just before the transaction would go into the pending state: why the caller no longer takes it (the mempool paused or filled while it was checked), or null. A refusal leaves nothing behind." The mempool passes it from `addTx` (below); the recheck after a commit passes none.
 - **`CheckTxResult`**: `{ ok: boolean; error?: string }`. The mempool stores the transaction only if `ok`, and returns `error` to the submitter.
 - **`TxResult`**: the same shape, one per transaction in a block. The executor hashes these into the results root (`resultsRoot` in `src/types/txproof.ts`, which encodes each as `u8 ok, string error`) and stores them with the block so the RPC can serve result proofs.
-- **`Misbehavior`**: `{ address: Uint8Array; height: bigint }`, "A validator proven to have double-signed, for the app to slash." The executor resolves evidence to this form so the application never parses votes.
+- **`Misbehavior`**: `{ kind: 'duplicateVote' | 'amnesia'; address: Uint8Array; height: bigint }`, "A validator proven at fault by evidence in the block, for the app to slash: two votes in one place, or a lock forgotten." The executor resolves evidence to this form so the application never parses votes; the kind is passed on because an application may punish the two differently.
 - **`FinalizeBlockRequest`**: `height`, `time` (the proposer's block time, the application's only clock), `txs`, `proposerAddress`, `lastCommitSigners` ("Addresses whose precommits were included in this block's lastCommit. For rewards.") and `misbehavior`. Compare ABCI's `RequestFinalizeBlock`, which carries the same information as `decided_last_commit` and `misbehavior`.
 - **`FinalizeBlockResult`**: `appHash`, `txResults` (same length and order as `txs`), `validatorUpdates` (`ValidatorUpdate` from chapter 3: public key and power, power 0 removes).
 - **`InitChainResult`**: `appHash` and optional `validators`; "If non-empty, replaces the genesis validator set." This is `STAKING.md` section 2.3: the core application derives the set from its own genesis (operators, consensus keys, self-bonds), and the engine's `Genesis.validators` is optional.
@@ -514,18 +514,19 @@ Only the last applied height, only for the same block hash, only if the new comm
 
 `blockTimeAt(height)`: `lastBlockTime` for the last height, else the time of `headerAt(height)`, else null. This is the `BlockTimeLookup` for evidence age, for consensus and for block sync alike.
 
-`buildRequest(block)` (private) turns a block into a `FinalizeBlockRequest`: `lastCommitSigners` are the addresses at the non-null indices of `block.lastCommit.signatures` in the set that signed `h - 1` (`STAKING.md` section 9 notes that the application simply skips a signer removed since); `misbehavior` resolves each evidence item's `validatorIndex` through the set of its height:
+`buildRequest(block)` (private) turns a block into a `FinalizeBlockRequest`: `lastCommitSigners` are the addresses at the non-null indices of `block.lastCommit.signatures` in the set that signed `h - 1` (`STAKING.md` section 9 notes that the application simply skips a signer removed since); `misbehavior` resolves each evidence item's accused (`evidenceValidator`, an index) through the set of its height (`evidenceHeight`), whichever kind of evidence it is:
 
 ```ts
     const misbehavior: Misbehavior[] = [];
     for (const ev of block.evidence) {
       // Every node must hand the application the same offender, so a set this node cannot find is a halt with a
       // reason, never a silent omission that would leave it computing a different state from everyone else.
-      const set = this.validatorSetAtHeight(ev.voteA.height);
-      if (!set) throw new Error(`block ${h} carries evidence for height ${ev.voteA.height}, whose validator set this node does not hold; its history does not reach that far`);
-      const val = set.byIndex(ev.voteA.validatorIndex);
-      if (!val) throw new Error(`block ${h} carries evidence naming validator ${ev.voteA.validatorIndex}, outside the set of height ${ev.voteA.height}`);
-      misbehavior.push({ address: val.address, height: ev.voteA.height });
+      const at = evidenceHeight(ev);
+      const set = this.validatorSetAtHeight(at);
+      if (!set) throw new Error(`block ${h} carries evidence for height ${at}, whose validator set this node does not hold; its history does not reach that far`);
+      const val = set.byIndex(evidenceValidator(ev));
+      if (!val) throw new Error(`block ${h} carries evidence naming validator ${evidenceValidator(ev)}, outside the set of height ${at}`);
+      misbehavior.push({ kind: ev.kind, address: val.address, height: at });
     }
 ```
 
@@ -581,7 +582,7 @@ Evidence this node cannot place, because it holds neither the block nor the head
     const age = this.d.evidenceAgeMs?.();
     if (age !== undefined) {
       this.d.evidencePool.pruneIf((ev) => {
-        const at = ev.voteA.height === newState.lastHeight ? newState.lastBlockTime : this.blockTimeAt(ev.voteA.height);
+        const at = evidenceHeight(ev) === newState.lastHeight ? newState.lastBlockTime : this.blockTimeAt(evidenceHeight(ev));
         return at === null || newState.lastBlockTime - at > age;
       });
     }

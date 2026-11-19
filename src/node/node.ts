@@ -10,8 +10,8 @@ import type { Application } from '../app/types.ts';
 import { CoreApp } from '../app/core/app.ts';
 import { loadAppGenesis } from '../app/core/genesis.ts';
 import { Consensus, DEFAULT_LIMITS, type ConsensusTimeouts } from '../consensus/consensus.ts';
-import { EvidencePool, evidenceId, verifyDuplicateVoteEvidence } from '../consensus/evidence.ts';
-import { decodeEvidence, encodeEvidence } from '../types/evidence.ts';
+import { EvidencePool, evidenceId, verifyEvidence } from '../consensus/evidence.ts';
+import { decodeEvidence, encodeEvidence, evidenceHeight, evidenceValidator } from '../types/evidence.ts';
 import { decode } from '../codec/reader.ts';
 import { sha256, toHex } from '../crypto/hash.ts';
 import { txHash, type Header } from '../types/block.ts';
@@ -633,15 +633,15 @@ export class Node {
     // commit let it go. Measured at the last block's time, which is the earliest the next block's can be. The peer
     // is not marked for it: it may be ahead of this node, or hold history this node has pruned.
     const state = this.executor.state;
-    if (evidenceAgeOk(ev.voteA.height, state.lastHeight + 1n, state.lastBlockTime, state, this.limits, (h) => this.executor.blockTimeAt(h))) return;
-    const set = this.executor.validatorSetAtHeight(ev.voteA.height);
+    if (evidenceAgeOk(evidenceHeight(ev), state.lastHeight + 1n, state.lastBlockTime, state, this.limits, (h) => this.executor.blockTimeAt(h))) return;
+    const set = this.executor.validatorSetAtHeight(evidenceHeight(ev));
     if (!set) return;
-    const err = await verifyDuplicateVoteEvidence(this.chainId, ev, set, this.verifier);
+    const err = await verifyEvidence(this.chainId, ev, set, this.verifier);
     if (err) {
       this.network.score(peerId, 20, `invalid evidence: ${err}`);
       return;
     }
-    if (this.evidencePool.add(ev)) this.log('warn', 'evidence received from peer', { h: ev.voteA.height, validator: ev.voteA.validatorIndex });
+    if (this.evidencePool.add(ev)) this.log('warn', 'evidence received from peer', { h: evidenceHeight(ev), kind: ev.kind, validator: evidenceValidator(ev) });
   }
 
   /**

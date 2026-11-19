@@ -27,10 +27,21 @@ Principle: as simple as possible, borrowing proven ideas from other chains.
   keeps the time its first proposer gave it and is not clock-checked again, nor are
   blocks arriving through block sync or fetched after a precommit quorum.
 - **Validator set changes:** updates returned by the app at height H take effect at H+2.
-- **Slashable faults:** duplicate vote (same height/round, different block). Amnesia
-  evidence deferred.
+- **Slashable faults:** duplicate vote (two different votes of one type at one height
+  and round) and amnesia (a precommit for one block and a later prevote for another
+  with nothing since the precommit to justify it). Both are proven by two votes of the
+  validator. For the second, a prevote for a block signs the round of the +2/3 prevotes
+  it relies on (`polRound`), and a node counts such a prevote for its block only once it
+  holds that round's +2/3 itself; so a validator leaves a lock either on a majority that
+  exists or by naming a round before its lock, and its own two votes then convict it.
+  If two blocks are ever decided at one height while less than two thirds of the power
+  is faulty, more than a third of the power has left evidence of one kind or the other.
+  (With two thirds faulty, precommits alone can decide two blocks and convict nobody.)
 - **Double-sign protection:** every validator persists last signed (height, round, step)
-  to disk *before* broadcasting any vote. Non-negotiable.
+  to disk *before* broadcasting any vote. Non-negotiable. The same record holds the
+  validator's lock (the block it last precommitted in the height, and the round), so a
+  restart in the middle of a height takes the lock up again, and the signer itself refuses
+  a prevote for another block that names no majority from the lock's round on.
 
 ## 2. Consensus / application split (ABCI-style)
 
@@ -1196,18 +1207,16 @@ misbehaviour list than every other node and diverge the state. Validator sets ar
 also stored by the height they sign, priorities included, because a state-synced
 node must continue consensus with the exact proposer priorities. The set hash covers
 members and powers only, so that one record by hash serves every height those members
-sign. From protocol version 2 a header therefore carries one more hash, `prioritiesHash`:
+sign. A header therefore carries one more hash, `prioritiesHash`:
 the hash of the priorities and proposer of the set of its height, then of the set of the
 next. Block validation checks it against the state like the two set hashes, and a
 joining node takes the sets of H+1 and H+2 only as a pair header H+1 commits to, and
 the set of H only as header H commits to it with the set of H+1; a peer serving others
-is charged and the next one asked. A chain keeps the version of its genesis: one started
-under version 1 keeps headers without the field, and a node joining it can only check
-that the sets pick the proposers the chain used.
+is charged and the next one asked.
 
 ## 10. Implementation status (2026-11-19)
 
-Everything above is implemented in TypeScript under `src/`. 299 tests in 30 files
+Everything above is implemented in TypeScript under `src/`. 306 tests in 31 files
 pass, and the whole suite passes under either signature scheme
 (`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there) and with
 either tier of state paging dropped from the start (`INDEX_TREES=0`, `TREES=0`, or
@@ -1218,7 +1227,7 @@ on a live four-validator network with a full node, gossiping signed transactions
 checking a proof from one node against the app hash in the next header on every node,
 then querying a past height and a name and verifying them with the light client. A
 separate test grows a validator set and shrinks it past the trust level and watches
-the light client bisect. The priorities suite hashes a set by its members and by its priorities, refuses a block whose header commits to other priorities than the state's, runs a chain of version 1 with headers as they were, and joins from a snapshot past sources that serve sets with shifted priorities. The staking suite walks every rule one block at a time with
+the light client bisect. The priorities suite hashes a set by its members and by its priorities, refuses a block whose header commits to other priorities than the state's, and joins from a snapshot past sources that serve sets with shifted priorities. The amnesia suite signs the round a prevote relies on, keeps a validator's lock through a restart and refuses to sign past it, proves a forgotten lock from two votes, counts a prevote that names a majority only once that majority is held, has a network find a forgotten lock and every application punish it, and decides a block proposed again in a later round on prevotes that name the first. The staking suite walks every rule one block at a time with
 a supply invariant checked after each scenario, and a network test runs an
 application-owned set through delegation, a stopped validator being jailed, its
 return by unjail, and a light client following the whole sequence. The fee suite prices
@@ -1277,7 +1286,7 @@ blocks and 72,092 transfers without an abort.
 | `src/codec/` | deterministic binary writer and reader |
 | `src/crypto/` | sha256, tagged keys and signing under ML-DSA-44 or secp256k1, verification worker pool |
 | `src/types/` | validator set and proposer selection, votes, evidence, blocks, proposals, genesis, chain state |
-| `src/consensus/` | the Tendermint state machine, vote sets, evidence pool, private validator with double-sign guard, block validation |
+| `src/consensus/` | the Tendermint state machine, vote sets with the counting of prevotes that name a majority, evidence pool, private validator with double-sign guard and durable lock, block validation |
 | `src/mempool.ts` | FIFO pool with checkTx admission and post-commit recheck |
 | `src/p2p/` | transport interface, in-memory and TCP transports, wire messages, peer database, network with handshake and peer exchange |
 | `src/node/` | block executor with crash recovery, the memory guard with load shedding and the collection scheduler, and the node that wires everything |
@@ -1296,7 +1305,13 @@ blocks and 72,092 transfers without an abort.
 
 Known simplifications, all deliberate and all revisitable:
 
-- Amnesia evidence (locking rule violations) is not detected. Only duplicate votes are.
+- Evidence is found only in the votes of the height a node is in: a fault that comes to
+  light after the height is over is not reported by nodes that were not there to see both
+  votes. A prevote that names a majority which never formed is not punished, only never
+  counted; a proposer that signs two proposals for one round is not reported.
+- There is one protocol version, 1, and it changes in place while the chain is
+  unreleased: a data directory written by an earlier build of the header, vote or
+  evidence formats is not carried over.
 - Vote verification is not rate limited per peer; a vote more than 1,000 rounds ahead
   of the node's round is dropped before its signature is verified.
 - Proposals for the next height are held until it starts, 8 in all. One is held only
@@ -1320,13 +1335,6 @@ Known simplifications, all deliberate and all revisitable:
   proxy.
 - A delegator who redelegates away from a validator and then undelegates from the
   destination escapes a later slash of the source, as in Cosmos.
-- On a chain of protocol version 1, proposer priorities are covered by nothing a
-  validator signs. A node joining such a chain by state sync checks that the sets it is
-  given pick the proposers the chain actually used at the snapshot height and the one
-  after, and derives nothing else from them; a peer could still craft priorities that
-  pass that check and diverge later. Version 2, the default for a new chain, commits
-  every header to them (section 9). There is no way to move a running chain from one
-  version to the other.
 - The light client's trusting period is the client's choice and must stay below the
   chain's unbonding period; the engine's evidence age follows the unbonding period
   automatically.
@@ -1401,9 +1409,6 @@ done about each finding.
   block stay, and so do the sets by hash that only heights pruned then carried.
 - `changedSince()` does not see an object removed outside a session since the last
   root. The node never writes outside a session.
-- A validator restarted in the middle of a height forgets its lock: the sign state keeps what
-  was signed, not the locked block, so after a restart it may prevote another block in a later
-  round of that height. Tendermint's accountability for this (amnesia evidence) is not implemented.
 - Index roots inside a type leaf are the SMT roots at that height; the B+ tree indices used for lookups are not authenticated.
 - The version history window is trimmed in memory as the heap fills: from `warn` until
   the window has grown back, proofs and queries at heights older than the last two are

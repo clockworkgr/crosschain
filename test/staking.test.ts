@@ -70,7 +70,7 @@ function makeApp(genesis = makeGenesis()): CoreApp {
 interface BlockOpts {
   proposer?: KeyPair;
   signers?: KeyPair[];
-  misbehavior?: { address: Uint8Array; height: bigint }[];
+  misbehavior?: { address: Uint8Array; height: bigint; kind?: 'duplicateVote' | 'amnesia' }[];
   dt?: bigint;
 }
 
@@ -83,7 +83,7 @@ async function block(app: CoreApp, txs: Uint8Array[] = [], o: BlockOpts = {}) {
     txs,
     proposerAddress: (o.proposer ?? cons[0]!).address,
     lastCommitSigners: height === 1n ? [] : (o.signers ?? [cons[0]!, cons[1]!]).map((k) => k.address),
-    misbehavior: o.misbehavior ?? [],
+    misbehavior: (o.misbehavior ?? []).map((m) => ({ kind: 'duplicateVote' as const, ...m })),
   });
   await app.commit();
   return res;
@@ -300,6 +300,41 @@ describe('staking', () => {
     expect(app.db.range(UnbondingType, 'byCompletion', new Uint8Array(0)).length).toBe(0);
     expect(app.balance(OP_ID(0))).toBeGreaterThan(opBalance);
     checkSupply(app);
+  });
+
+  it('tombstones a validator that forgot a lock like a double signer, at the rate of its own parameter', async () => {
+    // The two rates apart, so that which one was applied shows: 5% for a double sign, 20% for a forgotten lock.
+    const app = makeApp(makeGenesis({ ...PARAMS, amnesiaSlashBps: 2000 }));
+    expect(app.global().staking.amnesiaSlashBps).toBe(2000);
+    expect(app.global().staking.doubleSignSlashBps).toBe(500);
+    await block(app);
+    await block(app, [tx(app, [{ type: 'delegate', delegator: FAUCET_ID, validator: VAL_ID(0), amount: T(100) }], [faucet])]);
+    const infraction = app.lastHeight;
+    const d = delegationOf(app.db, FAUCET_ID, VAL_ID(0))!;
+    await block(app, [tx(app, [{ type: 'undelegate', delegator: FAUCET_ID, validator: VAL_ID(0), shares: d.shares / 2n }], [faucet])]);
+    const entryBefore = app.db.range(UnbondingType, 'byCompletion', new Uint8Array(0))[0]!;
+    const a = val(app, 0);
+    const pool = app.dynamic().communityPool;
+    const r = await block(app, [], { misbehavior: [{ kind: 'amnesia', address: cons[0]!.address, height: infraction }] });
+    const after = val(app, 0);
+    expect(after.status).toBe(ValidatorStatus.tombstoned);
+    expect(after.tokens).toBe(0n);
+    expect(r.validatorUpdates.map((u) => u.power)).toEqual([0n]);
+    const entries = app.db.range(UnbondingType, 'byValidator', encode((w) => w.u64(VAL_ID(0))));
+    expect(entries.length).toBe(3);
+    // The entry that left after the infraction lost a fifth, and so did the stake: what the delegators are owed is at most four fifths.
+    expect(entries.find((e) => e.id === entryBefore.id)!.tokens).toBe(entryBefore.tokens - (entryBefore.tokens * 2000n) / 10_000n);
+    const forced = entries.filter((e) => e.id !== entryBefore.id).reduce((s, e) => s + e.tokens, 0n);
+    expect(forced).toBeLessThanOrEqual(a.tokens - (a.tokens * 2000n) / 10_000n);
+    expect(forced).toBeGreaterThan(a.tokens - (a.tokens * 2000n) / 10_000n - T(1));
+    expect(app.dynamic().communityPool).toBeGreaterThanOrEqual(pool + (a.tokens * 2000n) / 10_000n);
+    // Tombstoned once: evidence of the other kind for the same validator changes nothing more.
+    const poolAfter = app.dynamic().communityPool;
+    await block(app, [], { misbehavior: [{ address: cons[0]!.address, height: infraction }], signers: [cons[1]!], proposer: cons[1]! });
+    expect(app.dynamic().communityPool - poolAfter).toBeLessThan(T(1));
+    checkSupply(app);
+    // The rate is a staking parameter like the others: out of range, the genesis is refused.
+    expect(() => makeApp(makeGenesis({ ...PARAMS, amnesiaSlashBps: 10_001 }))).toThrow(/amnesiaSlashBps must be 0 to 10000/);
   });
 
   it('mints toward the bonded goal and never past the max supply', async () => {
