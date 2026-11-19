@@ -28,15 +28,22 @@ Principle: as simple as possible, borrowing proven ideas from other chains.
   blocks arriving through block sync or fetched after a precommit quorum.
 - **Validator set changes:** updates returned by the app at height H take effect at H+2.
 - **Slashable faults:** duplicate vote (two different votes of one type at one height
-  and round) and amnesia (a precommit for one block and a later prevote for another
-  with nothing since the precommit to justify it). Both are proven by two votes of the
-  validator. For the second, a prevote for a block signs the round of the +2/3 prevotes
+  and round), duplicate proposal (two different proposals for one height and round),
+  amnesia (a precommit for one block and a later prevote for another with nothing
+  since the precommit to justify it) and false citation (a prevote that names a round
+  in which +2/3 of the power prevoted something else). The first three are proven by
+  two signatures of the validator; the fourth by its prevote and the prevotes of
+  others, on the assumption that less than a third of the power signs twice. Nodes keep
+  the votes and proposal signatures of the last 16 heights, so the second half of a
+  proof may arrive after its height is decided. For amnesia, a prevote for a block signs the round of the +2/3 prevotes
   it relies on (`polRound`), and a node counts such a prevote for its block only once it
   holds that round's +2/3 itself; so a validator leaves a lock either on a majority that
   exists or by naming a round before its lock, and its own two votes then convict it.
   If two blocks are ever decided at one height while less than two thirds of the power
   is faulty, more than a third of the power has left evidence of one kind or the other.
-  (With two thirds faulty, precommits alone can decide two blocks and convict nobody.)
+  (With more than two thirds faulty, precommits alone can decide two blocks and convict nobody.)
+  A validator that names a later round falsely to avoid that is not counted, and is
+  convicted of the false citation where the prevotes of that round allow it.
 - **Double-sign protection:** every validator persists last signed (height, round, step)
   to disk *before* broadcasting any vote. Non-negotiable. The same record holds the
   validator's lock (the block it last precommitted in the height, and the round), so a
@@ -938,8 +945,9 @@ ids make adding one unusually easy.
   lets past index versions be rebuilt from the object history after a restart, when
   the store's history records do not hold the nodes each version overwrote (they do
   since STATE-PAGING.md section 7.3; the store holds the current nodes, below). Nodes are immutable and writes
-  copy the path, so a past version is a root pointer. Lookups by owner and similar
-  non-unique indices stay unauthenticated.
+  copy the path, so a past version is a root pointer. A non-unique index
+  can be authenticated too, over its entries (the key with the object's id); the indices
+  with an entry for each balance stay unauthenticated.
 - **Trees on disk and droppable Merkle trees.** Tier three of `STATE-PAGING.md` (phase
   four; `src/db/merkle.ts`, `src/db/smt.ts`). Every root also reports the tree chunks
   and sparse tree nodes it wrote or deleted (`Changes.trees`), and the commit writes
@@ -1216,7 +1224,7 @@ is charged and the next one asked.
 
 ## 10. Implementation status (2026-11-19)
 
-Everything above is implemented in TypeScript under `src/`. 306 tests in 31 files
+Everything above is implemented in TypeScript under `src/`. 322 tests in 32 files
 pass, and the whole suite passes under either signature scheme
 (`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there) and with
 either tier of state paging dropped from the start (`INDEX_TREES=0`, `TREES=0`, or
@@ -1227,7 +1235,7 @@ on a live four-validator network with a full node, gossiping signed transactions
 checking a proof from one node against the app hash in the next header on every node,
 then querying a past height and a name and verifying them with the light client. A
 separate test grows a validator set and shrinks it past the trust level and watches
-the light client bisect. The priorities suite hashes a set by its members and by its priorities, refuses a block whose header commits to other priorities than the state's, and joins from a snapshot past sources that serve sets with shifted priorities. The amnesia suite signs the round a prevote relies on, keeps a validator's lock through a restart and refuses to sign past it, proves a forgotten lock from two votes, counts a prevote that names a majority only once that majority is held, has a network find a forgotten lock and every application punish it, and decides a block proposed again in a later round on prevotes that name the first. The staking suite walks every rule one block at a time with
+the light client bisect. The priorities suite hashes a set by its members and by its priorities, refuses a block whose header commits to other priorities than the state's, and joins from a snapshot past sources that serve sets with shifted priorities. The amnesia suite signs the round a prevote relies on, keeps a validator's lock through a restart and refuses to sign past it, proves a forgotten lock from two votes, counts a prevote that names a majority only once that majority is held, has a network find a forgotten lock and every application punish it, and decides a block proposed again in a later round on prevotes that name the first. The faults suite proves two proposals for a round from their signatures and a prevote on a majority that never was from the prevotes of the round it names, has one state machine report each, and has a network punish a double sign, a second proposal and a false citation that came to light when their height was over. The staking suite walks every rule one block at a time with
 a supply invariant checked after each scenario, and a network test runs an
 application-owned set through delegation, a stopped validator being jailed, its
 return by unjail, and a light client following the whole sequence. The fee suite prices
@@ -1305,14 +1313,24 @@ blocks and 72,092 transfers without an abort.
 
 Known simplifications, all deliberate and all revisitable:
 
-- Evidence is found only in the votes of the height a node is in: a fault that comes to
-  light after the height is over is not reported by nodes that were not there to see both
-  votes. A prevote that names a majority which never formed is not punished, only never
-  counted; a proposer that signs two proposals for one round is not reported.
+- Evidence is found in what a node holds in memory: the votes and proposal signatures of
+  its height and of the 16 heights before. The second half of a proof that comes later
+  than that, or to a node that was restarted since, is dropped. A prevote that names a
+  majority which never formed is punished only where +2/3 of the power prevoted something
+  else in the round named, and on the assumption that less than a third signs twice;
+  elsewhere it is only never counted. A second proposal for a round is not relayed, so two
+  nodes that were each sent a different one may never compare.
+- A validator restarted without its sign-state record signs again in heights it signed in
+  before and is reported for it; a node does not hold back from signing while it catches up.
 - There is one protocol version, 1, and it changes in place while the chain is
   unreleased: a data directory written by an earlier build of the header, vote or
   evidence formats is not carried over.
-- Vote verification is not rate limited per peer; a vote more than 1,000 rounds ahead
+- Vote verification is limited to 200 votes of one peer a second, or eight for each
+  validator if that is more; the rest wait, up to 1,024 of one peer or 64 for each validator (32,768 at most), and are verified as
+  the budget allows, and a peer whose votes find no room to wait is charged 10 points
+  for the second. Proposals are not counted this way: a bad
+  signature costs 20 points, and a proposal for a round that has one costs a
+  verification only if it says something else. A vote more than 1,000 rounds ahead
   of the node's round is dropped before its signature is verified.
 - Proposals for the next height are held until it starts, 8 in all. One is held only
   if it is fresh (no proof of lock), its round is within 1,000, its block is of that
@@ -1324,17 +1342,24 @@ Known simplifications, all deliberate and all revisitable:
   validator of the next height's set, and the limits are counted by signer. Four validators that sign proposals for rounds that
   will not come can still fill the 8 and keep the real proposal out until gossip sends
   it again, which it does while its round lasts.
-- Non-unique indices (balances by owner, transactions by expiry, validators by power)
-  are not in the state root; only the authenticated unique indices are: account
-  names, asset symbols, validators by operator and by current consensus address, and
-  delegations by (delegator, validator).
+- An index is in the state root if it is marked authenticated, unique or not: account
+  names, asset symbols, validators by operator, by current consensus address and by
+  power, delegations by (delegator, validator) and by validator, and every index of the
+  unbonding entries, the redelegation entries and the proposals. A proof is of one
+  entry, present or absent; for a non-unique index the entry is the key with an
+  object's id, so that a list of the objects under a key is complete cannot be proven.
+  The indices that have an entry for each balance or each recent transaction are left
+  out, since their trees would grow with the state.
 - A state-synced node has account history only from its snapshot height; backfilled
   blocks carry no execution results, so their transactions are indexed as not
   executed here.
-- The RPC has no authentication; it is meant for loopback or a query node behind a
-  proxy.
-- A delegator who redelegates away from a validator and then undelegates from the
-  destination escapes a later slash of the source, as in Cosmos.
+- The RPC's authentication is one shared token (`rpcToken` in a node's `config.json`),
+  sent in the clear with each request and good for every method; without one the RPC
+  answers anyone who reaches it. It is meant for loopback or a query node behind a
+  proxy that provides TLS.
+- A slash of redelegated stake is taken at the destination, from the delegation there
+  and then from what the delegator has undelegated from it since. Cosmos stops at the
+  delegation, which lets a delegator who redelegates and then undelegates escape.
 - The light client's trusting period is the client's choice and must stay below the
   chain's unbonding period; the engine's evidence age follows the unbonding period
   automatically.

@@ -20,7 +20,7 @@ import { Requester } from '../p2p/request.ts';
 import { stateSync } from '../sync/statesync.ts';
 import { CORE_TYPES } from '../app/core/types.ts';
 import { getGlobal } from '../app/core/state.ts';
-import { FileSignStateStore, MemorySignStateStore, PrivValidator } from '../consensus/privval.ts';
+import { FileSignStateStore, MemorySignStateStore, PrivValidator, type SignStateStore } from '../consensus/privval.ts';
 import { evidenceAgeOk, type ValidationLimits } from '../consensus/validate.ts';
 import { keyPairFromSeed, schemeTag, type KeyPair } from '../crypto/keys.ts';
 import { WorkerVerifier, type Verifier } from '../crypto/verifier.ts';
@@ -87,6 +87,12 @@ export interface NodeConfig {
   limits?: Partial<Omit<ValidationLimits, 'maxBlockBytes'>>;
   network?: Partial<Pick<NetworkConfig, 'desiredOutbound' | 'maxInbound' | 'connectIntervalMs' | 'pingIntervalMs' | 'idleTimeoutMs'>>;
   lagGraceMs?: number;
+  /**
+   * Where the validator's last signature and lock are kept, for a node without a data directory that is to be
+   * stopped and made again: a validator that comes back without them signs heights it already signed, and its
+   * peers hold the first signatures against the second for as long as they keep those heights.
+   */
+  signState?: SignStateStore;
   log?: Logger;
   logLevel?: LogLevel;
   /** Heap thresholds and sampling for the memory guard (see memory.ts); tests inject their own `stats`. */
@@ -252,7 +258,7 @@ export class Node {
       this.privValidator = cfg.validatorSeed
         ? new PrivValidator(
             keyPairFromSeed(cfg.validatorSeed, scheme),
-            cfg.dataDir ? new FileSignStateStore(join(cfg.dataDir, 'priv_validator_state.bin')) : new MemorySignStateStore(),
+            cfg.signState ?? (cfg.dataDir ? new FileSignStateStore(join(cfg.dataDir, 'priv_validator_state.bin')) : new MemorySignStateStore()),
             this.chainId,
           )
         : null;
@@ -403,6 +409,9 @@ export class Node {
     if (this.app instanceof CoreApp && this.indexTrees === 'store') this.app.db.dropIndexTrees();
     // A window in memory shorter than the provable one, when asked for: never longer than what the store was opened with.
     if (this.app instanceof CoreApp && this.historyInMemory < this.app.db.historyWindow) this.app.db.setHistoryWindow(this.historyInMemory);
+    // What the block builder will give one piece of evidence: half the block, less its slack and the two array
+    // counts around it. A larger record is taken in by no node, since no block this chain's proposers build has room.
+    this.evidencePool.maxRecordBytes = Math.floor(this.limits.maxBlockBytes / 2) - 1024 - 8;
     // Half the block at most, with the four bytes of its length: the block builder gives evidence no more than
     // the other half, so a transaction admitted here fits the next block it is first in line for.
     this.mempool = new Mempool(this.app, { maxTxBytes: Math.min(1024 * 1024, Math.floor(this.limits.maxBlockBytes / 2) - 4) });

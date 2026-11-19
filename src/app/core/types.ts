@@ -535,7 +535,7 @@ export const ValidatorType: ObjectType<Validator> = {
     { name: 'byOperator', unique: true, authenticated: true, key: (v, k) => k.id(v.operator) },
     { name: 'byConsensusAddress', unique: true, authenticated: true, key: (v, k) => k.fixed(addressOf(v.consensusKey)) },
     // Ascending key order is descending stake; ties fall back to the id the index appends.
-    { name: 'byPower', unique: false, key: (v, k) => k.u64(MAX_U64 - v.tokens) },
+    { name: 'byPower', unique: false, authenticated: true, key: (v, k) => k.u64(MAX_U64 - v.tokens) },
   ],
 };
 
@@ -550,7 +550,7 @@ export const DelegationType: ObjectType<Delegation> = {
   },
   indices: [
     { name: 'byDelegatorValidator', unique: true, authenticated: true, key: (d, k) => k.id(d.delegator).id(d.validator) },
-    { name: 'byValidator', unique: false, key: (d, k) => k.id(d.validator) },
+    { name: 'byValidator', unique: false, authenticated: true, key: (d, k) => k.id(d.validator) },
   ],
 };
 
@@ -564,9 +564,9 @@ export const UnbondingType: ObjectType<Unbonding> = {
     return { id, delegator: r.u64(), validator: r.u64(), tokens: r.u64(), creationHeight: r.u64(), completion: r.u64() };
   },
   indices: [
-    { name: 'byCompletion', unique: false, key: (u, k) => k.u64(u.completion) },
-    { name: 'byDelegatorValidator', unique: false, key: (u, k) => k.id(u.delegator).id(u.validator) },
-    { name: 'byValidator', unique: false, key: (u, k) => k.id(u.validator) },
+    { name: 'byCompletion', unique: false, authenticated: true, key: (u, k) => k.u64(u.completion) },
+    { name: 'byDelegatorValidator', unique: false, authenticated: true, key: (u, k) => k.id(u.delegator).id(u.validator) },
+    { name: 'byValidator', unique: false, authenticated: true, key: (u, k) => k.id(u.validator) },
   ],
 };
 
@@ -580,10 +580,10 @@ export const RedelegationType: ObjectType<Redelegation> = {
     return { id, delegator: r.u64(), source: r.u64(), destination: r.u64(), tokens: r.u64(), creationHeight: r.u64(), completion: r.u64() };
   },
   indices: [
-    { name: 'byCompletion', unique: false, key: (x, k) => k.u64(x.completion) },
-    { name: 'byDelegatorSourceDestination', unique: false, key: (x, k) => k.id(x.delegator).id(x.source).id(x.destination) },
-    { name: 'byDelegatorDestination', unique: false, key: (x, k) => k.id(x.delegator).id(x.destination) },
-    { name: 'bySource', unique: false, key: (x, k) => k.id(x.source) },
+    { name: 'byCompletion', unique: false, authenticated: true, key: (x, k) => k.u64(x.completion) },
+    { name: 'byDelegatorSourceDestination', unique: false, authenticated: true, key: (x, k) => k.id(x.delegator).id(x.source).id(x.destination) },
+    { name: 'byDelegatorDestination', unique: false, authenticated: true, key: (x, k) => k.id(x.delegator).id(x.destination) },
+    { name: 'bySource', unique: false, authenticated: true, key: (x, k) => k.id(x.source) },
   ],
 };
 
@@ -610,7 +610,7 @@ export const ProposalType: ObjectType<Proposal> = {
   decode(r, id) {
     return { id, proposer: r.u64(), parameters: decodeChainParameters(r), signals: r.array((r) => r.u64(), MAX_SIGNALS), created: r.u64(), expiration: r.u64() };
   },
-  indices: [{ name: 'byExpiration', unique: false, key: (p, k) => k.u64(p.expiration) }],
+  indices: [{ name: 'byExpiration', unique: false, authenticated: true, key: (p, k) => k.u64(p.expiration) }],
 };
 
 export const AccountType: ObjectType<Account> = {
@@ -651,6 +651,9 @@ export const BalanceType: ObjectType<Balance> = {
   },
   indices: [
     { name: 'byOwnerAsset', unique: true, key: (b, k) => k.id(b.owner).id(b.asset) },
+    // Not authenticated, unlike the non-unique indices of the staking types: there is one entry for each balance, so
+    // a sparse-tree leaf for each would grow with the accounts, for a proof (this balance is of that asset) the
+    // balance's own object proof already gives.
     { name: 'byAsset', unique: false, key: (b, k) => k.id(b.asset) },
   ],
 };

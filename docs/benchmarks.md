@@ -229,7 +229,7 @@ then the instance in the cache of decoded objects (42 ns in the build whose prim
 an array of objects, 74 ns with the arena of section 4.10); a lookup by index walks a B+ tree,
 whose depth grows with the log of the state, and at the sizes measured neither showed it. The
 sparse Merkle tree for names costs about 27 microseconds per insert, five times a dense leaf,
-which is why only unique indices that need proofs are authenticated. The last line of the
+which is why only indices that need proofs, and do not have an entry for each balance or transaction, are authenticated. The last line of the
 measurements is the one to remember: version history is retained objects times retained
 versions, and a benchmark that modifies 10,000 objects per version for 100 versions keeps a
 million prior values. At realistic block sizes that is tens of megabytes; the retention window
@@ -1483,9 +1483,30 @@ larger segments (1,520 to 1,791). Other work was running on the machine through 
 and a second pair was lost to it altogether), and they were made before the step was given
 its present form (it now takes the entries that come next from whichever small segments have
 them, where it took an equal share from each, and writes above what it finds missing there
-when removing, where it began the copy again). So the node figures are an indication and the
-store's own, above, are the measurement: three to five milliseconds of a block's 44 while a
-move is under way.
+when removing, where it began the copy again). So those node figures were an indication.
+
+The run was repeated with the step in its present form (ten minutes, 30-second windows, the
+same state and load, a heap limit of 1,488 MiB, the sync probe on; the window line of the
+suite now prints the store time a block and the probe). The machine was still not idle:
+other processes took a few cores throughout, and the first five windows were disturbed, the
+fourth reading 178 ms a block with the probe at 21 ms where it is 3 to 4 everywhere else.
+From 180 seconds on the windows are steady:
+
+| windows | blocks | store time a block | transfers/s |
+|---|---|---|---|
+| 180 to 360 s, before block 1,024 | 89 to 95 a window | 40.0 to 42.7 ms | 1,680 to 1,815 |
+| 390 s, in which block 1,024 came and the copy began | 93 | 41.9 ms | 1,751 |
+| 420 to 480 s, the first larger segment being copied | 89 to 92 | 43.8 to 44.4 ms | 1,718 to 1,724 |
+| 510 s, in which the copy ended and the removal began | 91 | 44.7 ms | 1,714 |
+| 540 to 600 s, its small segments being removed | 90 to 91 | 46.8 to 47.2 ms | 1,690 to 1,694 |
+
+Block 1,024 was committed at about 380 seconds and the copy, 341 blocks at this load's budget,
+was done at about 495. A block's store time is about 3 ms more while entries are copied and about 6
+more while they are removed, of 41 without, close to the 3 and 5 the block store measured on
+its own above; the node commits 1,690 to 1,750 transfers a second through both, against 1,680
+to 1,815 before. One run, on a machine with other work on it: the size of the step's cost agrees with
+the store's own measurement, and the comparison of rates is within what windows of one run
+differ by.
 
 The expirations have to move for the second remedy to do anything. The suite's own load signs
 every transfer with one expiration, an hour after the run starts, and under it the new index

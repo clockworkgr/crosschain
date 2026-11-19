@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: thirty-one files, 306 cases, about 10,400 lines counting the shared harness
+`test/**/*.test.ts`: thirty-two files, 322 cases, about 11,300 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (305 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (321 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -24,7 +24,7 @@ guard's dials on the object database show; `chain`, `app`, `staking`, `staking-n
 `genesis` cover the core application, and `history` the log its account history is stored in; `txproof`, `light`, `rpc` and
 `sync` cover proofs, clients and catching up, and `priorities` the proposer priorities a header
 commits to, from the two hashes of a validator set to a join from a snapshot; `amnesia` covers a
-validator's lock, from the round a prevote signs to a forgotten lock punished on a network; `review` holds one regression test per finding of
+validator's lock, from the round a prevote signs to a forgotten lock punished on a network, and `faults` the other evidence: two proposals for a round, a prevote on a majority that never was, and what arrives when its height is over; `review` holds one regression test per finding of
 the external review and the later cases of the same kind, `review2` five more that each
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
@@ -229,6 +229,7 @@ recreate a node later with different settings:
       app: opts.appFor ? opts.appFor(i, dataDir, genesis) : new KvStoreApp(dataDir ? join(dataDir, 'app.json') : null),
       nodeKeySeed: nodeSeed(i),
       validatorSeed: i < opts.validators ? validatorSeed(i) : null,
+      ...(dataDir === null && !overrides.dataDir ? { signState: signStateOf(i) } : {}),
       transport: hub.transport(addrOf(i)),
       listenAddr: addrOf(i),
       seeds: allAddrs.filter((a) => a !== addrOf(i)),
@@ -252,6 +253,14 @@ it asks for `'memory'` in the default mode, so that the suites exercise a node t
 index trees, drops them at `warn` and rebuilds them, and for `'store'` under `INDEX_TREES=0`, so
 that in that mode the node never builds them, as the databases of the run do not. A test's
 own `indexTrees` in the overrides wins over both.
+A node without a data directory is given a `signState`: one `MemorySignStateStore` for each
+index, kept by the testnet for as long as it lives, so that a validator a test stops and makes
+again with `makeNode` comes back knowing what it last signed, as one restarted on its data
+directory does. Without it the second node would sign again in heights the first signed in,
+and its peers, which keep the votes of the last sixteen heights, would report it for a double
+sign ([chapter 4](04-consensus.md)); `test/staking-net.test.ts` failed that way when the kept
+heights were added. A test that means a new chain under the same key passes a store of its own
+(`test/recovery.test.ts` does), and one that passes a `dataDir` in the overrides gets the file.
 The `overrides` are a `Partial<NodeConfig>`, so `net.makeNode(4, { validatorSeed: net.validatorSeed(4) })`
 turns a full node into a validator, and `net.makeNode(0, { dataDir })` reopens a node from
 disk. All nodes are created first, then started in index order, except those in `skipStart`.
@@ -635,9 +644,9 @@ and `stats.slabs` is 2. This is `Arena.shrink`, the arena as a cache over a stor
 
 ### test/db.test.ts
 
-Forty-four tests on the object database and the trees beneath it ([the database
+Forty-five tests on the object database and the trees beneath it ([the database
 chapter](09-database.md)). The fixture defines two object types: `ItemType` (type id 7) with
-a unique, authenticated index `byName` and a non-unique `byGroup`, and `CounterType` (type id
+a unique, authenticated index `byName` and a non-unique one, authenticated as well, `byGroup`, and `CounterType` (type id
 3) with no indices. `fresh()` makes a database over both, `mk` creates an item, `byName` and
 `inGroup` query the two indices. For the store-backed cases, `persistIndex(db, kv)` writes the
 last root's index and tree changes to a `MemoryKv` as the application's commit does and calls
@@ -899,6 +908,16 @@ case keeps it tested on its own. The history records are captured by the `keyPro
 module-level `histories` array as a side effect of each call; the comment `// filled below`
 marks it.
 
+**`it('proves an entry of a non-unique index present or absent, by its key and the id of its object')`**.
+Two items in group 5 and one in group 6. Each is proven under `byGroup` by the entry key, the
+group followed by the item's id, and the value proven is the id. An item under another group
+than its own is proven absent, and so is the group's key alone, which is no entry. The proof
+names index position 1, and with position 0 it does not verify. Changing an item's value leaves
+the index's root as it was while the state root moves; changing its group and removing the
+other item moves it, the old entries are proven absent and the new one present, and the entry
+removed is still proven as of the version before. A database filled from the exported objects
+has the same root.
+
 **`` it(`forgets the older versions at once, answers the same for the ones it keeps, and grows back (trees ...)`) ``**
 (describe `object database: a trimmed history window`). Two cases from one loop, with the
 Merkle trees resident and with them dropped. Two databases with `retainVersions: 8` and no
@@ -1144,7 +1163,8 @@ wrapping a `MemoryEnv` in a `KvEnv` of its own, `noting()`: its `transaction(fn)
 call and keeps a depth while `fn` runs, and every store it hands out records, at each `write`,
 the store's name and `inside` or `alone` according to that depth. A one-validator chain of the
 core application (one faucet account, no inflation) is made unstarted, and `run(env, app)`
-makes node 0 over the given environment, starts it, waits for height 3 and stops it. First
+makes node 0 over the given environment, with a fresh `MemorySignStateStore` since each run is a
+chain from genesis, starts it, waits for height 3 and stops it. First
 with `app` undefined, so the node builds its own `CoreApp` on the environment's `app` store: at
 least six writes were made inside a transaction, there were exactly half as many transactions
 as such writes, and they alternate `chain inside`, `app inside`, the chain's writes first, as
@@ -1652,7 +1672,7 @@ ones.
 
 ### test/staking.test.ts
 
-Thirteen unit tests that walk the staking rules of [STAKING.md](../../STAKING.md) and the
+Fifteen unit tests that walk the staking rules of [STAKING.md](../../STAKING.md) and the
 application chapter ([11](11-application.md)) one block at a time. The genesis has a faucet,
 three operator accounts `op-a`, `op-b`, `op-c`, a community pool of 1,000 tokens, and two
 genesis validators: A with a self-bond of 200 and B with 100, so A alone holds exactly two thirds
@@ -1714,6 +1734,20 @@ Moving it on from B while the entry is pending is `/still redelegating/`; after 
 gone and the move passes `checkTx`. `op-b` undelegating half its self-bond is `/self-bond/`: an
 operator cannot drop below the floor.
 
+**`it('slashes redelegated stake where it went: at the destination, or in what was undelegated from there since')`**.
+`run(undelegated, tombstoneDestination)` delegates `T(60)` to A, notes the height, moves all
+of it to B, then undelegates none, half or all of it from B, optionally has B tombstoned, and
+last gives a block evidence against A at the noted height. It returns the cut (5% of the tokens
+the redelegation entry recorded), what the delegator lost of its delegation and unbonding
+entries at B, what the pool gained, and the entry's tokens afterwards. For none, half and all,
+the delegator lost the cut to within a token, the pool gained at least that, the entry is down
+by the cut and the supply balances. With B tombstoned in between, for a fault at height 1,
+which turned the delegation into an unbonding entry made by that block, the same. And with B slashed to nothing for
+downtime (a genesis with `downtimeSlashBps` at 10,000) after half was undelegated from it, the
+whole cut comes out of that unbonding entry: the empty delegation pays nothing and is not
+counted as having paid. Before the change the delegator who undelegated all lost
+nothing.
+
 **`it('creates validators with the fee and minimums, ranks the top N, and rotates keys')`**.
 `op-c` creating a validator with a 99 self-bond is `/self-bond must be at least/`; with A's
 consensus key `/consensus key already in use/`; with 150 it succeeds, costing `T(150)` plus the
@@ -1754,6 +1788,13 @@ less than that by a token, and the pool grew by a fifth of it. Evidence of the o
 the same validator a block later moves less than a token, the block reward: a tombstoned
 validator is punished once. The supply balances, and a genesis with the rate at 10,001 is
 refused (`/amnesiaSlashBps must be 0 to 10000/`).
+
+**`it('slashes two proposals at the rate of a double sign, and a prevote on a majority that never was at the rate of a forgotten lock')`**.
+Four applications, each from a genesis with `amnesiaSlashBps` at 2,000 and the double-sign rate
+at 500, each given one block with a misbehaviour entry of one kind. For `duplicateVote` and
+`duplicateProposal` the delegators' forced unbonding entries hold what the validator held less
+5%, to within a token; for `amnesia` and `falseCitation`, less 20%. Each validator is
+tombstoned and each supply balances.
 
 **`it('mints toward the bonded goal and never past the max supply')`**. Inflation between 7% and
 20%. The initial rate is 700 bps (`700n * 100_000n` parts per billion). After a one-hour block,
@@ -1929,7 +1970,7 @@ consistently, so only the signatures, made over the genuine hash, give it away. 
 
 ### test/rpc.test.ts
 
-Six tests on the JSON-RPC server and client ([12](12-rpc.md)), the keystore
+Seven tests on the JSON-RPC server and client ([12](12-rpc.md)), the keystore
 ([14](14-wallet-cli.md)) and the RPC-backed light client provider. `up(limits)` starts a
 four-validator core-application network, an `RpcServer` on node 0 at port 0 (the OS picks),
 waits for height 2 and returns an `RpcClient` on `server.url`. The server and the network are
@@ -1976,6 +2017,18 @@ by hash; `verifyLatest()` reaches a height no later than the one `status` then r
 faucet's name proof from
 `account`, with the header and commit of the next height fetched over the RPC, verifies
 through `client.verifyKey` to the id `3.0`. A wrong trusted hash is refused.
+
+**`it('answers only requests that carry the token, when one is set')`**. One validator on the
+toy application. A token shorter than 16 characters is refused by the constructor, and so is
+one that is `true`, a number, an object, has spaces or a newline; a client made with the last
+throws without the token in its message. A server
+with a token, a burst of 8 and no refill answers 401, with `WWW-Authenticate: Bearer` and an
+empty body, to a POST without the token, with a token one letter off, with the token outside
+`Bearer`, and with it in the query; an `RpcClient` without it throws `/asks for a token/`. With
+the header the call returns the chain id, from `fetch` and from a client made with the token.
+`/events` is 401 without it and 200 with it in the header or the query. Those were eight calls
+and refusals: a ninth, right token or none, is 429. `/health` is 200 throughout and the
+preflight allows `Authorization`.
 
 **`it('reports the parameters in force so a wallet can price its operations, and the open proposals')`**
 (describe `json-rpc parameters`). A genesis with a transfer fee of 250 and a premium name fee of
@@ -2114,7 +2167,7 @@ first of these: the joiner takes the shifted set.
 
 ### test/amnesia.test.ts
 
-Seven tests on a validator's lock and on the evidence of one forgotten ([03](03-types.md),
+Eight tests on a validator's lock and on the evidence of one forgotten ([03](03-types.md),
 [04](04-consensus.md)), in two groups. The helpers sign votes with a fixed key for height 7:
 `precommit(round, hash)` and `prevote(round, hash, polRound)`, and `block(n)` is a hash of 32
 bytes `n`.
@@ -2152,7 +2205,7 @@ each with its reason: the prevote names round 2 or round 4; it is for the same b
 vote is for nil; the prevote is of the precommit's round or an earlier one; the heights or the
 validators differ; both are prevotes or both precommits. `evidenceKey` is `amnesia/7/0` for any
 pair of that validator and height and `7/5/1/0` for a double prevote in round 5. Both kinds
-round-trip through the codec under tags 2 and 1, and tag 3 is refused. `verifyEvidence` passes
+round-trip through the codec under tags 2 and 1, and tag 5, which no kind has, is refused. `verifyEvidence` passes
 the good pair and reports `/bad signature/` for a prevote whose round was changed after
 signing, a prevote signed by another key and another chain id, `/unknown validator/` for index
 4 in a set of one, and the shape's own message for a pair that is no evidence.
@@ -2202,6 +2255,157 @@ round-1 prevote for a block seen on the wire names round 0, every node stores th
 and no node holds evidence or has slashed anyone. The two validators that lacked a prevote of
 round 0 got it from the gossip tick, without which their copies of the round-1 prevotes would
 wait.
+
+**`it('prevotes the block its lock moved to on the round of that lock, when the block comes back on an older majority')`**.
+One `Consensus` built directly, with a `PrivValidator` in memory, a fixed genesis state, an
+`EvidencePool` and timeouts of ten minutes, so only what the test hands it moves it. Its
+validator has power 1 beside three of power 10, whose keys the test holds: it proposes none of
+rounds 0 to 3, the three others are a majority without it, and two of them are the third that
+takes it to a later round. The three are named by the rounds they propose, `p0`, `p1`, `p2`, and
+`p0` proposes round 3 as well; what they send is what validators following the rules send in
+one possible history, which the test's first comment sets out (`p1` missed round 0's proposal,
+`p0` saw round 0's majority only after precommitting nil, and so holds D as its valid block
+without being locked). Round 0: block D proposed, `p0`'s prevote for it heard. Round 1: block
+B, fresh, prevoted by `p0` and `p1`; with its own that is +2/3, and it precommits B: locked, round 1.
+Round 2: `p2`'s round-0 prevote for D arrives and completes that majority, with `p1`'s for nil; D is proposed with `polRound` 0 and
+prevoted by the three naming round 0; it prevotes nil, sees their majority and precommits D:
+locked on D, round 2. Round 3: D proposed with `polRound` 0 again. Its prevote for D names round
+2, and with the two others' it is a majority; it precommits, two more precommits decide D, and
+the commit handed to `applyBlock` has its signature. The seven votes it broadcast are listed
+with the rounds they name, no precommit and prevote among them are `isAmnesia`, a fresh
+`HeightVoteSet` takes them without a conflict, and the pool is empty. The same prevote naming
+round 0 is `isAmnesia` with the precommit for B. Naming the proposal's round in `prevote`
+fails the test at the prevote of round 3: the guard refuses to sign it.
+
+### test/faults.test.ts
+
+Eleven tests on the evidence that is not two votes of the height a node is in, and on the votes one peer may have verified
+([03](03-types.md), [04](04-consensus.md)). The helpers sign votes, proposal heads and whole
+proposals with one of four fixed keys. `equal` is a set of the four with power 1 each, and
+`pre(i, round, hash, polRound)` a prevote of the validator at index `i` of it for height 7.
+`machine()` is the single `Consensus` of the last amnesia case: height 1, the validator under
+test with power 1 beside three of power 10 played by the test, timeouts of ten minutes, and an
+`EvidencePool` the test reads. It takes the verifier to use, and its `sync(round, hash)` stands
+for block sync: from then on the state it serves is at height 1, with a commit of that round as
+the last one, and `consensus.restart()` is called.
+
+**`it('are evidence against their signer by the two signatures alone, whatever the blocks were')`**
+(`describe('two proposals for one round')`). Two heads signed by one key for height 7, round 3
+and two hashes: `makeDuplicateProposalEvidence` puts the lower hash first, the shape is good
+and `verifyEvidence` passes on a set of that one validator. The same hash on `polRound` -1 and
+1 is evidence too, the lower round first. The shape refuses the same head twice, the wrong
+order, a `polRound` of the proposal's own round or below -1, and a negative round.
+`verifyEvidence` reports `/bad signature/` when the evidence names another round or height
+than was signed, when a head's `polRound` is changed, for a head signed by another key, under
+another chain id, and for two heads whose bytes were signed with the vote context instead of
+the proposal's; and `/unknown validator/` for index 1 in a set of one. The key is
+`proposal/7/3/0`, the tag byte 3, and the evidence comes back from its encoding.
+
+**`it('are reported by a node that is given both in the round, once, and not for the same proposal twice')`**.
+The machine is given block D for round 0 twice: nothing in the pool. Block E for round 0 signed
+by round 1's proposer: nothing, it is no proposal of the round. E signed by round 0's
+proposer: one `duplicateProposal` against that proposer, with the hashes of D and E, which
+`verifyEvidence` accepts. A third block F adds nothing, and the validator is still in step
+`prevote`: it prevoted D and the round kept D. With the pool's `maxRecordBytes` at 0, two proposals for round 1 leave the pool as it was; with the limit lifted, the second handed in again is taken, so a proof the pool had no room for is not lost. Then two proposals of D for round 2, on
+`polRound` 0 and 1, handed in at once with `Promise.all`, so that both are in verification
+together and the second finds the first recorded: evidence for round 2 with the two rounds.
+
+**`it('are found when the second comes out of verification after the height is over, and when the round decided on a block fetched without a signature')`**.
+Two machines. The first has a verifier whose `verifyOne` can be made to wait. D is proposed for
+round 0 and taken; E, by the same proposer, is handed in with the verifier holding; `sync`
+moves the node to height 2 with nothing in the pool; the verifier is let go, and the pool has a
+`duplicateProposal` for height 1. The second machine holds D for round 0 and is given
+precommits for E from the three heavy validators and then E itself through
+`handleFetchedBlock`: it decides E, and the pool is empty, since a fetched block carries no
+signature. The proposer's signed proposal of E then arrives and is the second: evidence, which
+verifies.
+
+**`it('is proven by the prevotes of the round it names, when +2/3 of the power prevoted something else there')`**
+(`describe('a prevote on a majority that never was')`). Validator 3 prevotes X in round 5 naming
+round 2; validators 0, 1 and 2 prevoted Y, nil and Y in round 2. The shape is good and
+`verifyEvidence` passes on `equal`, also with the accused's own round-2 prevote for Y in place
+of validator 0's. With two prevotes it is `/not \+2\/3/`. Ten shapes are refused, each with its
+reason: an accused vote that names no round, is for nil or is a precommit; no prevotes; one of
+them for X; one of another round; out of order; one validator twice; a precommit among them;
+one of another height. A signature moved from one prevote to another, and an accused vote
+altered after signing, are `/bad signature/`; a set without validator 3 refuses the evidence.
+Power and not heads: in a set where one validator has 10 and three have 1, the three light
+ones are not +2/3 and the heavy one with a light one is. The key is `citation/7/3`, the tag 4.
+
+**`it('is found in the votes held whichever comes last, with no more prevotes than make the +2/3')`**.
+`faultsShown` over a `HeightVoteSet`, vote by vote, keeping the first evidence for each key as
+the pool does. Four round-2 prevotes for something else and then the false prevote: evidence
+with the first three by index (equal powers, so the lowest indices). The false prevote first: nothing after two of the others,
+evidence with the third. A round in which two of four prevoted X gives nothing, nor does a
+round truly named, nor prevotes of another round than the one named. On seven validators, four
+prevote nil in round 1, a fifth prevotes X there, and a sixth names round 1 for X in round 2;
+the fifth then signs nil for round 1 too. The set reports the conflict and adds nothing, and
+`faultsShown` with that second vote gives the false citation, with it as the fifth prevote
+against, whether the set had counted the fifth's first vote or held it waiting. The same with the claim arriving last, after both of the fifth's votes in either order: the set has put the second aside (`alternates`), and the proof is five prevotes for nil. And when the vote put aside later takes the place of the one held (both named a round whose majority came afterwards), the displaced one is put aside in its turn and refutes a later claim. A validator that named round 2 falsely in each of 37 later rounds is proven once by the completing prevote. On five validators of power 5, 4, 2, 1 and 1, one of the 1s names round 2 for Y, which takes four prevotes to refute, and then for X, which takes the two heaviest: the one proof made is the second, with the votes of the 5 and the 4. Three prevotes for Y and one for nil refute a claim for X with the nil and two of the three, since nil is the smaller vote. And 117 claims by one validator for as many blocks are answered by one proof in under half a second. Two validators naming
+round 2 falsely are two pieces of evidence when the third prevote against arrives.
+
+**`it('is reported by a node from a prevote held for a later round and the prevotes of the round it is in')`**.
+The machine is given a prevote of one heavy validator for round 2, block 9, naming round 0;
+it stays in round 0, since 10 of 31 is not a third. Round 0 then goes as it does: D proposed,
+the validator's own prevote, one more for D (nothing yet: 11 of 31), and a second (21): one
+`falseCitation` in the pool, the three prevotes for D in index order against it, verified.
+A second machine is given the same false prevote and then, from one of the two others, a
+prevote of round 0 for block 9 before its prevote for D: the second is a conflict, and the pool
+ends with a `duplicateVote` against that validator and the `falseCitation` its second vote
+completed, both verified.
+
+**`it('are verified up to a number a second, the rest waiting their turn, and a peer is charged only for what there is no room to keep')`**
+(`describe('votes from one peer')`). The machine's clock is one the test moves. One validator's
+precommits for nil in rounds 0 to 239, all good votes, are handed in as from the peer `relay`,
+which is what a peer that has just connected is sent of a height with many rounds: 200 are
+held and nothing is charged. Another peer's vote is taken, and one with no peer behind it. Two
+hundred votes already held, sent by the other peer, cost none of its budget: its next new vote
+is taken. The forty that wait, sent thirty times more, take no further places and cost nothing.
+Six hundred milliseconds on, with the clock unmoved, nothing more is held; once the
+clock moves a second, all 240 are, and still nothing is charged. Then 1,300 votes with a
+signature of zeros in one second: the budget takes 163, 1,024 wait, and for the rest `relay`
+is charged 10 points for `vote flood`, once. A second machine has a verifier that counts and
+takes 20 ms: one vote handed in by four peers at once is verified once and held, and two votes
+that differ only in the signature, one of zeros and one good, are verified both, and the good
+one is held. A vote whose verification throws while a copy of it was dropped is not held at
+once and is held a moment later, when it has been tried again.
+
+**`it('offers the pool again, when the next height starts, the evidence it had no room for')`**
+(`describe('a height that is over')`). The machine's pool is made to refuse everything while
+two precommits of one validator for one round arrive, and the second once more: nothing is in
+the pool, and the votes are held, so they would never be looked at again. The pool is put
+back, `sync` starts the next height, and the double sign is in the pool.
+
+**`it('keeps the rounds up to the one the height was committed in, when block sync and not this node decided it')`**. The machine, in round 0, is given one validator's
+precommits of rounds 5 and 7 (10 of 31, so it stays in round 0), and then `sync(5, …)`: the
+height was committed in round 5. The same validator's other precommit for round 5 is evidence
+of a double sign at height 1, round 5; its other precommit for round 7 is nothing, since that
+round was not kept. With the bound taken from the node's own round alone, round 5 is dropped
+and the test fails.
+
+**`it('takes no evidence into the pool that is larger than a block gives it, or beyond the bytes that may wait')`**.
+A pool whose `maxRecordBytes` is the size of a duplicate-proposal record refuses a false
+citation with three prevotes and takes the smaller record: `size` 1, `bytes` its length.
+`markCommitted` with both remembers both, the large one too, and nothing waits; the small one
+is not taken a second time. Another record is added and pruned, and `bytes` is 0 again.
+`MAX_PENDING_BYTES` is 32 MiB.
+
+**`it('is still held against a late vote, a late proposal and a prevote that named one of its rounds, and every application punishes what they show')`**. Four validators on the toy application, run to height 5.
+`late` is a height from 2 to 4 that every node decided in round 0. Two prevotes of validator 3
+for round 0 of it, for two made-up blocks, are handed to node 0: whatever it held of validator
+3, there are now two in one place, and every application is told of a `duplicateVote` at
+`late`. The stored block of `late` with one millisecond added to its time is signed as a
+proposal for round 0 by that block's proposer and handed to every node (the stored one, handed
+in again, is no second proposal): every application is told of one `duplicateProposal` at
+`late`, against the proposer. Two conflicting precommits of another validator for round 5 of
+`late`, a round it never reached, are handed to node 1. A prevote of that validator for the
+next height, round 1, block 9, naming round 0, is handed to node 2 and held until the height
+starts; its round 0 then has +2/3 prevotes for the block proposed, and every application is
+told of a `falseCitation`. The chain's blocks carried exactly one piece of evidence of each of
+the three kinds and each application was told of three faults: nothing came of the votes of
+round 5. Last, once the chain is `PAST_HEIGHTS_KEPT` and three heights past `late`, two
+conflicting prevotes of a fourth validator for `late` are handed to node 0, and a second later
+the count is still three and the pool is empty.
 
 ### test/review.test.ts
 
@@ -3448,14 +3652,14 @@ child process too, started by the command; in the third the node answers from th
 own process, so the command runs beside it.
 
 **`it('writes the block size it was given into the genesis, and runs a node that stops on a signal with its directory released')`**.
-In a temporary directory, with a base port taken from the process id, `init` for one validator
+In a temporary directory, with a base port from `freePortPair()` (a port the system gave out for port 0 and released, with the one after it bound and released too, since the node serves its RPC on the p2p port plus one; a number worked out from the process id could be in use), `init` for one validator
 with `--max-block-bytes 100` exits 1 with
 `/maxBlockBytes must be a whole number from 65536 to 16777216/` and the chain's directory does
 not exist: the size is refused before anything is written. `init` with `--scheme` naming
 `DEFAULT_SCHEME` and `--max-block-bytes 131072` exits 0, and `consensus.maxBlockBytes` in the
 `genesis.json` it wrote is 131072. Then `start` is run on `node0` with `--heap 512` as a child
 process whose environment has `CROSSCHAIN_CHILD` emptied, so that the command starts the node
-under its heap wrapper, as an operator runs it. The test waits, thirty seconds at most, for an
+under its heap wrapper, as an operator runs it, with `LOG` set to `info` so that the status line is logged whatever level the suite runs at, and in a process group of its own, which the `finally` ends if the test fails before the node has stopped. The test waits, thirty seconds at most, for an
 `info` line `status` with a `height=`, which the command logs every five seconds: the node is
 up and has run past a tick of the status interval. The `LOCK` file is then in `node0/data`,
 and a second `start` on the same directory exits 1 with `/in use by process/`. The child is

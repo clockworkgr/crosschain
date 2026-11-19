@@ -12,19 +12,25 @@ export class RpcClientError extends Error {
 
 export class RpcClient {
   readonly url: string;
+  /** Sent as `Authorization: Bearer <token>` with every call, for a server that asks for one. */
+  private readonly token: string | null;
   private nextId = 1;
 
-  constructor(url: string) {
+  constructor(url: string, token: string | null = null) {
     this.url = url.replace(/\/$/, '');
+    // Checked here, without the value in the message: fetch would refuse a header it cannot send and say what it was.
+    if (token !== null && (typeof token !== 'string' || !/^[\x21-\x7e]+$/.test(token))) throw new Error('the rpc token must be visible ASCII characters with no spaces');
+    this.token = token;
   }
 
   async call<T = any>(method: string, params: Record<string, unknown> = {}): Promise<T> {
     const res = await fetch(this.url + '/', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...(this.token === null ? {} : { Authorization: `Bearer ${this.token}` }) },
       body: JSON.stringify({ jsonrpc: '2.0', id: this.nextId++, method, params }),
     });
     if (res.status === 429) throw new RpcClientError(-32004, 'rate limited');
+    if (res.status === 401) throw new RpcClientError(-32000, 'the server asks for a token (http 401): pass --rpc-token or set RPC_TOKEN');
     if (!res.ok) throw new RpcClientError(-32000, `http ${res.status}`);
     const j = (await res.json()) as { result?: T; error?: { code: number; message: string } };
     if (j.error) throw new RpcClientError(j.error.code, j.error.message);

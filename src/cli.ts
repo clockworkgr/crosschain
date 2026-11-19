@@ -91,6 +91,8 @@ interface NodeFiles {
   /** 'store' (the default) reads the application's secondary indices from LMDB and never builds their trees in memory; 'memory' builds them. */
   indexTrees?: 'memory' | 'store';
   snapshotInterval?: number;
+  /** A secret of 16 characters or more that RPC requests must carry; unset, the RPC answers anyone who reaches it. */
+  rpcToken?: string;
 }
 
 const UNBONDING_MS = 7 * 24 * 3_600_000;
@@ -115,13 +117,15 @@ function need(i: number, what: string): string {
 /** A node directory gives an RPC URL and a keystore next to the testnet's genesis; a URL stands alone. */
 function target(arg: string): { rpc: RpcClient; keystorePath: string; nodeDir: string | null } {
   if (/^https?:\/\//.test(arg)) {
-    return { rpc: new RpcClient(flags.get('rpc') ?? arg), keystorePath: flags.get('keystore') ?? resolve('keystore.json'), nodeDir: null };
+    return { rpc: new RpcClient(flags.get('rpc') ?? arg, flags.get('rpc-token') ?? process.env.RPC_TOKEN ?? null), keystorePath: flags.get('keystore') ?? resolve('keystore.json'), nodeDir: null };
   }
   // A node directory still names the keystore and the node even when --rpc points somewhere else.
   const nodeDir = resolve(arg);
   const cfg = JSON.parse(readFileSync(join(nodeDir, 'config.json'), 'utf8')) as NodeFiles;
   const rpcListen = cfg.rpcListen ?? `127.0.0.1:${Number(cfg.listenAddr.split(':')[1]) + 1}`;
-  return { rpc: new RpcClient(flags.get('rpc') ?? `http://${rpcListen}`), keystorePath: flags.get('keystore') ?? join(nodeDir, '..', 'keystore.json'), nodeDir };
+  // The node's own token, unless another server is named, whose token the node's is not.
+  const token = flags.get('rpc-token') ?? process.env.RPC_TOKEN ?? (flags.has('rpc') ? null : (cfg.rpcToken ?? null));
+  return { rpc: new RpcClient(flags.get('rpc') ?? `http://${rpcListen}`, token), keystorePath: flags.get('keystore') ?? join(nodeDir, '..', 'keystore.json'), nodeDir };
 }
 
 async function passphrase(): Promise<string> {
@@ -286,7 +290,8 @@ async function start(nodeDir: string): Promise<void> {
     await made.start();
     if (stopping) return;
     const [host, port] = (cfg.rpcListen ?? `127.0.0.1:${Number(cfg.listenAddr.split(':')[1]) + 1}`).split(':');
-    rpc = new RpcServer(made, { host, port: Number(port), log });
+    rpc = new RpcServer(made, { host, port: Number(port), log, token: cfg.rpcToken });
+    if (cfg.rpcToken === undefined && host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') log('warn', 'the RPC listens beyond loopback without a token: anyone who reaches it may call it', { host });
     await rpc.start();
     if (stopping) return; // the shutdown that began meanwhile has the server to stop, and no status line follows it
   } catch (e) {

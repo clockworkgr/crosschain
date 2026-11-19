@@ -6,6 +6,7 @@
  */
 import { spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -24,6 +25,24 @@ import { RpcServer } from '../src/rpc/server.ts';
 import { headerHash, txHash } from '../src/types/block.ts';
 import { Keystore } from '../src/wallet/keystore.ts';
 import { makeTestnet, sleep, seedFor, verifier, waitFor, waitForHeight, type Testnet } from './helpers.ts';
+
+/** A port on loopback with the one after it also free, as far as binding and releasing both can tell. */
+async function freePortPair(): Promise<number> {
+  const bind = (port: number) =>
+    new Promise<number | null>((resolve) => {
+      const server = createServer();
+      server.once('error', () => resolve(null));
+      server.listen(port, '127.0.0.1', () => {
+        const bound = (server.address() as { port: number }).port;
+        server.close(() => resolve(bound));
+      });
+    });
+  for (let i = 0; i < 50; i++) {
+    const first = await bind(0);
+    if (first !== null && first < 65_535 && (await bind(first + 1)) !== null) return first;
+  }
+  throw new Error('no two free ports in a row');
+}
 
 const faucet = keyPairFromSeed(seedFor('r5/faucet'));
 const operators = [0, 1, 2, 3].map((i) => keyPairFromSeed(seedFor(`r5/op/${i}`)));
@@ -279,7 +298,8 @@ describe('the command line', () => {
   it('writes the block size it was given into the genesis, and runs a node that stops on a signal with its directory released', async () => {
     dir = mkdtempSync(join(tmpdir(), 'r5-cli-'));
     const chain = join(dir, 'chain');
-    const port = 42_000 + (process.pid % 1000) * 2;
+    // The node listens for peers on one port and serves its RPC on the next: two the system says are free now.
+    const port = await freePortPair();
     // A size no node would take is refused before anything is written.
     const refused = await cli('init', chain, '1', String(port), '--max-block-bytes', '100');
     expect(refused.status).toBe(1);
@@ -290,11 +310,17 @@ describe('the command line', () => {
 
     // The node as an operator runs it: under the wrapper that sets its heap, until an interrupt.
     const nodeDir = join(chain, 'node0');
-    const child = spawn(process.execPath, [join(import.meta.dirname, '..', 'src', 'cli.ts'), 'start', nodeDir, '--heap', '512'], { env: { ...process.env, CROSSCHAIN_CHILD: '' } });
+    const child = spawn(process.execPath, [join(import.meta.dirname, '..', 'src', 'cli.ts'), 'start', nodeDir, '--heap', '512'], {
+      // The status line the test waits for is logged at info, whatever level the suite itself was run with. A group
+      // of its own, so that the wrapper and the node under it can be ended together if the test fails.
+      env: { ...process.env, CROSSCHAIN_CHILD: '', LOG: 'info' },
+      detached: true,
+    });
     let out = '';
     child.stdout.on('data', (d) => (out += d));
     child.stderr.on('data', (d) => (out += d));
-    const exited = new Promise<number | null>((resolve) => child.on('close', (status) => resolve(status)));
+    let gone = false;
+    const exited = new Promise<number | null>((resolve) => child.on('close', (status) => ((gone = true), resolve(status))));
     try {
       // The status line comes every five seconds: the node is up, serving, and has committed by then.
       await waitFor(() => /\binfo\b.*\bstatus\b.*height=/.test(out), 30_000, () => `a status line; the node said:\n${out}`);
@@ -305,7 +331,17 @@ describe('the command line', () => {
       child.kill('SIGINT');
       expect(await exited).toBe(0);
     } finally {
-      child.kill('SIGKILL');
+      // A failure above leaves the node running under its wrapper: ask it to stop, which the wrapper passes on, and
+      // after five seconds end the whole group, so that nothing keeps the ports or the directory.
+      if (!gone) {
+        child.kill('SIGTERM');
+        await Promise.race([exited, sleep(5000)]);
+      }
+      try {
+        process.kill(-child.pid!, 'SIGKILL');
+      } catch {
+        // the group is gone already
+      }
     }
     expect(existsSync(join(nodeDir, 'data', 'LOCK'))).toBe(false);
     expect(out).not.toMatch(/stopping failed|start failed|the store is closed|Unhandled|Error:/);

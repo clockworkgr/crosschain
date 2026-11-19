@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { CoreApp } from '../src/app/core/app.ts';
 import { appGenesisBytes, authorityJson } from '../src/app/core/genesis.ts';
 import { KvStoreApp } from '../src/app/kvstore.ts';
+import { MemorySignStateStore } from '../src/consensus/privval.ts';
 import { toHex } from '../src/crypto/hash.ts';
 import { sign, signContext, keyPairFromSeed } from '../src/crypto/keys.ts';
 import { MemoryEnv, MemoryKv, type KvEnv } from '../src/store/kv.ts';
@@ -86,7 +87,8 @@ describe('persistence and recovery', () => {
       return { env, writes, transactions: () => transactions };
     };
     const run = async (env: KvEnv, app: CoreApp | undefined): Promise<void> => {
-      const node = await net!.makeNode(0, { env, app });
+      // Each run is a chain from genesis in an environment of its own, so it starts with nothing signed either.
+      const node = await net!.makeNode(0, { env, app, signState: new MemorySignStateStore() });
       net!.nodes[0] = node;
       await node.start();
       await waitForHeight([node], 3n);

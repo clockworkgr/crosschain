@@ -211,6 +211,64 @@ describe('json-rpc parameters', () => {
     net = null;
   });
 
+  it('answers only requests that carry the token, when one is set', async () => {
+    net = await makeTestnet({ validators: 1 });
+    const node = net.nodes[0]!;
+    expect(() => new RpcServer(node, { port: 0, token: 'too-short' })).toThrow(/at least 16 characters/);
+    // A config file can hold anything under the name: only a string of visible characters is a token, and neither
+    // the server nor the client repeats a refused one in its message.
+    for (const bad of [true, 1234567890123456, { a: 1 }, 'sixteen characters with spaces', 'a-secret-of-some-length\nx']) {
+      expect(() => new RpcServer(node, { port: 0, token: bad as string })).toThrow(/rpc token must be a string/);
+    }
+    let said = '';
+    try {
+      new RpcClient('http://127.0.0.1:1', 'a-secret-of-some-length\nx');
+    } catch (e) {
+      said = (e as Error).message;
+    }
+    expect(said).toMatch(/visible ASCII/);
+    expect(said).not.toMatch(/a-secret/);
+    const token = 'a-secret-of-some-length';
+    // No refill, so that what each request spends of the address's allowance can be counted.
+    server = new RpcServer(node, { port: 0, token, limits: { burst: 8, ratePerSecond: 0 } });
+    await server.start();
+    const post = (headers: Record<string, string>, query = '') =>
+      fetch(`${server!.url}/${query}`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'status', params: {} }) });
+    const events = async (headers: Record<string, string>, query = '') => {
+      const stop = new AbortController();
+      const res = await fetch(`${server!.url}/events${query}`, { headers, signal: stop.signal });
+      stop.abort();
+      return res.status;
+    };
+
+    // Without the token, with another, and with the right one in the wrong place: 401, and nothing of the node.
+    const none = await post({});
+    expect(none.status).toBe(401);
+    expect(none.headers.get('www-authenticate')).toBe('Bearer');
+    expect(await none.text()).toBe('');
+    expect((await post({ Authorization: 'Bearer a-secret-of-some-lengtH' })).status).toBe(401);
+    expect((await post({ Authorization: token })).status).toBe(401);
+    expect((await post({}, `?token=${token}`)).status).toBe(401);
+    await expect(new RpcClient(server.url).status()).rejects.toThrow(/asks for a token/);
+    // With it, the methods answer; the client sends it with every call.
+    const ok = await post({ Authorization: `Bearer ${token}` });
+    expect(ok.status).toBe(200);
+    expect(((await ok.json()) as { result: { chainId: string } }).result.chainId).toBe(net.genesis.chainId);
+    expect((await new RpcClient(server.url, token).status()).chainId).toBe(net.genesis.chainId);
+    // The event stream asks for it too, and takes it in the query as well, for a browser's EventSource.
+    expect(await events({})).toBe(401);
+    expect(await events({ Authorization: `Bearer ${token}` })).toBe(200);
+    expect(await events({}, `?token=${token}`)).toBe(200);
+    expect(await events({}, '?token=another-secret-of-length')).toBe(429); // the allowance of eight calls and refusals is spent
+    // Guesses are counted like calls: the address has nothing left, with or without the token.
+    expect((await post({})).status).toBe(429);
+    expect((await post({ Authorization: `Bearer ${token}` })).status).toBe(429);
+    // Health is open, and a preflight allows the header.
+    expect((await fetch(`${server.url}/health`)).status).toBe(200);
+    const preflight = await fetch(`${server.url}/`, { method: 'OPTIONS' });
+    expect(preflight.headers.get('access-control-allow-headers')).toMatch(/Authorization/);
+  });
+
   it('reports the parameters in force so a wallet can price its operations, and the open proposals', async () => {
     net = await makeTestnet({
       validators: 4,

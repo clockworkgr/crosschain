@@ -41,11 +41,12 @@
  * empties the overlay, since the store (with the root's changes) then says
  * the same.
  *
- * An index marked `authenticated` (unique only) also keeps a sparse Merkle
- * tree (smt.ts) over its keys, whose root goes into the type's leaf in the
- * state root, so a key can be proven present or absent. Those trees are
- * tier three: the database drops and rebuilds them with the dense trees,
- * whatever happens to the B+ trees, and they take the same writes either way.
+ * An index marked `authenticated` also keeps a sparse Merkle tree (smt.ts)
+ * over its entries, whose root goes into the type's leaf in the state root,
+ * so an entry can be proven present or absent: a key of a unique index, a
+ * key with its object's id of a non-unique one. Those trees are tier three:
+ * the database drops and rebuilds them with the dense trees, whatever
+ * happens to the B+ trees, and they take the same writes either way.
  */
 import { decode, type Reader } from '../codec/reader.ts';
 import type { Writer } from '../codec/writer.ts';
@@ -70,7 +71,7 @@ export class DbError extends Error {
 export interface IndexDef<T> {
   name: string;
   unique: boolean;
-  /** Keep a Merkle root over the keys, so membership and absence can be proven. Unique indices only. */
+  /** Keep a Merkle root over the entries, so that one can be proven present or absent: for a non-unique index, the key with the object's id. */
   authenticated?: boolean;
   key(obj: T, k: KeyWriter): void;
 }
@@ -199,7 +200,6 @@ export class TypeIndex<T extends { id: ObjectId }> {
       this.secondary.push(s);
       this.byName.set(ix.name, s);
       if (ix.authenticated) {
-        if (!ix.unique) throw new Error(`${type.name}.${ix.name}: only unique indices can be authenticated`);
         this.trees.set(ix.name, new SparseMerkleTree(retainVersions, nodeHeader(type.id, position)));
         this.authenticated.push(ix.name);
       }
@@ -432,8 +432,9 @@ export class TypeIndex<T extends { id: ObjectId }> {
     }
   }
 
-  private indexKeys(obj: T, keys: Uint8Array[]): void {
+  private indexKeys(obj: T, keys: Uint8Array[], skip: boolean[] | null = null): void {
     for (let i = 0; i < keys.length; i++) {
+      if (skip?.[i]) continue;
       const s = this.secondary[i]!;
       const k = keys[i]!;
       if (s.tree) s.tree.set(k, obj.id);
@@ -449,11 +450,15 @@ export class TypeIndex<T extends { id: ObjectId }> {
     const instance = instanceOf(obj.id);
     if (instance > MAX_INSTANCE) throw new DbError(`${this.type.name}: instance ${instance} is beyond the index`);
     const old = this.get(instance);
-    const oldKeys = old ? this.unindex(old) : null;
+    // A key the write leaves as it was is left alone in the tree, the overlay and the sparse tree: taking it out and
+    // putting it back says the same, and most writes change no key (a balance's amount, a validator's counters).
+    const oldKeys = old ? this.keysOf(old) : null;
+    const same = oldKeys ? keys.map((k, i) => bytesEqual(k, oldKeys[i]!)) : null;
+    if (oldKeys) this.unindexKeys(oldKeys, same);
     this.wrote(instance, oldKeys, keys);
     this.pinned.add(instance);
     this.cache(instance, obj);
-    this.indexKeys(obj, keys);
+    this.indexKeys(obj, keys, same);
   }
 
   /** Remember an instance's keys as committed (on its first write since the root) and as they now stand. */
@@ -506,7 +511,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
         this.checkShape(s, k, v);
         const key = k.subarray(INDEX_HEADER);
         s.tree?.set(key, this.storedId(s, k, v));
-        smt?.set(key, v);
+        smt?.set(key, idBytes(this.storedId(s, k, v)));
       }
     }
   }
@@ -550,14 +555,19 @@ export class TypeIndex<T extends { id: ObjectId }> {
 
   private unindex(obj: T): Uint8Array[] {
     const keys = this.keysOf(obj);
+    this.unindexKeys(keys, null);
+    return keys;
+  }
+
+  private unindexKeys(keys: Uint8Array[], skip: boolean[] | null): void {
     for (let i = 0; i < keys.length; i++) {
+      if (skip?.[i]) continue;
       const s = this.secondary[i]!;
       const k = keys[i]!;
       if (s.tree) s.tree.delete(k);
       else s.overlay!.set(k, null);
       this.trees.get(s.def.name)?.delete(k);
     }
-    return keys;
   }
 
   erase(obj: T): void {

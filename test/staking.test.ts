@@ -7,6 +7,7 @@ import { delegationOf, SHARE_SCALE, signingInfoOf, tokensForShares, validatorByO
 import type { OperationDraft } from '../src/app/core/tx.ts';
 import { AssetType, BalanceType, DelegationType, DynamicType, GlobalType as GlobalTypeRef, ProposalType, RedelegationType, TYPE, UnbondingType, ValidatorStatus, ValidatorType, type ChainParameters, type StakingParameters } from '../src/app/core/types.ts';
 import { encode } from '../src/codec/writer.ts';
+import type { Misbehavior } from '../src/app/types.ts';
 import { toHex } from '../src/crypto/hash.ts';
 import { DEFAULT_SCHEME, keyPairFromSeed, schemeName, type KeyPair } from '../src/crypto/keys.ts';
 import { InlineVerifier } from '../src/crypto/verifier.ts';
@@ -70,7 +71,7 @@ function makeApp(genesis = makeGenesis()): CoreApp {
 interface BlockOpts {
   proposer?: KeyPair;
   signers?: KeyPair[];
-  misbehavior?: { address: Uint8Array; height: bigint; kind?: 'duplicateVote' | 'amnesia' }[];
+  misbehavior?: { address: Uint8Array; height: bigint; kind?: Misbehavior['kind'] }[];
   dt?: bigint;
 }
 
@@ -204,6 +205,67 @@ describe('staking', () => {
     checkSupply(app);
   });
 
+  it('slashes redelegated stake where it went: at the destination, or in what was undelegated from there since', async () => {
+    // The faucet delegates 60 to validator 0, moves all of it to validator 1 and then takes all of it out of
+    // validator 1. Validator 0 is then proven to have double signed while the stake was still its own.
+    const run = async (undelegated: 'all' | 'half' | 'none', tombstoneDestination = false) => {
+      const app = makeApp();
+      await block(app);
+      await block(app, [tx(app, [{ type: 'delegate', delegator: FAUCET_ID, validator: VAL_ID(0), amount: T(60) }], [faucet])]);
+      const infraction = app.lastHeight;
+      await block(app, [tx(app, [{ type: 'redelegate', delegator: FAUCET_ID, source: VAL_ID(0), destination: VAL_ID(1), shares: delegationOf(app.db, FAUCET_ID, VAL_ID(0))!.shares }], [faucet])]);
+      const moved = app.db.range(RedelegationType, 'byCompletion', new Uint8Array(0))[0]!.tokens;
+      const at1 = delegationOf(app.db, FAUCET_ID, VAL_ID(1))!.shares;
+      if (undelegated !== 'none') await block(app, [tx(app, [{ type: 'undelegate', delegator: FAUCET_ID, validator: VAL_ID(1), shares: undelegated === 'all' ? at1 : at1 / 2n }], [faucet])]);
+      // For a fault older than the redelegation: the entries this makes are of the block that makes them, not of the fault.
+      if (tombstoneDestination) await block(app, [], { misbehavior: [{ address: cons[1]!.address, height: 1n }], signers: [cons[0]!], proposer: cons[0]! });
+      const held = () => {
+        const d = delegationOf(app.db, FAUCET_ID, VAL_ID(1));
+        const entries = app.db.range(UnbondingType, 'byDelegatorValidator', encode((w) => w.u64(FAUCET_ID).u64(VAL_ID(1))));
+        return (d ? tokensForShares(val(app, 1), d.shares) : 0n) + entries.reduce((sum, e) => sum + e.tokens, 0n);
+      };
+      const before = held();
+      const pool = app.dynamic().communityPool;
+      await block(app, [], { misbehavior: [{ address: cons[0]!.address, height: infraction }], signers: [cons[1]!], proposer: cons[1]! });
+      checkSupply(app);
+      return { cut: (moved * 500n) / 10_000n, lost: before - held(), pool: app.dynamic().communityPool - pool, entry: app.db.range(RedelegationType, 'byCompletion', new Uint8Array(0))[0]!.tokens, moved };
+    };
+    // Whatever the delegator did with the stake at the destination, it loses the cut, to within the rounding of
+    // shares and the block's reward, and the pool gains at least that.
+    for (const how of ['none', 'half', 'all'] as const) {
+      const r = await run(how);
+      expect(r.cut).toBeGreaterThan(T(2));
+      expect(r.lost).toBeGreaterThan(r.cut - T(1));
+      expect(r.lost).toBeLessThanOrEqual(r.cut);
+      expect(r.pool).toBeGreaterThanOrEqual(r.lost);
+      expect(r.entry).toBe(r.moved - r.cut);
+    }
+    // A destination slashed to nothing has shares that are worth nothing: the cut comes out of what was undelegated
+    // from it before that, and is not counted as paid by the empty delegation.
+    {
+      const app = makeApp(makeGenesis({ ...PARAMS, downtimeSlashBps: 10_000, downtimeWindow: 2 }));
+      await block(app);
+      await block(app, [tx(app, [{ type: 'delegate', delegator: FAUCET_ID, validator: VAL_ID(0), amount: T(60) }], [faucet])]);
+      const infraction = app.lastHeight;
+      await block(app, [tx(app, [{ type: 'redelegate', delegator: FAUCET_ID, source: VAL_ID(0), destination: VAL_ID(1), shares: delegationOf(app.db, FAUCET_ID, VAL_ID(0))!.shares }], [faucet])]);
+      const moved = app.db.range(RedelegationType, 'byCompletion', new Uint8Array(0))[0]!.tokens;
+      await block(app, [tx(app, [{ type: 'undelegate', delegator: FAUCET_ID, validator: VAL_ID(1), shares: delegationOf(app.db, FAUCET_ID, VAL_ID(1))!.shares / 2n }], [faucet])]);
+      const entry = () => app.db.range(UnbondingType, 'byDelegatorValidator', encode((w) => w.u64(FAUCET_ID).u64(VAL_ID(1))))[0]!.tokens;
+      // Validator 1 stops signing and loses everything it holds for it.
+      for (let i = 0; i < 6 && val(app, 1).tokens > 0n; i++) await block(app, [], { signers: [cons[0]!], proposer: cons[0]! });
+      expect(val(app, 1).tokens).toBe(0n);
+      expect(delegationOf(app.db, FAUCET_ID, VAL_ID(1))).not.toBeNull();
+      const before = entry();
+      await block(app, [], { misbehavior: [{ address: cons[0]!.address, height: infraction }], signers: [cons[0]!], proposer: cons[0]! });
+      expect(before - entry()).toBe((moved * 500n) / 10_000n);
+      checkSupply(app);
+    }
+    // And when the destination was tombstoned in between, which turned the delegation there into an unbonding entry.
+    const t = await run('none', true);
+    expect(t.lost).toBeGreaterThan(t.cut - T(1));
+    expect(t.lost).toBeLessThanOrEqual(t.cut);
+  });
+
   it('creates validators with the fee and minimums, ranks the top N, and rotates keys', async () => {
     const app = makeApp();
     await block(app);
@@ -335,6 +397,22 @@ describe('staking', () => {
     checkSupply(app);
     // The rate is a staking parameter like the others: out of range, the genesis is refused.
     expect(() => makeApp(makeGenesis({ ...PARAMS, amnesiaSlashBps: 10_001 }))).toThrow(/amnesiaSlashBps must be 0 to 10000/);
+  });
+
+  it('slashes two proposals at the rate of a double sign, and a prevote on a majority that never was at the rate of a forgotten lock', async () => {
+    const rates: [Misbehavior['kind'], bigint][] = [['duplicateVote', 500n], ['duplicateProposal', 500n], ['amnesia', 2000n], ['falseCitation', 2000n]];
+    for (const [kind, bps] of rates) {
+      const app = makeApp(makeGenesis({ ...PARAMS, amnesiaSlashBps: 2000 }));
+      await block(app);
+      const a = val(app, 0);
+      await block(app, [], { misbehavior: [{ kind, address: cons[0]!.address, height: app.lastHeight }] });
+      expect(val(app, 0).status).toBe(ValidatorStatus.tombstoned);
+      // What the delegators are owed after the cut is what the validator held, less the rate of that kind.
+      const forced = app.db.range(UnbondingType, 'byValidator', encode((w) => w.u64(VAL_ID(0)))).reduce((s, e) => s + e.tokens, 0n);
+      expect(forced).toBeLessThanOrEqual(a.tokens - (a.tokens * bps) / 10_000n);
+      expect(forced).toBeGreaterThan(a.tokens - (a.tokens * bps) / 10_000n - T(1));
+      checkSupply(app);
+    }
   });
 
   it('mints toward the bonded goal and never past the max supply', async () => {

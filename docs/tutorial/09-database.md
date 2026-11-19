@@ -152,7 +152,7 @@ Storage is per level in chunks of 1,024 hashes, allocated when a node in the chu
 
 ### The sparse Merkle tree for proofs by key
 
-The dense tree proves things about ids. Users ask about names: "is there an account called alice", "what id does the symbol CORE have". A unique index can be marked `authenticated`, and such an index keeps a second structure beside its B+ tree: a sparse Merkle tree over `sha256(key)`, in `src/db/smt.ts`. Its root goes into the type leaf after the counter and the type root, so a proof by key is a sparse-tree path to one of those roots followed by the same type leg.
+The dense tree proves things about ids. Users ask about names: "is there an account called alice", "what id does the symbol CORE have". An index can be marked `authenticated`, and such an index keeps a second structure beside its B+ tree: a sparse Merkle tree over `sha256(key)`, in `src/db/smt.ts`. Its root goes into the type leaf after the counter and the type root, so a proof by key is a sparse-tree path to one of those roots followed by the same type leg. For a non-unique index the key in the tree is the entry's key, the index key followed by the object's id, and the value is that id, as for a unique one: what is proven is that one object is under one key, or is not. That a list of objects under a key is complete cannot be proven this way.
 
 Why not hash the B+ tree itself, which would avoid a second structure: the header of `src/db/smt.ts` answers that its root would depend on node layout, which depends on the order of inserts and deletes, and a node that restarts rebuilds its indices from the objects in id order. Two nodes with the same key set but different histories would disagree on the root. A sparse tree keyed by the hash of the key has one shape per key set, so any node, after any history, hashes identically. That property is also what lets a dropped tree apply its pending writes to the store in any order, and what lets past index versions be rebuilt from the object history after a restart: the store keeps the current tree's nodes since phase four of STATE-PAGING.md and a restart loads them and takes the versions inside the window from the history records, replaying them from the objects only when a record came without its sparse tree nodes. DESIGN.md section 6 draws the line the same way: the B+ trees are not part of the root, and the unique indices that need proofs are authenticated by sparse Merkle trees whose roots are in the type leg.
 
@@ -1661,7 +1661,6 @@ The constructor takes the arena, the shared budget and the store view besides th
       this.secondary.push(s);
       this.byName.set(ix.name, s);
       if (ix.authenticated) {
-        if (!ix.unique) throw new Error(`${type.name}.${ix.name}: only unique indices can be authenticated`);
         this.trees.set(ix.name, new SparseMerkleTree(retainVersions, nodeHeader(type.id, position)));
         this.authenticated.push(ix.name);
       }
@@ -1671,7 +1670,7 @@ The constructor takes the arena, the shared budget and the store view besides th
   }
 ```
 
-`authenticated` keeps the names in definition order; that order is the order of `indexRoots` in the type leaf, which is why `KeyProof.indexPosition` is meaningful and why reordering a type's indices would change the app hash, and now also the layout of the `'i'` and `'n'` keys in the store. Duplicate index names, more than 256 indices (the position is one byte), an authenticated non-unique index and more than 16 authenticated indices are rejected with plain `Error`s at construction: they are configuration mistakes, not runtime failures. The 16 is `MAX_AUTHENTICATED_INDICES` of `src/db/proof.ts`, the one constant `decodeProof`, `decodeKeyProof` and the snapshot manifest's decoder ([chapter 11](11-application.md)) also bound their lists of index roots by, so a type the constructor accepts makes proofs and manifests that decode. The core types have two at most.
+`authenticated` keeps the names in definition order; that order is the order of `indexRoots` in the type leaf, which is why `KeyProof.indexPosition` is meaningful and why reordering a type's indices would change the app hash, and now also the layout of the `'i'` and `'n'` keys in the store. Duplicate index names, more than 256 indices (the position is one byte) and more than 16 authenticated indices are rejected with plain `Error`s at construction: they are configuration mistakes, not runtime failures. The 16 is `MAX_AUTHENTICATED_INDICES` of `src/db/proof.ts`, the one constant `decodeProof`, `decodeKeyProof` and the snapshot manifest's decoder ([chapter 11](11-application.md)) also bound their lists of index roots by, so a type the constructor accepts makes proofs and manifests that decode. The core types have four at most (the redelegation entries).
 
 **Reads.** `get` is the cache, then the arena, then, for an object the arena let go, the store:
 
@@ -1792,11 +1791,15 @@ Anything in the cache answers, and counts a hit: an object, whose touched bit is
     const instance = instanceOf(obj.id);
     if (instance > MAX_INSTANCE) throw new DbError(`${this.type.name}: instance ${instance} is beyond the index`);
     const old = this.get(instance);
-    const oldKeys = old ? this.unindex(old) : null;
+    // A key the write leaves as it was is left alone in the tree, the overlay and the sparse tree: taking it out and
+    // putting it back says the same, and most writes change no key (a balance's amount, a validator's counters).
+    const oldKeys = old ? this.keysOf(old) : null;
+    const same = oldKeys ? keys.map((k, i) => bytesEqual(k, oldKeys[i]!)) : null;
+    if (oldKeys) this.unindexKeys(oldKeys, same);
     this.wrote(instance, oldKeys, keys);
     this.pinned.add(instance);
     this.cache(instance, obj);
-    this.indexKeys(obj, keys);
+    this.indexKeys(obj, keys, same);
   }
 
   /** Remember an instance's keys as committed (on its first write since the root) and as they now stand. */
@@ -1811,14 +1814,19 @@ Anything in the cache answers, and counts a hit: an object, whose touched bit is
 ```ts
   private unindex(obj: T): Uint8Array[] {
     const keys = this.keysOf(obj);
+    this.unindexKeys(keys, null);
+    return keys;
+  }
+
+  private unindexKeys(keys: Uint8Array[], skip: boolean[] | null): void {
     for (let i = 0; i < keys.length; i++) {
+      if (skip?.[i]) continue;
       const s = this.secondary[i]!;
       const k = keys[i]!;
       if (s.tree) s.tree.delete(k);
       else s.overlay!.set(k, null);
       this.trees.get(s.def.name)?.delete(k);
     }
-    return keys;
   }
 
   erase(obj: T): void {
@@ -1830,7 +1838,7 @@ Anything in the cache answers, and counts a hit: an object, whose touched bit is
   }
 ```
 
-The uniqueness checks (`checkUnique`, shared with the import path) run before anything changes, so a `modify` that would collide on a name leaves the old object in place; they go through `find` (below), so they consult the tree while it is resident, and otherwise the overlay and then the store. The instance check sits with them: an instance past `MAX_INSTANCE` is refused with a `DbError` rather than written, since the tables are indexed by instance and the arena header holds it in four bytes. Nothing in `src/db/` creates ids that large, but `importObject` takes ids from a store or a snapshot, and `insert` and the imports (`importBytes`, which `importCommitted` goes through, and `importStored`) are the doors every object comes through. A replace reads the old object (from the cache, or decoded from the arena) and unindexes its keys, then pins the instance, caches the new object, and writes its keys with `indexKeys`: into the B+ tree, or while that is dropped into the overlay (`unindex` sets null there, a release), and where present into the sparse tree with the 8-byte id as the value, which takes the same writes whether its own nodes are resident or not. `wrote` keeps, per pinned instance, the keys the object had at the last root (from its first write since then) and the keys it has now, both of which the write computed anyway; a root compares those arrays to report its index changes instead of encoding keys again. `erase` unindexes and caches a tombstone, pinned: the object is gone for every read at once, while its committed bytes stay in the arena until the root frees them. Neither writes to the arena, and the database's `undoSession` restores old values through the same two methods, so a transaction that fails writes nothing there either, and while the trees are dropped its overlay entries are put back by the same calls.
+The uniqueness checks (`checkUnique`, shared with the import path) run before anything changes, so a `modify` that would collide on a name leaves the old object in place; they go through `find` (below), so they consult the tree while it is resident, and otherwise the overlay and then the store. The instance check sits with them: an instance past `MAX_INSTANCE` is refused with a `DbError` rather than written, since the tables are indexed by instance and the arena header holds it in four bytes. Nothing in `src/db/` creates ids that large, but `importObject` takes ids from a store or a snapshot, and `insert` and the imports (`importBytes`, which `importCommitted` goes through, and `importStored`) are the doors every object comes through. A replace reads the old object (from the cache, or decoded from the arena), computes its keys and compares them with the new ones: a key the write leaves as it was is skipped by both `unindexKeys` and `indexKeys` (`same`), since taking an entry out and putting the same entry back says nothing, and most writes change no key at all, a balance's amount or a validator's counters. That matters most for the sparse tree, where each of the two writes copies a path from the root. For the keys that did change it unindexes the old ones, then pins the instance, caches the new object, and writes its keys with `indexKeys`: into the B+ tree, or while that is dropped into the overlay (`unindex` sets null there, a release), and where present into the sparse tree with the 8-byte id as the value, which takes the same writes whether its own nodes are resident or not. `wrote` keeps, per pinned instance, the keys the object had at the last root (from its first write since then) and the keys it has now, both of which the write computed anyway; a root compares those arrays to report its index changes instead of encoding keys again. `erase` unindexes and caches a tombstone, pinned: the object is gone for every read at once, while its committed bytes stay in the arena until the root frees them. Neither writes to the arena, and the database's `undoSession` restores old values through the same two methods, so a transaction that fails writes nothing there either, and while the trees are dropped its overlay entries are put back by the same calls.
 
 The import path skips the cache altogether, and comes in two forms:
 
@@ -1868,7 +1876,7 @@ The import path skips the cache altogether, and comes in two forms:
         this.checkShape(s, k, v);
         const key = k.subarray(INDEX_HEADER);
         s.tree?.set(key, this.storedId(s, k, v));
-        smt?.set(key, v);
+        smt?.set(key, idBytes(this.storedId(s, k, v)));
       }
     }
   }
@@ -3305,6 +3313,7 @@ A snapshot that leaves a type out, repeats one or names one out of order is refu
 - "keeps past versions inside the window": `proveAt` and `rootAt` inside a window of 2, refusal outside.
 - "counts the nodes its past versions hold while resident, and gives them up with the window": a resident tree made to retain four versions takes eight commits that list their changes; `historyNodes` is at least 4, each of the four retained commits having replaced at least the root. `setWindow(1)` leaves fewer, at least 1, and `setWindow(0)` leaves 0. A second tree whose commits do not list their changes counts 0.
 - "object database: key proofs: proves index keys and rebuilds index versions from history": present names prove to their id and absent ones to null at every version; then a fresh database is fed `exportObjects`, `counters`, `loadHistory` for every version and `rebuildIndexVersions`, and every key proof and object proof in the window is byte-identical to the original's. This keeps the replay, now the fallback of a restart, tested on its own.
+- "object database: key proofs: proves an entry of a non-unique index present or absent, by its key and the id of its object": membership and absence proofs of `byGroup` entries (the group followed by the id), the index's root unmoved by a write that changes no key, the entries following a change of group and a removal, and the same root in a database filled from the exported objects. The test type's `byGroup` is authenticated, so every other case of the file runs with a non-unique authenticated index as well.
 - "object database: arena and hot cache: serves reads from the arena once decoded objects are evicted, and never evicts what is dirty": with a budget of two, five unrooted objects stay cached, pinned, until the root; then the cache keeps its budget while every object reads correctly from the arena, frozen, by id and by name; a removal is a tombstone that hides the object and leaves it out of the export before the root frees its bytes; and with a budget of zero a modified object stays cached until the root, then reads back from the arena.
 - "keeps history as bytes, agrees between getAt and bytesAt, and exports after churn what it holds": with a budget of one, `bytesAt` at every version is the encoding of what `getAt` returns, `historyBytes` is counted, every exported object is the encoding of what `get` returns, and the window still closes behind.
 - "computes the same roots whatever the cache budget": five versions of creates, modifies and removes give the same roots with a budget of zero as with a million.
@@ -3344,7 +3353,7 @@ A snapshot that leaves a type out, repeats one or names one out of order is refu
 
 Known simplifications, from DESIGN.md section 10 and the code:
 
-- Only unique indices can be authenticated. Balances by owner and the other non-unique indices are not in the state root, so "all balances of account X" cannot be proven, only each balance by id.
+- An authenticated index proves one entry present or absent. For a non-unique index the entry is the key with an object's id, so "this object is under this key" and "it is not" can be proven, and "these are all the objects under this key" cannot: the sparse tree is keyed by the hash of the entry, and entries that are neighbours in the index are nowhere near each other in it.
 - History records are written in full per version. The window is counted in versions, not in time: a restart finds the records of the window in its own store however long the node was down, and the blocks it catches up on add theirs as usual. Only a node that starts from an empty database or from a snapshot begins its window at the height it starts at.
 - The B+ tree merges but never borrows, so fill can degrade under adversarial delete patterns.
 - Versions must be consecutive for leaf and inner history to agree (`pendingVersion` in `src/db/merkle.ts`); the code relies on callers using heights.
@@ -3364,7 +3373,7 @@ Exercises:
 2. Convert an `ObjectProof` into two ICS23 `ExistenceProof` messages (one per leg) and check them with an off-the-shelf ICS23 verifier configured with the spec in the header of `src/db/proof.ts`.
 3. Write a property test for range proofs: for random leaf counts and ranges, `rangeProofAt` and `rootFromRange` must agree with `rootAt`, and a proof with one sibling dropped, duplicated or swapped must make `rootFromRange` return null or a different root.
 4. This exercise used to ask for the sparse trees' past versions to be taken from the store at a restart instead of being replayed from the objects. That is done (`restoreIndexVersions` and `SparseMerkleTree.loadVersions`, step 7). What is left of it: measure both paths on a large state by reopening the same store once as it is and once with one history record rewritten without its `nodes`, and compare the `historyMs` the line `loaded application state` reports for `indexVersions: 'records'` and for `'replay'` against the 3.5 s of history STATE-PAGING.md 5.3 reports for the replay and the 2 ms section 7.3 reports for the records.
-5. Authenticate a non-unique index with a sparse tree over `key || id` and design a proof for "every entry with this prefix"; note what the type leaf would have to carry.
+5. A non-unique index is authenticated with a sparse tree over `key || id`, which proves one entry at a time. Design a proof for "every entry with this prefix": an ordered tree whose shape does not depend on the history of writes, and note what the type leaf would have to carry.
 6. `loadSnapshot` now requires every registered type's section in `order`. Give the snapshot a version of its type list, so that a database with one more registered type can load a snapshot written before the type existed, and add the test.
 7. Make the dense tree's chunk size a parameter of the store (STATE-PAGING.md 5.3 suggests smaller chunks on disk would about halve a scattered block's commit): keep 1,024 hashes in memory, write a chunk as several keys, and measure the commit of the scale suite's block of 2,400 random transfers and the cost of a root over dropped trees at each size.
 8. Measure what opening a store paged takes (STATE-PAGING.md section 9.1): start a node on a large state with a `--heap` well below its resident heap, with and without `--arena`, and record the heap and the array buffers once it has opened, which tiers `loaded application state` reports as `paged`, and how long the history window takes to fill again.

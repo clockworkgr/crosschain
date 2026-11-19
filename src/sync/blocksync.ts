@@ -1,6 +1,8 @@
 /**
  * Block sync brings a lagging node up to date. Consensus gossip cannot do
- * that: nobody keeps votes for old heights. Instead the node asks peers that
+ * that: nobody sends the votes of a decided height again, and what a node
+ * keeps of the last few is there to find evidence in, not to decide by.
+ * Instead the node asks peers that
  * reported higher heights for committed blocks, a window of heights at a
  * time spread over several peers, verifies each block's commit against the
  * validator set it already knows for that height, and runs it through the

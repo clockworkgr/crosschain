@@ -22,12 +22,17 @@ export interface Proposal {
 export type UnsignedProposal = Omit<Proposal, 'signature'>;
 
 export function proposalSignBytes(chainId: string, p: UnsignedProposal): Uint8Array {
+  return proposalHeadSignBytes(chainId, p.height, p.round, p.polRound, blockHash(p.block));
+}
+
+/** The same bytes from the block's hash alone: what evidence of two proposals is checked against, without the blocks. */
+export function proposalHeadSignBytes(chainId: string, height: bigint, round: number, polRound: number, hash: Uint8Array): Uint8Array {
   return encode((w) => {
     w.string(chainId);
-    w.u64(p.height);
-    w.u32(p.round);
-    w.i64(BigInt(p.polRound));
-    w.fixed(blockHash(p.block));
+    w.u64(height);
+    w.u32(round);
+    w.i64(BigInt(polRound));
+    w.fixed(hash);
   });
 }
 

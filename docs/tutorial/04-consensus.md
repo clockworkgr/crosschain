@@ -86,7 +86,7 @@ In a longest-chain protocol (Bitcoin, early Ethereum) a block is "probably final
 
 ### Why a validator must never sign two different blocks at one height and round
 
-The overlap argument assumed an honest validator votes once per (height, round, vote type). A validator that signs prevotes for A and for B in the same round lets both sides count it, and if enough validators do it, two blocks can be decided at one height: a fork. This is the one fault Tendermint treats as provable misbehaviour, because the two signed votes are the proof. The chain calls it a *duplicate vote*; `src/types/evidence.ts` defines `DuplicateVoteEvidence` as the pair. The staking module moves part of the validator's stake to the community pool and tombstones the validator, which removes it from the set (`STAKING.md` sections 5 and 7).
+The overlap argument assumed an honest validator votes once per (height, round, vote type). A validator that signs prevotes for A and for B in the same round lets both sides count it, and if enough validators do it, two blocks can be decided at one height: a fork. This is the one fault Tendermint treats as provable misbehaviour, because the two signed votes are the proof. The chain calls it a *duplicate vote*; `src/types/evidence.ts` defines `DuplicateVoteEvidence` as the pair. A proposer that signs two proposals for one round does the same thing one step earlier, splitting the validators between two blocks, and is proven the same way: `DuplicateProposalEvidence` is the two signatures. The staking module moves part of the validator's stake to the community pool and tombstones the validator, which removes it from the set (`STAKING.md` sections 5 and 7).
 
 A validator does not have to be malicious to double sign. The classic way is a crash: the validator signs a prevote for A, crashes before the vote reaches anyone, restarts, forgets, and signs a prevote for B. The private validator in `privval.ts` exists to make that impossible: it writes a record of what it last signed to disk before handing the signature back, and refuses anything at or before that point.
 
@@ -96,6 +96,8 @@ The other way to a fork needs no two votes in one place. Suppose A gathers +2/3 
 
 Two things make it provable here. The first is that a prevote for a block says what it relies on: the signed `polRound` of [chapter 3](03-types.md). A validator that precommitted A in round `r` and prevotes B in a later round naming a round before `r`, or none, has said itself that it knew of no polka for B since its lock. Its two votes are `AmnesiaEvidence`, as self-contained as a duplicate vote.
 
+That leaves the validator that names a round at or after its lock in which there was no polka. Its prevote is not counted (the second thing, next), and where the votes allow, it is punished too: if +2/3 of the power prevoted something other than B in the round it names, those prevotes beside its own are `FalseCitationEvidence`. This proof is of another nature than the other three. They convict on the accused's own signatures and nothing else. This one convicts unless more than a third of the power prevoted twice in the round named, which is the assumption the whole protocol makes, and a validator that did so to frame another is convicted itself by the two prevotes. It is also not always available: a liar that names a round in which a third of the power did prevote B, or in which too few prevoted at all, cannot be refuted.
+
 The second closes the way round that: naming a round at or after `r` in which no polka for B ever formed. Two votes cannot show that something did not happen, so nothing is proven against such a prevote. It is made useless instead. A node counts a prevote that names round `vr` towards +2/3 for its block only once the node itself holds +2/3 prevotes, counted the same way, for that block in round `vr` (`src/consensus/votes.ts`, below). A prevote naming a polka that never was waits for ever and helps no quorum at an honest node.
 
 Put together, provided less than two thirds of the power is faulty, so that every +2/3 of precommits includes an honest validator's: let A have +2/3 precommits in round `r` and another block be decided in a later round. An honest validator precommitted that block, so some honest node counted +2/3 prevotes for it; take the first round after `r` in which an honest node counts +2/3 prevotes for a block B other than A. Every prevote it counted names nothing or a round whose polka for B the node holds. A round after `r` it cannot be, since this is the first round after `r` with such a polka. So each names `r`, an earlier round, or nothing. More than a third of the power is in both majorities, and each of those validators either named a round before `r` or none, which with its precommit is amnesia evidence, or named `r` itself, and then round `r` held +2/3 prevotes for A and for B, which more than a third signed twice. A fork therefore always leaves evidence against more than a third of the power, of one kind or the other. (Two blocks decided in the same round are the simpler case: more than a third precommitted both.) Beyond two thirds faulty there is no such promise: validators holding +2/3 can precommit one block in one round and another in the next without a prevote between them, and two precommits in different rounds are something an honest validator may also sign.
@@ -104,7 +106,9 @@ As with the duplicate vote, the usual cause is not malice but a restart: a valid
 
 ### Evidence
 
-Evidence is a self-contained proof of misbehaviour. Any node that holds both votes can build it (`addVote` does, when the vote set reports a conflict or when a precommit and a later prevote of one validator show a lock forgotten), nodes gossip it by inventory like transactions (`RPC-SYNC-PROOFS.md` section 4.4), proposers include it in blocks, every validator verifies it against the validator set of the height it refers to, and the executor hands it to the application as `misbehavior` (next chapter). Evidence older than the unbonding period is rejected, by block time, so that stake cannot escape a slash by leaving before the proof lands (`STAKING.md` section 2.2).
+Evidence is a self-contained proof of misbehaviour. Any node that holds the signatures can build it (consensus does, when a vote set reports a conflict, when a precommit and a later prevote of one validator show a lock forgotten, when the prevotes of a round rule out the polka a later prevote names, and when a second proposal arrives for a round), nodes gossip it by inventory like transactions (`RPC-SYNC-PROOFS.md` section 4.4), proposers include it in blocks, every validator verifies it against the validator set of the height it refers to, and the executor hands it to the application as `misbehavior` (next chapter). Evidence older than the unbonding period is rejected, by block time, so that stake cannot escape a slash by leaving before the proof lands (`STAKING.md` section 2.2).
+
+The two halves of a proof need not arrive in the same height. A validator that signs twice can show one node the second signature when the height is already decided, and a node that dropped everything of a height on leaving it would never hold both. So consensus keeps the votes and the proposals' signatures of the last `PAST_HEIGHTS_KEPT` heights, 16, takes late votes and proposals for them, and passes a late vote on if it is new, so that two votes shown to two nodes still meet at one of them. Nothing kept there can change a decision. The price is paid by a validator that is restarted without the record of what it last signed: it signs again in heights it already signed in, and its peers now hold the first signatures. That was always a double sign; it is now also found (`privval.ts`, below, is what prevents it).
 
 ### Message flow
 
@@ -234,10 +238,14 @@ Vote bookkeeping for one height. The file answers the three questions the rules 
       if (sameVoteContent(existing, vote)) return { added: false, conflict: null };
       // Of two votes in one place the one that counts is kept: a validator that signs twice must not be able to
       // leave a node holding only the vote that waits for a majority that will never come.
-      if (backed && this.waiting.delete(vote.validatorIndex)) {
+      const replaced = backed && this.waiting.delete(vote.validatorIndex);
+      if (replaced) {
         this.votes[vote.validatorIndex] = vote;
         this.count(vote, val.power);
       }
+      // The vote not kept is put aside, if none is yet, or if the one put aside is the vote that has just taken the place.
+      const aside = this.others.get(vote.validatorIndex);
+      if (!aside || (replaced && sameVoteContent(aside, vote))) this.others.set(vote.validatorIndex, replaced ? existing : vote);
       return { added: false, conflict: existing };
     }
     this.votes[vote.validatorIndex] = vote;
@@ -248,7 +256,7 @@ Vote bookkeeping for one height. The file answers the three questions the rules 
   }
 ```
 
-The invariant is one vote per validator per set. A second vote that says the same thing (`sameVoteContent`: the same hash and the same `polRound`) is a duplicate (`added: false`, no conflict). A second vote that says anything else is returned as `conflict` together with the existing one, and is not stored, with one exception: if the vote held is waiting uncounted and the new one counts, the new one takes its place, so that a validator signing twice cannot leave a node holding only the vote that waits for a majority which will never come. Either way the caller (`Consensus.addVote`) turns the pair into evidence. A nil vote and a block vote from the same validator are a conflict, and so are two prevotes for one block that name different rounds. A vote added with `backed` false is held and counts in `totalVoted`, but not in `powerByBlock`: it is a vote cast, and not yet a vote for its block. `waitingOn(polRound, blockHash)` lists such votes and `back(validatorIndex)` counts one. `add` does not verify signatures; the caller does that before calling.
+The invariant is one vote per validator per set. A second vote that says the same thing (`sameVoteContent`: the same hash and the same `polRound`) is a duplicate (`added: false`, no conflict). A second vote that says anything else is returned as `conflict` together with the existing one, and is not stored, with one exception: if the vote held is waiting uncounted and the new one counts, the new one takes its place, so that a validator signing twice cannot leave a node holding only the vote that waits for a majority which will never come. Either way the caller (`Consensus.addVote`) turns the pair into evidence, and the vote that is not kept is put aside in `others`, the first such vote for each validator (if the vote put aside later takes the place, the one it displaced is put aside instead, so the two stay two); `alternates()` returns them. They count for nothing and are not passed on, but they are signed, and a proof against another validator may rest on one (`refuter`, below). A nil vote and a block vote from the same validator are a conflict, and so are two prevotes for one block that name different rounds. A vote added with `backed` false is held and counts in `totalVoted`, but not in `powerByBlock`: it is a vote cast, and not yet a vote for its block. `waitingOn(polRound, blockHash)` lists such votes and `back(validatorIndex)` counts one. `add` does not verify signatures; the caller does that before calling.
 
 The rest of the class:
 
@@ -273,7 +281,7 @@ The rest of the class:
   }
 ```
 
-The literals `1` and `2` are `VoteType.Prevote` and `VoteType.Precommit`; the file imports only the type, not the constant. Methods: `prevotes(r)`, `precommits(r)`, `set(vote)` (picks the set by type), `has(vote)` (true only if the same validator already cast the same vote, hash and `polRound`, in that set; used by `handleVote` to drop duplicates before paying for verification), `allVotes()` (every vote of every round and type, for `messagesForPeer`), `roundNumbers()` (sorted ascending; rule 49 and rule 55 iterate it), and:
+The literals `1` and `2` are `VoteType.Prevote` and `VoteType.Precommit`; the file imports only the type, not the constant. Methods: `prevotes(r)`, `precommits(r)`, `set(vote)` (picks the set by type), `has(vote)` (true only if the same validator already cast the same vote, hash and `polRound`, in that set; used by `handleVote` to drop duplicates before paying for verification), `allVotes()` (every vote of every round and type, for `messagesForPeer`), `roundNumbers()` (sorted ascending; rule 49 and rule 55 iterate it), `dropRoundsAbove(r)` (forgets the rounds after `r`, when a height that is over is kept; `keepHeight`, below), and:
 
 ```ts
   /** Power of validators that have cast any vote in round r. Used to detect that the network has moved on. */
@@ -330,10 +338,11 @@ A thing to notice: a peer can make the node allocate a `VoteSet` pair for any ro
 
 **`evidenceId(ev)`** is `sha256` of the codec encoding of one piece of evidence; it is the inventory key the p2p layer announces and fetches by (`src/node/node.ts` maps evidence through it for the `onAdded` broadcast and for the pending list a new peer receives). Its comment separates it from `evidenceHash` in `src/types/block.ts`, "the root over a list", which hashes a block's whole evidence list for the header; `consensus.ts` imports that one.
 
-**`EvidencePool`** holds evidence waiting to be included in a block. Three containers: `pending` (keyed by `evidenceKey`, which is `height/round/type/validatorIndex`, so one record per infraction slot), `committed` (the evidence that has been in a block, under the same keys, kept so that it is not taken in a second time), and `byHash` (inventory hash to evidence, for serving fetches). **`EvidencePool.MAX_PENDING`**, 1,000, is the most evidence that waits for a block: "a block carries far less, and one piece is enough to punish a validator." Methods:
+**`EvidencePool`** holds evidence waiting to be included in a block. Three containers: `pending` (keyed by `evidenceKey` of [chapter 3](03-types.md), so one record per offence), `committed` (the evidence that has been in a block, under the same keys, kept so that it is not taken in a second time), and `byHash` (inventory hash to evidence, for serving fetches). **`EvidencePool.MAX_PENDING`**, 1,000, is the most evidence that waits for a block: "a block carries far less, and one piece is enough to punish a validator." Methods:
 
-- `add(ev): boolean` returns false if the key is already pending or committed, or if `MAX_PENDING` pieces already wait (a validator willing to sign twice can do so at every height and round inside the window); otherwise stores it, indexes it by hash, notifies the `onAdded` listeners and returns true. The node's listener broadcasts an inventory announcement (`src/node/node.ts`).
-- `onAdded(fn)`, `getByHash(hash)`, `hasHash(hash)`, `has(ev)`: lookups the gossip code needs.
+- `add(ev): boolean` returns false if the key is already pending or committed, if `MAX_PENDING` pieces already wait (a validator willing to sign twice can do so at every height and round inside the window), if the record encodes to more than `maxRecordBytes`, or if it would take what waits past `MAX_PENDING_BYTES`, 32 MiB; otherwise stores it, indexes it by hash, notifies the `onAdded` listeners and returns true. The node's listener broadcasts an inventory announcement (`src/node/node.ts`).
+- `maxRecordBytes` is the most one record may encode to (`evidenceBytes(ev)`, the length of its encoding) and still be taken in. It is `Infinity` until the node sets it to what a block builder gives one piece of evidence: half the chain's block size, less the builder's slack of 1 KiB and the eight bytes of the two array counts ([chapter 8](08-node.md)). Three kinds of evidence are two signatures and far below it. A false citation carries a vote for most of the validator set, about 2.5 KiB each under ML-DSA-44, and with a large set or small blocks it can be more than any proposer would include; a record like that, left waiting, would sit at the head of the list and keep every other record out of every block (`createBlock`, below), and on a node that never proposes it would simply accumulate. So the limit is the pool's, applied on every node and to both ways in. It is a rule for what waits, not for what is valid: a block may carry a larger record if its proposer put one in, and `markCommitted` records it like any other.
+- `onAdded(fn)`, `getByHash(hash)`, `hasHash(hash)`, `has(ev)`: lookups the gossip code needs. `size` and `bytes` are the number and the encoded bytes of what waits.
 - `list(max = 100)`: pending evidence in insertion order, capped. `createBlock` calls it with `MAX_EVIDENCE_PER_BLOCK`, 16 (from `validate.ts`, below), and the node with `Infinity` to announce everything pending to a newly connected peer.
 - `markCommitted(evs)`: the executor calls this after applying a block, moving the evidence from pending to committed so the same infraction is never included twice. What waited for the same offence may be another pair of votes, under another hash, so the inventory entry of the pair that waited is removed. It also records the inventory entry of the committed evidence, so that evidence that came in a block without passing through the pool is served by hash like the rest.
 - `pruneIf(stale)`: forgets evidence for which the predicate is true, pending or committed, and its inventory entry:
@@ -343,6 +352,7 @@ A thing to notice: a peer can make the node allocate a `VoteSet` pair for any ro
     for (const held of [this.pending, this.committed]) {
       for (const [k, ev] of held) {
         if (!stale(ev)) continue;
+        if (held === this.pending) this.forget(k);
         held.delete(k);
         this.byHash.delete(toHex(evidenceId(ev)));
       }
@@ -356,24 +366,44 @@ A thing to notice: a peer can make the node allocate a `VoteSet` pair for any ro
 
 Invariant: an infraction key is in at most one of `pending` and `committed`. Everything the pool holds is let go once it is too old for any block to carry. Both callers' predicates count evidence whose height they have no block time for as stale: the node prunes blocks and headers only when they are older than the evidence window, so a height whose time is no longer held is a height too old, which on a pruning node is how evidence that has just expired leaves ([chapter 5](05-mempool-executor.md)). Before, only a proposer pruned, and only what was pending, so `committed` and `byHash` grew for ever.
 
-**`verifyEvidence(chainId, ev, valset, verifier)`** is the full check of either kind:
+**`verifyEvidence(chainId, ev, valset, verifier)`** is the full check of every kind:
 
 ```ts
+/**
+ * Full verification: shape, then every signature against the validator set of that height, and for a false
+ * citation the power behind the prevotes that speak against it, which must be +2/3 of that set.
+ */
 export async function verifyEvidence(chainId: string, ev: Evidence, valset: ValidatorSet, verifier: Verifier): Promise<string | null> {
   const shape = checkEvidenceShape(ev);
   if (shape) return shape;
   const val = valset.byIndex(evidenceValidator(ev));
   if (!val) return 'unknown validator index';
-  const ctx = signContext(chainId, 'vote');
-  const results = await verifier.verify(evidenceVotes(ev).map((v) => ({ sig: v.signature, msg: voteSignBytes(chainId, v), publicKey: val.publicKey, context: ctx })));
+  let jobs;
+  if (ev.kind === 'duplicateProposal') {
+    const ctx = signContext(chainId, 'proposal');
+    jobs = [ev.a, ev.b].map((h) => ({ sig: h.signature, msg: proposalHeadSignBytes(chainId, ev.height, ev.round, h.polRound, h.blockHash), publicKey: val.publicKey, context: ctx }));
+  } else {
+    const ctx = signContext(chainId, 'vote');
+    jobs = [];
+    let against = 0n;
+    for (const [i, v] of evidenceVotes(ev).entries()) {
+      // Each vote under the key of its own signer: in a false citation only the first is the accused's.
+      const signer = valset.byIndex(v.validatorIndex);
+      if (!signer) return 'unknown validator index';
+      if (i > 0) against += signer.power;
+      jobs.push({ sig: v.signature, msg: voteSignBytes(chainId, v), publicKey: signer.publicKey, context: ctx });
+    }
+    if (ev.kind === 'falseCitation' && !valset.isQuorum(against)) return 'the prevotes against the round named are not +2/3 of the power';
+  }
+  const results = await verifier.verify(jobs);
   if (results.some((ok) => !ok)) return 'bad signature in evidence';
   return null;
 }
 ```
 
-`checkEvidenceShape` from `src/types/evidence.ts` ([chapter 3](03-types.md)) says whether the two votes are a double sign or a forgotten lock at all; then the accused's index must exist in `valset` (the set of the infraction height, not the current one), and both signatures are verified in one batch with the vote context, over the votes exactly as given, `polRound` included. Returns an error string or null. Callers: `verifyBlockSignatures` below, and `Node.acceptEvidence` for gossiped evidence, which first asks `evidenceAgeOk` (below) whether the next block could still carry it, at the last block's time: evidence that is too old, names a height the node has no time for, or lies beyond the height being decided is dropped unverified and unpooled, and the peer is not charged, since it may be ahead of this node or hold history this node has pruned.
+`checkEvidenceShape` from `src/types/evidence.ts` ([chapter 3](03-types.md)) says whether what is given is one of the four faults at all; then the accused's index must exist in `valset` (the set of the infraction height, not the current one), and every signature is verified in one batch. Two proposals are checked with the proposal context over `proposalHeadSignBytes` of the evidence's height and round and each head's `polRound` and hash, both under the accused's key; whether the accused was the proposer of that round is not asked, since a validator has no business signing two proposals for a round in any case. Votes are checked with the vote context, exactly as given, `polRound` included, each under the key of its own signer, which for a false citation is a different validator for every vote after the first. For that kind the powers of those signers are added up on the way, and less than +2/3 of the set is refused before any signature is verified: `the prevotes against the round named are not +2/3 of the power`. Returns an error string or null. Callers: `verifyBlockSignatures` below, and `Node.acceptEvidence` for gossiped evidence, which first asks `evidenceAgeOk` (below) whether the next block could still carry it, at the last block's time: evidence that is too old, names a height the node has no time for, or lies beyond the height being decided is dropped unverified and unpooled, and the peer is not charged, since it may be ahead of this node or hold history this node has pruned.
 
-The node builds evidence in two ways: locally in `Consensus.addVote`, when `VoteSet.add` reports a conflict or the vote added shows a lock forgotten, and from peers by inventory. `test/recovery.test.ts` and `test/amnesia.test.ts` exercise the first path and `test/sync.test.ts` the second.
+The node builds evidence in two ways: locally in `Consensus` (`report`, below), from the votes and proposals it holds for its height and for the heights it keeps, and from peers by inventory. `test/recovery.test.ts`, `test/amnesia.test.ts` and `test/faults.test.ts` exercise the first path and `test/sync.test.ts` the second.
 
 ### src/consensus/validate.ts
 
@@ -426,6 +456,8 @@ The state machine. Its file header is a good summary and should be read first; t
 - **`Step`** is `'propose' | 'prevote' | 'precommit' | 'commit'`; a private `STEP_ORDER` gives them numbers so rule 36 can test "step at least prevote".
 - **`MAX_ROUND_AHEAD`** is 1000. The comment: "Rounds beyond this many ahead of ours are ignored; a round number is otherwise a free CPU budget for a peer." Review finding 6 found that a proposal for round 4294967295 made the node run billions of proposer-priority iterations before even checking the signature, because `proposerAt(r)` costs O(r).
 - `MAX_NEXT_HEIGHT_PROPOSALS` (8) and `MAX_NEXT_HEIGHT_PROPOSALS_PER_VALIDATOR` (2), the proposals for the next height held until it starts, "in all and signed by any one validator", are private. `MAX_EVIDENCE_PER_BLOCK` is imported from `validate.ts`.
+- **`VOTES_PER_PEER_SECOND`** is 200: the votes of one peer whose signatures a node verifies in a second, "or eight for each validator if that is more"; `MAX_DEFERRED_VOTES_PER_PEER`, 1,024, is the least number of votes over it that may wait for one peer (64 for each validator if that is more, up to `DEFERRED_VOTES_CAP`, 32,768), and `DEFERRED_VOTES_MS`, 250, how long before they are tried again; `VOTE_FLOOD_POINTS`, 10, is what a peer is charged for a second in which a vote of its found no room, and `MAX_REFUSED`, 64, the most evidence that waits for room in the pool.
+- **`PAST_HEIGHTS_KEPT`** is 16: the heights that are over whose votes and proposals are kept, "to hold a late vote or proposal against". The private **`PastHeight`** is what is kept of one: `validators`, `votes` (the height's `HeightVoteSet`), `maxRound` (the round it ended in), `proposals` (what each round's proposer signed, a `ProposalHead` by round; the height's `heads`) and `proposedTwice` (the rounds already reported).
 - **`StaleHeightError`** is thrown by the executor when a block arrives for a height that has already passed; `decide` treats it as "block sync got there first".
 - **`ConsensusDeps`** is everything consensus needs from the node. Reading the fields is reading the node wiring in `src/node/node.ts`: `chainId`; `getState()` is the executor's chain state; `applyBlock` and `updateCommit` go to the executor; `blockTimeAt` reads stored headers for evidence age; `requestBlock` broadcasts a `blockRequest` (the hash argument is accepted but the node sends only the height); `scorePeer` feeds the p2p scoring; `getLastCommit` loads the previous block's commit, needed to build a block; `validatorSetAtHeight` for evidence verification and for votes of the next height; `reapTxs(maxBytes)` is `mempool.reap`; `privValidator` is null on a full node; `verifier`; `evidencePool`; `broadcastProposal` and `broadcastVote` with an `exceptPeer` so a message is not echoed to its sender; optional `timeouts`, `limits` and `now` (injectable clock); `log`.
 - `RoundProposal` (private) is what the machine stores per round: the `proposal`, whether the block was `valid`, its `hash`, and `fetched` for a block obtained through `handleFetchedBlock` rather than from the proposer.
@@ -449,10 +481,14 @@ Two getters: `isValidator` (a key is present and its address is in the current s
     for (const t of this.timers.values()) clearTimeout(t);
     this.timers.clear();
     const st = this.d.getState();
+    if (this.hvs && st.lastHeight + 1n > this.height) this.keepHeight(st.lastHeight + 1n);
+    if (this.refused.size > 0) this.reportRefused(st);
     this.height = st.lastHeight + 1n;
     this.validators = st.validators;
     this.hvs = new HeightVoteSet(this.height, this.validators);
     this.proposals.clear();
+    this.heads = new Map();
+    this.proposedTwice = new Set();
     this.proposerCache.clear();
     this.prevoteTimeoutScheduled.clear();
     this.precommitTimeoutScheduled.clear();
@@ -484,7 +520,25 @@ Two getters: `isValidator` (a key is present and its address is in the current s
   }
 ```
 
-Everything per-height is reset, `fetchRequested` included: the hashes in it are of blocks of the height that is over. The lock is the exception. For a new height `lockAt` answers null and the validator starts unlocked; for the height a restarted process finds itself in, it answers the lock the private validator wrote with the last precommit for a block, and the validator goes on bound by it. `test/amnesia.test.ts`, "takes its lock up again after a restart in the same height, and commits nothing else there", plants a precommit record with a lock on a block nobody holds, restarts a single-validator chain and watches it pass round after round without committing: it promised that block, and the alternative, committing the next proposal, is how a restart turns into a fork. The two buffers for the next height are emptied once their entries for this height are taken out, and `nextHeightVoteKeys` with them. The validator set is the one chain state says signs `lastHeight + 1`. The resume logic is review finding 5: a validator that had signed, say, a proposal at this height before crashing would, on restarting at round 0, build a block with a new timestamp and be refused by its own guard with no timeout armed. Resuming at `last.round + 1` sidesteps the round the guard owns. The regression test in `test/review.test.ts` plants a guard record for height `h+1`, round 0, and checks that the chain continues and that block `h+1` was committed in round 1 or later. Votes and proposals that arrived early for this height are then replayed. A proposal was buffered once its signature verified with the key of the validator its block names (`holdNextHeightProposal`, below) and is replayed through `handleProposal` with the peer it came from (by way of `proposalUnawaited`, below, since nothing here waits for it), which decides what could not be decided on arrival: whether that validator is the proposer of the proposal's round, and whether the block is valid. The votes were verified when buffered, against the set `validatorSetAtHeight` returned for their own height, and each buffer entry keeps the public key the signature verified under; replay accepts a vote only if that same key still holds the vote's index in the set this height actually uses. A vote verified against one set is thus never credited to whichever validator sits at that index in another.
+Before anything is reset, the height that is over is kept (`keepHeight`): its vote set, its validator set and what each round's proposer signed go into `past`, a map by height of `PastHeight` records, and heights more than `PAST_HEIGHTS_KEPT` behind the new one leave it.
+
+```ts
+  /** Put the height that is over among the kept ones, cut to the round it ended in, and let go of the oldest. */
+  private keepHeight(next: bigint): void {
+    // The round this node was in, and the round the height was committed in: block sync may have applied a block
+    // decided in a later round than this node reached.
+    const commit = this.d.getLastCommit();
+    const maxRound = Math.max(this.round, this.decided ? this.decidedRound : 0, commit && commit.height === this.height ? commit.round : 0);
+    this.hvs.dropRoundsAbove(maxRound);
+    for (const r of this.heads.keys()) if (r > maxRound) this.heads.delete(r);
+    this.past.set(this.height, { validators: this.validators, votes: this.hvs, maxRound, proposals: this.heads, proposedTwice: this.proposedTwice });
+    for (const h of this.past.keys()) if (h + BigInt(PAST_HEIGHTS_KEPT) < next) this.past.delete(h);
+  }
+```
+
+The round the height ended in bounds what is kept and what is taken in for it later: `dropRoundsAbove` forgets the vote sets of later rounds, which a single validator can create by voting up to `MAX_ROUND_AHEAD` rounds ahead, and `maxRound` refuses late votes for them. That round is the latest of three: the round this node was in, the round it decided in, and the round of the stored commit for the height. The third matters when block sync applied the height: the node may have sat in round 0 holding one validator's vote of round 5 while the rest of the network committed in round 5, and that vote's conflicting twin must still find it. What is kept of the proposals is `heads`, what each round's proposer is known to have signed (below), and the set of rounds already reported for two proposals moves with it. `startHeight` runs this only when the height has moved, which is every time but the first, and also when block sync moved it (`restart`).
+
+Everything per-height is then reset, `fetchRequested` included: the hashes in it are of blocks of the height that is over. The lock is the exception. For a new height `lockAt` answers null and the validator starts unlocked; for the height a restarted process finds itself in, it answers the lock the private validator wrote with the last precommit for a block, and the validator goes on bound by it. `test/amnesia.test.ts`, "takes its lock up again after a restart in the same height, and commits nothing else there", plants a precommit record with a lock on a block nobody holds, restarts a single-validator chain and watches it pass round after round without committing: it promised that block, and the alternative, committing the next proposal, is how a restart turns into a fork. The two buffers for the next height are emptied once their entries for this height are taken out, and `nextHeightVoteKeys` with them. The validator set is the one chain state says signs `lastHeight + 1`. The resume logic is review finding 5: a validator that had signed, say, a proposal at this height before crashing would, on restarting at round 0, build a block with a new timestamp and be refused by its own guard with no timeout armed. Resuming at `last.round + 1` sidesteps the round the guard owns. The regression test in `test/review.test.ts` plants a guard record for height `h+1`, round 0, and checks that the chain continues and that block `h+1` was committed in round 1 or later. Votes and proposals that arrived early for this height are then replayed. A proposal was buffered once its signature verified with the key of the validator its block names (`holdNextHeightProposal`, below) and is replayed through `handleProposal` with the peer it came from (by way of `proposalUnawaited`, below, since nothing here waits for it), which decides what could not be decided on arrival: whether that validator is the proposer of the proposal's round, and whether the block is valid. The votes were verified when buffered, against the set `validatorSetAtHeight` returned for their own height, and each buffer entry keeps the public key the signature verified under; replay accepts a vote only if that same key still holds the vote's index in the set this height actually uses. A vote verified against one set is thus never credited to whichever validator sits at that index in another.
 
 #### `startRound` and `proposerAt`
 
@@ -556,13 +610,16 @@ Neither `propose` nor `startHeight` waits for `handleProposal`: both are synchro
     // by bytes it may be more under a small one, and the last record is left for the next block until it fits.
     // The transactions get what is left, never less than half, which is the most one transaction may be
     // (the mempool admits none larger), so evidence arriving block after block cannot keep a transaction out.
+    // A record that is more than the half on its own would keep every other record waiting behind it; the pool
+    // takes none in (EvidencePool.maxRecordBytes, set by the node to what fits here).
     const SLACK = 1024;
+    let evidence = this.d.evidencePool.list(MAX_EVIDENCE_PER_BLOCK);
     while (evidence.length > 0 && blockDataBytes({ txs: [], evidence }) + SLACK > Math.floor(this.limits.maxBlockBytes / 2)) evidence = evidence.slice(0, -1);
     const budget = this.limits.maxBlockBytes - blockDataBytes({ txs: [], evidence }) - SLACK;
     const txs = budget > 0 ? this.d.reapTxs(budget) : [];
 ```
 
-Review finding 15: a fixed 64 KiB reservation did not account for a large commit or many evidence items, so a full mempool plus a hundred evidence records produced blocks that every validator rejected as too large, forever. The first fix measured the block without its transactions (a shell of header, last commit and evidence) and gave the remainder, less 1 KiB of slack, to the mempool. That made the builder exact, but the limit still counted the commit, which grows with the validator set: with 64 KiB blocks and 40 ML-DSA-44 validators the commit alone makes an empty block 65,781 bytes, so every proposal would have been invalid and the chain would have stopped. The limit is now on what the proposer chooses, the transactions and the evidence (`blockDataBytes`, [chapter 3](03-types.md)), and the builder measures the same thing. Evidence is picked by count, not by bytes, and each record carries two signed votes, about 5 KiB under ML-DSA-44 (about 230 bytes under secp256k1); with a small `maxBlockBytes` sixteen of them could exceed the limit before a single transaction is added, and `budget > 0` would then only leave the block without transactions, not make it small enough. The `while` loop drops the last record until the evidence plus the slack fits in half the limit, `Math.floor(this.limits.maxBlockBytes / 2)`. The dropped records stay in the pool and go into a later block; nothing is lost, only deferred. The transactions get the limit less the evidence and the slack, which is never less than half the limit, and a block with neither is within the limit whatever the validator set.
+Review finding 15: a fixed 64 KiB reservation did not account for a large commit or many evidence items, so a full mempool plus a hundred evidence records produced blocks that every validator rejected as too large, forever. The first fix measured the block without its transactions (a shell of header, last commit and evidence) and gave the remainder, less 1 KiB of slack, to the mempool. That made the builder exact, but the limit still counted the commit, which grows with the validator set: with 64 KiB blocks and 40 ML-DSA-44 validators the commit alone makes an empty block 65,781 bytes, so every proposal would have been invalid and the chain would have stopped. The limit is now on what the proposer chooses, the transactions and the evidence (`blockDataBytes`, [chapter 3](03-types.md)), and the builder measures the same thing. Evidence is picked by count, not by bytes, and most records carry two signatures, about 5 KiB under ML-DSA-44 (about 230 bytes under secp256k1), while a false citation carries a vote for most of the validator set; with a small `maxBlockBytes` sixteen of them could exceed the limit before a single transaction is added, and `budget > 0` would then only leave the block without transactions, not make it small enough. The `while` loop drops the last record until the evidence plus the slack fits in half the limit, `Math.floor(this.limits.maxBlockBytes / 2)`. The dropped records stay in the pool and go into a later block; nothing is lost, only deferred. The loop always ends with at least one record in the block if any waits, because the pool takes in no record that is more than this half on its own (`maxRecordBytes`, above). The transactions get the limit less the evidence and the slack, which is never less than half the limit, and a block with neither is within the limit whatever the validator set.
 
 Half, and not the whole limit, because of the transaction at the head of the queue. The loop first let evidence have the whole limit less the slack. On a chain with 64 KiB blocks the mempool then admitted a transaction of 32,768 bytes, and thirteen ML-DSA-44 records, about 4.9 KiB each, left it no room. `reapTxs` stops at the first transaction that does not fit ([chapter 5](05-mempool-executor.md)), so as long as evidence arrived with every block that transaction, and everything queued behind it, stayed out. Now evidence takes at most half a block, and the mempool admits no transaction that costs more than the other half: its `maxTxBytes` is half the limit less the four bytes of the transaction's length prefix in the block, and never more than 1 MiB, which is what it comes to at the default limit ([chapter 8](08-node.md)). A transaction the pool admitted therefore fits the next block it is first in line for, whatever evidence is waiting. With the default 4 MiB the rule changes nothing in practice: sixteen ML-DSA-44 records are about 79 KiB, far below 2 MiB. The header then takes `appHash`, `lastResultsHash`, `validatorsHash` and `nextValidatorsHash` from chain state, `dataHash` from `txsRoot(txs)`, `evidenceHash` from the evidence list, and `proposerAddress` from the private validator. Everything a validator checks in `validateBlockStructure` is set here.
 
@@ -575,8 +632,16 @@ Half, and not the whole limit, because of the transaction at the head of the que
       await this.holdNextHeightProposal(p, fromPeer);
       return;
     }
+    if (p.height < this.height) {
+      await this.handlePastProposal(p, fromPeer);
+      return;
+    }
     if (p.height !== this.height) return;
-    if (this.proposals.has(p.round)) return;
+    // A proposal for a round that has one is looked at only for what its proposer signed: nothing, if that is known
+    // and this says the same, or if the proposer was already reported for signing two.
+    const taken = this.proposals.has(p.round);
+    const head = this.heads.get(p.round);
+    if (taken && head && (this.proposedTwice.has(p.round) || sameProposal(head, p))) return;
     if (p.polRound < -1 || p.polRound >= p.round) return;
     if (p.block.header.height !== p.height) return;
 
@@ -591,7 +656,9 @@ Half, and not the whole limit, because of the transaction at the head of the que
     });
 ```
 
-Cheap filters first: a proposal for the next height goes to `holdNextHeightProposal` (below), other heights are dropped, one proposal per round is kept (the first to verify wins), `polRound` must be `-1` or an earlier round, the block's own height must match, and the round must be within `MAX_ROUND_AHEAD`. Then the signature is checked against the *round's* proposer, not the block's `proposerAddress`. Review finding 4 found three honest validators stuck forever because a re-proposal of a polka'd block was rejected for carrying the original builder's address.
+Cheap filters first: a proposal for the next height goes to `holdNextHeightProposal` (below), one for an earlier height to `handlePastProposal` (further below), other heights are dropped, one proposal per round is kept (the first to verify wins), `polRound` must be `-1` or an earlier round, the block's own height must match, and the round must be within `MAX_ROUND_AHEAD`. Then the signature is checked against the *round's* proposer, not the block's `proposerAddress`. Review finding 4 found three honest validators stuck forever because a re-proposal of a polka'd block was rejected for carrying the original builder's address.
+
+A round that has its proposal does not take another, but a second one is no longer dropped unseen. Beside `proposals`, which holds what each round decides on, consensus keeps `heads`: for each round, the `ProposalHead` (`polRound`, block hash, signature) of the first proposal whose signature verified under the round's proposer. If a proposal for a taken round says what the head says (`sameProposal`), which is what the proposer's re-sending and every relay produce, or the proposer was already reported, it is dropped at no cost as before. Otherwise it goes on to the signature check, because with a good signature it is the second half of a proof (`signedProposal`, below). The two maps are apart because they can differ: a round may decide on a block that was fetched after +2/3 precommitted it (`handleFetchedBlock`), which replaces the round's entry in `proposals` with a placeholder that carries no signature, while what the proposer signed for the round is still what it signed.
 
 A proposal for the next height arrives when a peer has decided this height a moment before the node has. It cannot be handled yet, since the round's proposer is not known until the height starts, but it is not held unchecked either:
 
@@ -637,6 +704,10 @@ So a place is taken only by a proposal that carries the valid signature of a val
 
     // Stopped while the signature was verified: the checks below read stored blocks, and the store may be closed.
     if (!this.running) return;
+    // Whatever becomes of the proposal, its proposer signed it. The height may have moved on meanwhile, and then
+    // it is held against what is kept of that height.
+    this.signedProposal(p);
+    if (taken || p.height !== this.height) return;
 
     // The signature covers the header; a relay can pair it with another body. That is a corrupt message, not
     // the round's proposal: drop it without recording the round, so the real one can still arrive.
@@ -647,7 +718,7 @@ So a place is taken only by a proposal that carries the valid signature of a val
     }
 ```
 
-A bad signature costs the sending peer 20 points, the same as a bad vote signature: a proposal is as expensive to verify as a vote and the signer is just as well known, so there is no reason to let a peer send them for free. Then `running` is read again. The verification is a wait on the worker pool, and the node may have been stopped during it: `stop()` clears the flag and does not wait for a proposal that is being verified, and a node that stops closes its store soon after ([chapter 8](08-node.md)). "The checks below read stored blocks, and the store may be closed": the validity checks ask for the time of an earlier block and for the validator sets of earlier heights, which come from the block store. A proposal whose verification outlasted the stop therefore ends here, having read nothing. The node's handler does not wait for `handleProposal`; it hands the promise to `detached` ([chapter 8](08-node.md)), which takes whatever the call ends with. A proposal that resumes after a stop somewhere this check does not cover, to a closed verifier pool or a closed store, therefore ends as the line `handling a proposal failed` in the log, at `debug`, and nothing more. The two kinds of proposal no handler of the node stands behind, the proposer's own and one held for the height, end with the same line in `proposalUnawaited` (above). Then the body. `proposalSignBytes` covers the proposal's header, and the header commits to the body only through its three roots (`dataHash`, `evidenceHash`, `lastCommitHash`); a relay could keep the signed header and pair it with other transactions, other evidence or a different commit. `bodyMatchesHeader` (in `src/consensus/validate.ts`, re-exported by state sync, which needs the same check on a fetched block) recomputes the three roots and compares. A mismatch is a corrupt message rather than the round's proposal, so it is dropped *without* recording the round: if it were recorded as an invalid proposal, the `proposals.has(p.round)` filter above would then reject the genuine proposal when it arrived, and the whole round would be lost to one bad relay.
+A bad signature costs the sending peer 20 points, the same as a bad vote signature: a proposal is as expensive to verify as a vote and the signer is just as well known, so there is no reason to let a peer send them for free. Then `running` is read again, and `signedProposal` is told of the proposal, whatever becomes of it next: its proposer signed it. A proposal for a round that had one ends here, as evidence or as nothing; it is never the round's proposal, so its body and its block are not looked at. So does one whose height ended during the verification, which `signedProposal` holds against what was kept of that height. The verification is a wait on the worker pool, and the node may have been stopped during it: `stop()` clears the flag and does not wait for a proposal that is being verified, and a node that stops closes its store soon after ([chapter 8](08-node.md)). "The checks below read stored blocks, and the store may be closed": the validity checks ask for the time of an earlier block and for the validator sets of earlier heights, which come from the block store. A proposal whose verification outlasted the stop therefore ends here, having read nothing. The node's handler does not wait for `handleProposal`; it hands the promise to `detached` ([chapter 8](08-node.md)), which takes whatever the call ends with. A proposal that resumes after a stop somewhere this check does not cover, to a closed verifier pool or a closed store, therefore ends as the line `handling a proposal failed` in the log, at `debug`, and nothing more. The two kinds of proposal no handler of the node stands behind, the proposer's own and one held for the height, end with the same line in `proposalUnawaited` (above). Then the body. `proposalSignBytes` covers the proposal's header, and the header commits to the body only through its three roots (`dataHash`, `evidenceHash`, `lastCommitHash`); a relay could keep the signed header and pair it with other transactions, other evidence or a different commit. `bodyMatchesHeader` (in `src/consensus/validate.ts`, re-exported by state sync, which needs the same check on a fetched block) recomputes the three roots and compares. A mismatch is a corrupt message rather than the round's proposal, so it is dropped *without* recording the round: if it were recorded as an invalid proposal, the `proposals.has(p.round)` filter above would then reject the genuine proposal when it arrived, and the whole round would be lost to one bad relay.
 
 After the signature and the body, the block itself:
 
@@ -674,11 +745,79 @@ After the signature and the body, the block itself:
   }
 ```
 
-An invalid proposal is still recorded (with `valid: false`), because the paper's rules say to prevote nil on an invalid proposal rather than wait for the timeout, and the record stops a second copy from being verified. Only valid proposals are forwarded to peers. Contrast the two earlier failures: a bad signature or a body that does not match the header is not the round's proposal at all, so neither is recorded, and the round stays open for the real one.
+Before the proposal is recorded the round is looked up once more, since two proposals for one round can both be in verification at once and only the first to come out is the round's. If they differ, that was already seen: each went through `signedProposal` when its signature verified. An invalid proposal is still recorded (with `valid: false`), because the paper's rules say to prevote nil on an invalid proposal rather than wait for the timeout, and the record stops a second copy from being verified. Only valid proposals are forwarded to peers. Contrast the two earlier failures: a bad signature or a body that does not match the header is not the round's proposal at all, so neither is recorded, and the round stays open for the real one.
+
+#### Two proposals for a round
+
+```ts
+  /**
+   * A proposal whose signature verified under the proposer of its round, of this height or a kept one. The first
+   * for a round is what the proposer signed; another that says something else is the second half of the proof
+   * that it signed twice.
+   */
+  private signedProposal(p: Proposal): void {
+    const kept = p.height === this.height ? null : this.past.get(p.height);
+    if (p.height !== this.height && (!kept || p.round > kept.maxRound)) return;
+    const [heads, reported, validators] = kept ? [kept.proposals, kept.proposedTwice, kept.validators] : [this.heads, this.proposedTwice, this.validators];
+    const second = { polRound: p.polRound, blockHash: blockHash(p.block), signature: p.signature };
+    const first = heads.get(p.round);
+    if (!first) {
+      heads.set(p.round, second);
+      return;
+    }
+    if (reported.has(p.round) || sameProposal(first, p)) return;
+    // Marked once the pool holds the proof or it waits for room there.
+    if (this.report(makeDuplicateProposalEvidence(p.height, p.round, validators.indexOf(proposerOf(validators, p.round).address), first, second))) reported.add(p.round);
+  }
+
+  /** A proposal for a kept height: nothing to decide any more, but beside the one its proposer is known to have signed it may show two. */
+  private async handlePastProposal(p: Proposal, fromPeer: string | null): Promise<void> {
+    const kept = this.past.get(p.height);
+    const first = kept?.proposals.get(p.round);
+    if (!kept || !first || kept.proposedTwice.has(p.round) || sameProposal(first, p)) return;
+    if (p.polRound < -1 || p.polRound >= p.round || p.block.header.height !== p.height) return;
+    // The proposer of the round in that height's set; the round is one the height reached, so the walk is bounded.
+    const ok = await this.d.verifier.verifyOne({ sig: p.signature, msg: proposalSignBytes(this.d.chainId, p), publicKey: proposerOf(kept.validators, p.round).publicKey, context: this.proposalCtx });
+    if (!ok) {
+      if (fromPeer) this.d.scorePeer?.(fromPeer, 20, 'bad proposal signature');
+      return;
+    }
+    if (this.running) this.signedProposal(p);
+  }
+
+  /**
+   * Evidence this node made itself: into the pool, from where it is announced and proposed. True if the pool holds
+   * a proof of the offence afterwards, this one or one it had; false if it had no room.
+   */
+  private report(ev: Evidence): boolean {
+    const pool = this.d.evidencePool;
+    if (pool.add(ev)) this.log('warn', 'fault detected', { kind: ev.kind, h: evidenceHeight(ev), validator: evidenceValidator(ev) });
+    if (pool.has(ev)) return true;
+    // No room now. A proof the pool could take when it has room waits here, since the votes that made it are held
+    // already and will not be looked at again; one too large for the pool never fits.
+    if (evidenceBytes(ev) > pool.maxRecordBytes || this.refused.size >= MAX_REFUSED) return false;
+    this.refused.set(evidenceKey(ev), ev);
+    return true;
+  }
+
+  /** Offer the pool again what it had no room for, and let go of what has grown too old for any block. */
+  private reportRefused(st: ChainState): void {
+    for (const [k, ev] of this.refused) {
+      const old = evidenceAgeOk(evidenceHeight(ev), st.lastHeight + 1n, st.lastBlockTime, st, this.limits, this.d.blockTimeAt) !== null;
+      if (old || this.d.evidencePool.add(ev) || this.d.evidencePool.has(ev)) this.refused.delete(k);
+    }
+  }
+```
+
+`signedProposal` is given every proposal whose signature verified with the key of its round's proposer. The first for a round becomes the round's head. A later one that says something else, with the first, is `DuplicateProposalEvidence` against the proposer (`proposerOf`, a function at the end of the file that advances a copy of a set by the round), and once the pool holds the proof, or the proof waits for room there, the round is marked in `proposedTwice`, so that when the round has its proposal a third is not verified at all. If the proof is one the pool will never take, the round is left unmarked. It does not matter what else became of either proposal: the first may have been judged invalid, or dropped because its body did not match its header, and its signature was verified all the same, which is all the evidence needs. A second proposal is not passed on to peers, and the round keeps the proposal it had: the evidence travels by inventory. For a proposal of a height that is over, the heads, the reported rounds and the validator set are the kept ones, and a round the height never reached is ignored; that is the path of a proposal that was in verification when its height ended.
+
+`handlePastProposal` is for a proposal that arrives when its height is already over. It is verified only if the kept height has a head for the round that says something else and the proposer was not reported, so a late proposal costs a verification only when it may complete a proof. A single late proposal for a round with no head proves nothing, and the node that holds the other one will see this one if it was ever relayed.
+
+`report` is where all evidence this node makes itself goes into the pool. The pool refuses a second proof of an offence it holds, so the log line `fault detected`, with the kind, the height and the validator's index, appears once per offence. If the pool has no room (it is bounded in number and in bytes), the proof is kept in `refused`, by offence and at most `MAX_REFUSED`, 64, of them, unless it is larger than the pool takes at all. The votes or proposals that made it are held already and are dropped as duplicates when they come again, so nothing would make the proof a second time. `reportRefused` offers the pool what waits there when each height starts, which is when a block has just taken evidence out of the pool, and lets go of what has grown too old for any block. `report` answers whether the proof is in the pool or waiting for it.
 
 #### `handleVote` and `addVote`
 
-`handleVote(v, fromPeer)` accepts votes for the current height (dropping exact duplicates with `hvs.has` before verification, which is what makes the gossip re-send cost bandwidth rather than CPU) and for the next height, where a vote already held is dropped in the same way and the rest are verified against `validatorSetAtHeight(v.height)`, the stored set for the vote's own height. What tells one held vote from another is `nextHeightVoteKey(v)`, a string of the round, the type, the validator index, the block hash in hex (empty for nil) and the `polRound`, kept in the set `nextHeightVoteKeys`: "a peer repeating a valid vote would otherwise have it checked each time and fill the places with copies". A conflicting vote differs in its hash or in the round it names, so it has another key and is verified and held too, and both reach `addVote` when the height starts, where the pair becomes evidence. The obvious shortcut, `getState().nextValidators`, is wrong in a corner: block sync may have applied the current height already while consensus was still on it, and then the state's "next" set is the one *after* the vote's height, whose index positions mean other keys. Asking by the vote's height is right in both cases. The validator is looked up by index; a vote for a round more than `MAX_ROUND_AHEAD` beyond the node's own is dropped here, before its signature is verified, since a vote the node will not count must not cost it a verification; the signature is verified with the vote context; a bad signature is logged and costs the sending peer 20 points through `scorePeer` (`RPC-SYNC-PROOFS.md` section 4.6). After the await: `running` again, `MAX_ROUND_AHEAD` again (the height may have moved on while the worker verified, and the round with it), and then either `addVote` or the next-height buffer (at most 4096 entries, each the vote with the public key it verified under, which `startHeight` checks again before replaying it). The key is looked up once more before the vote is pushed, because two copies of one vote can both be in verification at once, and it is added to `nextHeightVoteKeys` with the push.
+`handleVote(v, fromPeer)` accepts votes for the current height (dropping exact duplicates with `hvs.has` before verification, which is what makes the gossip re-send cost bandwidth rather than CPU), for a kept earlier height (if the round is one that height reached and the vote is not held already; it is verified against the kept set and goes to `addPastVote`, below), and for the next height, where a vote already held is dropped in the same way and the rest are verified against `validatorSetAtHeight(v.height)`, the stored set for the vote's own height. What tells one held vote from another is `nextHeightVoteKey(v)`, a string of the round, the type, the validator index, the block hash in hex (empty for nil) and the `polRound`, kept in the set `nextHeightVoteKeys`: "a peer repeating a valid vote would otherwise have it checked each time and fill the places with copies". A conflicting vote differs in its hash or in the round it names, so it has another key and is verified and held too, and both reach `addVote` when the height starts, where the pair becomes evidence. The obvious shortcut, `getState().nextValidators`, is wrong in a corner: block sync may have applied the current height already while consensus was still on it, and then the state's "next" set is the one *after* the vote's height, whose index positions mean other keys. Asking by the vote's height is right in both cases. The validator is looked up by index; a vote of the current or next height for a round more than `MAX_ROUND_AHEAD` beyond the node's own is dropped here, and one from a peer that has used up its budget for the second is put aside to wait (`withinVoteBudget` and `deferVote`, below), before its signature is verified, since a vote the node will not count must not cost it a verification; the signature is verified with the vote context; a bad signature is logged and costs the sending peer 20 points through `scorePeer` (`RPC-SYNC-PROOFS.md` section 4.6). After the await: `running` again, `MAX_ROUND_AHEAD` again (the height may have moved on while the worker verified, and the round with it), and then either `addVote` or the next-height buffer (at most 4096 entries, each the vote with the public key it verified under, which `startHeight` checks again before replaying it). The key is looked up once more before the vote is pushed, because two copies of one vote can both be in verification at once, and it is added to `nextHeightVoteKeys` with the push.
 
 ```ts
   /** Add an already-verified vote for the current height. */
@@ -686,18 +825,15 @@ An invalid proposal is still recorded (with `valid: false`), because the paper's
     if (v.height !== this.height) return;
     const { added, conflict } = this.hvs.add(v);
     if (conflict) {
-      const ev = makeDuplicateVoteEvidence(conflict, v);
-      if (this.d.evidencePool.add(ev)) {
-        this.log('warn', 'double sign detected', { h: v.height, r: v.round, type: voteTypeName(v.type), validator: v.validatorIndex });
-      }
+      this.report(makeDuplicateVoteEvidence(conflict, v));
+      // The second vote is as signed as the first, and may complete a proof against another validator.
+      for (const ev of faultsShown(this.hvs, this.validators, v)) this.report(ev);
       // The vote set keeps whichever of the two counts for its block, so a majority may have formed.
       if (!this.decided) this.evaluateRules();
       return;
     }
     if (!added) return;
-    for (const ev of this.forgottenLocks(v)) {
-      if (this.d.evidencePool.add(ev)) this.log('warn', 'forgotten lock detected', { h: v.height, validator: v.validatorIndex, precommit: ev.precommit.round, prevote: ev.prevote.round, polRound: ev.prevote.polRound });
-    }
+    for (const ev of faultsShown(this.hvs, this.validators, v)) this.report(ev);
     this.log('debug', 'got vote', { h: v.height, r: v.round, type: voteTypeName(v.type), i: v.validatorIndex, block: v.blockHash });
     this.d.broadcastVote(v, fromPeer);
     if (this.decided) {
@@ -712,28 +848,248 @@ An invalid proposal is still recorded (with `valid: false`), because the paper's
   }
 ```
 
-Three outcomes. A conflict becomes evidence: `makeDuplicateVoteEvidence` puts the pair in canonical order and the pool deduplicates; the rules run after it, because the vote set may have kept the second vote in place of the first and a majority may have formed. A new vote is first held against the validator's other votes of the height:
+Three outcomes. A conflict becomes evidence: `makeDuplicateVoteEvidence` puts the pair in canonical order and `report` hands it to the pool, which deduplicates. The second vote is then held against the other votes like a new one, since it is as signed as the first and may be what completes a proof against another validator (below). The rules run after it, because the vote set may have kept the second vote in place of the first and a majority may have formed. A new vote is first held against the other votes of the height, by `faultsShown`, a function of a height's votes and its validator set that is used for kept heights as well:
 
 ```ts
-  /**
-   * What a vote just added proves with the votes already held from the same validator: a precommit for one block
-   * and a prevote for another in a later round that names no proof of lock from the precommit's round or after.
-   * Either vote may arrive last.
-   */
-  private forgottenLocks(v: Vote): AmnesiaEvidence[] {
-    if (v.blockHash === null) return [];
-    const out: AmnesiaEvidence[] = [];
-    for (const r of this.hvs.roundNumbers()) {
-      const other = v.type === VoteType.Prevote ? this.hvs.precommits(r).get(v.validatorIndex) : this.hvs.prevotes(r).get(v.validatorIndex);
+/**
+ * What a verified vote proves with the votes held for its height, whichever arrived last. The vote is one just
+ * added, or the second of two a validator signed for one place, of which the set holds one: both are signed, so
+ * where the held one says nothing against a claim and this one does, this one is taken.
+ *
+ * A forgotten lock: a precommit for one block and a prevote of the same validator for another in a later round
+ * that names no proof of lock from the precommit's round or after.
+ *
+ * A false citation: a prevote for a block that names a round in which +2/3 of the power prevoted something else.
+ * The vote added may be the prevote that names the round, or one of the round named that completes the +2/3.
+ */
+export function faultsShown(votes: HeightVoteSet, validators: ValidatorSet, v: Vote): Evidence[] {
+  const out: Evidence[] = [];
+  if (v.blockHash !== null) {
+    for (const r of votes.roundNumbers()) {
+      const other = v.type === VoteType.Prevote ? votes.precommits(r).get(v.validatorIndex) : votes.prevotes(r).get(v.validatorIndex);
       if (!other) continue;
       const [precommit, prevote] = v.type === VoteType.Prevote ? [other, v] : [v, other];
-      if (isAmnesia(precommit, prevote)) out.push({ kind: 'amnesia', precommit, prevote });
+      // One proof of an offence is enough: the pool keeps one a validator and height.
+      if (isAmnesia(precommit, prevote)) {
+        out.push({ kind: 'amnesia', precommit, prevote });
+        break;
+      }
     }
-    return out;
+  }
+  if (v.type !== VoteType.Prevote) return out;
+  const citing: Vote[] = v.blockHash !== null && v.polRound >= 0 ? [v] : [];
+  for (const r of votes.roundNumbers()) {
+    if (r <= v.round) continue;
+    for (const w of votes.prevotes(r).all()) if (speaksAgainst(w, v)) citing.push(w);
+  }
+  // One proof a validator, the smallest in bytes: a larger one may be more than a pool takes where a smaller is not.
+  // A minority can sign such prevotes for every round ahead that a node takes votes for and for any number of
+  // blocks, so while looking only the cost of each claim is worked out, once for each round and block named, and
+  // the votes of a proof are gathered for the winners alone.
+  const rounds = new Map<number, (hash: Uint8Array) => Refutation | null>();
+  const best = new Map<number, { prevote: Vote; refutation: Refutation }>();
+  for (const prevote of citing) {
+    let refute = rounds.get(prevote.polRound);
+    if (!refute) rounds.set(prevote.polRound, (refute = refuter(votes.prevotes(prevote.polRound), validators, v)));
+    const refutation = refute(prevote.blockHash!);
+    const had = best.get(prevote.validatorIndex);
+    if (refutation && (!had || refutation.bytes < had.refutation.bytes)) best.set(prevote.validatorIndex, { prevote, refutation });
+  }
+  for (const { prevote, refutation } of best.values()) out.push({ kind: 'falseCitation', prevote, against: refutation.votes() });
+  return out;
+}
+```
+
+A prevote for a block is paired with each precommit the validator has in the height, a precommit for a block with each of its prevotes, and `isAmnesia` ([chapter 3](03-types.md)) says whether the pair shows a lock forgotten. Either vote may be the one that arrives last, which is why the search runs from both. The pool keeps one such piece per validator and height (`evidenceKey`), so a validator that forgot its lock in several rounds is reported once. An honest validator never appears here: its prevote for another block names the round of its lock or a later one, by rule 28 and by its private validator.
+
+The second half is the false citation, and only a prevote can complete one. The prevotes that might be shown false by the new vote are the new vote itself, if it names a round, and every held prevote of a later round that names the new vote's round for another block (`speaksAgainst`). For each, `refuter` (below) gives the cheapest set of prevotes of the round it names that are not for its block and hold +2/3 of the power, if the votes held make one. Votes that wait uncounted are taken like any other: a signed prevote says what its signer prevoted whether or not this node counts it. One proof is made for each accused validator in a call, the one that encodes to the fewest bytes, however many rounds and blocks it named falsely. The same evidence is produced again by each further prevote of that round, and the pool refuses the copies.
+
+```ts
+/** The cheapest prevotes that refute a claim, +2/3 of the power not for its block: what they encode to, and the votes, by validator index. */
+interface Refutation {
+  bytes: number;
+  votes(): Vote[];
+}
+
+/**
+ * For the prevotes held of one round, a function from a block's hash to the cheapest refutation of the claim that
+ * the block had +2/3 there, or null if the votes do not make one.
+ *
+ * A prevote for nil encodes to 32 bytes less than one for a block, and all else in a vote is of one size, so the
+ * cheapest set is some number of the heaviest nil prevotes and, with them, as few of the heaviest block prevotes
+ * as reach +2/3: one pass over the two lists finds it. Every block the round holds no prevote for is refuted by
+ * the same votes, so that answer is worked out once, and the others once for each block the round does hold.
+ *
+ * A validator that signed two prevotes for the round has prevoted both: the set holds one and keeps the other
+ * aside, and `inHand`, the vote being looked at, may be a third. Whichever of them speaks against a claim is
+ * taken, nil before a block.
+ */
+function refuter(round: VoteSet, validators: ValidatorSet, inHand: Vote): (hash: Uint8Array) => Refutation | null {
+  const held = round.all();
+  const power = (o: Vote) => validators.byIndex(o.validatorIndex)!.power;
+  const heaviest = (a: Vote, b: Vote) => (power(a) === power(b) ? a.validatorIndex - b.validatorIndex : power(a) > power(b) ? -1 : 1);
+  // The validators with more than one prevote of this round, each with all of them.
+  const several = new Map<number, Vote[]>();
+  const also = (o: Vote) => {
+    const first = round.get(o.validatorIndex);
+    if (!first) return;
+    const all = several.get(o.validatorIndex) ?? [first];
+    if (all.some((x) => sameVoteContent(x, o))) return;
+    all.push(o);
+    several.set(o.validatorIndex, all);
+  };
+  for (const o of round.alternates()) also(o);
+  if (inHand.type === round.type && inHand.round === round.round) also(inHand);
+  const single = several.size === 0 ? held : held.filter((o) => !several.has(o.validatorIndex));
+  const nils = single.filter((o) => o.blockHash === null).sort(heaviest);
+  const blocks = single.filter((o) => o.blockHash !== null).sort(heaviest);
+  const present = new Set<string>();
+  for (const o of [...blocks, ...[...several.values()].flat()]) if (o.blockHash) present.add(blockHashKey(o.blockHash));
+  const size = (o: Vote) => encode((w) => encodeVote(w, o)).length;
+  const nilBytes = size({ ...(held[0] ?? inHand), blockHash: null });
+  const blockBytes = nilBytes + HASH_SIZE;
+
+  const cheapest = (hash: Uint8Array | null): Refutation | null => {
+    // Of a validator's several prevotes, one that speaks against the claim, nil before a block.
+    const speaks = (o: Vote) => hash === null || !bytesEqual(o.blockHash, hash);
+    const extra: Vote[] = [];
+    for (const all of several.values()) {
+      const o = all.find((x) => x.blockHash === null) ?? all.find(speaks);
+      if (o) extra.push(o);
+    }
+    const nil = extra.some((o) => o.blockHash === null) ? [...nils, ...extra.filter((o) => o.blockHash === null)].sort(heaviest) : nils;
+    const block = (extra.some((o) => o.blockHash !== null) ? [...blocks, ...extra.filter((o) => o.blockHash !== null)].sort(heaviest) : blocks).filter(speaks);
+    // k of the nil prevotes and the fewest block prevotes that reach +2/3 with them, for every k; fewer are needed as k grows.
+    let blockPower = 0n;
+    let m = 0;
+    while (m < block.length) blockPower += power(block[m++]!);
+    let nilPower = 0n;
+    let found: { k: number; m: number; bytes: number } | null = null;
+    for (let k = 0; k <= nil.length; k++) {
+      if (k > 0) nilPower += power(nil[k - 1]!);
+      if (!validators.isQuorum(nilPower + blockPower)) continue;
+      while (m > 0 && validators.isQuorum(nilPower + blockPower - power(block[m - 1]!))) blockPower -= power(block[--m]!);
+      const bytes = k * nilBytes + m * blockBytes;
+      if (!found || bytes < found.bytes) found = { k, m, bytes };
+    }
+    if (!found) return null;
+    const { k, m: taken, bytes } = found;
+    return { bytes, votes: () => [...nil.slice(0, k), ...block.slice(0, taken)].sort((a, b) => a.validatorIndex - b.validatorIndex) };
+  };
+
+  let absent: Refutation | null | undefined;
+  const byBlock = new Map<string, Refutation | null>();
+  return (hash) => {
+    const key = blockHashKey(hash);
+    // No prevote of the round is for this block: every vote speaks against, as for any other such block.
+    if (!present.has(key)) return absent === undefined ? (absent = cheapest(null)) : absent;
+    if (!byBlock.has(key)) byBlock.set(key, cheapest(hash));
+    return byBlock.get(key)!;
+  };
+}
+```
+
+Three things shape this function. The first is size. A proof holds a vote for much of the validator set, the pool takes no record above its limit, and a validator's different claims are refuted by different votes; so the proof must be the smallest the votes allow, or a claim could go unpunished for want of a few bytes while a smaller proof of it existed. Every vote of a chain encodes to the same size but for the hash, 32 bytes that a prevote for nil does not have. The cheapest refutation is therefore `k` of the heaviest nil prevotes and the fewest of the heaviest block prevotes that reach +2/3 with them, for the best `k`; the loop tries every `k`, and since more nil power never needs more block votes, `m` only moves down and the whole search is one pass over the two sorted lists. Fewest votes is not the same thing: where signatures are small (secp256k1), a few more nil prevotes can cost less than fewer block prevotes.
+
+The second is cost. A minority of validators can sign prevotes for every round ahead that a node takes votes for, each naming the same round for a different made-up block, and all of them are held when that round's prevotes arrive. Every block the round holds no prevote for is refuted by the same votes, so that answer (`absent`) is worked out once and shared; a block the round does hold prevotes for gets its own, and there are no more such blocks than validators. The votes of a refutation are gathered only when `votes()` is called, which `faultsShown` does for the one winning claim of each accused.
+
+The third is the validator that signed two prevotes for the round. It has prevoted both. The set holds one and keeps the other aside (`alternates`), and the vote in hand may be yet another; `several` gathers them by validator, and for each claim the one that speaks against it is taken, nil before a block: a validator that prevoted the block and then also nil has prevoted nil. Without the vote put aside, a claim that arrives after the double sign would be held against one of the two votes only, and whether it was refuted would depend on the order the votes came in.
+
+An honest validator names only a round in which it counted +2/3 for the block itself (rule 28, or the round of its own lock). That majority and +2/3 against it, held at one node or at two, share more than a third of the power, and every validator in that share signed two prevotes in the round. So an honest validator is proven false here only by more than a third of the power signing twice, each of them convicted by its own two votes.
+
+Then the new vote is forwarded to every peer except its source and the rules run. A new vote after the decision is the "fuller commit" of `STAKING.md` section 2.1: a precommit for the decided block in the decided round is merged into the stored commit so that the slow validator is credited as a signer (block rewards and downtime tracking in the staking module are keyed on `lastCommitSigners`, so being recorded absent for a few hundred milliseconds of latency would be a penalty). `test/engine.test.ts`, "folds a precommit that arrives after the decision into the stored commit", isolates one validator, lets the other three decide, then injects the fourth's precommit and reads the stored commit back with four signatures.
+
+The budget is what keeps one peer from spending the node's signature checks:
+
+```ts
+  /** Whether one more vote of this peer may be verified in the current second, and if so, counted. */
+  private withinVoteBudget(peerId: string, validators: number): boolean {
+    const b = this.voteBudget(peerId);
+    if (b.votes >= Math.max(VOTES_PER_PEER_SECOND, 8 * validators)) return false;
+    b.votes++;
+    return true;
+  }
+
+  private voteBudget(peerId: string): { second: bigint; votes: number; charged: boolean } {
+    const second = this.now() / 1000n;
+    let b = this.voteBudgets.get(peerId);
+    if (!b || b.second !== second) {
+      // Peers come and go: what is left of other seconds is let go once there is much of it.
+      if (this.voteBudgets.size > 4096) for (const [k, x] of this.voteBudgets) if (x.second !== second) this.voteBudgets.delete(k);
+      this.voteBudgets.set(peerId, (b = { second, votes: 0, charged: false }));
+    }
+    return b;
+  }
+
+  /**
+   * A vote over its peer's budget waits, unverified, and is taken up again shortly: a peer that hands over all the
+   * votes of a height at once, as every node does for a peer that has just connected, is slowed and loses none.
+   * What waits is bounded for each peer and in all. A vote there is no room for is dropped, and the peer is
+   * charged, once for the second.
+   */
+  private deferVote(v: Vote, peerId: string, validators: number): void {
+    const queue = this.deferredVotes.get(peerId) ?? new Map<string, Vote>();
+    // The same signed vote again takes no second place; one with another signature is another vote.
+    const id = signedVoteKey(v);
+    if (queue.has(id)) return;
+    const room = Math.min(DEFERRED_VOTES_CAP, Math.max(MAX_DEFERRED_VOTES_PER_PEER, 64 * validators));
+    if (queue.size >= room || this.deferredCount >= 2 * room) {
+      const b = this.voteBudget(peerId);
+      if (!b.charged) {
+        b.charged = true;
+        this.log('warn', 'peer sends more votes than are verified or kept waiting', { peer: peerId });
+        this.d.scorePeer?.(peerId, VOTE_FLOOD_POINTS, 'vote flood');
+      }
+      return;
+    }
+    queue.set(id, v);
+    this.deferredVotes.set(peerId, queue);
+    this.deferredCount++;
+    this.deferredTimer ??= setTimeout(() => this.resumeDeferredVotes(), DEFERRED_VOTES_MS);
+  }
+
+  /** Hand the votes that waited to `handleVote` again, in the order they came; those still over the budget wait on. */
+  private resumeDeferredVotes(): void {
+    this.deferredTimer = null;
+    if (!this.running) return;
+    const waiting = [...this.deferredVotes];
+    this.deferredVotes.clear();
+    this.deferredCount = 0;
+    for (const [peerId, votes] of waiting) {
+      for (const v of votes.values()) {
+        this.handleVote(v, peerId).catch((e: unknown) => this.log(this.running ? 'error' : 'debug', 'handling a vote failed', { err: e instanceof Error ? e.message : String(e) }));
+      }
+    }
   }
 ```
 
-A prevote for a block is paired with each precommit the validator has in the height, a precommit for a block with each of its prevotes, and `isAmnesia` ([chapter 3](03-types.md)) says whether the pair shows a lock forgotten. Either vote may be the one that arrives last, which is why the search runs from both. The pool keeps one such piece per validator and height (`evidenceKey`), so a validator that forgot its lock in several rounds is reported once. An honest validator never appears here: its prevote for another block names the round of its lock or a later one, by rule 28 and by its private validator. Then the new vote is forwarded to every peer except its source and the rules run. A new vote after the decision is the "fuller commit" of `STAKING.md` section 2.1: a precommit for the decided block in the decided round is merged into the stored commit so that the slow validator is credited as a signer (block rewards and downtime tracking in the staking module are keyed on `lastCommitSigners`, so being recorded absent for a few hundred milliseconds of latency would be a penalty). `test/engine.test.ts`, "folds a precommit that arrives after the decision into the stored commit", isolates one validator, lets the other three decide, then injects the fourth's precommit and reads the stored commit back with four signatures.
+A second is the node's clock in whole seconds, and the budget is `VOTES_PER_PEER_SECOND`, 200, or eight for each validator of the vote's set if that is more. A round is two votes a validator and a peer passes each on once, and a vote already held is dropped before this point at no cost, so in the ordinary run of things a peer stays far below it. The exception is the honest one that matters: a node hands a peer that has just connected every vote it holds of the height (`messagesForPeer`), and after thirty rounds of four validators that is 240 votes at once. If the votes over the budget were dropped, some would not come back: a full node passes a vote on once, and when its signer sends it again the full node holds it already and passes nothing on.
+
+One more thing happens before the budget is asked: a vote whose signature is being verified at this moment is not verified a second time. The same vote arrives from every peer that has it, often within the few milliseconds the first copy spends with the verifier, before `hvs.has` can know it; `verifyingVotes` holds the keys of the votes in verification, and a copy that finds its own there is dropped, since it says nothing the first does not. The key is released when the verification returns, and what follows runs without a pause, so the next copy finds the vote held. If the verification does not return but throws, because a worker exited, the copies were dropped on the strength of a check that never happened; the vote is then put with the ones that wait and tried again, and a line is logged.
+
+So a vote over the budget waits (`deferVote`): it is put, unverified, in its peer's queue, and `resumeDeferredVotes` hands the queues back to `handleVote` every `DEFERRED_VOTES_MS`, 250 ms, in the order the votes came. Those the budget still has no room for wait on; those that have meanwhile arrived another way, or belong to a height that is over and not kept, fall out at the checks before the budget, which cost nothing. A queue holds `MAX_DEFERRED_VOTES_PER_PEER`, 1,024, or 64 for each validator if that is more, and never more than 32,768; all the queues together hold twice one queue's bound. With the second's budget of eight for each validator, a peer whose queue is empty can hand over 36 whole rounds of a height at once with 100 validators and 153 with four, and with 2,000 validators, where the cap is what binds, 12; less when other peers' votes are waiting too. The same signed vote takes one place however often it is sent (`signedVoteKey`: what the vote says, whose it is, and the hash of its signature, so that a copy with another signature is another vote and cannot be kept out by a bad one). Only a vote there is no room to keep waiting is dropped, and then the peer is charged 10 points through `scorePeer`, once for the second, so one that keeps it up is banned ([chapter 6](06-p2p.md)). A vote with no peer behind it, the node's own or one replayed when a height starts, is not counted. The map of budgets is swept of other seconds' entries when it has grown past 4,096, and `stop` empties the queues. `test/faults.test.ts`, "are verified up to a number a second, the rest waiting their turn, and a peer is charged only for what there is no room to keep", sends 240 good votes through one peer within a second: 200 are held at once, the other 40 a moment after the second has passed, and nothing is charged, also when the 40 are sent thirty times over while they wait; 1,300 more in one second, of which 113 find neither budget nor room, cost one charge; and one vote handed in by four peers at once is verified once.
+
+A vote for a kept height takes a shorter way:
+
+```ts
+  /**
+   * A verified vote for a kept height. It is held against the votes kept, reported if it shows a fault, and passed
+   * on if it is new, so that two votes shown to two nodes still meet at one of them.
+   */
+  private addPastVote(v: Vote, fromPeer: string | null): void {
+    const kept = this.past.get(v.height);
+    if (!kept || v.round > kept.maxRound) return;
+    const { added, conflict } = kept.votes.add(v);
+    if (conflict) this.report(makeDuplicateVoteEvidence(conflict, v));
+    if (!added && !conflict) return;
+    // Also for the second of two votes in one place: it is as signed as the first.
+    for (const ev of faultsShown(kept.votes, kept.validators, v)) this.report(ev);
+    if (!added) return;
+    this.d.broadcastVote(v, fromPeer);
+  }
+```
+
+It is added to the kept vote set, where a conflict is a double sign as in the current height, held against the other votes with `faultsShown` (the second of two in one place as well), and passed on to the peers if it is new. No rule runs and no commit is touched. Passing it on is what lets the two halves meet: a validator that shows one late vote to one node and a conflicting one to another has each of them relay what it was given, and each then holds both. The relay is bounded, because a kept vote set has one place a validator, type and round, and rounds past the last the height reached are refused.
 
 #### Signing: `signAndAddVote`, `prevote`, `precommit`
 
@@ -772,7 +1128,7 @@ A prevote for a block is paired with each precommit the validator has in the hei
   }
 ```
 
-A full node (no key) or a node whose key is not in the current set silently does nothing: it still runs every rule and follows the decision, it just never votes. The guard's refusal is caught and logged; any other error propagates. A signed vote enters through the same `addVote` as a peer's vote, which broadcasts it (with `fromPeer` null, so to everyone) and re-runs the rules. This is the only place votes are signed; `prevote(hash, polRound)` and `precommit(hash)` are one-line wrappers. `prevote` is given the `polRound` of the proposal it answers. A prevote for nil names nothing; a prevote for the block the validator is locked on names the round of the lock if that is later than the proposal's, since that is the majority the lock stands on and the one that answers for every precommit before it; any other names the proposal's round. The guard's refusals now include a prevote that would leave a lock on too old a round, which the rules never ask for; if a bug ever did, the vote would not be cast.
+A full node (no key) or a node whose key is not in the current set silently does nothing: it still runs every rule and follows the decision, it just never votes. The guard's refusal is caught and logged; any other error propagates. A signed vote enters through the same `addVote` as a peer's vote, which broadcasts it (with `fromPeer` null, so to everyone) and re-runs the rules. This is the only place votes are signed; `prevote(hash, polRound)` and `precommit(hash)` are one-line wrappers. `prevote` is given the `polRound` of the proposal it answers. A prevote for nil names nothing; a prevote for the block the validator is locked on names the round of the lock if that is later than the proposal's, since that is the majority the lock stands on and the one that answers for every precommit before it; any other names the proposal's round. The guard's refusals now include a prevote that would leave a lock on too old a round, which the rules never ask for; if a bug ever did, the vote would not be cast. `test/amnesia.test.ts`, "prevotes the block its lock moved to on the round of that lock, when the block comes back on an older majority", drives one `Consensus` through four rounds with the other three validators played by the test: locked on B in round 1, moved to D in round 2, and D proposed in round 3 with `polRound` 0. Its prevote names round 2. With the proposal's round in it the guard refuses and the validator casts no prevote, which is the test failing.
 
 #### Gossip, fetched blocks and catch-up
 
@@ -1033,7 +1389,7 @@ The engine tests build several nodes in one process over the in-memory transport
 - "rejects a block from another protocol version": `validateBlockStructure` returns the version error.
 - "refuses a genesis with no validators from either side": `genesisState` throws (chapter 3, cited by `STAKING.md` section 2.3).
 
-`test/amnesia.test.ts` has seven cases on locks. Four are described where their code is: the round a prevote signs and the double sign by round alone (chapter 3), the private validator's lock (`privval.ts` above), the restart that takes the lock up again (`startHeight`), and the counting rule on a `HeightVoteSet` (`votes.ts`). "proves a forgotten lock with a precommit and a later prevote for another block that names no round from the lock on" is the evidence itself (chapter 3). "finds a forgotten lock in the votes it holds, whichever came last, and has every application punish it as one": on four validators, a precommit in round 4 and a prevote for another block in round 6 are signed with one validator's key for the next height and handed to one node, the prevote naming round 2; then the same for another validator at another node, prevote first and naming no round; then a pair whose prevote names round 5, which the rules allow. Every application is told of the first two as `amnesia` at their heights, the blocks hold exactly two pieces of evidence of that kind, and nothing is made of the third. One validator at a time, because votes of more than a third of the power in a later round would take every node there (rule 55). "decides a block proposed again in the next round on prevotes that name the first round, and slashes nobody": a message filter arranges a round 0 that decides nothing and leaves round 1's proposer locked (one validator never gets the proposal, and the proposer-to-be's prevote reaches neither of the other two); round 1 proposes the same block with `polRound` 0, the filter is lifted, the gossip tick passes round 0's polka on, and the block is committed in round 1 with every round-1 prevote for it naming round 0, no evidence anywhere and nobody slashed.
+`test/amnesia.test.ts` has eight cases on locks. Four are described where their code is: the round a prevote signs and the double sign by round alone (chapter 3), the private validator's lock (`privval.ts` above), the restart that takes the lock up again (`startHeight`), and the counting rule on a `HeightVoteSet` (`votes.ts`). "proves a forgotten lock with a precommit and a later prevote for another block that names no round from the lock on" is the evidence itself (chapter 3). "finds a forgotten lock in the votes it holds, whichever came last, and has every application punish it as one": on four validators, a precommit in round 4 and a prevote for another block in round 6 are signed with one validator's key for the next height and handed to one node, the prevote naming round 2; then the same for another validator at another node, prevote first and naming no round; then a pair whose prevote names round 5, which the rules allow. Every application is told of the first two as `amnesia` at their heights, the blocks hold exactly two pieces of evidence of that kind, and nothing is made of the third. One validator at a time, because votes of more than a third of the power in a later round would take every node there (rule 55). "decides a block proposed again in the next round on prevotes that name the first round, and slashes nobody": a message filter arranges a round 0 that decides nothing and leaves round 1's proposer locked (one validator never gets the proposal, and the proposer-to-be's prevote reaches neither of the other two); round 1 proposes the same block with `polRound` 0, the filter is lifted, the gossip tick passes round 0's polka on, and the block is committed in round 1 with every round-1 prevote for it naming round 0, no evidence anywhere and nobody slashed.
 
 `test/review.test.ts`, "resumes after a restart that left a signature at the current height, by skipping that round": review finding 5, described under `startHeight`. "decides a block re-proposed with a proof of lock after its round stalled past the clock drift limit": review finding 37; four validators with `maxClockDriftMs: 300`, and at two consecutive heights a message filter drops the round-0 proposal on its way to validator 3, every round-0 prevote on its way to validator 2, and every round-1 proposal, so in round 0 validators 0 and 1 see the polka and lock while no one holds three precommits for the block, and round 1 is lost; round 2 or later re-proposes the block with `polRound: 0`, by then older than the drift limit, and the chain must still reach four more heights. The same file's "rejects decoded validator sets with duplicate members, wrong order or a bad proposer index" protects `proposerAt` and the quorum arithmetic from a crafted set (finding 1), and "does a bounded amount of work on a peer status it cannot act on" is the block sync recursion of finding 30, which surfaced as a stack overflow during consensus tests.
 
@@ -1049,19 +1405,20 @@ The engine tests build several nodes in one process over the in-memory transport
 
 Known simplifications, from `DESIGN.md` section 10 and from reading the code:
 
-- Evidence is found only in the votes of the height a node is in. A precommit and a prevote that show a forgotten lock, or two votes in one place, that reach a node after it has left the height are dropped with the rest of that height's votes, so a fault is reported by the nodes that were there, not by one that hears of it later.
-- A prevote that names a polka which never formed is not punished, only never counted. Punishing it would take a proof that something did not happen.
-- A proposer that sends different proposals for the same round to different peers is not reported; each node keeps the first that verifies.
+- Evidence is found in what a node holds: the votes and proposals of its height and of the 16 heights before it, in memory. A node that was restarted, or that joined later, holds nothing of the heights before, and the second half of a proof that arrives after 16 heights is dropped. A late vote for a round the height never reached is dropped too.
+- A validator restarted without its sign-state record signs again where it signed before, and is now reported for it within those 16 heights. The record is the defence, and a node does not otherwise hold back from signing while it catches up.
+- A prevote that names a polka which never formed is punished only where +2/3 of the power prevoted something else in the round named, and on the assumption that less than a third signs twice; elsewhere it is only never counted. That evidence carries a vote for most of the set, and no node takes into its pool one that is larger than half a block less the builder's slack.
+- A proposer that sends different proposals for the same round to different peers is reported by a node that receives both; a second proposal is not relayed, so two nodes that were each sent one find out only if the proposals crossed while both were being flooded. Two proposals held for the next height, before it starts, are not compared.
 - A proposal carries the whole block in one message; Tendermint splits large blocks into gossiped parts.
-- Vote verification is not rate limited per peer. `handleVote` verifies every vote for the current or the next height that names an index of the set, is not already held and is for a round within `MAX_ROUND_AHEAD` of the node's own; nothing but the 20 points a bad signature costs limits how many of them one peer has verified.
+- Vote verification is limited by peer and by second, with one figure for every peer. A peer that relays for many validators and one that relays for few have the same budget; votes over it wait up to a bound and are verified late, and beyond the bound they are dropped: a peer that hands over more rounds of a height at once than the receiver's budget and queue take (36 with 100 validators, 12 with 2,000) loses the rest, and a node left without the votes it needs is caught up by block sync when the height is decided. Proposals are not counted.
 - The 8 proposals held for the next height can be filled by four validators signing two each for rounds that will not come; the real proposal then has to wait for the proposer's next gossip tick. A place needs the valid signature of a next-height validator, so a peer that is no validator cannot fill one with a proposal of its own, though any peer may relay a validator's.
 
 Exercises:
 
 1. Persist `lockedRound` and the locked block hash in `LastSigned`, restore them in `startHeight`, and write a test that restarts a validator between a precommit and the decision and checks that it prevotes only its locked block in later rounds.
 2. Drive `Consensus` directly in a unit test with an injected `now`, a scripted `ConsensusDeps` and forged votes, and make rule 28 fire: a polka in round 0, a timeout, and a re-proposal with `polRound: 0` that a validator locked in round 0 accepts.
-3. Add proposal equivocation evidence: two proposals signed by the same proposer for the same height and round with different block hashes. Define the type in `src/types/evidence.ts`, detect it in `handleProposal`, and decide how the application should slash it.
-4. Rate limit vote verification per peer: count verifications per peer per second in `handleVote` and call `scorePeer` past a threshold. Measure the effect with a peer that floods votes for 1000 future rounds.
+3. A second proposal for a round is not relayed, so two nodes that were each sent a different one may never compare. Relay the head of a second proposal (not the block) once per round, and work out what that costs a node when the proposer is honest and when it is not.
+4. A node hands a newly connected peer every vote of the height at once, and the peer makes them wait if they are over its budget. Send them paced instead: so many a second, newest round first, stopping when the height ends. What does the receiver's queue then need to hold, and what does a full node that relays for a validator need to do when a vote it passed on was dropped?
 5. Drive `Consensus` with an injected `now` that runs ahead of the proposer's clock by more than `maxClockDriftMs`, and show that the same block is refused as a fresh proposal and accepted when re-proposed with a proof of lock; then decide whether a re-proposal should still be bounded by some larger window, and what it would be.
 6. Replace the fixed `commitMs` pause with one that ends early once every validator's precommit has arrived, and measure the block rate on the four-validator benchmark.
 

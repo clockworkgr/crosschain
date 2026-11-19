@@ -9,11 +9,19 @@
  * Exposure defaults to loopback. Every remote address has a token bucket;
  * costly methods spend more. Bodies over the limit are refused before they
  * are read.
+ *
+ * With a `token` set, a request must carry it: `Authorization: Bearer <token>`
+ * on POST / and on GET /events, where a browser's EventSource cannot set a
+ * header and `?token=<token>` is taken as well. /health stays open, for
+ * whatever watches the node. The token is a shared secret sent in the clear:
+ * it keeps the methods from whoever can reach the port, and is no substitute
+ * for TLS on a network where the traffic can be read.
  */
+import { timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { CoreApp } from '../app/core/app.ts';
-import { toHex } from '../crypto/hash.ts';
+import { sha256, toHex } from '../crypto/hash.ts';
 import type { Node } from '../node/node.ts';
 import { txHash } from '../types/block.ts';
 import { silentLogger, type Logger } from '../util/log.ts';
@@ -47,6 +55,16 @@ export interface RpcServerOptions {
   port?: number;
   log?: Logger;
   limits?: Partial<RpcLimits>;
+  /** When set, POST / and GET /events are answered only to requests that carry it. */
+  token?: string;
+}
+
+/**
+ * What a token must be: a string (a config file can hold anything), 16 characters or more, each a visible ASCII
+ * character, so that it goes into a header as it is. The message never repeats the value.
+ */
+export function checkRpcToken(token: unknown): asserts token is string {
+  if (typeof token !== 'string' || !/^[\x21-\x7e]{16,}$/.test(token)) throw new Error('rpc token must be a string of at least 16 characters, each a visible ASCII character with no spaces');
 }
 
 interface Bucket {
@@ -62,7 +80,7 @@ interface Stream {
   remote: string;
 }
 
-const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, GET, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Last-Event-ID' };
+const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, GET, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Last-Event-ID, Authorization' };
 
 export class RpcServer {
   private readonly node: Node;
@@ -79,6 +97,8 @@ export class RpcServer {
   private readonly streams = new Set<Stream>();
   private boundPort = 0;
   private readonly unsubscribe: () => void;
+  /** The hash of the token requests must carry, or null when none is asked for. */
+  private readonly tokenHash: Uint8Array | null;
 
   constructor(node: Node, opts: RpcServerOptions = {}) {
     this.node = node;
@@ -86,6 +106,8 @@ export class RpcServer {
     this.limits = { ...DEFAULT_RPC_LIMITS, ...opts.limits };
     this.host = opts.host ?? '127.0.0.1';
     this.port = opts.port ?? 0;
+    if (opts.token !== undefined) checkRpcToken(opts.token);
+    this.tokenHash = opts.token === undefined ? null : sha256(new TextEncoder().encode(opts.token));
     this.events = new RpcEvents(node);
     this.methods = makeMethods(node, this.events);
     this.server = createServer((req, res) => {
@@ -162,6 +184,24 @@ export class RpcServer {
     return true;
   }
 
+  /**
+   * Whether the request carries the token. The two are compared as hashes and in constant time, so neither the
+   * length of the token nor how much of a guess was right shows in how long the answer takes.
+   */
+  private authorized(req: IncomingMessage, url: URL, queryToo: boolean): boolean {
+    if (this.tokenHash === null) return true;
+    const header = req.headers.authorization;
+    const given = header?.startsWith('Bearer ') ? header.slice(7) : queryToo ? url.searchParams.get('token') : null;
+    if (given === null || given === undefined) return false;
+    return timingSafeEqual(sha256(new TextEncoder().encode(given)), this.tokenHash);
+  }
+
+  /** 401 for a request without the token; 429 once the address has spent its allowance, so guesses are rate limited like requests. */
+  private refuse(res: ServerResponse, remote: string): void {
+    if (!this.allow(remote, 1)) res.writeHead(429, CORS).end();
+    else res.writeHead(401, { ...CORS, 'WWW-Authenticate': 'Bearer' }).end();
+  }
+
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const remote = req.socket.remoteAddress ?? 'unknown';
     const url = new URL(req.url ?? '/', 'http://localhost');
@@ -174,6 +214,7 @@ export class RpcServer {
       return;
     }
     if (req.method === 'GET' && url.pathname === '/events') {
+      if (!this.authorized(req, url, true)) return this.refuse(res, remote);
       this.openStream(req, res, url, remote);
       return;
     }
@@ -181,6 +222,7 @@ export class RpcServer {
       res.writeHead(404, CORS).end();
       return;
     }
+    if (!this.authorized(req, url, false)) return this.refuse(res, remote);
     if (!this.allow(remote, 1)) {
       res.writeHead(429, { ...CORS, 'Content-Type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: RATE_LIMITED, message: 'rate limited' } }));
       return;

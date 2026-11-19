@@ -32,9 +32,12 @@ export interface TxResult {
   error?: string;
 }
 
-/** A validator proven at fault by evidence in the block, for the app to slash: two votes in one place, or a lock forgotten. */
+/**
+ * A validator proven at fault by evidence in the block, for the app to slash: two votes in one place, two
+ * proposals for one round, a lock forgotten, or a prevote on a majority that never was.
+ */
 export interface Misbehavior {
-  kind: 'duplicateVote' | 'amnesia';
+  kind: 'duplicateVote' | 'amnesia' | 'duplicateProposal' | 'falseCitation';
   address: Uint8Array;
   height: bigint;
 }

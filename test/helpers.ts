@@ -5,6 +5,7 @@ import { InlineVerifier } from '../src/crypto/verifier.ts';
 import { join } from 'node:path';
 import type { Application } from '../src/app/types.ts';
 import { KvStoreApp } from '../src/app/kvstore.ts';
+import { MemorySignStateStore } from '../src/consensus/privval.ts';
 import { Node, type NodeConfig } from '../src/node/node.ts';
 import type { ValidationLimits } from '../src/consensus/validate.ts';
 import { MemoryHub } from '../src/p2p/memory.ts';
@@ -94,6 +95,12 @@ export async function makeTestnet(opts: TestnetOptions): Promise<Testnet> {
   const allAddrs = Array.from({ length: total }, (_, i) => addrOf(i));
   const nodes: Node[] = [];
 
+  // A validator made again in a test is the same validator restarted: what it last signed outlives the node, as the
+  // file in a data directory does. Without it the second node would sign heights the first already signed, and its
+  // peers, which keep the votes of the last heights, would rightly report it.
+  const signStates = new Map<number, MemorySignStateStore>();
+  const signStateOf = (i: number) => signStates.get(i) ?? signStates.set(i, new MemorySignStateStore()).get(i)!;
+
   const makeNode = async (i: number, overrides: Partial<NodeConfig> = {}): Promise<Node> => {
     const dataDir = opts.dataDirFor?.(i) ?? null;
     const node = await Node.create({
@@ -103,6 +110,7 @@ export async function makeTestnet(opts: TestnetOptions): Promise<Testnet> {
       app: opts.appFor ? opts.appFor(i, dataDir, genesis) : new KvStoreApp(dataDir ? join(dataDir, 'app.json') : null),
       nodeKeySeed: nodeSeed(i),
       validatorSeed: i < opts.validators ? validatorSeed(i) : null,
+      ...(dataDir === null && !overrides.dataDir ? { signState: signStateOf(i) } : {}),
       transport: hub.transport(addrOf(i)),
       listenAddr: addrOf(i),
       seeds: allAddrs.filter((a) => a !== addrOf(i)),

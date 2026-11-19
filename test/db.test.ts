@@ -30,7 +30,7 @@ const ItemType: ObjectType<Item> = {
   },
   indices: [
     { name: 'byName', unique: true, authenticated: true, key: (o, k) => k.str(o.name) },
-    { name: 'byGroup', unique: false, key: (o, k) => k.u32(o.group) },
+    { name: 'byGroup', unique: false, authenticated: true, key: (o, k) => k.u32(o.group) },
   ],
 };
 
@@ -1176,6 +1176,46 @@ describe('object database: key proofs', () => {
       names.forEach((name, i) => expect(toHex(keyProofBytesAt(fresh, name, v))).toBe(toHex(made[v]![i]!)));
       expect(toHex(proofToBytes(fresh.proofAt(objectId(7, v), v)))).toBe(toHex(proofToBytes(db.proofAt(objectId(7, v), v))));
     }
+  });
+  it('proves an entry of a non-unique index present or absent, by its key and the id of its object', () => {
+    const db = new ObjectDatabase([ItemType, CounterType], { retainVersions: 4 });
+    const entry = (group: number, id: bigint) => key((k) => k.u32(group).id(id));
+    const idBytes = (id: bigint) => toHex(encode((w) => w.u64(id)));
+    const [a, b, c] = [mk(db, 'a', 5), mk(db, 'b', 5), mk(db, 'c', 6)];
+    const r0 = db.root(0);
+    // Two objects under one key are two entries, each proven by the key with its own id; the value is the id.
+    for (const o of [a, b]) expect(toHex(verifyKeyProof(r0, db.proveKey(ItemType, 'byGroup', entry(5, o.id)))!)).toBe(idBytes(o.id));
+    expect(toHex(verifyKeyProof(r0, db.proveKey(ItemType, 'byGroup', entry(6, c.id)))!)).toBe(idBytes(c.id));
+    // What is not there is proven absent: an object under another key than its own, and the key alone, which is no entry.
+    expect(verifyKeyProof(r0, db.proveKey(ItemType, 'byGroup', entry(6, a.id)))).toBeNull();
+    expect(verifyKeyProof(r0, db.proveKey(ItemType, 'byGroup', key((k) => k.u32(5))))).toBeNull();
+    // The proof is of this index: the same bytes are no key of the other, and its position is in the proof.
+    const proof = db.proveKey(ItemType, 'byGroup', entry(5, a.id));
+    expect(proof.indexPosition).toBe(1);
+    expect(verifyKeyProof(r0, { ...proof, indexPosition: 0 })).toBeUndefined();
+
+    // A write that changes no key leaves the index's root as it was; one that moves the object moves the entry.
+    const rootOf = () => toHex(db.proveKey(ItemType, 'byGroup', entry(5, a.id)).indexRoots[1]!);
+    const before = rootOf();
+    db.modify(ItemType, a.id, (o) => ({ ...o, value: 99n }));
+    const r1 = db.root(1);
+    expect(rootOf()).toBe(before);
+    expect(toHex(r1)).not.toBe(toHex(r0));
+    db.modify(ItemType, a.id, (o) => ({ ...o, group: 6 }));
+    db.remove(ItemType, b.id);
+    const r2 = db.root(2);
+    expect(rootOf()).not.toBe(before);
+    expect(verifyKeyProof(r2, db.proveKey(ItemType, 'byGroup', entry(5, a.id)))).toBeNull();
+    expect(verifyKeyProof(r2, db.proveKey(ItemType, 'byGroup', entry(5, b.id)))).toBeNull();
+    expect(toHex(verifyKeyProof(r2, db.proveKey(ItemType, 'byGroup', entry(6, a.id)))!)).toBe(idBytes(a.id));
+    // And as of the version before, the entries are where they were.
+    expect(toHex(verifyKeyProof(r1, db.proveKeyAt(ItemType, 'byGroup', entry(5, b.id), 1))!)).toBe(idBytes(b.id));
+
+    // A database filled from this one's objects, as a restart or a snapshot fills it, has the same root.
+    const fresh = new ObjectDatabase([ItemType, CounterType], { retainVersions: 4 });
+    for (const [id, bytes] of db.exportObjects()) fresh.importObject(id, bytes);
+    for (const [t, n] of db.counters()) fresh.setCounter(t, n);
+    expect(toHex(fresh.root(2))).toBe(toHex(r2));
   });
 });
 

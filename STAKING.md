@@ -21,7 +21,9 @@ of a block reward is computed on the stake before the proposer bonus is paid.
 | commission | one fixed rate for all validators, a parameter (10%) |
 | unbonding | 7 days by block time, automatic release, still slashable; redelegation allowed with Cosmos rules |
 | double sign | slash 5%, tombstone, slash unbonding and redelegation entries created after the infraction, auto-unbond delegators |
+| two proposals | duplicate-proposal evidence (two different proposals signed for one height and round): punished as a double sign, at the same rate |
 | forgotten lock | amnesia evidence (a precommit for one block and a later prevote for another naming no polka since): punished as a double sign, at a rate of its own (5%) |
+| false citation | a prevote naming a round in which +2/3 of the power prevoted something else: punished as a forgotten lock, at the same rate |
 | downtime | engine commits made fuller first; then window 1000 blocks, jail when under 50% signed, 10 minutes, slash 0.01%, explicit unjail |
 | minimums | self-bond 10 000, delegation 10, validator creation fee 1 000 into the pool (whole tokens) |
 | power | bonded tokens in whole units (stake divided by 10^precision) |
@@ -129,8 +131,8 @@ genesis:
 | commissionBps | 1 000 (10%) | one rate for everyone |
 | fixedRewardPerBlock | 1 | paid from the pool; skipped when the pool holds less |
 | proposerBonusBps | 500 (5%) | of the block reward |
-| doubleSignSlashBps | 500 (5%) | |
-| amnesiaSlashBps | 500 (5%) | the slash for a lock forgotten; the rest of the punishment is a double sign's |
+| doubleSignSlashBps | 500 (5%) | two votes in one place, or two proposals for one round |
+| amnesiaSlashBps | 500 (5%) | the slash for a lock forgotten, and for a prevote on a majority that never was; the rest of the punishment is a double sign's |
 | downtimeWindow | 1 000 | blocks |
 | downtimeMinSignedBps | 5 000 (50%) | jailed when signed blocks in the window fall below this |
 | downtimeJailMs | 600 000 (10 min) | |
@@ -258,13 +260,16 @@ Before transactions, in this order:
    reset the window. Jailed and tombstoned validators are not tracked, and nothing
    is tracked at height 1.
 6. Misbehavior. For each `{ kind, address, height }`: find the validator by consensus
-   address; if not tombstoned: slash `tokens` by doubleSignSlashBps, or by
-   amnesiaSlashBps when the kind is `amnesia`; slash every
+   address; if not tombstoned: slash `tokens` by doubleSignSlashBps when the
+   kind is `duplicateVote` or `duplicateProposal`, by amnesiaSlashBps when it is
+   `amnesia` or `falseCitation`; slash every
    unbonding entry and every redelegation entry from this validator whose
    `creationHeight >= height - 1` by the same fraction (the two-height delay before an update
    lands, review finding 10; for redelegations, the slash is
-   taken from the destination delegation's shares at the destination's rate, as
-   Cosmos does); set status tombstoned; convert every delegation into an unbonding
+   taken from the destination delegation's shares at the destination's rate, and
+   if that delegation runs out or the destination has no tokens, the rest from the delegator's unbonding entries at the
+   destination with `creationHeight >=` the redelegation's, in index order, so that
+   undelegating at the destination does not escape it); set status tombstoned; convert every delegation into an unbonding
    entry maturing at `time + unbondingPeriodMs` (one per delegation, ignoring
    maxEntries); the validator keeps `tokens = 0`, `shares = 0`, and its signing
    record is removed.

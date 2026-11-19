@@ -20,7 +20,7 @@ out of this round; proofs stay ICS23-shaped for the latter.
 | wire protocol | JSON-RPC 2.0 over HTTP, decoded objects as JSON, proofs and raw transactions as hex of the binary encoding |
 | broadcast | `sync` (after checkTx) and `commit` (after inclusion, with the result) |
 | push | Server-Sent Events: blocks, transaction results, account history, validator set changes |
-| exposure | loopback by default, configurable bind, CORS open, body and per-address rate limits; costly calls and new streams refused while the node sheds load under memory pressure |
+| exposure | loopback by default, configurable bind, an optional shared token (`Authorization: Bearer`), CORS open, body and per-address rate limits; costly calls and new streams refused while the node sheds load under memory pressure |
 | keys | encrypted keystore, scrypt and AES-256-GCM, each key recorded with its signature scheme, passphrase on signing, a lock file around every write |
 | CLI | an RPC client; the inbox file and read-only store access are removed; the light client gets an RPC provider |
 | state sync | periodic snapshots every K blocks, last two kept, chunks with range proofs baked in, served over p2p; the headers of the evidence window below the join, installed with the state in one transaction |
@@ -231,7 +231,10 @@ that is a string, a number or null and with `id: null` otherwise.
 `GET /events` is the Server-Sent Events stream. `GET /health` returns height, peer count and
 the memory guard's level (`memory`). Default bind `127.0.0.1`
 on the p2p port plus one; config `rpcListen` sets host and port. Responses carry
-`Access-Control-Allow-Origin: *`. Bodies over 1 MiB are rejected with HTTP 413. Each
+`Access-Control-Allow-Origin: *`. With `rpcToken` set in the node's config, `POST /` and
+`GET /events` answer 401 to a request that does not carry it as `Authorization: Bearer <token>`
+(the event stream also takes `?token=<token>`), and such a request spends a token of the
+address's bucket like a call. Bodies over 1 MiB are rejected with HTTP 413. Each
 remote address has a token bucket of 50 tokens per second with a burst of 100: every
 `POST /` costs one token, which covers its first call (`OPTIONS`, `GET /health` and a
 `GET /events` without replay cost none); each further call of a

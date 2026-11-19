@@ -32,6 +32,11 @@ export class VoteSet {
   private readonly powerByBlock = new Map<string, bigint>();
   /** Prevotes held whose proof of lock this node does not hold yet, by validator index. */
   private readonly waiting = new Set<number>();
+  /**
+   * The other vote of a validator that signed two for this place, the one not kept in `votes`: one a validator,
+   * the first seen. It counts for nothing here, but it is signed, and evidence against others may rest on it.
+   */
+  private readonly others = new Map<number, Vote>();
   private totalVoted = 0n;
 
   constructor(height: bigint, round: number, type: VoteType, valset: ValidatorSet) {
@@ -54,10 +59,14 @@ export class VoteSet {
       if (sameVoteContent(existing, vote)) return { added: false, conflict: null };
       // Of two votes in one place the one that counts is kept: a validator that signs twice must not be able to
       // leave a node holding only the vote that waits for a majority that will never come.
-      if (backed && this.waiting.delete(vote.validatorIndex)) {
+      const replaced = backed && this.waiting.delete(vote.validatorIndex);
+      if (replaced) {
         this.votes[vote.validatorIndex] = vote;
         this.count(vote, val.power);
       }
+      // The vote not kept is put aside, if none is yet, or if the one put aside is the vote that has just taken the place.
+      const aside = this.others.get(vote.validatorIndex);
+      if (!aside || (replaced && sameVoteContent(aside, vote))) this.others.set(vote.validatorIndex, replaced ? existing : vote);
       return { added: false, conflict: existing };
     }
     this.votes[vote.validatorIndex] = vote;
@@ -122,6 +131,11 @@ export class VoteSet {
 
   all(): Vote[] {
     return this.votes.filter((v): v is Vote => v !== null);
+  }
+
+  /** The second votes of validators that signed two for this place: not counted, not passed on, kept to find evidence with. */
+  alternates(): Vote[] {
+    return [...this.others.values()];
   }
 
   voterIndices(): number[] {
@@ -228,6 +242,11 @@ export class HeightVoteSet {
     const out: Vote[] = [];
     for (const rv of this.rounds.values()) out.push(...rv.prevotes.all(), ...rv.precommits.all());
     return out;
+  }
+
+  /** Forget the rounds after `r`: what a height that is over keeps is bounded by the round it ended in. */
+  dropRoundsAbove(r: number): void {
+    for (const k of this.rounds.keys()) if (k > r) this.rounds.delete(k);
   }
 
   roundNumbers(): number[] {

@@ -10,14 +10,19 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { KvStoreApp } from '../src/app/kvstore.ts';
 import { Reader } from '../src/codec/reader.ts';
 import { encode } from '../src/codec/writer.ts';
-import { verifyEvidence } from '../src/consensus/evidence.ts';
+import { Consensus } from '../src/consensus/consensus.ts';
+import { EvidencePool, verifyEvidence } from '../src/consensus/evidence.ts';
 import { DoubleSignError, FileSignStateStore, MemorySignStateStore, PrivValidator, SignStep } from '../src/consensus/privval.ts';
 import { HeightVoteSet, VoteSet } from '../src/consensus/votes.ts';
 import { toHex } from '../src/crypto/hash.ts';
-import { DEFAULT_SCHEME, keyPairFromSeed, sign, signContext, zeroSignature, type KeyPair } from '../src/crypto/keys.ts';
+import { DEFAULT_SCHEME, keyPairFromSeed, schemeName, sign, signContext, zeroSignature, type KeyPair } from '../src/crypto/keys.ts';
 import { checkEvidenceShape, decodeEvidence, encodeEvidence, evidenceHeight, evidenceKey, evidenceValidator, isAmnesia, makeDuplicateVoteEvidence, type AmnesiaEvidence, type Evidence } from '../src/types/evidence.ts';
 import { decodeMessage } from '../src/p2p/messages.ts';
-import { blockHash } from '../src/types/block.ts';
+import { blockHash, commitHash, evidenceHash, type Block, type Commit } from '../src/types/block.ts';
+import { proposalSignBytes, type Proposal } from '../src/types/proposal.ts';
+import { genesisState } from '../src/types/state.ts';
+import { txsRoot } from '../src/types/txproof.ts';
+import { prioritiesHash } from '../src/types/validator.ts';
 import { ValidatorSet } from '../src/types/validator.ts';
 import { VoteType, checkPolRound, decodeVote, encodeVote, voteSignBytes, type UnsignedVote, type Vote } from '../src/types/vote.ts';
 import { makeTestnet, seedFor, sleep, verifier, waitFor, waitForHeight, type Testnet } from './helpers.ts';
@@ -188,7 +193,7 @@ describe('a forgotten lock', () => {
     const bytes = encode((w) => encodeEvidence(w, good));
     expect(bytes[0]).toBe(2);
     expect(encode((w) => encodeEvidence(w, twice))[0]).toBe(1);
-    expect(() => decodeEvidence(new Reader(new Uint8Array([3, ...bytes.subarray(1)])))).toThrow(/unknown evidence kind 3/);
+    expect(() => decodeEvidence(new Reader(new Uint8Array([5, ...bytes.subarray(1)])))).toThrow(/unknown evidence kind 5/);
 
     // Both signatures are the accused's, over the votes as given.
     expect(await verifyEvidence(CHAIN, good, set, verifier)).toBeNull();
@@ -397,6 +402,125 @@ describe('a prevote that names a proof of lock', () => {
       expect(toHex(blockHash(node.store.loadBlock(height)!.block))).toBe(toHex(blockHash(stored.block)));
       expect(node.evidencePool.held).toEqual({ pending: 0, committed: 0, inventory: 0 });
       expect((node.app as KvStoreApp).slashed.length).toBe(0);
+    }
+  });
+
+  it('prevotes the block its lock moved to on the round of that lock, when the block comes back on an older majority', async () => {
+    // One validator's state machine, with the three others played by the test, and no timeout short enough to fire.
+    // Every proposal and vote it is given is one a validator following the rules could have sent, in this history:
+    // p0, p1 and p2 propose rounds 0, 1 and 2, and p0 round 3. In round 0, p1 misses the proposal and prevotes nil; p0
+    // sees two prevotes for D and that nil, precommits nil on the timeout and only then sees the third prevote for D
+    // (D is its valid block, of round 0, and it is not locked); p2 sees the majority for D in time. In round 1 only
+    // the validator under test sees the majority for B. p0 prevotes D in round 2 and misses that round's majority.
+    const keys = [0, 1, 2, 3].map((i) => keyPairFromSeed(seedFor(`amnesia/moved/${i}`)));
+    const mine = keys[0]!;
+    const state = genesisState({ chainId: CHAIN, genesisTime: 1n, signatureScheme: schemeName(DEFAULT_SCHEME), validators: keys.map((k, i) => ({ publicKey: k.publicKey, power: i === 0 ? 1n : 10n })), appState: new Uint8Array(0) }, new Uint8Array(32));
+    const set = state.validators;
+    const me = set.indexOf(mine.address);
+    const sent: Vote[] = [];
+    const applied: { block: Block; commit: Commit }[] = [];
+    const pool = new EvidencePool();
+    const never = 600_000;
+    const consensus = new Consensus({
+      chainId: CHAIN,
+      getState: () => state,
+      applyBlock: async (b, c) => void applied.push({ block: b, commit: c }),
+      updateCommit: () => {},
+      blockTimeAt: () => null,
+      getLastCommit: () => null,
+      validatorSetAtHeight: () => set,
+      reapTxs: () => [],
+      privValidator: new PrivValidator(mine, new MemorySignStateStore(), CHAIN),
+      verifier,
+      evidencePool: pool,
+      broadcastProposal: () => {},
+      broadcastVote: (v, except) => void (except === null && v.validatorIndex === me && sent.push(v)),
+      timeouts: { proposeMs: never, prevoteMs: never, precommitMs: never, commitMs: never, gossipMs: never },
+      log: () => {},
+    });
+    const proposerOf = (round: number) => keys.find((k) => toHex(k.address) === toHex(consensus.proposerAt(round)))!;
+    const make = (round: number, time: bigint): Block => ({
+      header: {
+        chainId: CHAIN, version: state.version, height: 1n, time, lastBlockHash: state.lastBlockHash, lastCommitHash: commitHash(null), dataHash: txsRoot([]), lastResultsHash: state.lastResultsHash,
+        validatorsHash: set.hash(), nextValidatorsHash: state.nextValidators.hash(), appHash: state.appHash, evidenceHash: evidenceHash([]), proposerAddress: proposerOf(round).address, prioritiesHash: prioritiesHash(set, state.nextValidators),
+      },
+      txs: [], lastCommit: null, evidence: [],
+    });
+    const propose = (round: number, b: Block, polRound: number) => {
+      const unsigned = { height: 1n, round, polRound, block: b };
+      const proposal: Proposal = { ...unsigned, signature: sign(proposalSignBytes(CHAIN, unsigned), proposerOf(round).secretKey, signContext(CHAIN, 'proposal')) };
+      return consensus.handleProposal(proposal, 'peer');
+    };
+    const vote = (who: { key: KeyPair; index: number }, type: VoteType, round: number, hash: Uint8Array | null, polRound = -1) =>
+      consensus.handleVote(signed({ type, height: 1n, round, blockHash: hash, polRound, validatorIndex: who.index }, who.key), 'peer');
+    const last = () => sent[sent.length - 1]!;
+    const player = (round: number) => ({ key: proposerOf(round), index: set.indexOf(proposerOf(round).address) });
+    try {
+      consensus.start();
+      // The light validator proposes none of the four rounds: the three others take the first three in turn, and
+      // the first of them the fourth.
+      const [p0, p1, p2] = [player(0), player(1), player(2)];
+      expect(new Set([me, p0.index, p1.index, p2.index]).size).toBe(4);
+      expect(proposerOf(3)).toBe(p0.key);
+      const now = BigInt(Date.now());
+      const D = make(0, now);
+      const B = make(1, now + 1n);
+      const [d, b] = [blockHash(D), blockHash(B)];
+
+      // Round 0: D is proposed and prevoted, and this validator hears one prevote beside its own: no majority yet.
+      await propose(0, D, -1);
+      expect(last()).toMatchObject({ type: VoteType.Prevote, round: 0, blockHash: d, polRound: -1 });
+      await vote(p0, VoteType.Prevote, 0, d);
+      // Round 1: B, fresh, from a proposer that knows of no majority, prevoted by it and by p0, which locked nothing
+      // in round 0. With this validator's prevote that is a majority: the lock is on B, round 1.
+      await propose(1, B, -1);
+      await vote(p0, VoteType.Prevote, 1, b);
+      await vote(p1, VoteType.Prevote, 1, b);
+      expect(consensus.round).toBe(1);
+      expect(last()).toMatchObject({ type: VoteType.Precommit, round: 1, blockHash: b });
+      expect([consensus.lockedRound, consensus.lockedHash]).toEqual([1, b]);
+      // Round 2: D again, on round 0's majority, which arrives only now. Older than the lock, so the prevote is nil;
+      // but the others prevote D, and on that majority, in a round after the lock, the lock moves to D.
+      await vote(p2, VoteType.Prevote, 0, d);
+      await vote(p1, VoteType.Prevote, 0, null);
+      await propose(2, D, 0);
+      await vote(p0, VoteType.Prevote, 2, d, 0);
+      await vote(p1, VoteType.Prevote, 2, d, 0);
+      expect(consensus.round).toBe(2);
+      expect(last()).toMatchObject({ type: VoteType.Prevote, round: 2, blockHash: null, polRound: -1 });
+      await vote(p2, VoteType.Prevote, 2, d, 0);
+      expect(last()).toMatchObject({ type: VoteType.Precommit, round: 2, blockHash: d });
+      expect([consensus.lockedRound, consensus.lockedHash]).toEqual([2, d]);
+      // Round 3: D once more, from a proposer that missed round 2 and still dates the block to round 0.
+      await propose(3, D, 0);
+      await vote(p0, VoteType.Prevote, 3, d, 0);
+      await vote(p1, VoteType.Prevote, 3, d, 0);
+      expect(consensus.round).toBe(3);
+      // The prevote is for D and names round 2, the round of the lock, not the proposal's round 0. With the two
+      // others it is a majority, and the precommit follows it.
+      const again = sent[sent.length - 2]!;
+      expect(again).toMatchObject({ type: VoteType.Prevote, round: 3, blockHash: d, polRound: 2 });
+      // With round 0 in it, the precommit for B in round 1 beside it would prove a lock forgotten.
+      const first = sent.find((v) => v.type === VoteType.Precommit && v.round === 1)!;
+      expect(isAmnesia(first, { ...again, polRound: 0 })).toBe(true);
+      // The round goes on to decide D, with this validator's precommit in the commit.
+      expect(last()).toMatchObject({ type: VoteType.Precommit, round: 3, blockHash: d });
+      await vote(p0, VoteType.Precommit, 3, d);
+      await vote(p1, VoteType.Precommit, 3, d);
+      await waitFor(() => applied.length === 1, 5000, 'the decision');
+      expect(blockHash(applied[0]!.block)).toEqual(d);
+      expect(applied[0]!.commit.signatures[me]).not.toBeNull();
+
+      // Nothing this validator signed in the height is evidence against it, as its peers see the votes or as it does.
+      expect(sent.map((v) => [v.type, v.round, v.polRound])).toEqual([
+        [VoteType.Prevote, 0, -1], [VoteType.Prevote, 1, -1], [VoteType.Precommit, 1, -1], [VoteType.Prevote, 2, -1], [VoteType.Precommit, 2, -1], [VoteType.Prevote, 3, 2], [VoteType.Precommit, 3, -1],
+      ]);
+      for (const c of sent) for (const p of sent) expect(isAmnesia(c, p)).toBe(false);
+      const seen = new HeightVoteSet(1n, set);
+      for (const v of sent) expect(seen.add(v)).toEqual({ added: true, conflict: null });
+      expect(pool.held).toEqual({ pending: 0, committed: 0, inventory: 0 });
+    } finally {
+      consensus.stop();
     }
   });
 });

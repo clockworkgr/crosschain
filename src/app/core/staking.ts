@@ -23,7 +23,7 @@ import { idToString, type ObjectId } from '../../db/id.ts';
 import { key } from '../../db/keys.ts';
 import type { ValidatorUpdate } from '../../types/validator.ts';
 import type { Logger } from '../../util/log.ts';
-import type { FinalizeBlockRequest } from '../types.ts';
+import type { FinalizeBlockRequest, Misbehavior } from '../types.ts';
 import { HistoryKind, virtualData, type HistoryRecorder } from './history.ts';
 import { accountOf, adjustBalance, adjustPool, assetOf, getDynamic, getGlobal, TxError } from './state.ts';
 import {
@@ -369,10 +369,10 @@ function trackDowntime(db: ObjectDatabase, req: FinalizeBlockRequest, params: St
 }
 
 /**
- * A fault proven by evidence at `height`, a double sign or a forgotten lock: slash by `bps`, slash what left afterwards,
+ * A fault proven by evidence at `height`, in the block at height `at`, a double sign or a forgotten lock: slash by `bps`, slash what left afterwards,
  * tombstone, and send every delegator into unbonding. The two faults differ in the rate alone.
  */
-export function punishEvidence(db: ObjectDatabase, v: Validator, height: bigint, time: bigint, params: StakingParameters, bps: number, history: HistoryRecorder | null = null): void {
+export function punishEvidence(db: ObjectDatabase, v: Validator, height: bigint, at: bigint, time: bigint, params: StakingParameters, bps: number, history: HistoryRecorder | null = null): void {
   let current = slash(db, v, bps);
   history?.virtual(v.operator, HistoryKind.slash, virtualData.slash(v.id, v.tokens - current.tokens, true));
   history?.virtual(v.operator, HistoryKind.tombstone, virtualData.validator(v.id));
@@ -387,12 +387,36 @@ export function punishEvidence(db: ObjectDatabase, v: Validator, height: bigint,
   for (const r of db.range(RedelegationType, 'bySource', key((k) => k.id(v.id)))) {
     if (r.creationHeight < height - 1n) continue;
     const cut = (r.tokens * BigInt(bps)) / BPS;
+    if (cut === 0n) continue;
+    // From the stake at the destination first, at the destination's rate.
+    let left = cut;
     const dst = db.get(ValidatorType, r.destination);
-    const d = dst ? delegationOf(db, r.delegator, dst.id) : null;
-    if (cut === 0n || !dst || dst.status === ValidatorStatus.tombstoned || !d) continue;
-    const shares = sharesForTokens(dst, cut) < d.shares ? sharesForTokens(dst, cut) : d.shares;
-    const { tokens } = unbond(db, d, dst, shares);
-    adjustPool(db, tokens);
+    const d = dst && dst.status !== ValidatorStatus.tombstoned ? delegationOf(db, r.delegator, dst.id) : null;
+    // A destination with shares and no tokens (slashed to nothing) has nothing to give and no rate to give it at.
+    if (dst && d && dst.tokens > 0n) {
+      const want = sharesForTokens(dst, cut);
+      const shares = want < d.shares ? want : d.shares;
+      const { tokens } = unbond(db, d, dst, shares);
+      adjustPool(db, tokens);
+      // A delegation that had the shares has paid, whatever the rounding of shares to tokens kept back by a unit;
+      // only one that ran out leaves a remainder to look for elsewhere.
+      left = want <= d.shares ? 0n : left - (tokens < left ? tokens : left);
+    }
+    // Then from what the delegator has taken out of the destination since it moved the stake there: undelegating
+    // after a redelegation does not carry the stake out of the source's reach. An entry made at or after the
+    // redelegation's height is liable, by the height of the block that made it; a destination tombstoned
+    // meanwhile has turned the delegation into such an entry itself. An entry that has matured is beyond reach:
+    // that takes an unbonding period shortened by a proposal since, as both wait the period in force when made.
+    if (left > 0n) {
+      for (const u of db.range(UnbondingType, 'byDelegatorValidator', key((k) => k.id(r.delegator).id(r.destination)))) {
+        if (left === 0n) break;
+        if (u.creationHeight < r.creationHeight || u.tokens === 0n) continue;
+        const take = u.tokens < left ? u.tokens : left;
+        adjustPool(db, take);
+        db.modify(UnbondingType, u.id, (x) => ({ ...x, tokens: x.tokens - take }));
+        left -= take;
+      }
+    }
     db.modify(RedelegationType, r.id, (x) => ({ ...x, tokens: x.tokens - cut }));
   }
   current = db.modify(ValidatorType, v.id, (x) => ({ ...x, status: ValidatorStatus.tombstoned, jailedUntil: 0n }));
@@ -403,7 +427,8 @@ export function punishEvidence(db: ObjectDatabase, v: Validator, height: bigint,
     db.remove(DelegationType, d.id);
     if (tokens > 0n) {
       owed += tokens;
-      db.create(UnbondingType, (id) => ({ id, delegator: d.delegator, validator: v.id, tokens, creationHeight: height, completion: time + params.unbondingPeriodMs }));
+      // Made by this block, whatever the height of the fault: a slash that follows redelegated stake here asks when.
+      db.create(UnbondingType, (id) => ({ id, delegator: d.delegator, validator: v.id, tokens, creationHeight: at, completion: time + params.unbondingPeriodMs }));
       history?.virtual(d.delegator, HistoryKind.forcedUnbond, virtualData.matured(v.id, tokens));
     }
   }
@@ -412,6 +437,8 @@ export function punishEvidence(db: ObjectDatabase, v: Validator, height: bigint,
   const info = signingInfoOf(db, v.id);
   if (info) db.remove(SigningInfoType, info.id);
 }
+
+const FAULTS: Record<Misbehavior['kind'], string> = { duplicateVote: 'double signing', duplicateProposal: 'proposing twice in one round', amnesia: 'forgetting a lock', falseCitation: 'prevoting on a majority that never was' };
 
 /** Everything that happens before a block's transactions. */
 export function beginBlock(db: ObjectDatabase, req: FinalizeBlockRequest, log: Logger, history: HistoryRecorder | null = null): void {
@@ -424,9 +451,11 @@ export function beginBlock(db: ObjectDatabase, req: FinalizeBlockRequest, log: L
   for (const m of req.misbehavior) {
     const v = validatorByAddress(db, m.address);
     if (!v || v.status === ValidatorStatus.tombstoned) continue;
-    const amnesia = m.kind === 'amnesia';
-    punishEvidence(db, v, m.height, req.time, params, amnesia ? params.amnesiaSlashBps : params.doubleSignSlashBps, history);
-    log('warn', amnesia ? 'validator tombstoned for forgetting a lock' : 'validator tombstoned for double signing', { validator: idToString(v.id), height: m.height });
+    // Signing twice in one place, votes or proposals, is one fault at one rate; forgetting a lock and naming a
+    // majority that never was (the lie that would hide a forgotten lock) are the other.
+    const twice = m.kind === 'duplicateVote' || m.kind === 'duplicateProposal';
+    punishEvidence(db, v, m.height, req.height, req.time, params, twice ? params.doubleSignSlashBps : params.amnesiaSlashBps, history);
+    log('warn', `validator tombstoned for ${FAULTS[m.kind]}`, { validator: idToString(v.id), height: m.height });
   }
   // Last, so that stake whose liability ends in this very block is still there to be punished.
   matureQueues(db, req.time, g.coreAsset, history);

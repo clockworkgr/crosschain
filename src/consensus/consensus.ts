@@ -26,7 +26,11 @@
  * polRound, which its prevote then names). The lock is kept by hash and
  * written by the private validator with the precommit, so a restart in the
  * same height takes it up again. A validator whose votes show a lock
- * forgotten is reported like one that signed twice (types/evidence.ts).
+ * forgotten is reported like one that signed twice, and so is one that
+ * prevotes on a majority the votes held rule out, and a proposer that signs
+ * two proposals for a round (types/evidence.ts). The votes and proposals of
+ * the last heights are kept for that, since the second half of such a pair
+ * may come when the height is over.
  * Liveness comes from the timeouts, which grow with the round number.
  *
  * Signature verification is asynchronous (it runs in worker threads), so
@@ -34,23 +38,24 @@
  * message is still relevant before touching state. All state mutation is
  * synchronous and happens on the main thread.
  */
-import { bytesEqual, toHex } from '../crypto/hash.ts';
+import { encode } from '../codec/writer.ts';
+import { HASH_SIZE, bytesEqual, sha256, toHex } from '../crypto/hash.ts';
 import { signContext } from '../crypto/keys.ts';
 import type { Verifier } from '../crypto/verifier.ts';
 import { blockDataBytes, blockHash, commitHash, evidenceHash, type Block, type Commit, type Header } from '../types/block.ts';
 import { txsRoot } from '../types/txproof.ts';
-import { evidenceHeight, isAmnesia, makeDuplicateVoteEvidence, type AmnesiaEvidence } from '../types/evidence.ts';
+import { evidenceHeight, evidenceKey, evidenceValidator, isAmnesia, makeDuplicateProposalEvidence, makeDuplicateVoteEvidence, speaksAgainst, type Evidence, type ProposalHead } from '../types/evidence.ts';
 import { zeroSignature } from '../crypto/keys.ts';
 import { proposalSignBytes, type Proposal } from '../types/proposal.ts';
 import type { ChainState } from '../types/state.ts';
-import { prioritiesHash, type ValidatorSet } from '../types/validator.ts';
-import { VoteType, voteSignBytes, voteTypeName, type Vote } from '../types/vote.ts';
+import { prioritiesHash, type Validator, type ValidatorSet } from '../types/validator.ts';
+import { VoteType, blockHashKey, encodeVote, sameVoteContent, voteSignBytes, voteTypeName, type Vote } from '../types/vote.ts';
 import type { Logger } from '../util/log.ts';
-import { EvidencePool } from './evidence.ts';
+import { EvidencePool, evidenceBytes } from './evidence.ts';
 import { DoubleSignError, type PrivValidator } from './privval.ts';
 import { DEFAULT_MAX_BLOCK_BYTES } from '../types/genesis.ts';
 import { MAX_EVIDENCE_PER_BLOCK, bodyMatchesHeader, evidenceAgeOk, validateBlockStructure, verifyBlockSignatures, type BlockTimeLookup, type ValidationLimits } from './validate.ts';
-import { HeightVoteSet } from './votes.ts';
+import { HeightVoteSet, type VoteSet } from './votes.ts';
 
 export interface ConsensusTimeouts {
   proposeMs: number;
@@ -90,6 +95,46 @@ export const MAX_ROUND_AHEAD = 1000;
 /** Proposals for the next height held until it starts, in all and signed by any one validator. */
 const MAX_NEXT_HEIGHT_PROPOSALS = 8;
 const MAX_NEXT_HEIGHT_PROPOSALS_PER_VALIDATOR = 2;
+
+/**
+ * Heights that are over whose votes and proposals are kept, to hold a late vote or proposal against: a validator
+ * that signs twice, or forgets a lock, may show one node the second signature only once the height is decided.
+ */
+export const PAST_HEIGHTS_KEPT = 16;
+
+/**
+ * Votes of one peer whose signatures a node verifies in a second: this many, or eight for each validator if that
+ * is more. A round is two votes a validator, and a peer passes each on once, so a peer that follows the protocol
+ * stays far below, except when it hands a newly connected peer all the votes of a height at once. Votes over the
+ * budget therefore wait, and only what there is no room to keep waiting is dropped.
+ */
+export const VOTES_PER_PEER_SECOND = 200;
+/**
+ * Votes over the budget that wait to be verified, of one peer: this many, or 64 for each validator if that is more
+ * (what a peer holds of a height that has gone through 32 rounds), and never more than the cap. Of all peers
+ * together, twice that.
+ */
+export const MAX_DEFERRED_VOTES_PER_PEER = 1024;
+const DEFERRED_VOTES_CAP = 32_768;
+/** How long votes wait before they are tried again. */
+const DEFERRED_VOTES_MS = 250;
+/** What a peer is charged for each second in which a vote of its was dropped for want of room. */
+const VOTE_FLOOD_POINTS = 10;
+
+/** The most evidence that waits for room in the pool. */
+const MAX_REFUSED = 64;
+
+/** What is kept of a height that is over. Nothing in it moves consensus; it is there to find evidence in. */
+interface PastHeight {
+  validators: ValidatorSet;
+  votes: HeightVoteSet;
+  /** The round the height ended in. Later rounds are not kept and nothing is taken in for them. */
+  maxRound: number;
+  /** What each round's proposer signed, by round. */
+  proposals: Map<number, ProposalHead>;
+  /** Rounds whose proposer was already reported for two proposals. */
+  proposedTwice: Set<number>;
+}
 
 /** What tells one held vote for the next height from another: a conflicting vote differs in its block hash or in the round it names, and is held too. */
 const nextHeightVoteKey = (v: Vote): string => `${v.round}:${v.type}:${v.validatorIndex}:${v.blockHash ? toHex(v.blockHash) : ''}:${v.polRound}`;
@@ -166,6 +211,24 @@ export class Consensus {
   private prevoteTimeoutScheduled = new Set<number>();
   private precommitTimeoutScheduled = new Set<number>();
   private polkaHandled = new Set<number>();
+  /**
+   * What the proposer of each round of this height signed: the first proposal whose signature verified. Apart from
+   * `proposals`, which holds what the round decides on and may be a block fetched without a signature.
+   */
+  private heads = new Map<number, ProposalHead>();
+  /** Rounds of this height whose proposer was already reported for two proposals. */
+  private proposedTwice = new Set<number>();
+  private readonly past = new Map<bigint, PastHeight>();
+  /** Evidence this node made that the pool had no room for, by offence, offered again as each height starts. */
+  private readonly refused = new Map<string, Evidence>();
+  /** For each peer, the second it is in and the votes of it verified in that second. */
+  private readonly voteBudgets = new Map<string, { second: bigint; votes: number; charged: boolean }>();
+  /** Votes over their peer's budget, by peer, waiting to be verified. */
+  private readonly deferredVotes = new Map<string, Map<string, Vote>>();
+  /** The signed votes whose signatures are being verified now: a copy that arrives meanwhile waits for nothing and costs nothing. */
+  private readonly verifyingVotes = new Set<string>();
+  private deferredCount = 0;
+  private deferredTimer: NodeJS.Timeout | null = null;
   private timers = new Map<string, NodeJS.Timeout>();
   /** Votes for the next height with the key each was verified against, replayed once that height starts. */
   private nextHeightVotes: { vote: Vote; publicKey: Uint8Array }[] = [];
@@ -211,6 +274,10 @@ export class Consensus {
     this.running = false;
     for (const t of this.timers.values()) clearTimeout(t);
     this.timers.clear();
+    if (this.deferredTimer) clearTimeout(this.deferredTimer);
+    this.deferredTimer = null;
+    this.deferredVotes.clear();
+    this.deferredCount = 0;
   }
 
   /** Called after block sync applied blocks behind consensus's back. */
@@ -229,10 +296,14 @@ export class Consensus {
     for (const t of this.timers.values()) clearTimeout(t);
     this.timers.clear();
     const st = this.d.getState();
+    if (this.hvs && st.lastHeight + 1n > this.height) this.keepHeight(st.lastHeight + 1n);
+    if (this.refused.size > 0) this.reportRefused(st);
     this.height = st.lastHeight + 1n;
     this.validators = st.validators;
     this.hvs = new HeightVoteSet(this.height, this.validators);
     this.proposals.clear();
+    this.heads = new Map();
+    this.proposedTwice = new Set();
     this.proposerCache.clear();
     this.prevoteTimeoutScheduled.clear();
     this.precommitTimeoutScheduled.clear();
@@ -261,6 +332,18 @@ export class Consensus {
     this.startRound(resumeRound);
     for (const v of votes) this.addVote(v, null);
     for (const e of proposals) this.proposalUnawaited(e.proposal, e.from);
+  }
+
+  /** Put the height that is over among the kept ones, cut to the round it ended in, and let go of the oldest. */
+  private keepHeight(next: bigint): void {
+    // The round this node was in, and the round the height was committed in: block sync may have applied a block
+    // decided in a later round than this node reached.
+    const commit = this.d.getLastCommit();
+    const maxRound = Math.max(this.round, this.decided ? this.decidedRound : 0, commit && commit.height === this.height ? commit.round : 0);
+    this.hvs.dropRoundsAbove(maxRound);
+    for (const r of this.heads.keys()) if (r > maxRound) this.heads.delete(r);
+    this.past.set(this.height, { validators: this.validators, votes: this.hvs, maxRound, proposals: this.heads, proposedTwice: this.proposedTwice });
+    for (const h of this.past.keys()) if (h + BigInt(PAST_HEIGHTS_KEPT) < next) this.past.delete(h);
   }
 
   private startRound(r: number): void {
@@ -340,12 +423,14 @@ export class Consensus {
     if (time <= st.lastBlockTime) time = st.lastBlockTime + 1n;
     // Evidence a validator would reject as too old must not go into the block, and is dropped for good.
     this.d.evidencePool.pruneIf((ev) => evidenceAgeOk(evidenceHeight(ev), st.lastHeight + 1n, time, st, this.limits, this.d.blockTimeAt) !== null);
-    let evidence = this.d.evidencePool.list(MAX_EVIDENCE_PER_BLOCK);
     // The limit is on the transactions and the evidence. Evidence is picked by count and may have half the limit:
     // by bytes it may be more under a small one, and the last record is left for the next block until it fits.
     // The transactions get what is left, never less than half, which is the most one transaction may be
     // (the mempool admits none larger), so evidence arriving block after block cannot keep a transaction out.
+    // A record that is more than the half on its own would keep every other record waiting behind it; the pool
+    // takes none in (EvidencePool.maxRecordBytes, set by the node to what fits here).
     const SLACK = 1024;
+    let evidence = this.d.evidencePool.list(MAX_EVIDENCE_PER_BLOCK);
     while (evidence.length > 0 && blockDataBytes({ txs: [], evidence }) + SLACK > Math.floor(this.limits.maxBlockBytes / 2)) evidence = evidence.slice(0, -1);
     const budget = this.limits.maxBlockBytes - blockDataBytes({ txs: [], evidence }) - SLACK;
     const txs = budget > 0 ? this.d.reapTxs(budget) : [];
@@ -407,8 +492,16 @@ export class Consensus {
       await this.holdNextHeightProposal(p, fromPeer);
       return;
     }
+    if (p.height < this.height) {
+      await this.handlePastProposal(p, fromPeer);
+      return;
+    }
     if (p.height !== this.height) return;
-    if (this.proposals.has(p.round)) return;
+    // A proposal for a round that has one is looked at only for what its proposer signed: nothing, if that is known
+    // and this says the same, or if the proposer was already reported for signing two.
+    const taken = this.proposals.has(p.round);
+    const head = this.heads.get(p.round);
+    if (taken && head && (this.proposedTwice.has(p.round) || sameProposal(head, p))) return;
     if (p.polRound < -1 || p.polRound >= p.round) return;
     if (p.block.header.height !== p.height) return;
 
@@ -429,6 +522,10 @@ export class Consensus {
 
     // Stopped while the signature was verified: the checks below read stored blocks, and the store may be closed.
     if (!this.running) return;
+    // Whatever becomes of the proposal, its proposer signed it. The height may have moved on meanwhile, and then
+    // it is held against what is kept of that height.
+    this.signedProposal(p);
+    if (taken || p.height !== this.height) return;
 
     // The signature covers the header; a relay can pair it with another body. That is a corrupt message, not
     // the round's proposal: drop it without recording the round, so the real one can still arrive.
@@ -459,6 +556,64 @@ export class Consensus {
     this.evaluateRules();
   }
 
+  /**
+   * A proposal whose signature verified under the proposer of its round, of this height or a kept one. The first
+   * for a round is what the proposer signed; another that says something else is the second half of the proof
+   * that it signed twice.
+   */
+  private signedProposal(p: Proposal): void {
+    const kept = p.height === this.height ? null : this.past.get(p.height);
+    if (p.height !== this.height && (!kept || p.round > kept.maxRound)) return;
+    const [heads, reported, validators] = kept ? [kept.proposals, kept.proposedTwice, kept.validators] : [this.heads, this.proposedTwice, this.validators];
+    const second = { polRound: p.polRound, blockHash: blockHash(p.block), signature: p.signature };
+    const first = heads.get(p.round);
+    if (!first) {
+      heads.set(p.round, second);
+      return;
+    }
+    if (reported.has(p.round) || sameProposal(first, p)) return;
+    // Marked once the pool holds the proof or it waits for room there.
+    if (this.report(makeDuplicateProposalEvidence(p.height, p.round, validators.indexOf(proposerOf(validators, p.round).address), first, second))) reported.add(p.round);
+  }
+
+  /** A proposal for a kept height: nothing to decide any more, but beside the one its proposer is known to have signed it may show two. */
+  private async handlePastProposal(p: Proposal, fromPeer: string | null): Promise<void> {
+    const kept = this.past.get(p.height);
+    const first = kept?.proposals.get(p.round);
+    if (!kept || !first || kept.proposedTwice.has(p.round) || sameProposal(first, p)) return;
+    if (p.polRound < -1 || p.polRound >= p.round || p.block.header.height !== p.height) return;
+    // The proposer of the round in that height's set; the round is one the height reached, so the walk is bounded.
+    const ok = await this.d.verifier.verifyOne({ sig: p.signature, msg: proposalSignBytes(this.d.chainId, p), publicKey: proposerOf(kept.validators, p.round).publicKey, context: this.proposalCtx });
+    if (!ok) {
+      if (fromPeer) this.d.scorePeer?.(fromPeer, 20, 'bad proposal signature');
+      return;
+    }
+    if (this.running) this.signedProposal(p);
+  }
+
+  /**
+   * Evidence this node made itself: into the pool, from where it is announced and proposed. True if the pool holds
+   * a proof of the offence afterwards, this one or one it had; false if it had no room.
+   */
+  private report(ev: Evidence): boolean {
+    const pool = this.d.evidencePool;
+    if (pool.add(ev)) this.log('warn', 'fault detected', { kind: ev.kind, h: evidenceHeight(ev), validator: evidenceValidator(ev) });
+    if (pool.has(ev)) return true;
+    // No room now. A proof the pool could take when it has room waits here, since the votes that made it are held
+    // already and will not be looked at again; one too large for the pool never fits.
+    if (evidenceBytes(ev) > pool.maxRecordBytes || this.refused.size >= MAX_REFUSED) return false;
+    this.refused.set(evidenceKey(ev), ev);
+    return true;
+  }
+
+  /** Offer the pool again what it had no room for, and let go of what has grown too old for any block. */
+  private reportRefused(st: ChainState): void {
+    for (const [k, ev] of this.refused) {
+      const old = evidenceAgeOk(evidenceHeight(ev), st.lastHeight + 1n, st.lastBlockTime, st, this.limits, this.d.blockTimeAt) !== null;
+      if (old || this.d.evidencePool.add(ev) || this.d.evidencePool.has(ev)) this.refused.delete(k);
+    }
+  }
+
   // ----------------------------------------------------------- incoming votes
 
   async handleVote(v: Vote, fromPeer: string | null): Promise<void> {
@@ -475,25 +630,47 @@ export class Consensus {
       // state's "next" set is the one after, whose index positions mean other keys.
       set = this.d.validatorSetAtHeight(v.height);
     } else {
-      return;
+      // A height that is over and still kept: the vote decides nothing, but it may be the second half of evidence.
+      const kept = this.past.get(v.height);
+      if (!kept || v.round > kept.maxRound || kept.votes.has(v)) return;
+      set = kept.validators;
     }
     if (!set) return;
     const val = set.byIndex(v.validatorIndex);
     if (!val) return;
     // Before the signature is verified: a vote this node will not count must not cost it a verification.
-    if (v.round > this.round + MAX_ROUND_AHEAD) return;
-    const ok = await this.d.verifier.verifyOne({
-      sig: v.signature,
-      msg: voteSignBytes(this.d.chainId, v),
-      publicKey: val.publicKey,
-      context: this.voteCtx,
-    });
+    if (v.height >= this.height && v.round > this.round + MAX_ROUND_AHEAD) return;
+    // The same signed vote from several peers at once is verified once: the copies say nothing the first does not.
+    const id = signedVoteKey(v);
+    if (this.verifyingVotes.has(id)) return;
+    if (fromPeer !== null && !this.withinVoteBudget(fromPeer, set.size)) return this.deferVote(v, fromPeer, set.size);
+    this.verifyingVotes.add(id);
+    let ok: boolean;
+    try {
+      ok = await this.d.verifier.verifyOne({
+        sig: v.signature,
+        msg: voteSignBytes(this.d.chainId, v),
+        publicKey: val.publicKey,
+        context: this.voteCtx,
+      });
+    } catch (e) {
+      // The verifier failed, not the vote (a worker that exited, say). Copies that came meanwhile were dropped on
+      // the strength of this one, so it is not let go: it waits with the votes over the budget and is tried again.
+      this.verifyingVotes.delete(id);
+      if (!this.running) return;
+      this.log('warn', 'verifying a vote failed; it will be tried again', { err: e instanceof Error ? e.message : String(e) });
+      if (fromPeer !== null) this.deferVote(v, fromPeer, set.size);
+      return;
+    }
+    // What follows runs without a pause, so a copy that comes after this finds the vote held, or refused as this one was.
+    this.verifyingVotes.delete(id);
     if (!ok) {
       this.log('warn', 'vote with bad signature', { h: v.height, r: v.round, i: v.validatorIndex });
       if (fromPeer) this.d.scorePeer?.(fromPeer, 20, 'bad vote signature');
       return;
     }
     if (!this.running) return;
+    if (v.height < this.height) return this.addPastVote(v, fromPeer);
     if (v.round > this.round + MAX_ROUND_AHEAD) return; // again: the height may have moved on, and the round with it
     if (v.height === this.height) this.addVote(v, fromPeer);
     else if (v.height === this.height + 1n && this.nextHeightVotes.length < 4096 && !this.nextHeightVoteKeys.has(nextHeightVoteKey(v))) {
@@ -502,23 +679,80 @@ export class Consensus {
     }
   }
 
+  /** Whether one more vote of this peer may be verified in the current second, and if so, counted. */
+  private withinVoteBudget(peerId: string, validators: number): boolean {
+    const b = this.voteBudget(peerId);
+    if (b.votes >= Math.max(VOTES_PER_PEER_SECOND, 8 * validators)) return false;
+    b.votes++;
+    return true;
+  }
+
+  private voteBudget(peerId: string): { second: bigint; votes: number; charged: boolean } {
+    const second = this.now() / 1000n;
+    let b = this.voteBudgets.get(peerId);
+    if (!b || b.second !== second) {
+      // Peers come and go: what is left of other seconds is let go once there is much of it.
+      if (this.voteBudgets.size > 4096) for (const [k, x] of this.voteBudgets) if (x.second !== second) this.voteBudgets.delete(k);
+      this.voteBudgets.set(peerId, (b = { second, votes: 0, charged: false }));
+    }
+    return b;
+  }
+
+  /**
+   * A vote over its peer's budget waits, unverified, and is taken up again shortly: a peer that hands over all the
+   * votes of a height at once, as every node does for a peer that has just connected, is slowed and loses none.
+   * What waits is bounded for each peer and in all. A vote there is no room for is dropped, and the peer is
+   * charged, once for the second.
+   */
+  private deferVote(v: Vote, peerId: string, validators: number): void {
+    const queue = this.deferredVotes.get(peerId) ?? new Map<string, Vote>();
+    // The same signed vote again takes no second place; one with another signature is another vote.
+    const id = signedVoteKey(v);
+    if (queue.has(id)) return;
+    const room = Math.min(DEFERRED_VOTES_CAP, Math.max(MAX_DEFERRED_VOTES_PER_PEER, 64 * validators));
+    if (queue.size >= room || this.deferredCount >= 2 * room) {
+      const b = this.voteBudget(peerId);
+      if (!b.charged) {
+        b.charged = true;
+        this.log('warn', 'peer sends more votes than are verified or kept waiting', { peer: peerId });
+        this.d.scorePeer?.(peerId, VOTE_FLOOD_POINTS, 'vote flood');
+      }
+      return;
+    }
+    queue.set(id, v);
+    this.deferredVotes.set(peerId, queue);
+    this.deferredCount++;
+    this.deferredTimer ??= setTimeout(() => this.resumeDeferredVotes(), DEFERRED_VOTES_MS);
+  }
+
+  /** Hand the votes that waited to `handleVote` again, in the order they came; those still over the budget wait on. */
+  private resumeDeferredVotes(): void {
+    this.deferredTimer = null;
+    if (!this.running) return;
+    const waiting = [...this.deferredVotes];
+    this.deferredVotes.clear();
+    this.deferredCount = 0;
+    for (const [peerId, votes] of waiting) {
+      for (const v of votes.values()) {
+        this.handleVote(v, peerId).catch((e: unknown) => this.log(this.running ? 'error' : 'debug', 'handling a vote failed', { err: e instanceof Error ? e.message : String(e) }));
+      }
+    }
+  }
+
   /** Add an already-verified vote for the current height. */
   private addVote(v: Vote, fromPeer: string | null): void {
     if (v.height !== this.height) return;
     const { added, conflict } = this.hvs.add(v);
     if (conflict) {
-      const ev = makeDuplicateVoteEvidence(conflict, v);
-      if (this.d.evidencePool.add(ev)) {
-        this.log('warn', 'double sign detected', { h: v.height, r: v.round, type: voteTypeName(v.type), validator: v.validatorIndex });
-      }
+      this.report(makeDuplicateVoteEvidence(conflict, v));
+      // The second vote is as signed as the first, and may complete a proof against another validator.
+      for (const ev of faultsShown(this.hvs, this.validators, v)) this.report(ev);
       // The vote set keeps whichever of the two counts for its block, so a majority may have formed.
       if (!this.decided) this.evaluateRules();
       return;
     }
     if (!added) return;
-    for (const ev of this.forgottenLocks(v)) {
-      if (this.d.evidencePool.add(ev)) this.log('warn', 'forgotten lock detected', { h: v.height, validator: v.validatorIndex, precommit: ev.precommit.round, prevote: ev.prevote.round, polRound: ev.prevote.polRound });
-    }
+    for (const ev of faultsShown(this.hvs, this.validators, v)) this.report(ev);
     this.log('debug', 'got vote', { h: v.height, r: v.round, type: voteTypeName(v.type), i: v.validatorIndex, block: v.blockHash });
     this.d.broadcastVote(v, fromPeer);
     if (this.decided) {
@@ -533,20 +767,19 @@ export class Consensus {
   }
 
   /**
-   * What a vote just added proves with the votes already held from the same validator: a precommit for one block
-   * and a prevote for another in a later round that names no proof of lock from the precommit's round or after.
-   * Either vote may arrive last.
+   * A verified vote for a kept height. It is held against the votes kept, reported if it shows a fault, and passed
+   * on if it is new, so that two votes shown to two nodes still meet at one of them.
    */
-  private forgottenLocks(v: Vote): AmnesiaEvidence[] {
-    if (v.blockHash === null) return [];
-    const out: AmnesiaEvidence[] = [];
-    for (const r of this.hvs.roundNumbers()) {
-      const other = v.type === VoteType.Prevote ? this.hvs.precommits(r).get(v.validatorIndex) : this.hvs.prevotes(r).get(v.validatorIndex);
-      if (!other) continue;
-      const [precommit, prevote] = v.type === VoteType.Prevote ? [other, v] : [v, other];
-      if (isAmnesia(precommit, prevote)) out.push({ kind: 'amnesia', precommit, prevote });
-    }
-    return out;
+  private addPastVote(v: Vote, fromPeer: string | null): void {
+    const kept = this.past.get(v.height);
+    if (!kept || v.round > kept.maxRound) return;
+    const { added, conflict } = kept.votes.add(v);
+    if (conflict) this.report(makeDuplicateVoteEvidence(conflict, v));
+    if (!added && !conflict) return;
+    // Also for the second of two votes in one place: it is as signed as the first.
+    for (const ev of faultsShown(kept.votes, kept.validators, v)) this.report(ev);
+    if (!added) return;
+    this.d.broadcastVote(v, fromPeer);
   }
 
   // ------------------------------------------------------------------- voting
@@ -866,4 +1099,153 @@ export class Consensus {
       decisions: this.decisionCount,
     };
   }
+}
+
+/** What tells one signed vote from every other: what it says, whose it is, and the signature, by its hash. */
+function signedVoteKey(v: Vote): string {
+  return `${v.height}/${v.round}/${v.type}/${v.validatorIndex}/${blockHashKey(v.blockHash)}/${v.polRound}/${toHex(sha256(v.signature))}`;
+}
+
+/** Whether a proposal says what its proposer is known to have signed for the round: the same block on the same proof-of-lock round. */
+function sameProposal(head: ProposalHead, p: Proposal): boolean {
+  return head.polRound === p.polRound && bytesEqual(head.blockHash, blockHash(p.block));
+}
+
+/** The proposer of round `r` in a height's validator set as the height began. Costs O(r). */
+function proposerOf(validators: ValidatorSet, r: number): Validator {
+  if (r === 0) return validators.proposer();
+  const copy = validators.copy();
+  copy.incrementProposerPriority(r);
+  return copy.proposer();
+}
+
+/**
+ * What a verified vote proves with the votes held for its height, whichever arrived last. The vote is one just
+ * added, or the second of two a validator signed for one place, of which the set holds one: both are signed, so
+ * where the held one says nothing against a claim and this one does, this one is taken.
+ *
+ * A forgotten lock: a precommit for one block and a prevote of the same validator for another in a later round
+ * that names no proof of lock from the precommit's round or after.
+ *
+ * A false citation: a prevote for a block that names a round in which +2/3 of the power prevoted something else.
+ * The vote added may be the prevote that names the round, or one of the round named that completes the +2/3.
+ */
+export function faultsShown(votes: HeightVoteSet, validators: ValidatorSet, v: Vote): Evidence[] {
+  const out: Evidence[] = [];
+  if (v.blockHash !== null) {
+    for (const r of votes.roundNumbers()) {
+      const other = v.type === VoteType.Prevote ? votes.precommits(r).get(v.validatorIndex) : votes.prevotes(r).get(v.validatorIndex);
+      if (!other) continue;
+      const [precommit, prevote] = v.type === VoteType.Prevote ? [other, v] : [v, other];
+      // One proof of an offence is enough: the pool keeps one a validator and height.
+      if (isAmnesia(precommit, prevote)) {
+        out.push({ kind: 'amnesia', precommit, prevote });
+        break;
+      }
+    }
+  }
+  if (v.type !== VoteType.Prevote) return out;
+  const citing: Vote[] = v.blockHash !== null && v.polRound >= 0 ? [v] : [];
+  for (const r of votes.roundNumbers()) {
+    if (r <= v.round) continue;
+    for (const w of votes.prevotes(r).all()) if (speaksAgainst(w, v)) citing.push(w);
+  }
+  // One proof a validator, the smallest in bytes: a larger one may be more than a pool takes where a smaller is not.
+  // A minority can sign such prevotes for every round ahead that a node takes votes for and for any number of
+  // blocks, so while looking only the cost of each claim is worked out, once for each round and block named, and
+  // the votes of a proof are gathered for the winners alone.
+  const rounds = new Map<number, (hash: Uint8Array) => Refutation | null>();
+  const best = new Map<number, { prevote: Vote; refutation: Refutation }>();
+  for (const prevote of citing) {
+    let refute = rounds.get(prevote.polRound);
+    if (!refute) rounds.set(prevote.polRound, (refute = refuter(votes.prevotes(prevote.polRound), validators, v)));
+    const refutation = refute(prevote.blockHash!);
+    const had = best.get(prevote.validatorIndex);
+    if (refutation && (!had || refutation.bytes < had.refutation.bytes)) best.set(prevote.validatorIndex, { prevote, refutation });
+  }
+  for (const { prevote, refutation } of best.values()) out.push({ kind: 'falseCitation', prevote, against: refutation.votes() });
+  return out;
+}
+
+/** The cheapest prevotes that refute a claim, +2/3 of the power not for its block: what they encode to, and the votes, by validator index. */
+interface Refutation {
+  bytes: number;
+  votes(): Vote[];
+}
+
+/**
+ * For the prevotes held of one round, a function from a block's hash to the cheapest refutation of the claim that
+ * the block had +2/3 there, or null if the votes do not make one.
+ *
+ * A prevote for nil encodes to 32 bytes less than one for a block, and all else in a vote is of one size, so the
+ * cheapest set is some number of the heaviest nil prevotes and, with them, as few of the heaviest block prevotes
+ * as reach +2/3: one pass over the two lists finds it. Every block the round holds no prevote for is refuted by
+ * the same votes, so that answer is worked out once, and the others once for each block the round does hold.
+ *
+ * A validator that signed two prevotes for the round has prevoted both: the set holds one and keeps the other
+ * aside, and `inHand`, the vote being looked at, may be a third. Whichever of them speaks against a claim is
+ * taken, nil before a block.
+ */
+function refuter(round: VoteSet, validators: ValidatorSet, inHand: Vote): (hash: Uint8Array) => Refutation | null {
+  const held = round.all();
+  const power = (o: Vote) => validators.byIndex(o.validatorIndex)!.power;
+  const heaviest = (a: Vote, b: Vote) => (power(a) === power(b) ? a.validatorIndex - b.validatorIndex : power(a) > power(b) ? -1 : 1);
+  // The validators with more than one prevote of this round, each with all of them.
+  const several = new Map<number, Vote[]>();
+  const also = (o: Vote) => {
+    const first = round.get(o.validatorIndex);
+    if (!first) return;
+    const all = several.get(o.validatorIndex) ?? [first];
+    if (all.some((x) => sameVoteContent(x, o))) return;
+    all.push(o);
+    several.set(o.validatorIndex, all);
+  };
+  for (const o of round.alternates()) also(o);
+  if (inHand.type === round.type && inHand.round === round.round) also(inHand);
+  const single = several.size === 0 ? held : held.filter((o) => !several.has(o.validatorIndex));
+  const nils = single.filter((o) => o.blockHash === null).sort(heaviest);
+  const blocks = single.filter((o) => o.blockHash !== null).sort(heaviest);
+  const present = new Set<string>();
+  for (const o of [...blocks, ...[...several.values()].flat()]) if (o.blockHash) present.add(blockHashKey(o.blockHash));
+  const size = (o: Vote) => encode((w) => encodeVote(w, o)).length;
+  const nilBytes = size({ ...(held[0] ?? inHand), blockHash: null });
+  const blockBytes = nilBytes + HASH_SIZE;
+
+  const cheapest = (hash: Uint8Array | null): Refutation | null => {
+    // Of a validator's several prevotes, one that speaks against the claim, nil before a block.
+    const speaks = (o: Vote) => hash === null || !bytesEqual(o.blockHash, hash);
+    const extra: Vote[] = [];
+    for (const all of several.values()) {
+      const o = all.find((x) => x.blockHash === null) ?? all.find(speaks);
+      if (o) extra.push(o);
+    }
+    const nil = extra.some((o) => o.blockHash === null) ? [...nils, ...extra.filter((o) => o.blockHash === null)].sort(heaviest) : nils;
+    const block = (extra.some((o) => o.blockHash !== null) ? [...blocks, ...extra.filter((o) => o.blockHash !== null)].sort(heaviest) : blocks).filter(speaks);
+    // k of the nil prevotes and the fewest block prevotes that reach +2/3 with them, for every k; fewer are needed as k grows.
+    let blockPower = 0n;
+    let m = 0;
+    while (m < block.length) blockPower += power(block[m++]!);
+    let nilPower = 0n;
+    let found: { k: number; m: number; bytes: number } | null = null;
+    for (let k = 0; k <= nil.length; k++) {
+      if (k > 0) nilPower += power(nil[k - 1]!);
+      if (!validators.isQuorum(nilPower + blockPower)) continue;
+      while (m > 0 && validators.isQuorum(nilPower + blockPower - power(block[m - 1]!))) blockPower -= power(block[--m]!);
+      const bytes = k * nilBytes + m * blockBytes;
+      if (!found || bytes < found.bytes) found = { k, m, bytes };
+    }
+    if (!found) return null;
+    const { k, m: taken, bytes } = found;
+    return { bytes, votes: () => [...nil.slice(0, k), ...block.slice(0, taken)].sort((a, b) => a.validatorIndex - b.validatorIndex) };
+  };
+
+  let absent: Refutation | null | undefined;
+  const byBlock = new Map<string, Refutation | null>();
+  return (hash) => {
+    const key = blockHashKey(hash);
+    // No prevote of the round is for this block: every vote speaks against, as for any other such block.
+    if (!present.has(key)) return absent === undefined ? (absent = cheapest(null)) : absent;
+    if (!byBlock.has(key)) byBlock.set(key, cheapest(hash));
+    return byBlock.get(key)!;
+  };
 }

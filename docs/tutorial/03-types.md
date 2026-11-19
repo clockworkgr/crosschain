@@ -62,7 +62,7 @@ A *Merkle root* is a single hash computed from a list of values by hashing pairs
 
 ### Evidence
 
-Two faults are punished on evidence. The first is a validator signing two different votes of the same type at the same height and round. Tendermint calls this `DuplicateVoteEvidence`, and it has the pleasant property of being self-contained: the two signed votes are the whole proof. The second is amnesia, voting against a lock: a precommit for one block and, in a later round, a prevote for another that no polka since the precommit justifies. CometBFT dropped its amnesia evidence because two such votes prove nothing by themselves (the polka may exist); here the prevote signs the round of the polka it relies on, so a prevote that names too old a round is a confession, and the pair is as self-contained as a duplicate vote ([chapter 4](04-consensus.md) has the whole argument). The core application also slashes and jails a validator for downtime ([chapter 11](11-application.md)); that needs no evidence type, because the application counts missed signatures itself from each block's `lastCommitSigners`.
+Four faults are punished on evidence. The first is a validator signing two different votes of the same type at the same height and round. Tendermint calls this `DuplicateVoteEvidence`, and it has the pleasant property of being self-contained: the two signed votes are the whole proof. The second is amnesia, voting against a lock: a precommit for one block and, in a later round, a prevote for another that no polka since the precommit justifies. CometBFT dropped its amnesia evidence because two such votes prove nothing by themselves (the polka may exist); here the prevote signs the round of the polka it relies on, so a prevote that names too old a round is a confession, and the pair is as self-contained as a duplicate vote ([chapter 4](04-consensus.md) has the whole argument). The third is a proposer signing two proposals for one round, which is to proposals what the first is to votes. The fourth is the lie the second leaves open: a prevote that names a round in which its block had no polka. Nobody can show that votes do not exist, but the prevotes of that round by +2/3 of the power for something else leave no room for them, and those are the proof. The core application also slashes and jails a validator for downtime ([chapter 11](11-application.md)); that needs no evidence type, because the application counts missed signatures itself from each block's `lastCommitSigners`.
 
 ### Proposals
 
@@ -378,7 +378,7 @@ export function blockHash(b: Block): Uint8Array {
 
 ### src/types/evidence.ts
 
-**`type Evidence`** is a union of the two faults this chain punishes on evidence, told apart by a `kind` field. Each is two votes signed by one validator at one height, so anyone holding both signatures can prove it and the proof needs nothing else.
+**`type Evidence`** is a union of the four faults this chain punishes on evidence, told apart by a `kind` field. Three are two things one validator signed at one height (two votes, or two proposals), so anyone holding both signatures can prove them and the proof needs nothing else. The fourth is one vote of the accused and the prevotes of others.
 
 **`interface DuplicateVoteEvidence`** is `{ kind: 'duplicateVote'; voteA: Vote; voteB: Vote }`: two different votes of the same type at the same height and round. **`makeDuplicateVoteEvidence(a, b)`** puts the votes in canonical order, "the vote with the lower block hash (nil lowest) comes first, then the lower polRound", using the private `compareVotes` and `compareHashes`; the latter orders `null` before any array and otherwise defers to `compareBytes`. Canonical order means the same pair of votes always encodes to the same bytes, so two nodes that observed the same double-sign produce identical evidence with an identical hash.
 
@@ -402,11 +402,37 @@ export function isAmnesia(precommit: Vote, prevote: Vote): boolean {
 
 Every clause is needed. A vote for nil forgets nothing, since a locked validator may always prevote nil and a precommit for nil takes no lock. The same block is the lock kept. A prevote of the same round was signed before the precommit. And `prevote.polRound < precommit.round` is the fault itself: with a round at or after the precommit's named, the validator claims a release the rules allow, and whether the claim is true is a question two votes cannot answer. Chapter 4 says what is done about a false claim (nobody counts the prevote).
 
-**`checkEvidenceShape(ev)`** is the structural check of either kind, returning an error string or `null`:
+**`interface ProposalHead`** is what a proposer signs of a proposal, without the block: `polRound`, `blockHash` and the `signature`. **`interface DuplicateProposalEvidence`** is `{ kind: 'duplicateProposal'; height; round; validatorIndex; a: ProposalHead; b: ProposalHead }`: two different proposals one validator signed for one height and round, whether for two blocks or for one block on two proof-of-lock rounds. The blocks are not carried, because a proposal's signature is over the block's hash (`proposalSignBytes`, below), so two heads are the whole proof and the evidence is a few kilobytes whatever the blocks held. **`makeDuplicateProposalEvidence(height, round, validatorIndex, x, y)`** orders the heads by block hash and then `polRound`, for the same reason the votes of a double sign are ordered.
+
+**`interface FalseCitationEvidence`** is `{ kind: 'falseCitation'; prevote: Vote; against: Vote[] }`: a prevote for a block that names a round, and prevotes of that round, one a validator and in ascending order of validator index, none of them for the block. With +2/3 of the power behind them (which only `verifyEvidence` can tell, since it takes the validator set), a polka for the block in that round would have needed more than a third of the power to prevote twice in it. So the evidence proves the fault under the assumption everything else in the protocol rests on, that less than a third signs twice; and if more than a third did sign twice to convict an honest validator, each of them is convicted by its own two prevotes. The evidence is also incomplete in the other direction: where a third of the power or more did prevote the block in the round named, or did not prevote at all, a false claim cannot be refuted, only left uncounted (chapter 4). **`speaksAgainst(prevote, other)`** is the test of one such vote: a prevote of the same height, of the round `prevote` names, and not for its block. The accused's own prevote of that round qualifies like any other.
+
+**`checkEvidenceShape(ev)`** is the structural check of every kind, returning an error string or `null`:
 
 ```ts
-/** Structural check only; signatures are verified separately. Returns an error string or null. */
+/** Structural check only; signatures, and the power behind a false citation's prevotes, are verified separately. Returns an error string or null. */
 export function checkEvidenceShape(ev: Evidence): string | null {
+  if (ev.kind === 'duplicateProposal') {
+    if (!Number.isInteger(ev.round) || ev.round < 0) return 'bad round';
+    for (const h of [ev.a, ev.b]) if (!Number.isInteger(h.polRound) || h.polRound < -1 || h.polRound >= ev.round) return 'polRound must be -1 or a round before the proposal\'s own';
+    if (compareHeads(ev.a, ev.b) === 0) return 'proposals are the same';
+    if (compareHeads(ev.a, ev.b) > 0) return 'proposals not in canonical order';
+    return null;
+  }
+  if (ev.kind === 'falseCitation') {
+    const p = ev.prevote;
+    if (p.type !== VoteType.Prevote || p.blockHash === null || p.polRound < 0) return 'a false citation is a prevote for a block that names a round';
+    if (ev.against.length === 0) return 'no prevotes against the round named';
+    let last = -1;
+    for (const v of ev.against) {
+      if (v.type !== VoteType.Prevote) return 'only prevotes speak against a round of prevotes';
+      if (v.height !== p.height) return 'heights differ';
+      if (v.round !== p.polRound) return 'a prevote of another round than the one named';
+      if (bytesEqual(v.blockHash, p.blockHash)) return 'a prevote for the block itself';
+      if (v.validatorIndex <= last) return 'prevotes not in ascending order of validator';
+      last = v.validatorIndex;
+    }
+    return null;
+  }
   if (ev.kind === 'amnesia') {
     const { precommit: c, prevote: p } = ev;
     if (c.type !== VoteType.Precommit || p.type !== VoteType.Prevote) return 'amnesia evidence is a precommit and a prevote';
@@ -429,19 +455,26 @@ export function checkEvidenceShape(ev: Evidence): string | null {
 }
 ```
 
-For a double sign: same height, round, type and validator; different content (a nil vote and a block vote differ, and so do two votes for one block that name different rounds); canonical order. For a forgotten lock: the clauses of `isAmnesia`, each with its own message. Signatures are deliberately not checked here; `verifyEvidence` in `src/consensus/evidence.ts` runs this check and then verifies both signatures against the public key at the accused's index in the set of that height, through the `Verifier` from [chapter 2](02-crypto.md). The split keeps this file free of asynchronous code and of the validator set.
+For a double sign: same height, round, type and validator; different content (a nil vote and a block vote differ, and so do two votes for one block that name different rounds); canonical order. For a forgotten lock: the clauses of `isAmnesia`, each with its own message. For two proposals: a round, each `polRound` one a proposal of that round may carry, different content, canonical order. For a false citation: the accused's vote is a prevote for a block that names a round, and every other vote is a prevote of that height and round, not for the block, with the indices strictly ascending, which also means no validator is counted twice. Signatures are deliberately not checked here, nor is the power behind a false citation's prevotes; `verifyEvidence` in `src/consensus/evidence.ts` runs this check and then verifies every signature against the public key its signer holds in the set of that height, through the `Verifier` from [chapter 2](02-crypto.md). The split keeps this file free of asynchronous code and of the validator set.
 
-**`evidenceVotes(ev)`** gives the two votes in the order they are written, **`evidenceHeight(ev)`** the height of the fault (whose validator set the votes are checked against and whose time the evidence is aged by) and **`evidenceValidator(ev)`** the accused's index; the rest of the node uses these and never looks inside a kind. **`evidenceKey(ev)`** is one key for one offence:
+**`evidenceVotes(ev)`** gives the votes a piece of evidence carries, the accused's first (none for two proposals), **`evidenceHeight(ev)`** the height of the fault (whose validator set the signatures are checked against and whose time the evidence is aged by) and **`evidenceValidator(ev)`** the accused's index; the rest of the node uses these and never looks inside a kind. **`evidenceKey(ev)`** is one key for one offence:
 
 ```ts
 export function evidenceKey(ev: Evidence): string {
-  if (ev.kind === 'amnesia') return `amnesia/${ev.precommit.height}/${ev.precommit.validatorIndex}`;
-  const v = ev.voteA;
-  return `${v.height}/${v.round}/${v.type}/${v.validatorIndex}`;
+  switch (ev.kind) {
+    case 'amnesia':
+      return `amnesia/${ev.precommit.height}/${ev.precommit.validatorIndex}`;
+    case 'duplicateProposal':
+      return `proposal/${ev.height}/${ev.round}/${ev.validatorIndex}`;
+    case 'falseCitation':
+      return `citation/${ev.prevote.height}/${ev.prevote.validatorIndex}`;
+    case 'duplicateVote':
+      return `${ev.voteA.height}/${ev.voteA.round}/${ev.voteA.type}/${ev.voteA.validatorIndex}`;
+  }
 }
 ```
 
-The evidence pool keys its maps by it, so one validator can be reported at most once per (height, round, type) for a double sign however many conflicting votes it signed, and once per height for a forgotten lock whichever of its votes show it. **`encodeEvidence`** writes a tag byte, 1 for a double sign and 2 for a forgotten lock, and the two votes back to back; **`decodeEvidence`** refuses any other tag with `unknown evidence kind N`.
+The evidence pool keys its maps by it, so one validator can be reported at most once per (height, round, type) for a double sign however many conflicting votes it signed, once per (height, round) for two proposals, and once per height for a forgotten lock or a false citation, whichever of its votes show it. **`encodeEvidence`** writes a tag byte and the body: 1 and 2 for a double sign and a forgotten lock, two votes back to back; 3 for two proposals, the height, round and validator index and then the two heads, each `polRound` as `i64`, the hash and the signature; 4 for a false citation, the prevote and then an array of votes, which **`decodeEvidence`** reads with a limit of `MAX_VALIDATORS`. It refuses any other tag with `unknown evidence kind N`.
 
 ### src/types/proposal.ts
 
@@ -462,17 +495,22 @@ The evidence pool keys its maps by it, so one validator can be reported at most 
 
 ```ts
 export function proposalSignBytes(chainId: string, p: UnsignedProposal): Uint8Array {
+  return proposalHeadSignBytes(chainId, p.height, p.round, p.polRound, blockHash(p.block));
+}
+
+/** The same bytes from the block's hash alone: what evidence of two proposals is checked against, without the blocks. */
+export function proposalHeadSignBytes(chainId: string, height: bigint, round: number, polRound: number, hash: Uint8Array): Uint8Array {
   return encode((w) => {
     w.string(chainId);
-    w.u64(p.height);
-    w.u32(p.round);
-    w.i64(BigInt(p.polRound));
-    w.fixed(blockHash(p.block));
+    w.u64(height);
+    w.u32(round);
+    w.i64(BigInt(polRound));
+    w.fixed(hash);
   });
 }
 ```
 
-Signing the hash keeps the sign bytes small and lets a re-proposal of a locked block (review finding 4) be signed by a different proposer without the block changing. **`encodeProposal`**/**`decodeProposal`** carry the block inline and the signature last, read back with `decodeSignature`; the decoder reads `polRound` with `r.i53()` ([chapter 1](01-codec.md)), which refuses a value too large to hold exactly, and does not range-check it further, leaving validation to consensus.
+**`proposalHeadSignBytes`** is the same from the hash alone, which is what lets two proposals be proven without their blocks. Signing the hash keeps the sign bytes small and lets a re-proposal of a locked block (review finding 4) be signed by a different proposer without the block changing. **`encodeProposal`**/**`decodeProposal`** carry the block inline and the signature last, read back with `decodeSignature`; the decoder reads `polRound` with `r.i53()` ([chapter 1](01-codec.md)), which refuses a value too large to hold exactly, and does not range-check it further, leaving validation to consensus.
 
 ### src/types/state.ts
 
@@ -694,7 +732,7 @@ A hash prints as its first six bytes, a `bigint` height as a number, a nil block
 
 **`test/priorities.test.ts`.** `hashes a set by its members and its priorities apart, and commits a header to the priorities` advances a copy of a three-validator set once and finds `hash()` unchanged and `prioritiesHash()` changed, moves one unit of priority between the two validators that are not proposing (same proposer, another hash), marks another validator as proposer over the same priorities (another hash again), reads a set back from its stored form with the same `prioritiesHash()`, and finds the header's hash different for the two sets in the other order; a header comes back from `decodeHeader` and from `headerFromJson` as it went in, with the hash as its last 32 bytes. `starts a chain under the one protocol version, and refuses a block whose header commits to other priorities` calls `genesisState` with no version and with 1 (both 1), and with 2 and 0 (`/protocol version 2; this node runs 1/`), then hands `validateBlockStructure` a block of height 1 whose `prioritiesHash` is that of the two sets in the wrong order, of one set alone, or of a set with the same members and shifted priorities or another proposer: each is `'wrong prioritiesHash'`.
 
-**`test/amnesia.test.ts`.** `signs into a prevote the proof-of-lock round it relies on, and counts two votes that differ in it alone as a double sign` runs `checkPolRound` over every case, shows the sign bytes change with the round, that `decodeVote` refuses a vote naming a round it may not, and that two prevotes for one block naming different rounds are a conflict in a `VoteSet` and valid duplicate-vote evidence, the lower round first. `proves a forgotten lock with a precommit and a later prevote for another block that names no round from the lock on` checks `checkEvidenceShape` and `isAmnesia` on a good pair and on eleven pairs that are no evidence, each with its reason, then the keys, the codec of both kinds (tag bytes 1 and 2, tag 3 refused) and `verifyEvidence` with a vote altered after signing, another signer, another chain id and an index outside the set.
+**`test/amnesia.test.ts`.** `signs into a prevote the proof-of-lock round it relies on, and counts two votes that differ in it alone as a double sign` runs `checkPolRound` over every case, shows the sign bytes change with the round, that `decodeVote` refuses a vote naming a round it may not, and that two prevotes for one block naming different rounds are a conflict in a `VoteSet` and valid duplicate-vote evidence, the lower round first. `proves a forgotten lock with a precommit and a later prevote for another block that names no round from the lock on` checks `checkEvidenceShape` and `isAmnesia` on a good pair and on eleven pairs that are no evidence, each with its reason, then the keys, the codec of both kinds (tag bytes 1 and 2, tag 5 refused) and `verifyEvidence` with a vote altered after signing, another signer, another chain id and an index outside the set.
 
 **`test/schemes.test.ts`.** `refuses a genesis whose validator keys are not of the scheme it names` calls `genesisState` with an ML-DSA-44 key under `signatureScheme: 'secp256k1'` and with a secp256k1 key under no scheme at all, expecting `/not a secp256k1 key/` and `/not a ml-dsa-44 key/`, and checks that the matching cases set `state.scheme`. `runs on secp256k1 keys end to end and refuses keys and signatures of the other scheme` runs a four-validator testnet on secp256k1 and reads a stored commit back with 65-byte signatures, which is `signatureSize(Scheme.secp256k1)`.
 
@@ -713,7 +751,7 @@ A hash prints as its first six bytes, a `bigint` height as a number, a nil block
 Known simplifications:
 
 - `ValidatorSet.hash()` excludes priorities and the proposer index; the header's `prioritiesHash` covers them instead, which costs a state-syncing node one more check and the store nothing.
-- Evidence is two votes of one validator at one height. A prevote that names a polka which never formed is not punishable, only never counted ([chapter 4](04-consensus.md)).
+- A prevote that names a polka which never formed is punishable only when +2/3 of the power prevoted something else in the round named; otherwise it is only never counted ([chapter 4](04-consensus.md)). And that evidence convicts on the assumption that less than a third of the power signs twice, where the other three kinds convict on the accused's signatures alone.
 - Votes carry no timestamp, so there is no BFT time; block time is the proposer's word, bounded by validation's clock-drift window.
 - Proposals carry whole blocks; there are no block parts, so a block must fit in one p2p frame. The bounds on a block's transactions and evidence (16 MiB) and on a validator set (2,000) are what make it fit.
 - `decodeVote` and `decodeProposal` do not range-check `round`, `validatorIndex` or `polRound`, beyond refusing a `polRound` too large to hold exactly; consensus does, after decoding.
@@ -727,7 +765,7 @@ Exercises:
 2. Implement `proposerForRound(set, r)` as a pure function and test it against `Consensus.proposerAt` for rounds 0 to 50.
 3. The header's `prioritiesHash` is one hash over two sets, which is why state sync asks one peer for the sets of H+1 and H+2 together. Replace it with two fields, one per set, and work out what that changes in `stateSync`, in the header's size, and in what a peer can be charged for. Then consider the other design: priorities folded into `hash()` itself. What would the store's record by hash and the light client have to do?
 4. Add a `timestamp` to `Vote` and `voteSignBytes`, collect the precommit timestamps in a commit, and compute Tendermint's BFT time (the power-weighted median). Decide what the header's `time` should then be.
-5. A proposer that signs two different proposals for one round is not reported. Define that evidence (two proposals of one height and round with different blocks or `polRound`), with a canonical form, a shape check and a codec, mirroring `src/types/evidence.ts`, and decide whether it should cost what a double vote costs.
+5. `FalseCitationEvidence` carries a vote for most of the validator set, so with a large set it is large, and it convicts under an assumption. Design the alternative: an accusation with the prevotes of more than a third of the power, a period in which anyone may answer it with the polka itself, and a slash if nobody does. What must validators keep, and for how long, to be able to defend themselves? What does the application have to store?
 6. Make the transaction count provable: put it in the header, or into the leaf value, give `TxProof` a `count` that is checked against it, and update `pathMatches` and the tests.
 7. Give `genesisFromJson` a schema check with clear messages and a test file of bad documents.
 8. Make `makeLogger` emit JSON lines when `out` is not a terminal, keeping `fmt`'s rules for hashes and `bigint`s.

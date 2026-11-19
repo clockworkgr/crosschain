@@ -17,7 +17,7 @@ the subject of the [tutorial](tutorial/00-overview.md); design decisions are in
 ```sh
 git clone <this repository> crosschain && cd crosschain
 npm install
-npm test                 # 306 tests, about two minutes
+npm test                 # 322 tests, about two minutes
 CHAIN_SCHEME=secp256k1 npm test   # the same suite on secp256k1 keys (one ML-DSA-only case is skipped)
 INDEX_TREES=0 npm test   # the same suite with every index B+ tree dropped from the start: lookups and scans through the store
 TREES=0 npm test         # and with every Merkle tree dropped: roots and proofs from the stored chunks and nodes; the two combine
@@ -180,6 +180,7 @@ Targets and flags:
 | `<nodeDir>` | a directory written by `init` or `join`: RPC address from its `config.json`, keystore at `../keystore.json` |
 | `http://host:port` | an RPC URL; needs `--keystore <path>` for anything that signs; not accepted by `create-validator` |
 | `--rpc <url>` | send the calls to this URL instead of the one in a node directory's `config.json`; the keystore and, for `create-validator`, the consensus key still come from the directory |
+| `--rpc-token <token>` | the token to send with each call, for a node whose `config.json` sets `rpcToken`; the environment's `RPC_TOKEN` is read when the flag is absent, and with a node directory as target (and no `--rpc`) the directory's own `rpcToken` |
 | `--keystore <path>` | the keystore file to sign with |
 | `--passphrase-file <path>` | read the keystore passphrase from a file |
 | `CHAIN_PASSPHRASE` | environment variable with the passphrase; without either, the CLI prompts |
@@ -248,6 +249,7 @@ exit with status 1. Transactions expire 60 seconds after they are built, or half
 | `name` | the prefix of log lines |
 | `listenAddr` | where peers connect, as `host:port` (an IPv6 host in brackets: `[::1]:26656`); the node also advertises it |
 | `rpcListen` | the HTTP address of the JSON-RPC as `host:port`; defaults to the p2p port plus one. The CLI splits it at the colon, so the host is an IPv4 address or a name, not IPv6 |
+| `rpcToken` | optional: a secret of 16 characters or more. When set, every JSON-RPC call and event stream must carry it (`Authorization: Bearer <token>`; the event stream also takes `?token=`), and `/health` stays open. It is sent in the clear, so beyond loopback put TLS in front. Unset, the RPC answers anyone who reaches it, and the node logs a warning at start if it listens beyond loopback |
 | `seeds` | peers to dial at start; more are learned by address exchange |
 | `nodeKeySeed` | the seed of the key that identifies the node on the network (hex) |
 | `validatorSeed` | the seed of the consensus key; `null` makes a full node that follows but does not vote |
