@@ -27,7 +27,7 @@ import type { Requester } from '../p2p/request.ts';
 import type { BlockStore } from '../store/blockstore.ts';
 import type { KvStore } from '../store/kv.ts';
 import { bodyMatchesHeader } from '../consensus/validate.ts';
-import { headerHash, type Block, type Commit, type Header } from '../types/block.ts';
+import { PRIORITIES_VERSION, headerHash, type Block, type Commit, type Header } from '../types/block.ts';
 import { verifyCommit } from '../consensus/validate.ts';
 
 export { bodyMatchesHeader } from '../consensus/validate.ts';
@@ -40,7 +40,7 @@ export function proposerForRound(set: ValidatorSet, round: number): Uint8Array {
   return copy.proposer().address;
 }
 import type { ChainState } from '../types/state.ts';
-import type { ValidatorSet } from '../types/validator.ts';
+import { prioritiesHash, type ValidatorSet } from '../types/validator.ts';
 import type { Logger } from '../util/log.ts';
 
 export interface StateSyncOptions {
@@ -223,17 +223,31 @@ export async function stateSync(o: StateSyncOptions): Promise<{ height: bigint }
   // Chain state at H: the block, and the exact sets (with priorities) for H, H+1 and H+2.
   const atH = await provider.signedHeader(H);
   if (!atH || !bytesEqual(headerHash(atH.header), next.lastBlockHash)) throw new Error('state sync: header at the snapshot height does not chain');
-  const setsAt = async (height: bigint, expectedHash: Uint8Array): Promise<ValidatorSet> => {
-    const set = await ask<ValidatorSet>(sources(), async (p) => {
-      const m = await o.requester.request(p, { type: 'validatorsRequest', height }, 'validatorsResponse', (m) => m.height === height, timeout);
-      return m.set && bytesEqual(m.set.hash(), expectedHash) ? m.set : null;
-    });
-    if (!set) throw new Error(`state sync: no validator set for height ${height}`);
-    return set;
+  const setFrom = async (p: Peer, height: bigint, expectedHash: Uint8Array): Promise<ValidatorSet | null> => {
+    const m = await o.requester.request(p, { type: 'validatorsRequest', height }, 'validatorsResponse', (m) => m.height === height, timeout);
+    return m.set && bytesEqual(m.set.hash(), expectedHash) ? m.set : null;
   };
-  const lastValidators = await setsAt(H, atH.header.validatorsHash);
-  const validators = await setsAt(H + 1n, next.validatorsHash);
-  const nextValidators = await setsAt(H + 2n, next.nextValidatorsHash);
+  // The set hash covers members and powers. From version PRIORITIES_VERSION a header also commits to the proposer
+  // priorities of its own set and the next, and a peer whose sets differ from that is marked and the next one asked.
+  const committed = (p: Peer, header: Header, set: ValidatorSet, nextSet: ValidatorSet): boolean => {
+    if (header.version < PRIORITIES_VERSION) return true;
+    if (header.prioritiesHash && bytesEqual(header.prioritiesHash, prioritiesHash(set, nextSet))) return true;
+    o.network.score(p.id, 50, `state sync: validator sets with priorities header ${header.height} does not commit to`);
+    return false;
+  };
+  // Header H+1 has one hash for the priorities of both its sets, so the two come from one peer.
+  const pair = await ask(sources(), async (p) => {
+    const validators = await setFrom(p, H + 1n, next.validatorsHash);
+    const nextValidators = validators && (await setFrom(p, H + 2n, next.nextValidatorsHash));
+    return validators && nextValidators && committed(p, next, validators, nextValidators) ? { validators, nextValidators } : null;
+  });
+  if (!pair) throw new Error(`state sync: no peer serves the validator sets of heights ${H + 1n} and ${H + 2n}`);
+  const { validators, nextValidators } = pair;
+  const lastValidators = await ask(sources(), async (p) => {
+    const set = await setFrom(p, H, atH.header.validatorsHash);
+    return set && committed(p, atH.header, set, validators) ? set : null;
+  });
+  if (!lastValidators) throw new Error(`state sync: no peer serves the validator set of height ${H}`);
   for (const set of [lastValidators, validators, nextValidators]) {
     for (const v of set.validators) if (schemeOf(v.publicKey) !== o.scheme) throw new Error(`state sync: a validator key is not a ${schemeName(o.scheme)} key; this is not the chain genesis describes`);
   }
@@ -253,9 +267,9 @@ export async function stateSync(o: StateSyncOptions): Promise<{ height: bigint }
     return { block: m.block, commit: m.commit };
   });
   if (!block) throw new Error(`state sync: no peer served block ${H} with a valid commit`);
-  // Priorities are not covered by the set hash; at least the proposers the chain actually used must agree with them.
-  // A block decided in round r may have been first proposed in an earlier round (a re-proposal keeps that proposer's name).
-  for (const [set, header, commit] of [[lastValidators, atH.header, block.commit], [validators, next, verified.commit]] as [ValidatorSet, Header, Commit][]) {
+  // A chain of version 1 commits to no priorities; there, at least the proposers the chain actually used must agree
+  // with them. A block decided in round r may have been first proposed in an earlier round (a re-proposal keeps that proposer's name).
+  for (const [set, header, commit] of next.version >= PRIORITIES_VERSION ? [] : [[lastValidators, atH.header, block.commit], [validators, next, verified.commit]] as [ValidatorSet, Header, Commit][]) {
     let named = false;
     for (let r = 0; r <= commit.round && !named; r++) named = bytesEqual(proposerForRound(set, r), header.proposerAddress);
     if (!named) throw new Error(`state sync: validator set for height ${header.height} names a proposer the chain did not use`);

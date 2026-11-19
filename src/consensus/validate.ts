@@ -6,10 +6,10 @@
 import { bytesEqual } from '../crypto/hash.ts';
 import { signContext } from '../crypto/keys.ts';
 import type { Verifier } from '../crypto/verifier.ts';
-import { blockDataBytes, blockHash, commitHash, evidenceHash, type Block, type Commit } from '../types/block.ts';
+import { blockDataBytes, blockHash, commitHash, evidenceHash, PRIORITIES_VERSION, type Block, type Commit } from '../types/block.ts';
 import { txsRoot } from '../types/txproof.ts';
 import type { ChainState } from '../types/state.ts';
-import type { ValidatorSet } from '../types/validator.ts';
+import { prioritiesHash, type ValidatorSet } from '../types/validator.ts';
 import { VoteType, voteSignBytes } from '../types/vote.ts';
 import { verifyDuplicateVoteEvidence } from './evidence.ts';
 
@@ -57,6 +57,8 @@ export function validateBlockStructure(state: ChainState, block: Block, limits: 
   if (!bytesEqual(h.lastBlockHash, state.lastBlockHash)) return 'wrong lastBlockHash';
   if (!bytesEqual(h.validatorsHash, state.validators.hash())) return 'wrong validatorsHash';
   if (!bytesEqual(h.nextValidatorsHash, state.nextValidators.hash())) return 'wrong nextValidatorsHash';
+  // The version is the chain's (checked above), so a header has the field exactly when this chain's headers do.
+  if (h.version >= PRIORITIES_VERSION && !(h.prioritiesHash && bytesEqual(h.prioritiesHash, prioritiesHash(state.validators, state.nextValidators)))) return 'wrong prioritiesHash';
   if (!bytesEqual(h.appHash, state.appHash)) return 'wrong appHash';
   if (!bytesEqual(h.dataHash, txsRoot(block.txs))) return 'wrong dataHash';
   if (!bytesEqual(h.lastResultsHash, state.lastResultsHash)) return 'wrong lastResultsHash';

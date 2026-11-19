@@ -72,6 +72,7 @@ import { commitFromJson, headerFromJson, txQueryFromJson } from './rpc/json.ts';
 import { encode } from './codec/writer.ts';
 import { RpcServer } from './rpc/server.ts';
 import { headerHash, txHash } from './types/block.ts';
+import { PROTOCOL_VERSION } from './types/state.ts';
 import { checkMaxBlockBytes, genesisToJson, loadGenesisFile, type Genesis } from './types/genesis.ts';
 import { makeLogger, type LogLevel } from './util/log.ts';
 import { Keystore } from './wallet/keystore.ts';
@@ -159,7 +160,7 @@ function init(dir: string, count: number, basePort: number, scheme: SchemeTag, m
     chainId: `chain-${toHex(generateSeed()).slice(0, 8)}`,
     signatureScheme: schemeName(scheme),
     genesisTime: BigInt(Date.now()),
-    consensus: { maxEvidenceAgeMs: BigInt(UNBONDING_MS), version: 1, ...(maxBlockBytes !== null ? { maxBlockBytes } : {}) },
+    consensus: { maxEvidenceAgeMs: BigInt(UNBONDING_MS), version: PROTOCOL_VERSION, ...(maxBlockBytes !== null ? { maxBlockBytes } : {}) },
     appState: appGenesisBytes({
       accounts: [account('faucet', faucet.publicKey, '1000000000000'), ...operators.map((k, i) => account(`op${i}`, k.publicKey, '5000000000'))],
       staking: { unbondingPeriodMs: UNBONDING_MS },

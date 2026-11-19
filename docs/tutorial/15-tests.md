@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: twenty-nine files, 295 cases, about 9,790 lines counting the shared harness
+`test/**/*.test.ts`: thirty files, 299 cases, about 10,000 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (294 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (298 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -22,7 +22,8 @@ schemes from a key pair up to a chain running on the second one; `network`, `con
 memory guard and the collection scheduler, its node case on the core application so that the
 guard's dials on the object database show; `chain`, `app`, `staking`, `staking-net`, `fees` and
 `genesis` cover the core application, and `history` the log its account history is stored in; `txproof`, `light`, `rpc` and
-`sync` cover proofs, clients and catching up; `review` holds one regression test per finding of
+`sync` cover proofs, clients and catching up, and `priorities` the proposer priorities a header
+commits to, from the two hashes of a validator set to a join from a snapshot; `review` holds one regression test per finding of
 the external review and the later cases of the same kind, `review2` five more that each
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
@@ -2054,6 +2055,58 @@ gossip from a node that could never put it in a block itself. Then `hub.messageF
 every `proposal` frame addressed to validator 3. It still advances four heights: its
 `decisions` counter rises and `blockSync.synced` stays `0n`, so it decided each height by
 fetching the block its peers precommitted to, not by block sync.
+
+### test/priorities.test.ts
+
+Four tests on proposer priorities and the header's commitment to them ([03](03-types.md),
+[07](07-sync.md)). The helper `shifted(set)` copies a set and moves one unit of priority between
+two validators that are not proposing: the members, their powers and the proposer of the moment
+are the same, so `hash()` and the proposer check of a version 1 join cannot tell the copy from
+the original, and the sets pick different proposers a few heights on.
+
+**`it('hashes a set by its members and its priorities apart, and commits a header to the priorities from version 2')`**.
+A set of three validators with powers 3, 2 and 1 and a copy advanced one round have the same
+`hash()` and different `prioritiesHash()`; a plain copy has the same; `shifted` has the same
+proposer and another hash; `reindexed`, a second helper that keeps every priority and marks
+another validator as the proposer (the set's stored form with its last field changed), has
+the same `hash()` and again another `prioritiesHash()`, so the index is committed to and not
+only the numbers; a set read back from its stored encoding has the same. The header's
+hash over two sets differs with their order. Then two headers that differ only in version: the
+version 2 one, with `prioritiesHash`, encodes 32 bytes longer; each decodes to what was encoded,
+and the version 1 one has no such property at all; `headerHash` throws `/needs a prioritiesHash/`
+for version 2 without the field and `/has no prioritiesHash/` for version 1 with it; a header
+changed in that hash alone has another block hash; and `headerFromJson(jsonify(h))` gives both
+back, refusing a version 2 header whose JSON lacks the field.
+
+**`it('starts a chain under version 1 or 2 and no other, and refuses a block whose header commits to other priorities')`**.
+`genesisState` gives version 2 for a genesis that names none and 1 for one that names 1, and
+throws `/protocol version 3/` and `/protocol version 0/`. `check` builds the state of a genesis
+and a bare block of height 1 from it and runs `validateBlockStructure`. On version 2 the block
+as built passes the hashes of the sets; with `prioritiesHash` of the two sets in the wrong
+order, of the first set alone, of the first set `shifted`, or absent, the answer is
+`'wrong prioritiesHash'`. On version 1 the block as built gets the same answer as the good one
+of version 2, and a header of the other version is refused for its version either way
+(`/protocol version 2, expected 1/`), before the field is looked at.
+
+**`it('runs a chain of version 1 with headers as they were')`**. Four validators on the toy
+application with `consensus: { version: 1 }` in the genesis reach height 4; every node's state
+says version 1 and none of the first three headers has a `prioritiesHash`.
+
+**`it('commits every header to the priorities its node holds, and joins from a snapshot only with the sets the headers commit to')`**.
+Four core-application validators, two of them taking snapshots every 6 blocks, run to height 9,
+and two validators are stopped so the snapshot at 6 stays the latest. On every node, for
+heights 1 to 8, the header is of version 2 and its `prioritiesHash` is the hash of the sets the
+store keeps by height for that height and the next: what a proposer writes and what a node
+serves a joiner are the same thing. A bare `Network` then joins through `stateSync` with a
+fresh store each time, and the two sources are made to lie by replacing their store's
+`loadValidatorsAt` with one that answers `shifted` sets for chosen heights. With source 0 lying
+about height 6 and source 1 honest, the join succeeds at 6 and the three sets of the chain state
+it wrote, and the set it stored for height 6, have the honest source's `prioritiesHash`. With
+source 0 lying about 8 and source 1 about 7, no peer has a pair for header 7: the join rejects
+with `/no peer serves the validator sets of heights 7 and 8/` and each source's score has risen
+by more than 40 (one charge of 50, less a moment of decay). With both lying about 6, source 0 this
+time with a `reindexed` set, it rejects with `/no peer serves the validator set of height 6/`. Turning the check off in `stateSync` fails the
+first of these: the joiner takes the shifted set, which is what a version 1 chain would let it do.
 
 ### test/review.test.ts
 

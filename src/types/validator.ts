@@ -126,7 +126,7 @@ export class ValidatorSet {
     );
   }
 
-  /** Hash commits to public keys and powers, not priorities (which are derivable). */
+  /** Hash commits to public keys and powers, not priorities: every height with these members names the same set. prioritiesHash() covers the rest. */
   hash(): Uint8Array {
     return sha256(
       encode((w) =>
@@ -135,6 +135,20 @@ export class ValidatorSet {
           w.u64(v.power);
         }),
       ),
+    );
+  }
+
+  /**
+   * Hash of what hash() leaves out: every validator's priority, in the set's order, and which of them proposes.
+   * Priorities come out of the whole history of the set, so a node that did not run that history (one joining
+   * from a snapshot) can only be handed them, and checks them against this.
+   */
+  prioritiesHash(): Uint8Array {
+    return sha256(
+      encode((w) => {
+        w.array(this.validators, (w, v) => w.i64(v.priority));
+        w.i64(BigInt(this.proposerIndex));
+      }),
     );
   }
 
@@ -270,4 +284,12 @@ export class ValidatorSet {
   toJSON(): unknown {
     return this.validators.map((v) => ({ address: toHex(v.address), power: v.power.toString(), priority: v.priority.toString() }));
   }
+}
+
+/**
+ * What a header says of proposer priorities: one hash over those of the set that signs its height and those of
+ * the set for the next. With the two set hashes beside it, a header then names both sets exactly.
+ */
+export function prioritiesHash(validators: ValidatorSet, nextValidators: ValidatorSet): Uint8Array {
+  return sha256(encode((w) => w.fixed(validators.prioritiesHash()).fixed(nextValidators.prioritiesHash())));
 }

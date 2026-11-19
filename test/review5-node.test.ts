@@ -31,7 +31,7 @@ import { MemoryGuard, memoryStats } from '../src/node/memory.ts';
 import { blockDataBytes, blockHash, commitHash, evidenceHash, txHash, type Block, type Commit, type Header } from '../src/types/block.ts';
 import { genesisFromJson, genesisToJson, MAX_BLOCK_BYTES, MIN_BLOCK_BYTES } from '../src/types/genesis.ts';
 import { MAX_FRAME } from '../src/p2p/tcp.ts';
-import { MAX_VALIDATORS, ValidatorSet } from '../src/types/validator.ts';
+import { MAX_VALIDATORS, ValidatorSet, prioritiesHash } from '../src/types/validator.ts';
 import { encodeEvidence, makeDuplicateVoteEvidence, type DuplicateVoteEvidence } from '../src/types/evidence.ts';
 import type { ChainState } from '../src/types/state.ts';
 import { txsRoot } from '../src/types/txproof.ts';
@@ -55,6 +55,7 @@ function blockAfter(state: ChainState, lastCommit: Commit | null, evidence: Dupl
     appHash: state.appHash,
     evidenceHash: evidenceHash(evidence),
     proposerAddress: state.validators.byIndex(0)!.address,
+    prioritiesHash: prioritiesHash(state.validators, state.nextValidators),
   };
   const block: Block = { header, txs: [], lastCommit, evidence };
   return { block, commit: { height: header.height, round: 0, blockHash: blockHash(block), signatures: state.validators.validators.map(() => null) } };

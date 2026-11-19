@@ -43,7 +43,7 @@ export async function run(): Promise<void> {
   const txs = signedTransfers(500, 1_700_000_060_000n);
   let height = 1n;
   const block = (h: bigint): Block => ({
-    header: { chainId: 'bench', version: PROTOCOL_VERSION, height: h, time: 1_700_000_000_000n + h, lastBlockHash: ZERO_HASH, lastCommitHash: ZERO_HASH, dataHash: txsRoot(txs), lastResultsHash: ZERO_HASH, validatorsHash: ZERO_HASH, nextValidatorsHash: ZERO_HASH, appHash: ZERO_HASH, evidenceHash: ZERO_HASH, proposerAddress: new Uint8Array(32) },
+    header: { chainId: 'bench', version: PROTOCOL_VERSION, height: h, time: 1_700_000_000_000n + h, lastBlockHash: ZERO_HASH, lastCommitHash: ZERO_HASH, dataHash: txsRoot(txs), lastResultsHash: ZERO_HASH, validatorsHash: ZERO_HASH, nextValidatorsHash: ZERO_HASH, appHash: ZERO_HASH, evidenceHash: ZERO_HASH, proposerAddress: new Uint8Array(32), prioritiesHash: ZERO_HASH },
     txs,
     lastCommit: null,
     evidence: [],

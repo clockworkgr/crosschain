@@ -18,7 +18,9 @@ import { ValidatorSet, type ValidatorUpdate } from './validator.ts';
  * This keeps the set that commits a block equal to the one named in its
  * header, and gives light clients one header's notice of every change.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
+/** The versions this code runs: 1, whose headers say nothing of proposer priorities, and 2, whose headers commit to them. */
+const VERSIONS = [1, 2];
 
 export interface ChainState {
   chainId: string;
@@ -42,12 +44,14 @@ export function genesisState(genesis: Genesis, appHash: Uint8Array, validatorsOv
   if (entries.length === 0) throw new Error('genesis names no validators and the application supplied none');
   const scheme = schemeTag(genesis.signatureScheme ?? 'ml-dsa-44');
   for (const v of entries) if (schemeOf(v.publicKey) !== scheme) throw new Error(`genesis validator key is not a ${schemeName(scheme)} key`);
+  const version = genesis.consensus?.version ?? PROTOCOL_VERSION;
+  if (!VERSIONS.includes(version)) throw new Error(`genesis asks for protocol version ${version}; this node runs ${VERSIONS.join(' and ')}`);
   const validators = ValidatorSet.create(entries.map((v) => ({ publicKey: v.publicKey, power: v.power })));
   const nextValidators = validators.copy();
   nextValidators.incrementProposerPriority(1);
   return {
     chainId: genesis.chainId,
-    version: genesis.consensus?.version ?? PROTOCOL_VERSION,
+    version,
     lastHeight: 0n,
     lastBlockHash: ZERO_HASH,
     lastBlockTime: genesis.genesisTime,

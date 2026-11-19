@@ -32,7 +32,15 @@ export interface Header {
   appHash: Uint8Array;
   evidenceHash: Uint8Array;
   proposerAddress: Uint8Array;
+  /**
+   * Hash of the proposer priorities of this height's set and the next height's (types/validator.ts). In every
+   * header from protocol version PRIORITIES_VERSION on, and in none before.
+   */
+  prioritiesHash?: Uint8Array;
 }
+
+/** The protocol version from which a header carries prioritiesHash. A chain started under an earlier version keeps its headers as they were. */
+export const PRIORITIES_VERSION = 2;
 
 /**
  * The precommit signatures that finalised a block. `signatures[i]` belongs
@@ -69,12 +77,18 @@ export function encodeHeader(w: Writer, h: Header): void {
   w.fixed(h.appHash);
   w.fixed(h.evidenceHash);
   w.fixed(h.proposerAddress);
+  if (h.version >= PRIORITIES_VERSION) {
+    if (!h.prioritiesHash) throw new Error(`a version ${h.version} header needs a prioritiesHash`);
+    w.fixed(h.prioritiesHash);
+  } else if (h.prioritiesHash) throw new Error(`a version ${h.version} header has no prioritiesHash`);
 }
 
 export function decodeHeader(r: Reader): Header {
+  const chainId = r.string(256);
+  const version = r.u32();
   return {
-    chainId: r.string(256),
-    version: r.u32(),
+    chainId,
+    version,
     height: r.u64(),
     time: r.u64(),
     lastBlockHash: r.fixed(HASH_SIZE),
@@ -86,6 +100,7 @@ export function decodeHeader(r: Reader): Header {
     appHash: r.fixed(HASH_SIZE),
     evidenceHash: r.fixed(HASH_SIZE),
     proposerAddress: r.fixed(ADDRESS_SIZE),
+    ...(version >= PRIORITIES_VERSION ? { prioritiesHash: r.fixed(HASH_SIZE) } : {}),
   };
 }
 

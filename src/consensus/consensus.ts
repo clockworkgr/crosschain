@@ -33,13 +33,13 @@
 import { bytesEqual, toHex } from '../crypto/hash.ts';
 import { signContext } from '../crypto/keys.ts';
 import type { Verifier } from '../crypto/verifier.ts';
-import { blockDataBytes, blockHash, commitHash, evidenceHash, type Block, type Commit, type Header } from '../types/block.ts';
+import { blockDataBytes, blockHash, commitHash, evidenceHash, PRIORITIES_VERSION, type Block, type Commit, type Header } from '../types/block.ts';
 import { txsRoot } from '../types/txproof.ts';
 import { makeDuplicateVoteEvidence } from '../types/evidence.ts';
 import { zeroSignature } from '../crypto/keys.ts';
 import { proposalSignBytes, type Proposal } from '../types/proposal.ts';
 import type { ChainState } from '../types/state.ts';
-import type { ValidatorSet } from '../types/validator.ts';
+import { prioritiesHash, type ValidatorSet } from '../types/validator.ts';
 import { VoteType, voteSignBytes, voteTypeName, type Vote } from '../types/vote.ts';
 import type { Logger } from '../util/log.ts';
 import { EvidencePool } from './evidence.ts';
@@ -357,6 +357,7 @@ export class Consensus {
         appHash: st.appHash,
         evidenceHash: evidenceHash(evidence),
         proposerAddress: pv.address,
+        ...(st.version >= PRIORITIES_VERSION ? { prioritiesHash: prioritiesHash(st.validators, st.nextValidators) } : {}),
       },
       txs,
       lastCommit,

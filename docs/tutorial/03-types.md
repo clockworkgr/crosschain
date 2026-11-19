@@ -122,7 +122,7 @@ An empty set is allowed here (nothing is incremented), but `genesisState` refuse
 **`hash()`** is the value the header's `validatorsHash` and `nextValidatorsHash` carry:
 
 ```ts
-  /** Hash commits to public keys and powers, not priorities (which are derivable). */
+  /** Hash commits to public keys and powers, not priorities: every height with these members names the same set. prioritiesHash() covers the rest. */
   hash(): Uint8Array {
     return sha256(
       encode((w) =>
@@ -135,7 +135,39 @@ An empty set is allowed here (nothing is incremented), but `genesisState` refuse
   }
 ```
 
-Because the order is canonical, two sets with the same members and powers hash alike whatever their priorities. The unit test checks that advancing a set three rounds does not change its hash. The flip side is `DESIGN.md` section 10's known simplification: "Proposer priorities are not covered by the validator set hash", which review finding 8 turned into a concrete attack on state sync (a peer supplying genuine keys with altered priorities), mitigated by checking that imported sets pick the proposers the chain actually used.
+Because the order is canonical, two sets with the same members and powers hash alike whatever their priorities. The unit test checks that advancing a set three rounds does not change its hash. That is deliberate: the hash names the members, so one stored record by hash serves every height those members sign, and a light client, which only counts signatures, never needs more.
+
+**`prioritiesHash()`** covers what `hash()` leaves out:
+
+```ts
+  /**
+   * Hash of what hash() leaves out: every validator's priority, in the set's order, and which of them proposes.
+   * Priorities come out of the whole history of the set, so a node that did not run that history (one joining
+   * from a snapshot) can only be handed them, and checks them against this.
+   */
+  prioritiesHash(): Uint8Array {
+    return sha256(
+      encode((w) => {
+        w.array(this.validators, (w, v) => w.i64(v.priority));
+        w.i64(BigInt(this.proposerIndex));
+      }),
+    );
+  }
+```
+
+The priorities are written in the set's order, which `hash()` has already fixed, and the proposer's index after them. Priorities cannot be recomputed from the members: they come out of every increment, rescale and update since genesis, so a node that did not run that history, one joining from a snapshot ([chapter 7](07-sync.md)), has to be handed them. Under protocol version 1 nothing a validator signed said what they were. Review finding 8 made that an attack on state sync: a peer supplies genuine keys and powers with altered priorities, and the joiner then expects other proposers than the rest of the chain. The mitigation was to check that the sets it was given pick the proposers the chain actually used at two heights, which a careful liar passes. From version 2 the header commits to them, with the function at the end of the file, **`prioritiesHash(validators, nextValidators)`**:
+
+```ts
+/**
+ * What a header says of proposer priorities: one hash over those of the set that signs its height and those of
+ * the set for the next. With the two set hashes beside it, a header then names both sets exactly.
+ */
+export function prioritiesHash(validators: ValidatorSet, nextValidators: ValidatorSet): Uint8Array {
+  return sha256(encode((w) => w.fixed(validators.prioritiesHash()).fixed(nextValidators.prioritiesHash())));
+}
+```
+
+It is one hash for two sets, beside `validatorsHash` and `nextValidatorsHash`: with those two, a header names the set of its height and the set of the next exactly, priorities and proposer included. The order matters, the two inner hashes being written one after the other. The cost is 32 bytes a header, and two hashes over 8 bytes a validator each time a header is built or checked.
 
 **`incrementProposerPriority(times)`** is Tendermint's `IncrementProposerPriority`. It mutates the set and returns the new proposer:
 
@@ -262,7 +294,7 @@ The chain id appears both here and in the signing context from [chapter 2](02-cr
 
 ### src/types/block.ts
 
-**`interface Header`** has thirteen fields, in encoding order: `chainId`, `version`, `height`, `time` (unix milliseconds set by the proposer), `lastBlockHash`, `lastCommitHash`, `dataHash`, `lastResultsHash`, `validatorsHash`, `nextValidatorsHash`, `appHash`, `evidenceHash`, `proposerAddress`. The source comment on the interface is the deferred-execution rule: "`appHash` and `lastResultsHash` describe the state and the transaction results after executing the *previous* block, because this block is proposed before anyone has run it."
+**`interface Header`** has thirteen fields under every protocol version, in encoding order: `chainId`, `version`, `height`, `time` (unix milliseconds set by the proposer), `lastBlockHash`, `lastCommitHash`, `dataHash`, `lastResultsHash`, `validatorsHash`, `nextValidatorsHash`, `appHash`, `evidenceHash`, `proposerAddress`; and from version 2 (`PRIORITIES_VERSION`) a fourteenth, `prioritiesHash`. The source comment on the interface is the deferred-execution rule: "`appHash` and `lastResultsHash` describe the state and the transaction results after executing the *previous* block, because this block is proposed before anyone has run it."
 
 Each field is checked by `validateBlockStructure` in `src/consensus/validate.ts` against the chain state or the block body, and reading that function is the best way to learn what each one means:
 
@@ -281,8 +313,20 @@ Each field is checked by `validateBlockStructure` in `src/consensus/validate.ts`
 | `lastCommitHash` | `commitHash(block.lastCommit)` |
 | `time` | after `state.lastBlockTime`; for a fresh proposal also within `maxClockDriftMs` of local time (a re-proposal, a fetched block and a synced block are not held to the clock, [chapter 4](04-consensus.md)) |
 | `proposerAddress` | present in `state.validators` |
+| `prioritiesHash` | from version 2, `prioritiesHash(state.validators, state.nextValidators)` (`'wrong prioritiesHash'`); under version 1 there is none |
 
 `version` was added in the proofs round (`RPC-SYNC-PROOFS.md` section 2.1): "validation rejects a header whose version differs from the state's. The first version with this header is 1."
+
+Version 2 added `prioritiesHash`, the hash of the proposer priorities of the two sets the header already names by their members (`src/types/validator.ts`, above). It is optional in the interface because a version 1 header has none, and it belongs to the version, not to the caller: `encodeHeader` ends
+
+```ts
+  if (h.version >= PRIORITIES_VERSION) {
+    if (!h.prioritiesHash) throw new Error(`a version ${h.version} header needs a prioritiesHash`);
+    w.fixed(h.prioritiesHash);
+  } else if (h.prioritiesHash) throw new Error(`a version ${h.version} header has no prioritiesHash`);
+```
+
+so neither a version 2 header without the field nor a version 1 header with it has an encoding, and with no encoding it has no hash. `decodeHeader` reads `chainId` and `version` first and the field only from version 2. A chain started under version 1 therefore keeps its headers, its block hashes and its stored blocks byte for byte, and `validateBlockStructure` checks the field only on a chain whose version has it; the version itself was compared with the state's a few lines earlier, so a header cannot choose.
 
 **`interface Commit`** is the set of precommits that finalized a block:
 
@@ -299,7 +343,7 @@ export interface Commit {
 
 **`interface Block`** is `header`, `txs: Uint8Array[]` (opaque to the engine), `lastCommit: Commit | null` ("null only at height 1") and `evidence: DuplicateVoteEvidence[]`.
 
-**`encodeHeader`** and **`decodeHeader`** write and read the thirteen fields; the decoder limits `chainId` to 256 bytes and reads every hash as `fixed(HASH_SIZE)` and the proposer as `fixed(ADDRESS_SIZE)`. **`headerHash(h)`** and **`blockHash(b)`**:
+**`encodeHeader`** and **`decodeHeader`** write and read the thirteen fields, and from version 2 the fourteenth; the decoder limits `chainId` to 256 bytes and reads every hash as `fixed(HASH_SIZE)` and the proposer as `fixed(ADDRESS_SIZE)`. **`headerHash(h)`** and **`blockHash(b)`**:
 
 ```ts
 /** The block hash is the header hash. The header commits to everything else. */
@@ -374,7 +418,7 @@ Signing the hash keeps the sign bytes small and lets a re-proposal of a locked b
 
 ### src/types/state.ts
 
-**`PROTOCOL_VERSION = 1`** is the version the chain runs unless genesis says otherwise. **`interface ChainState`**:
+**`PROTOCOL_VERSION = 2`** is the version a chain runs unless its genesis says otherwise; the private `VERSIONS` lists the two this code runs, 1, whose headers say nothing of proposer priorities, and 2, whose headers commit to them. The version is the chain's for good: it is read from the genesis once and kept in the chain state, so a store written under version 1 goes on under version 1 whatever the default has become. **`interface ChainState`**:
 
 ```ts
 export interface ChainState {
@@ -405,12 +449,14 @@ export function genesisState(genesis: Genesis, appHash: Uint8Array, validatorsOv
   if (entries.length === 0) throw new Error('genesis names no validators and the application supplied none');
   const scheme = schemeTag(genesis.signatureScheme ?? 'ml-dsa-44');
   for (const v of entries) if (schemeOf(v.publicKey) !== scheme) throw new Error(`genesis validator key is not a ${schemeName(scheme)} key`);
+  const version = genesis.consensus?.version ?? PROTOCOL_VERSION;
+  if (!VERSIONS.includes(version)) throw new Error(`genesis asks for protocol version ${version}; this node runs ${VERSIONS.join(' and ')}`);
   const validators = ValidatorSet.create(entries.map((v) => ({ publicKey: v.publicKey, power: v.power })));
   const nextValidators = validators.copy();
   nextValidators.incrementProposerPriority(1);
   return {
     chainId: genesis.chainId,
-    version: genesis.consensus?.version ?? PROTOCOL_VERSION,
+    version,
     lastHeight: 0n,
     lastBlockHash: ZERO_HASH,
     lastBlockTime: genesis.genesisTime,
@@ -424,7 +470,7 @@ export function genesisState(genesis: Genesis, appHash: Uint8Array, validatorsOv
 }
 ```
 
-`create` already performed one increment, so `validators` has the proposer for height 1; the copy advanced once more has the proposer for height 2. `lastValidators` is a copy of the same set although nothing signed height 0. `lastResultsHash` starts at the Merkle `EMPTY` value, not `ZERO_HASH`: `RPC-SYNC-PROOFS.md` section 2.1 says "Height 1 carries the empty value", and header validation compares it with `txsRoot([])`-style roots, which are `EMPTY`. This is why the file imports from `src/db/merkle.ts`. The scheme check runs before `ValidatorSet.create` sees the keys, so a genesis that names `secp256k1` but lists ML-DSA-44 validators fails with `genesis validator key is not a secp256k1 key` rather than with a message about key sizes, and a secp256k1 key under the default scheme fails the same way with `ml-dsa-44`.
+The version is checked before any set is built: a genesis asking for one this code does not run fails with `genesis asks for protocol version 3; this node runs 1 and 2`, since the node could neither build nor check that chain's headers. `create` already performed one increment, so `validators` has the proposer for height 1; the copy advanced once more has the proposer for height 2. `lastValidators` is a copy of the same set although nothing signed height 0. `lastResultsHash` starts at the Merkle `EMPTY` value, not `ZERO_HASH`: `RPC-SYNC-PROOFS.md` section 2.1 says "Height 1 carries the empty value", and header validation compares it with `txsRoot([])`-style roots, which are `EMPTY`. This is why the file imports from `src/db/merkle.ts`. The scheme check runs before `ValidatorSet.create` sees the keys, so a genesis that names `secp256k1` but lists ML-DSA-44 validators fails with `genesis validator key is not a secp256k1 key` rather than with a message about key sizes, and a secp256k1 key under the default scheme fails the same way with `ml-dsa-44`.
 
 **`nextState(state, block, updates, appHash, resultsHash)`** is the state transition the executor applies after each commit:
 
@@ -588,6 +634,8 @@ A hash prints as its first six bytes, a `bigint` height as a number, a nil block
 
 **`test/engine.test.ts`.** `rejects a block from another protocol version` bumps `header.version` on a real block and asserts `validateBlockStructure` reports `/protocol version/`, and that the node's state version is `PROTOCOL_VERSION`. `refuses a genesis with no validators from either side` calls `genesisState` with no genesis validators and no override, and with an empty override, expecting `/no validators/`. `drops evidence older than the configured age by block time, and keeps young evidence` forges two conflicting prevotes with `voteSignBytes` and `signContext(chainId, 'vote')`, wraps them with `makeDuplicateVoteEvidence`, and checks that stale evidence is discarded and young evidence reaches every application.
 
+**`test/priorities.test.ts`.** `hashes a set by its members and its priorities apart, and commits a header to the priorities from version 2` advances a copy of a three-validator set once and finds `hash()` unchanged and `prioritiesHash()` changed, moves one unit of priority between the two validators that are not proposing (same proposer, another hash), reads a set back from its stored form with the same `prioritiesHash()`, and finds the header's hash different for the two sets in the other order; a version 2 header is 32 bytes longer than the same header under version 1, both come back from `decodeHeader` and from `headerFromJson` as they went in, and `headerHash` throws for a version 2 header without the field and a version 1 header with it. `starts a chain under version 1 or 2 and no other, and refuses a block whose header commits to other priorities` calls `genesisState` with no version (2), with 1, and with 3 and 0 (`/protocol version 3/`), then hands `validateBlockStructure` a block of height 1 whose `prioritiesHash` is that of the two sets in the wrong order, of one set alone, of a set with the same members and shifted priorities, or missing: each is `'wrong prioritiesHash'`.
+
 **`test/schemes.test.ts`.** `refuses a genesis whose validator keys are not of the scheme it names` calls `genesisState` with an ML-DSA-44 key under `signatureScheme: 'secp256k1'` and with a secp256k1 key under no scheme at all, expecting `/not a secp256k1 key/` and `/not a ml-dsa-44 key/`, and checks that the matching cases set `state.scheme`. `runs on secp256k1 keys end to end and refuses keys and signatures of the other scheme` runs a four-validator testnet on secp256k1 and reads a stored commit back with 65-byte signatures, which is `signatureSize(Scheme.secp256k1)`.
 
 **`test/recovery.test.ts`, `double-sign evidence is built, included in a block, and handed to the app`** forges two prevotes for different hashes from one validator, feeds them to consensus, and asserts evidence appears in the pool, is included, and reaches every application with the right height. `a validator restarted from disk resumes with its state, key guard and app intact` compares `blockHash` of stored blocks across nodes after a restart.
@@ -604,7 +652,7 @@ A hash prints as its first six bytes, a `bigint` height as a number, a nil block
 
 Known simplifications:
 
-- `ValidatorSet.hash()` excludes priorities and the proposer index (`DESIGN.md` section 10). A state-syncing node checks that the sets it receives pick the proposers the chain actually used, and nothing more; review finding 8 records the residual risk.
+- `ValidatorSet.hash()` excludes priorities and the proposer index, and on a chain of protocol version 1 no header covers them (`DESIGN.md` section 10): a node state-syncing onto such a chain checks that the sets it receives pick the proposers the chain actually used, and nothing more; review finding 8 records the residual risk. A chain of version 2 commits every header to them with `prioritiesHash`.
 - Only duplicate-vote evidence exists. Amnesia evidence is deferred (`DESIGN.md` section 10).
 - Votes carry no timestamp, so there is no BFT time; block time is the proposer's word, bounded by validation's clock-drift window.
 - Proposals carry whole blocks; there are no block parts, so a block must fit in one p2p frame. The bounds on a block's transactions and evidence (16 MiB) and on a validator set (2,000) are what make it fit.
@@ -617,7 +665,7 @@ Exercises:
 
 1. Write a property test: for random sets of 2 to 20 validators with random powers, advance one step at a time for `1000 * totalPower` steps and assert each validator's share of proposals is within one of `power / totalPower`. Then do it with `incrementProposerPriority(k)` for random `k` and confirm the counts still match while the *sequence* differs.
 2. Implement `proposerForRound(set, r)` as a pure function and test it against `Consensus.proposerAt` for rounds 0 to 50.
-3. Add a `fullHash()` to `ValidatorSet` that covers priorities and the proposer index, and work out what the light client and state sync would need to change to use it instead of the proposer check.
+3. The header's `prioritiesHash` is one hash over two sets, which is why state sync asks one peer for the sets of H+1 and H+2 together. Replace it with two fields, one per set, and work out what that changes in `stateSync`, in the header's size, and in what a peer can be charged for. Then consider the other design: priorities folded into `hash()` itself. What would the store's record by hash and the light client have to do?
 4. Add a `timestamp` to `Vote` and `voteSignBytes`, collect the precommit timestamps in a commit, and compute Tendermint's BFT time (the power-weighted median). Decide what the header's `time` should then be.
 5. Define an amnesia evidence type (a precommit for a block in round R from a validator that had prevoted nil in R while locked), with a canonical form, a shape check and a codec, mirroring `src/types/evidence.ts`.
 6. Make the transaction count provable: put it in the header, or into the leaf value, give `TxProof` a `count` that is checked against it, and update `pathMatches` and the tests.

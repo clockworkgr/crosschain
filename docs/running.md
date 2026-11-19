@@ -17,7 +17,7 @@ the subject of the [tutorial](tutorial/00-overview.md); design decisions are in
 ```sh
 git clone <this repository> crosschain && cd crosschain
 npm install
-npm test                 # 295 tests, about two minutes
+npm test                 # 299 tests, about two minutes
 CHAIN_SCHEME=secp256k1 npm test   # the same suite on secp256k1 keys (one ML-DSA-only case is skipped)
 INDEX_TREES=0 npm test   # the same suite with every index B+ tree dropped from the start: lookups and scans through the store
 TREES=0 npm test         # and with every Merkle tree dropped: roots and proofs from the stored chunks and nodes; the two combine
@@ -329,7 +329,7 @@ a fresh one. Back a node up by copying `data` while the node is stopped.
   "signatureScheme": "ml-dsa-44",
   "genesisTime": "1761600000000",
   "validators": [{ "publicKey": "<hex>", "power": "10", "name": "v0" }],
-  "consensus": { "maxEvidenceAgeMs": "604800000", "version": 1 },
+  "consensus": { "maxEvidenceAgeMs": "604800000", "version": 2 },
   "appState": "{ ...the application genesis as a JSON string... }"
 }
 ```
@@ -341,7 +341,7 @@ a fresh one. Back a node up by copying `data` while the node is stopped.
 | `genesisTime` | unix milliseconds; block 1 must be later |
 | `validators` | the engine's initial set, used only when the application supplies none. `init` leaves it out and declares validators in the application genesis instead |
 | `consensus.maxEvidenceAgeMs` | how old evidence of double signing may be; `init` sets the unbonding period. A node running the core application follows the staking unbonding period in force instead, so the two never drift apart |
-| `consensus.version` | the protocol version every header must carry |
+| `consensus.version` | the protocol version every header must carry: 2, which `init` writes and which is the default when absent, or 1. Under version 2 every header commits to the proposer priorities of its validator sets, so a node joining from a snapshot can check the sets it is given exactly; a version 1 chain's headers have no such field, and a genesis that names 1 keeps running as it did. Any other value is refused when a node first starts on the file (`genesis asks for protocol version 3; this node runs 1 and 2`). It cannot change after genesis. A genesis file written by hand before version 2 existed, with no `version` field, meant 1: a data directory already started from it keeps running (the version is in its stored chain state), but a new node given that file would start under version 2 and refuse the chain's blocks (`protocol version 1, expected 2`), so add `"version": 1` to such a file. Files written by `init` always named the version |
 | `consensus.maxBlockBytes` | the most bytes the transactions and evidence of a block may encode to (its header and last commit are not counted, so a whole block is that much larger): a whole number from 65,536 to 16,777,216, written as a JSON number; 4 MiB (4,194,304) when absent. `init` writes the field when it is given `--max-block-bytes` and leaves it out otherwise (section 3.1). Any other value is refused when the file is read (`genesis: consensus.maxBlockBytes must be a whole number from 65536 to 16777216`). Every node holds a block over it invalid (`block too large`), whether proposed, committed or synced, so set it before the chain starts and keep the file the same on every node. The mempool's limit on one transaction follows it: 1 MiB, or four bytes under half the block size where that is less. A proposer gives evidence at most half the limit, so an admitted transaction always fits the next block it is first in line for |
 | `appState` | the application genesis, inline |
 | `appStateFile` | instead of `appState`: a path (relative to `genesis.json`) to a file holding the application genesis. Use it for large states; the node streams the file at first start and never reads it again |

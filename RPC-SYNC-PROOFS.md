@@ -55,6 +55,19 @@ in chain state as `lastResultsHash`; block validation checks the header's value
 against the state, as it does for `appHash`. The genesis files `init` writes change
 shape; existing data directories are discarded.
 
+Version 2 adds one field at the end of the header, and changes nothing else:
+
+- `prioritiesHash`: `sha256(P(validators) ‖ P(nextValidators))`, where `P(set)` is the
+  SHA-256 of the set's priorities (an array of i64 in the set's order) followed by its
+  proposer's index (i64). `validatorsHash` and `nextValidatorsHash` cover members and
+  powers; with this a header names both sets exactly. Validation checks it against the
+  state's two sets. A header of version 1 does not have the field, encoded or in JSON,
+  and one of version 2 always does.
+
+A chain runs the version its genesis names, 2 when it names none, and a genesis naming
+any other than 1 or 2 is refused. A data directory written under version 1 keeps
+running under version 1.
+
 ### 2.2 Proofs
 
 - `TxProof { height, index, tx, siblings }` verifies against `header(height).dataHash`.
@@ -534,7 +547,11 @@ directory with a trust anchor:
    header and the commit must verify against the set of H, or that peer is charged
    50 points and the next is asked. Fetch the exact validator sets, priorities
    included, for H, H+1 and H+2 by height and check them against the headers' set
-   hashes and against the proposers the chain used at H and H+1 (any round up to the
+   hashes. On a chain of version 2 they are also checked against `prioritiesHash`
+   (section 2.1): the sets of H+1 and H+2 come from one peer and must hash to header
+   H+1's value, then the set of H with the set of H+1 to header H's; a peer whose sets
+   do not is charged 50 points and the next is asked. On a chain of version 1 they are
+   checked against the proposers the chain used at H and H+1 (any round up to the
    commit's round, since a re-proposed block keeps its first proposer's name). Every
    key in the three sets must be of the scheme the node's genesis names, else the
    join stops with `state sync: a validator key is not a <scheme> key; this is not
@@ -709,7 +726,7 @@ node `{ versions: 10000, snapshots: 2 }`, archive: no `blocks` and as many
 
 | parameter | default |
 |---|---|
-| protocol version | 1 |
+| protocol version | 2 (a genesis may name 1) |
 | signature scheme | `ml-dsa-44` when genesis names none; `secp256k1` the other choice |
 | rpc bind | 127.0.0.1, p2p port + 1 |
 | rpc body limit | 1 MiB |

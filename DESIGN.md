@@ -1194,11 +1194,20 @@ for a height whose validator set a node does not hold halts it rather than being
 skipped: a block applied without it would hand the application a different
 misbehaviour list than every other node and diverge the state. Validator sets are
 also stored by the height they sign, priorities included, because a state-synced
-node must continue consensus with the exact proposer priorities.
+node must continue consensus with the exact proposer priorities. The set hash covers
+members and powers only, so that one record by hash serves every height those members
+sign. From protocol version 2 a header therefore carries one more hash, `prioritiesHash`:
+the hash of the priorities and proposer of the set of its height, then of the set of the
+next. Block validation checks it against the state like the two set hashes, and a
+joining node takes the sets of H+1 and H+2 only as a pair header H+1 commits to, and
+the set of H only as header H commits to it with the set of H+1; a peer serving others
+is charged and the next one asked. A chain keeps the version of its genesis: one started
+under version 1 keeps headers without the field, and a node joining it can only check
+that the sets pick the proposers the chain used.
 
-## 10. Implementation status (2026-11-15)
+## 10. Implementation status (2026-11-19)
 
-Everything above is implemented in TypeScript under `src/`. 295 tests in 29 files
+Everything above is implemented in TypeScript under `src/`. 299 tests in 30 files
 pass, and the whole suite passes under either signature scheme
 (`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there) and with
 either tier of state paging dropped from the start (`INDEX_TREES=0`, `TREES=0`, or
@@ -1209,7 +1218,7 @@ on a live four-validator network with a full node, gossiping signed transactions
 checking a proof from one node against the app hash in the next header on every node,
 then querying a past height and a name and verifying them with the light client. A
 separate test grows a validator set and shrinks it past the trust level and watches
-the light client bisect. The staking suite walks every rule one block at a time with
+the light client bisect. The priorities suite hashes a set by its members and by its priorities, refuses a block whose header commits to other priorities than the state's, runs a chain of version 1 with headers as they were, and joins from a snapshot past sources that serve sets with shifted priorities. The staking suite walks every rule one block at a time with
 a supply invariant checked after each scenario, and a network test runs an
 application-owned set through delegation, a stopped validator being jailed, its
 return by unjail, and a light client following the whole sequence. The fee suite prices
@@ -1311,10 +1320,13 @@ Known simplifications, all deliberate and all revisitable:
   proxy.
 - A delegator who redelegates away from a validator and then undelegates from the
   destination escapes a later slash of the source, as in Cosmos.
-- Proposer priorities are not covered by the validator set hash. A node joining by
-  state sync checks that the sets it is given pick the proposers the chain actually
-  used at the snapshot height and the one after, and derives nothing else from them;
-  a peer could still craft priorities that pass that check and diverge later.
+- On a chain of protocol version 1, proposer priorities are covered by nothing a
+  validator signs. A node joining such a chain by state sync checks that the sets it is
+  given pick the proposers the chain actually used at the snapshot height and the one
+  after, and derives nothing else from them; a peer could still craft priorities that
+  pass that check and diverge later. Version 2, the default for a new chain, commits
+  every header to them (section 9). There is no way to move a running chain from one
+  version to the other.
 - The light client's trusting period is the client's choice and must stay below the
   chain's unbonding period; the engine's evidence age follows the unbonding period
   automatically.
