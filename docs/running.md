@@ -145,7 +145,9 @@ A signal that comes before the node is ready, while it reads a large genesis or 
 sync, is acted on as soon as the node has been made: the store is closed and the claim given
 up as on any stop. If the node has not been made five seconds after the signal the process exits
 as it is, which is safe for the store and leaves a `LOCK` naming a process that is gone; the
-next start takes it over (section 5). If the node cannot start, or its RPC server cannot,
+next start takes it over (section 5). If the node cannot be made at all (a bad genesis or
+configuration, a directory another node holds), the error is printed and the process exits with
+code 1. If a node that was made cannot start, or its RPC server cannot,
 most often because another process is listening on the RPC address, the line `start failed`
 is logged with the error, the node is stopped like any other, so the store is closed and the
 claim given up, and the process exits with code 1.
@@ -249,7 +251,7 @@ exit with status 1. Transactions expire 60 seconds after they are built, or half
 | `name` | the prefix of log lines |
 | `listenAddr` | where peers connect, as `host:port` (an IPv6 host in brackets: `[::1]:26656`); the node also advertises it |
 | `rpcListen` | the HTTP address of the JSON-RPC as `host:port`; defaults to the p2p port plus one. The CLI splits it at the colon, so the host is an IPv4 address or a name, not IPv6 |
-| `rpcToken` | optional: a secret of 16 characters or more. When set, every JSON-RPC call and event stream must carry it (`Authorization: Bearer <token>`; the event stream also takes `?token=`), and `/health` stays open. It is sent in the clear, so beyond loopback put TLS in front. Unset, the RPC answers anyone who reaches it, and the node logs a warning at start if it listens beyond loopback |
+| `rpcToken` | optional: a secret of 16 characters or more, visible ASCII without spaces (a node with another does not start). When set, every JSON-RPC call and event stream must carry it (`Authorization: Bearer <token>`; the event stream also takes `?token=`), and `/health` stays open. It is sent in the clear, so beyond loopback put TLS in front. Unset, the RPC answers anyone who reaches it, and the node logs a warning at start if it listens beyond loopback |
 | `seeds` | peers to dial at start; more are learned by address exchange |
 | `nodeKeySeed` | the seed of the key that identifies the node on the network (hex) |
 | `validatorSeed` | the seed of the consensus key; `null` makes a full node that follows but does not vote |
@@ -343,7 +345,7 @@ a fresh one. Back a node up by copying `data` while the node is stopped.
 | `signatureScheme` | the signature scheme of every validator key, account key and signature on the chain: `ml-dsa-44` (the default when absent, so an older file keeps its meaning; post-quantum, 1,313-byte keys and 2,421-byte signatures) or `secp256k1` (34-byte keys and 65-byte signatures). `init --scheme` sets it; any other value is refused (`unknown signature scheme "x"; one of ml-dsa-44, secp256k1`). It is written into the chain state and into the application's global properties, which the app hash covers, so it cannot be changed after genesis: nodes whose genesis files name different schemes never agree on a block |
 | `genesisTime` | unix milliseconds; block 1 must be later |
 | `validators` | the engine's initial set, used only when the application supplies none. `init` leaves it out and declares validators in the application genesis instead |
-| `consensus.maxEvidenceAgeMs` | how old evidence of double signing may be; `init` sets the unbonding period. A node running the core application follows the staking unbonding period in force instead, so the two never drift apart |
+| `consensus.maxEvidenceAgeMs` | how old evidence of a validator's fault may be; `init` sets the unbonding period. A node running the core application follows the staking unbonding period in force instead, so the two never drift apart |
 | `consensus.version` | the protocol version every header must carry: 1, the one version there is, which `init` writes and which is the default when absent. Any other value is refused when a node first starts on the file (`genesis asks for protocol version 2; this node runs 1`). While the chain is unreleased the protocol changes in place, so a data directory written by an earlier build may not open under a later one |
 | `consensus.maxBlockBytes` | the most bytes the transactions and evidence of a block may encode to (its header and last commit are not counted, so a whole block is that much larger): a whole number from 65,536 to 16,777,216, written as a JSON number; 4 MiB (4,194,304) when absent. `init` writes the field when it is given `--max-block-bytes` and leaves it out otherwise (section 3.1). Any other value is refused when the file is read (`genesis: consensus.maxBlockBytes must be a whole number from 65536 to 16777216`). Every node holds a block over it invalid (`block too large`), whether proposed, committed or synced, so set it before the chain starts and keep the file the same on every node. The mempool's limit on one transaction follows it: 1 MiB, or four bytes under half the block size where that is less. A proposer gives evidence at most half the limit, so an admitted transaction always fits the next block it is first in line for |
 | `appState` | the application genesis, inline |
@@ -463,7 +465,7 @@ mixes them with requests is answered for the requests alone. `GET /health` answe
 | `validators` | `height?` | the validator set that signs that height: its hash, total power, members with their powers, and a proposer (proposer priorities are not included). That is the proposer of the height's first round, for the latest height, the two after it and every older height whose set the node still holds by height: the heights it applied itself, and the one whose snapshot it joined at, while their blocks are not pruned. For a block backfilled below a state-sync join, or a header kept alone, the set is read by its hash: the members and powers are that height's, and `proposer` is `null`, because the copy stored under the hash carries a later height's proposer | |
 | `validatorSet` | `hash` | a set by its hash, for light clients following set changes | |
 | `object` | `id`, `height?`, `prove?` | any object by id as JSON, with an object proof on request | yes |
-| `key` | `type`, `index`, `key`, `height?`, `prove?` | a lookup in an authenticated unique index (`account`/`byName`, `asset`/`bySymbol`, ...) as of the height, with a key proof; the id is the one the proof proves | yes |
+| `key` | `type`, `index`, `key`, `height?`, `prove?` | a lookup in an authenticated index (`account`/`byName`, `asset`/`bySymbol`, ...) as of the height, with a key proof; the id is the one the proof proves. For a non-unique index (`delegation`/`byValidator`, ...) the key is one entry, the index key followed by the eight bytes of an object's id, and the answer is that id or null | yes |
 | `account` | `name`, `height?`, `prove?` | account, balances (each with its asset's precision), its validator, history count, all as of the height, and a proof that the name maps to this account or to none | yes |
 | `validator` | `operator` or `id`, `height?` | the validator with status, power, self-bond and operator name as of the height; `delegators`, the count of its delegations as of the height | yes |
 | `delegation` | `delegator`, `validator`, `height?`, `prove?` | the delegation (shares and their token value as of the height), with a key proof; `unbonding`, the entries pending as of the height | yes |
@@ -629,11 +631,17 @@ among the top `maxValidators`; the engine applies set changes two heights later.
    commit by stake, with a bonus to the proposer and a commission to the validator.
 
 4. A validator that misses too many blocks in the downtime window is jailed, slashed lightly, and
-   leaves the set; after the jail time its operator runs `unjail`. Double signing, proven by
-   evidence any node can gossip, slashes 5% and tombstones the validator for good. A node that
+   leaves the set; after the jail time its operator runs `unjail`. A fault proven by evidence,
+   which any node that holds the signatures can gossip, slashes 5% and tombstones the validator
+   for good: two votes for one height, round and step or two proposals for one round
+   (`doubleSignSlashBps`), and a prevote that forgets the block the validator precommitted or
+   names a majority that never formed (`amnesiaSlashBps`). A node that
    restarts never signs two different proposals or votes for one height, round and step, nor
-   anything for a step behind the last it signed, because the sign state file remembers the
-   last signature; asked for the same one again, it gives the signature it made.
+   anything for a step behind the last it signed, nor a prevote against its lock, because the
+   sign state file remembers the last signature and the lock; asked for the same signature
+   again, it gives the one it made. Keep that file with the key: a validator started on an
+   empty one may sign something else for a height, round and step it has signed already, and
+   the two signatures are evidence.
 
 5. Validators change the chain's parameters by proposal: `propose` with the changes, `signal`
    from the others; more than two thirds of active stake adopts at the end of the block. Fees and

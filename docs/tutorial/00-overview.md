@@ -1,4 +1,4 @@
-# 0. Overview: a blockchain in fourteen thousand lines
+# 0. Overview: a blockchain in twenty-one thousand lines
 
 This tutorial reads the code of a complete proof-of-stake blockchain, part by part, in the
 order the parts depend on each other. It is written for a programmer who knows TypeScript and
@@ -126,9 +126,11 @@ it and chapter 11 the one real application behind it.
    a fuller commit, then starts height H+1. Without a decision, round r+1 starts with a longer
    timeout and the next proposer.
 5. A validator signs at most once per height, round and step; the private validator refuses
-   anything else and remembers its last signature on disk across restarts. Two conflicting
-   signatures from the same key are evidence; any node that sees them gossips them, and the
-   application slashes and tombstones the validator ([04](04-consensus.md), [11](11-application.md)).
+   anything else and remembers its last signature, and the block it is locked on, on disk across
+   restarts. Signatures that prove a fault are evidence: two votes or two proposals for one
+   place, a prevote that forgets a lock, or a prevote that names a majority that never was. Any
+   node that holds them gossips them, and the application slashes and tombstones the validator
+   ([04](04-consensus.md), [11](11-application.md)).
 6. Validator set changes the application returns at height H take effect at H+2, so that every
    node agrees on who signs H+1 before anyone has executed H ([03](03-types.md), [05](05-mempool-executor.md)).
 

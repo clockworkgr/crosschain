@@ -83,7 +83,10 @@ LMDB environment under each node's data directory; of the four runtime dependenc
 of docs/benchmarks.md section 4.13). The figures below are from an Apple M4 Pro
 (12 cores, 11 verification threads) on Node 24, one process. The network suite runs
 four validators inside that process on the in-memory transport, so it measures the
-engine and the application, not the wire.
+engine and the application, not the wire. A run of 2026-11-20, after the latest changes
+to consensus and the indices and on a machine that was not idle, read at worst 7% under
+the table (object proofs, and the network under load at 6%) and up to 14% over it (admission), ML-DSA-44
+signing aside, which varies as the row says (docs/benchmarks.md sections 4.5 and 4.6).
 
 | what | result |
 |---|---|

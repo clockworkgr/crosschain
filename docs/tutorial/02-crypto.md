@@ -39,7 +39,7 @@ The sizes compound through the data structures above this layer. With the tag in
 | public key | 1,313 B | 34 B | tag + 1,312, or tag + 33 (compressed point) |
 | signature | 2,421 B | 65 B | tag + 2,420, or tag + 64 (compact `r` and `s`) |
 | validator in a stored set | 1,329 B | 50 B | key + power 8 + priority 8 (`ValidatorSet.encode`) |
-| vote on the wire | 2,439 B or 2,471 B | 83 B or 115 B | 18 B of fields (nil) or 50 B (block hash) + the signature |
+| vote on the wire | 2,447 B or 2,479 B | 91 B or 123 B | 26 B of fields (nil) or 58 B (block hash) + the signature |
 | commit, N slots, S signatures | 48 + N + 2,421 × S B | 48 + N + 65 × S B | height, round, hash, count, one presence byte per slot, one signature per signer |
 | commit, 4 validators, all signing | about 9.7 KB | 312 B | |
 | commit, 100 validators, all signing | about 242 KB | about 6.6 KB | |
@@ -376,8 +376,8 @@ Who signs and who verifies, by purpose:
 
 | purpose | signer | message | verifier |
 |---|---|---|---|
-| `vote` | `PrivValidator.signVote` in `src/consensus/privval.ts` | `voteSignBytes(chainId, vote)` | consensus on every received vote; `verifyDuplicateVoteEvidence` in `src/consensus/evidence.ts`; the light client on commits |
-| `proposal` | `PrivValidator.signProposal` | `proposalSignBytes(chainId, proposal)` | consensus on every received proposal |
+| `vote` | `PrivValidator.signVote` in `src/consensus/privval.ts` | `voteSignBytes(chainId, vote)` | consensus on every received vote; `verifyEvidence` in `src/consensus/evidence.ts`; the light client on commits |
+| `proposal` | `PrivValidator.signProposal` | `proposalSignBytes(chainId, proposal)` | consensus on every received proposal; `verifyEvidence` on the two heads of duplicate-proposal evidence, over `proposalHeadSignBytes`, the same bytes made from a head |
 | `tx` | `signTransaction` in `src/app/core/client.ts` (the wallet side) | the transaction body | `CoreApp` in `src/app/core/app.ts`, at mempool admission and in blocks, after refusing any signature tagged with another scheme than the chain's |
 | `p2p` | `Network` in `src/p2p/network.ts` during the handshake | `handshakeSignBytes` over both hello messages, each carrying a fresh nonce (`DESIGN.md` section 3) | the other side of the handshake |
 

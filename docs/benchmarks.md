@@ -321,6 +321,17 @@ empty blocks run that code; then the engine discards it and they run unoptimised
 optimising compilers switched off the time is flat. Twenty iterations caught the first state or
 the second, by chance; the benchmark now measures the third.
 
+A later run, of 2026-11-20. The table above is from a build before the non-unique indices of
+the staking types were authenticated (each is a sparse tree more for its type) and before an
+insert that leaves an index key as it was stopped writing anything for that index. The suite
+was run once more after both, on the same machine with other work going on beside it, so the
+figures are not a replacement for the table: checkTx through the pool 6,613 a second, a cold
+block 6,098, a warm block of 500 transfers 24,764 a second (20.2 ms) and of 1,500 25,560 (58.7
+ms), an empty block 0.31 ms, commit to memory 3.1 ms and to LMDB 8.7 ms. Except for the empty
+block, 0.02 ms slower, each is at the table's figure or better, and one run on a busy machine
+shows no more than that nothing got measurably slower; a transfer changes no key of an
+authenticated index, so the new trees have nothing to write for a block of transfers.
+
 ### 4.6 network
 
 Whole nodes: four validators on the in-memory transport, then a fifth node catching up.
@@ -343,6 +354,15 @@ below that ceiling, and the run does not separate what held the other blocks sho
 Raising the block size raises the ceiling and lowering the commit timeout the cadence; neither
 changes the cost per transfer. Block sync runs at 3,400 transfers a
 second, against 5,800 for a cold block in section 4.5; the rest is the fetch round trips.
+
+The run of 2026-11-20 (section 4.5), made after consensus began to keep the votes of the last
+16 heights and to budget each peer's votes, on a machine that was not idle: 9.1 empty blocks a
+second (110 ms a block), 6,000 transfers committed in 6.28 s (956 a second, seven blocks, the
+largest full at 1,667), and block sync of the nine blocks in 1.86 s (3,232 transfers a second),
+the app hash agreeing at height 9. The load figure is 6% under the table's and the sync figure
+5%. One run on a busy machine cannot tell that from the difference between two runs, and
+it was not repeated on an idle one; a vote that arrives within its sender's budget takes the
+path it took before.
 
 ### 4.7 genesis
 

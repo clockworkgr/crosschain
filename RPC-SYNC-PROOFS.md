@@ -63,7 +63,7 @@ One more field was added at the end of the header later:
   powers; with this a header names both sets exactly. Validation checks it against the
   state's two sets.
 
-There is one protocol version, 1; a genesis naming another is refused.
+There is one protocol version, 1; a node starting a chain from a genesis that names another refuses it (a node opening a store it already has, or joining by state sync, takes the version from its state or the verified header and does not look at the genesis again).
 
 ### 2.2 Proofs
 
@@ -187,7 +187,7 @@ application's own store, next to the objects:
   is moved into the log the first time it is opened, by height and with each
   account's entries in their order, and the old keys are removed in the same write
   (`HistoryLog.migrate`, `src/app/core/history.ts`).
-- `entry = { height, position (u32, 0xffffffff for a virtual entry), opIndex (u32),
+- `entry = { height, position (u32, 0xffffffff for a virtual entry made outside a transaction; `unjail`'s, made inside one, keeps that transaction's position, hash and operation index), opIndex (u32),
   kind (u8), txHash (option), data (bytes) }` where `data` is the encoded operation,
   or the encoded virtual operation. There is no result in the entry: every recorded
   operation succeeded.
@@ -197,7 +197,8 @@ application's own store, next to the objects:
   delegate, undelegate and redelegate delegator and the validators' operators;
   unjail, proposalCreate and proposalSignal operator.
 - Virtual operations: `reward { validator, amount, commission }` to the operator,
-  `slash { validator, amount, doubleSign }` to the operator, `jail`, `unjail`,
+  `slash { validator, amount, doubleSign }` to the operator (`doubleSign` is true for
+  a slash on evidence of any kind and false for downtime), `jail`, `unjail`,
   `tombstone` to the operator, `unbondingMatured { validator, tokens }` and
   `redelegationMatured` to the delegator, `forcedUnbond { validator, tokens }` to
   each delegator of a tombstoned validator. Rewards are recorded per payment to a
@@ -234,7 +235,7 @@ on the p2p port plus one; config `rpcListen` sets host and port. Responses carry
 `Access-Control-Allow-Origin: *`. With `rpcToken` set in the node's config, `POST /` and
 `GET /events` answer 401 to a request that does not carry it as `Authorization: Bearer <token>`
 (the event stream also takes `?token=<token>`), and such a request spends a token of the
-address's bucket like a call. Bodies over 1 MiB are rejected with HTTP 413. Each
+address's bucket like a call; once the bucket is empty the answer is 429. Neither has a body. Bodies over 1 MiB are rejected with HTTP 413. Each
 remote address has a token bucket of 50 tokens per second with a burst of 100: every
 `POST /` costs one token, which covers its first call (`OPTIONS`, `GET /health` and a
 `GET /events` without replay cost none); each further call of a
@@ -290,7 +291,7 @@ mempool's lowered limit being its throttle then.
 | validators | height? | the set that signs that height: hash, total power, proposer address (`null` for a height whose set the node holds only by hash, a backfilled block or a header kept alone), members with address, public key and power (no priorities) |
 | validatorSet | hash | a set by hash, same shape |
 | object | id, height?, prove? | type, height, the object as of that height or null, with `proof` hex when asked |
-| key | type, index, key (hex), height?, prove? | `{ height, id, proof? }`: the object id the key mapped to at `height` (`"type.n"`) or null, read from the key proof at `height`, which is returned when asked |
+| key | type, index, key (hex), height?, prove? | `{ height, id, proof? }`: the object id the key mapped to at `height` (`"type.n"`) or null, read from the key proof at `height`, which is returned when asked; the index must be authenticated, and for a non-unique one the key is an entry, the index key followed by the object's id |
 | account | name, height?, prove? | `height`, the account object or null; with it the balances (asset symbol, id, precision, amount), the operated validator's id or null, and the history count, all as of `height`; the name proof at `height` when asked |
 | validator | operator or id (either takes the operator's name, the operator's account id or the validator's id), height? | `height`, the validator object with status, active flag, power, self-bond and operator name as of `height`; `delegators`, the count of its delegations as of `height` |
 | delegation | delegator, validator, height?, prove? | `height`, the delegation with its tokens' worth as of `height` or null; `unbonding`, the entries pending as of `height`; the key proof at `height` when asked |
@@ -316,9 +317,10 @@ method itself takes a name. Every state query (`object`,
 one in `height` or the last committed one, and returns it, so a value and the proof
 beside it are about the same state. A height outside what the application holds, from
 its lowest provable height to the last committed one, is refused with `-32001` and
-`the state at height H is not kept (heights A to B are)`. A unique index is read at
+`the state at height H is not kept (heights A to B are)`. An authenticated index is read at
 the height from the index's own tree: the key proof is made first and the id taken
-from its leaf, and the live index, which holds the writes of the block in progress
+from its leaf (for a non-unique index `key` takes one entry, the index key followed by the
+object's id, and answers that id or null), and the live index, which holds the writes of the block in progress
 and says nothing of a past height, is not asked. `account` finds the account through
 the name index at the height and reads it, its balances, its validator and its
 history count as of it; a balance object is never removed, so the balances the
@@ -482,8 +484,8 @@ New: `history <target> <account>`, `tx <target> <hash>`, `verify-tx <target> <ha
 `light <target> verify [height]`.
 
 No command, or one the CLI does not know, prints `usage: see the comment at the top of
-src/cli.ts` and exits with code 1, whatever follows it; a known command without its
-target says `missing target`. Amounts of an asset of precision 0 are printed without
+src/cli.ts` and exits with code 1, whatever follows it; a known client command without its
+target says `missing target` (`start` says `missing node directory` and `join` `missing dir`). Amounts of an asset of precision 0 are printed without
 a decimal point. `verify-tx` prints `verified: included at height H, succeeded` (or
 `failed: <error>`) when both proofs check; `included at height H; this node does not
 hold the results of that block` when the node holds the next block but not the
@@ -539,17 +541,20 @@ directory with a trust anchor:
 4. Fetch chunks from up to four of those peers in parallel, verifying each as it
    arrives by its manifest hash, its range and its range proof against the type root,
    and keep it; when all are there, load them into a fresh database. A bad chunk charges its peer 50 points and excludes it as a
-   source for the rest of the join, as do three timeouts; the chunk is refetched
+   source for the rest of the join; three requests that fail or time out exclude a peer too, without a charge. The chunk is refetched
    elsewhere.
-5. Set counters, compute `root(H)`, compare with the app hash; rebuild the
-   authenticated indices and check their roots against the manifest.
-6. Fetch block H with its commit from one of the peers; the body must match the
-   header and the commit must verify against the set of H, or that peer is charged
-   50 points and the next is asked. Fetch the exact validator sets, priorities
+5. Set counters (importing the objects has built their indices, the authenticated ones'
+   trees included), compute `root(H)`, compare with the app hash, and check the index
+   roots against the manifest.
+6. Fetch the exact validator sets, priorities
    included, for H, H+1 and H+2 by height and check them against the headers' set
    hashes and against `prioritiesHash` (section 2.1): the sets of H+1 and H+2 come from
    one peer and must hash to header H+1's value, then the set of H with the set of H+1
-   to header H's; a peer whose sets do not is charged 50 points and the next is asked. Every
+   to header H's; a peer whose sets have the right set hashes and not the right
+   priorities is charged 50 points and the next is asked (a set with another set hash is
+   passed over without a charge). Then fetch block H with its commit from one of the peers; the body must match the
+   header and the commit must verify against the set of H, or that peer is charged
+   50 points and the next is asked. Every
    key in the three sets must be of the scheme the node's genesis names, else the
    join stops with `state sync: a validator key is not a <scheme> key; this is not
    the chain genesis describes`.
@@ -625,7 +630,10 @@ this node or hold history this node has pruned. A block may carry at most 16 pie
 `validateBlockStructure` refuses a block with more (`too much evidence`). The
 pool lets go of evidence, pending or committed, and of its inventory entry once it is
 older than the evidence age, on every node after every commit, and holds at most
-1,000 pending pieces (`EvidencePool.MAX_PENDING`), refusing more. A
+1,000 pending pieces (`EvidencePool.MAX_PENDING`) and 32 MiB of them
+(`MAX_PENDING_BYTES`), refusing more; it also refuses a piece that encodes to more
+than this node as proposer would give one (`maxRecordBytes`, half the block size less the
+builder's margin), so that nothing waits in the pool that the node could never propose. A
 hash a peer announces is fetched at most once while a fetch for it is outstanding
 (ten seconds, after which another peer that announces it may be asked, four at most,
 or until the item arrives or every peer asked has said it lacks it), in
@@ -654,7 +662,8 @@ Points per offence: bad vote or proposal signature 20, proposal body not matchin
 its header 20, malformed message 20, malformed or invalid evidence 20, bad manifest,
 chunk, commit or batch of headers during state sync 50, bad block during sync or
 backfill 50, a block sync response that does not match its request 50, an
-oversized or repetitive fetch 5. A proposal for the next height is held until that
+oversized or repetitive fetch 5, votes arriving faster than they may be verified with
+no room left for them to wait 10 (at most once a second for a peer). A proposal for the next height is held until that
 height starts only if it is fresh (no proof of lock), its round is no more than 1,000,
 its block is of that height and its signature verifies with the key of the validator,
 in the next height's set, that the block names as proposer; a bad signature costs the
@@ -663,7 +672,7 @@ verified. There are 8 places, 2 for one validator and one for a validator and ro
 counted by the proposal's signer and not by the peer that relays it: any peer may relay
 a proposal a validator signed, and nothing takes a place without the signature of a
 validator of the next height's set; four validators together can still fill
-them, and a proposal not held is sent again while its round lasts. A vote more than 1,000 rounds ahead of the
+them, and a proposal not held is sent again while its round lasts. A vote for the height being decided or the next that is more than 1,000 rounds ahead of the
 node's round is dropped before its signature is verified. A response to a request the node
 awaits (blocks, headers, validator sets, snapshots, manifests, chunks) that matches no
 outstanding request is ignored without charge. Nothing is taken unasked: one
@@ -773,7 +782,7 @@ behind, a lone notification answered with 204 and a mixed batch answered only fo
 the request with an id, and a light client walking back from its anchor, refusing a
 height before genesis, one after the anchor and one beyond `maxBackwardSteps`, and
 catching a header that is not the one the header above names. `test/review4.test.ts`
-(nine cases) adds the state queries at a height with their proofs, a height not kept,
+(thirteen cases) adds the state queries at a height with their proofs, a height not kept,
 the peers' clock offsets and a batch paying for each of its calls; the transaction
 index with one transaction in three blocks and an index of the old layout moved when
 the store is opened; a snapshot

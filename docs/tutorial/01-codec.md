@@ -98,7 +98,7 @@ The `Number.isInteger` check matters: `w.u8(1.5)` would otherwise be silently tr
 
 **`bool(v)`** is `u8(v ? 1 : 0)`.
 
-**`u64(v: bigint)`** and **`i64(v: bigint)`** check the range (`0` to `2^64 - 1`, and `-2^63` to `2^63 - 1`) and write with `setBigUint64` and `setBigInt64`. `i64` is two's complement, which is what `setBigInt64` produces. The only `i64` fields in the chain are proposer priorities, which go negative, a proposal's `polRound`, which is `-1` when there is no proof-of-lock round, and a validator set's proposer index, which is `-1` while the set has no proposer.
+**`u64(v: bigint)`** and **`i64(v: bigint)`** check the range (`0` to `2^64 - 1`, and `-2^63` to `2^63 - 1`) and write with `setBigUint64` and `setBigInt64`. `i64` is two's complement, which is what `setBigInt64` produces. The only `i64` fields in the chain are proposer priorities, which go negative, the `polRound` of a proposal, of a vote and of a proposal head inside evidence, which is `-1` when there is no proof-of-lock round, and a validator set's proposer index, which is `-1` while the set has no proposer.
 
 **`fixed(b)`** copies the bytes with no prefix. It does not check the length: `encodeHeader` writes `w.fixed(h.lastBlockHash)` trusting that the hash is 32 bytes. If a bug ever produced a 31-byte hash, the writer would emit it without complaint, and the error would surface only on the other side, where `decodeHeader` reads `fixed(HASH_SIZE)` and every later field comes out shifted by one byte until `finish()` or a `need` check fails. The writer's contract is that its callers pass values of the right type and size; the decoder is the one that enforces sizes, because it is the one facing untrusted input. **`bytes(b)`** writes `u32(b.length)` then the bytes. **`string(s)`** first refuses a string holding a lone surrogate, then encodes with `TextEncoder` (always UTF-8) and writes it as `bytes`:
 
@@ -201,7 +201,7 @@ This is the canonical-decoding rule from the Concepts section: `0x02` is not a s
   }
 ```
 
-The decoders used to write `Number(r.u64())`, which rounds anything beyond 2^53 − 1 to the nearest double. Rounded, two different encodings decode to one value, which is the canonical-decoding rule broken again, and a count or an index is accepted here to be found wrong, or not, somewhere later. The callers are a proposal's `polRound` and a validator set's proposer index ([chapter 3](03-types.md)), a snapshot chunk's `from`, `to` and instance numbers ([chapter 11](11-application.md)), the database's snapshot counters and history records ([chapter 9](09-database.md)), and the counters and versions `src/app/core/app.ts` reads from its store. A field that stays a `bigint` (a height, an amount, an object id) is still read with `u64()`.
+The decoders used to write `Number(r.u64())`, which rounds anything beyond 2^53 − 1 to the nearest double. Rounded, two different encodings decode to one value, which is the canonical-decoding rule broken again, and a count or an index is accepted here to be found wrong, or not, somewhere later. The callers are the `polRound` of a proposal, a vote and a proposal head inside evidence, and a validator set's proposer index ([chapter 3](03-types.md)), a snapshot chunk's `from`, `to` and instance numbers ([chapter 11](11-application.md)), the database's snapshot counters and history records ([chapter 9](09-database.md)), and the counters and versions `src/app/core/app.ts` reads from its store. A field that stays a `bigint` (a height, an amount, an object id) is still read with `u64()`.
 
 **`fixed(n)`** reads exactly `n` bytes and returns `this.buf.slice(...)`, a copy:
 
@@ -278,6 +278,7 @@ The defaults on `bytes`, `string` and `array` are the outer fence. The real fenc
 | `src/types/block.ts` `decodeHeader` | `chainId` | `string(256)` |
 | `src/types/block.ts` `decodeCommit` | `signatures` | `array(..., MAX_VALIDATORS)`, 2,000 |
 | `src/types/block.ts` `decodeBlock` | `evidence` | `array(decodeEvidence, 1000)` |
+| `src/types/evidence.ts` `decodeEvidence` | a false citation's `against` | `array(decodeVote, MAX_VALIDATORS)`, 2,000 |
 | `src/types/block.ts` `decodeBlock` | each transaction | `bytes()` (64 MiB default) |
 | `src/types/validator.ts` `decode` | validators | `array(..., MAX_VALIDATORS)`, 2,000 |
 | `src/crypto/keys.ts` `decodePublicKey`, `decodeSignature` | every key and signature | one tag byte, then that scheme's size: 1,312 or 33 for a key, 2,420 or 64 for a signature |
@@ -295,7 +296,7 @@ Two things bound what these can add up to. A TCP frame is refused above `MAX_FRA
 
 ### A worked example: the bytes of a vote
 
-To make the rules concrete, here are the exact bytes of a few encodings, produced by running the writer. `voteSignBytes` from [chapter 3](03-types.md) writes a chain id string, the vote type as `u8`, the height as `u64`, the round as `u32` and an optional block hash. For a nil prevote at height 7, round 1, on a chain named `demo`:
+To make the rules concrete, here are the exact bytes of a few encodings, produced by running the writer. `voteSignBytes` from [chapter 3](03-types.md) writes a chain id string, the vote type as `u8`, the height as `u64`, the round as `u32`, an optional block hash and the `polRound` as `i64`. For a nil prevote at height 7, round 1, on a chain named `demo`:
 
 ```
 00000004 64656d6f   string: u32 length 4, then "demo"
@@ -303,9 +304,10 @@ To make the rules concrete, here are the exact bytes of a few encodings, produce
 0000000000000007    u64: height 7
 00000001            u32: round 1
 00                  option flag 0: nil (no block hash)
+ffffffffffffffff    i64: polRound -1 (a nil prevote names no round)
 ```
 
-Twenty-two bytes. The same vote for a block whose hash is thirty-two `0xab` bytes is fifty-four: the flag becomes `01` and the thirty-two hash bytes follow with no length prefix, because `fixed` is used for a value whose size both sides know.
+Thirty bytes. The same vote for a block whose hash is thirty-two `0xab` bytes is sixty-two: the flag becomes `01` and the thirty-two hash bytes follow with no length prefix, because `fixed` is used for a value whose size both sides know.
 
 Other primitives from the unit test, as the writer emits them:
 

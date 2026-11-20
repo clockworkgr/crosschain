@@ -96,9 +96,10 @@ function stateHeight(app: CoreApp, p: Record<string, unknown>): bigint {
 }
 
 /**
- * What an authenticated unique index held under a key at a height, read from the index's own tree at that height
+ * What an authenticated index held under a key at a height, read from the index's own tree at that height
  * together with the proof of it. The live index is not asked: it holds the writes of the block in progress, and
- * says nothing about a past height.
+ * says nothing about a past height. For a non-unique index the key is one entry, the index key followed by an
+ * object's id, and the answer is that id or null.
  */
 function keyAt(app: CoreApp, type: ObjectType<any>, index: string, k: Uint8Array, height: bigint): { id: ObjectId | null; proof: KeyProof } {
   const proof = app.db.proveKeyAt(type, index, k, Number(height));

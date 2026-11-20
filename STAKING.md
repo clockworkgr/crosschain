@@ -20,7 +20,7 @@ of a block reward is computed on the stake before the proposer bonus is paid.
 | delegator accounting | shares with an exchange rate; rewards auto-compound; commission paid as minted shares to the operator |
 | commission | one fixed rate for all validators, a parameter (10%) |
 | unbonding | 7 days by block time, automatic release, still slashable; redelegation allowed with Cosmos rules |
-| double sign | slash 5%, tombstone, slash unbonding and redelegation entries created after the infraction, auto-unbond delegators |
+| double sign | slash 5%, tombstone, slash unbonding and redelegation entries created from the height before the infraction on, auto-unbond delegators |
 | two proposals | duplicate-proposal evidence (two different proposals signed for one height and round): punished as a double sign, at the same rate |
 | forgotten lock | amnesia evidence (a precommit for one block and a later prevote for another naming no polka since): punished as a double sign, at a rate of its own (5%) |
 | false citation | a prevote naming a round in which +2/3 of the power prevoted something else: punished as a forgotten lock, at the same rate |
@@ -58,7 +58,9 @@ and reach +2/3; nodes do not compare it with their own view.
 infraction at height h is accepted when `blockTime(current) - blockTime(h) <=
 maxEvidenceAgeMs`, reading the header of h from the store (a block's, or one a
 state-synced node keeps alone, RPC-SYNC-PROOFS.md section 4.2); evidence for a height
-the store has no header for is rejected. The evidence pool prunes by the same rule.
+the store has no header for is rejected. (An infraction at the height of the block
+itself is timed by that block, and one at the last committed height by the chain
+state, so neither needs the store.) The evidence pool prunes by the same rule.
 Genesis carries the value under `consensus.maxEvidenceAgeMs`; it must equal the
 staking unbonding period, and `init` writes both from one number.
 
@@ -76,12 +78,12 @@ u64 like every other amount; shares are scaled so rounding is negligible (sectio
 
 | type | id | fields | indices |
 |---|---|---|---|
-| validator | 7 | operator (account id), consensusKey (tagged: 1313 B under ML-DSA-44, 34 B under secp256k1), tokens, shares, status (candidate, jailed, tombstoned), jailedUntil (ms), createdHeight | byOperator (unique, authenticated), byConsensusAddress (unique, authenticated; key = sha256(consensusKey)), byPower (non-unique; key = 2^64-1 - tokens, so an ascending scan is descending power) |
-| delegation | 8 | delegator (account id), validator (validator id), shares | byDelegatorValidator (unique, authenticated), byValidator (non-unique) |
-| unbonding | 9 | delegator, validator, tokens, creationHeight, completion (ms) | byCompletion (non-unique), byDelegatorValidator (non-unique), byValidator (non-unique) |
-| redelegation | 10 | delegator, source, destination, tokens (initial), creationHeight, completion (ms) | byCompletion (non-unique), byDelegatorSourceDestination (non-unique), byDelegatorDestination (non-unique), bySource (non-unique) |
+| validator | 7 | operator (account id), consensusKey (tagged: 1313 B under ML-DSA-44, 34 B under secp256k1), tokens, shares, status (candidate, jailed, tombstoned), jailedUntil (ms), createdHeight | byOperator (unique, authenticated), byConsensusAddress (unique, authenticated; key = sha256(consensusKey)), byPower (non-unique, authenticated; key = 2^64-1 - tokens, so an ascending scan is descending power) |
+| delegation | 8 | delegator (account id), validator (validator id), shares | byDelegatorValidator (unique, authenticated), byValidator (non-unique, authenticated) |
+| unbonding | 9 | delegator, validator, tokens, creationHeight, completion (ms) | byCompletion, byDelegatorValidator, byValidator (all non-unique, authenticated) |
+| redelegation | 10 | delegator, source, destination, tokens (the amount moved, less what slashes of the source have cut from it), creationHeight, completion (ms) | byCompletion, byDelegatorSourceDestination, byDelegatorDestination, bySource (all non-unique, authenticated) |
 | signingInfo | 11 | validator, bitmap (downtimeWindow bits, circular), cursor, missed, tracked (blocks observed so far) | byValidator (unique) |
-| proposal | 12 | proposer (validator id), parameters (fee schedule and the full staking set, section 4), signals (validator ids, sorted, at most 1 000), created (ms), expiration (ms) | byExpiration (non-unique) |
+| proposal | 12 | proposer (validator id), parameters (fee schedule and the full staking set, section 4), signals (validator ids, sorted, at most 1 000), created (ms), expiration (ms) | byExpiration (non-unique, authenticated) |
 | validatorKey | 13 | address (sha256 of a consensus key), validator | byAddress (unique) |
 
 A `validatorKey` record is written for every consensus key a validator has ever held,
@@ -112,7 +114,11 @@ and a node running this application then follows `staking.unbondingPeriodMs`
 The operator's own stake is an ordinary `delegation` object; commission shares are
 minted into it. A validator exists only with its operator's delegation present:
 `minSelfBond` is at least 1, undelegation and redelegation refuse to take the
-operator below it, and only a tombstone empties the delegation.
+operator below it, and a tombstone empties the delegation. One other thing can: a
+slash that follows stake the operator redelegated into its own validator from one
+since punished is taken from that delegation (section 8, step 6), below `minSelfBond`
+or to nothing if the delegation is worth less than the cut. The validator stays, and
+the next commission makes the delegation again.
 
 ## 4. Parameters
 
@@ -160,9 +166,10 @@ proposal): `maxValidators` 1 to 1 000; `downtimeWindow` 1 to 100 000 blocks;
 A validator holds `tokens` and `shares`. A delegation holds shares. The exchange rate
 is `tokens / shares`. Shares are scaled by `SHARE_SCALE = 1000` on first issue (lowered from
 10^6 so that the largest bond stays within a u64, review finding 7) so that
-integer division loses at most one share's worth per operation, in the validator's
-favour: under a thousandth of a base unit at the opening rate, and still under one
-base unit until rewards have raised the rate past one base unit per share. A
+integer division loses little per operation, in the validator's
+favour: bonding rounds down by less than one share, under a thousandth of a base unit
+at the opening rate and under one base unit until rewards have raised the rate past one
+base unit per share, and unbonding pays whole base units, rounding down by less than one. A
 delegation worth no shares at the current rate is refused rather than rounded to
 nothing.
 
@@ -175,8 +182,9 @@ nothing.
   shares would pass a u64. Add `t` to tokens and the issued amount to shares and to
   the delegation.
 - Unbond `s` shares: release `floor(s * tokens / shares)` tokens; subtract both. A
-  delegation whose shares reach zero is removed, unless it is the operator's, which
-  may only reach zero when the validator is tombstoned.
+  delegation whose shares reach zero is removed. The operations keep the operator's
+  above `minSelfBond`; it reaches zero when the validator is tombstoned, or when a
+  slash following stake redelegated into it takes all of it (section 3).
 - Reward `r` to a validator with commission `c = floor(r * commissionBps / 10000)`:
   add `r` to tokens, then mint `x = floor(c * shares / (tokens - c))` shares into the
   operator's delegation (tokens here is the value after adding r). Beside what its
@@ -248,8 +256,10 @@ Before transactions, in this order:
    split among the validators whose consensus addresses are in `lastCommitSigners`,
    pro rata to their `tokens` as they stood before the bonus was paid (base units,
    not whole-token power), rounding dust staying in the pool. Tombstoned validators
-   and validators with no tokens are skipped, and a bonus or share that cannot be
-   paid stays in the pool. Each validator's share goes through the reward rule of
+   and validators with no tokens are left out of the signers' shares, and a bonus or
+   share that cannot be paid stays in the pool (a proposer's bonus is not paid to a
+   tombstoned validator or to one with shares over no tokens; a proposer with neither
+   tokens nor shares is paid, the whole of it to its operator). Each validator's share goes through the reward rule of
    section 5. Nothing is paid at height 1.
 5. Downtime. For every validator expected to have signed the previous commit (the set
    for height H-1, computed at the end of block H-3 when this block is H, kept in
@@ -270,8 +280,9 @@ Before transactions, in this order:
    if that delegation runs out or the destination has no tokens, the rest from the delegator's unbonding entries at the
    destination with `creationHeight >=` the redelegation's, in index order, so that
    undelegating at the destination does not escape it); set status tombstoned; convert every delegation into an unbonding
-   entry maturing at `time + unbondingPeriodMs` (one per delegation, ignoring
-   maxEntries); the validator keeps `tokens = 0`, `shares = 0`, and its signing
+   entry maturing at `time + unbondingPeriodMs` (one per delegation worth at least one
+   base unit, ignoring maxEntries; a delegation worth nothing is removed without one,
+   and what rounding leaves goes to the pool); the validator keeps `tokens = 0`, `shares = 0`, and its signing
    record is removed.
 7. Mature queues, last, so that stake whose liability ends in this very block is
    still there to be slashed by the evidence the block carries: every unbonding
@@ -356,10 +367,18 @@ the heights it no longer holds.
 
 Authenticated unique indices: validator byOperator, validator byConsensusAddress,
 delegation byDelegatorValidator, in addition to account byName and asset bySymbol.
+The non-unique indices of the staking types are authenticated as well (section 3's
+table): validator byPower, delegation byValidator, and every index of the unbonding
+entries, the redelegation entries and the proposals. An entry of a non-unique index
+is its key followed by the object's id, and the proof is of that one entry: that a
+validator has a given delegation or unbonding entry, or has not, can be proven; that
+a list of them is complete cannot.
 The light client can therefore prove which validator stands behind a consensus
 address that is a validator's current one, and prove the existence or absence of a
-delegation. The value proven is the validator's id; the operator and the bonded
-amount are in the validator object, which takes an object proof of its own. A key
+delegation. The value proven is the id of the object the key leads to, the validator's
+for an address and the delegation's for a delegator and validator; the operator and the
+bonded amount are in the validator object and the shares in the delegation object, each
+of which takes an object proof of its own. A key
 that was rotated away is not covered: byConsensusAddress holds only the current
 address, so for the two heights the engine's set still signs with the old key the
 proof for that address is one of absence, and the `validatorKey` record that leads
@@ -369,7 +388,9 @@ The application makes the proofs with `CoreApp.proveValidatorAddress(address, he
 and `CoreApp.proveDelegation(delegator, validator, height)`. Over RPC, `validator`
 (by `operator` or `id`) and `delegation` (by `delegator` and `validator`) answer as
 of a `height`, `delegation` returns the proof with `prove`, and `key` looks up and
-proves a key of any authenticated index, a validator by consensus address among them.
+proves a key of any authenticated index, a validator by consensus address among them;
+for a non-unique index the key given is the entry, the index key followed by the eight
+bytes of the object's id.
 
 CLI additions: `create-validator <nodeDir> <operator> <selfBond>` (uses the node's own
 validator key from its `config.json` and the operator's key in the keystore),
@@ -388,10 +409,10 @@ registers an account, pays one, or delegates 500 tokens to a validator in turn.
 ## 11. Invariants to test
 
 - Supply: `currentSupply = sum(balances) + sum(validator.tokens) + sum(unbonding.tokens) + communityPool` at every height; the mint is the only increase and nothing is burned.
-- Per validator: `shares > 0` iff `tokens > 0`, except after a slash of the whole stake, which leaves shares over no tokens (section 5); delegation shares sum to `shares`, the operator's delegation exists unless tombstoned.
+- Per validator: `shares > 0` iff `tokens > 0`, except after a slash of the whole stake, which leaves shares over no tokens (section 5); delegation shares sum to `shares`, the operator's delegation exists unless tombstoned or taken whole by a slash that followed redelegated stake into it (section 3).
 - `dynamic.bonded = sum(validator.tokens over candidates and jailed)`.
 - Active set: at most maxValidators, all candidates with power >= 1 and self-bond met, no higher-power candidate excluded.
-- Pending entries per pair never exceed maxEntries except forced tombstone conversions.
+- No entry is made beyond maxEntries pending per (delegator, validator) or (delegator, source, destination), except by the forced conversions of a tombstone; entries made under a higher cap stay when a proposal lowers it.
 - A proof by consensus address at height H names the validator whose stake at H set its power in `dynamic.active` at H, the set the engine applies at H+2 (header H+1's `nextValidatorsHash`); the set that signs H+1 was computed at H-1.
 
 ## 12. Test plan

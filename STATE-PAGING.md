@@ -1128,7 +1128,7 @@ records of those heights all the while. The database now reads them.
   the version before it differs by, so each older version is built against the next newer
   one from that commit's records alone, newest first, sharing every subtree the commit
   left alone, and every node taken from a record must hash to what its parent says. A
-  dropped tree builds nothing: it takes the root hashes and keeps the records as its own
+  dropped tree builds nothing and so checks nothing of that: it takes the root hashes and keeps the records as its own
   history. The cost is the nodes the window's blocks changed, not every key.
   `restoreIndexVersions()` returns `'records'` when it did this, `'none'` when there is no
   past version to restore, and `'replay'` when it fell back on `rebuildIndexVersions`,

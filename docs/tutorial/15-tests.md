@@ -1,7 +1,7 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: thirty-two files, 322 cases, about 11,300 lines counting the shared harness
+`test/**/*.test.ts`: thirty-two files, 322 cases, about 11,400 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
@@ -28,7 +28,7 @@ validator's lock, from the round a prevote signs to a forgotten lock punished on
 the external review and the later cases of the same kind, `review2` five more that each
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
-by title at the end of the suites, `review4` the ten cases for the items the first review
+by title at the end of the suites, `review4` thirteen cases, most for the items the first review
 noted and left, and the four `review5` files 75 cases for failures and unusual callers at the
 edges of every layer: `review5-net` the peer layer, sync, consensus intake and the mempool,
 `review5-node` the node, the executor and the block store, `review5-app` the application, the
@@ -38,7 +38,7 @@ below.
 
 ## The harness
 
-Everything the suites share lives in `test/helpers.ts`, 162 lines. It exports two constants,
+Everything the suites share lives in `test/helpers.ts`, 170 lines. It exports two constants,
 seven functions, two interfaces and one shared verifier.
 
 ### `FAST_TIMEOUTS`
@@ -481,7 +481,7 @@ running on the second one. The first four are unit tests under `describe('signat
 the fifth runs a testnet under `describe('a chain on secp256k1')`, with an `RpcServer` stopped
 before the network in `afterEach`. These, a few regression cases in `test/review3.test.ts` (off-curve secp256k1 keys, a restart on
 a secp256k1 genesis, a handshake between nodes of the two schemes, a keystore holding both) and
-the hedged signature in `test/review.test.ts` are the cases that name a scheme explicitly;
+the hedged signature in `test/review.test.ts`, with `test/review5-app.test.ts`'s validator key of another scheme than the set's, are the cases that name a scheme explicitly;
 everything else in the suite follows `DEFAULT_SCHEME`.
 
 **`it('signs and verifies under each scheme, with tagged keys and signatures that tell them apart')`**.
@@ -1085,8 +1085,9 @@ within 3 s `a` has no peers, because the idle timeout of 1,000 ms expired withou
 
 **`it('handshakes over real sockets and delivers framed messages')`** (describe `p2p over TCP`).
 Two `TcpTransport` networks on `127.0.0.1:38881` and `38882`; they handshake, `b` sends a
-status to `a`, `a` receives 42, and `b` knows `a`'s height 3. The only test in the suite that
-opens real sockets for the p2p layer.
+status to `a`, `a` receives 42, and `b` knows `a`'s height 3. The one case that checks a handshake and
+a framed message over real p2p sockets (`review5-net` dials a TCP address and `review5-rpc`
+starts a whole node through the CLI).
 
 ### test/consensus.test.ts
 
@@ -1785,7 +1786,8 @@ infraction height) ends with a block whose misbehaviour entry has the kind `amne
 validator is tombstoned with no tokens and power 0, the entry that left after the infraction
 has lost a fifth, the delegators' forced entries hold at most four fifths of the stake and no
 less than that by a token, and the pool grew by a fifth of it. Evidence of the other kind for
-the same validator a block later moves less than a token, the block reward: a tombstoned
+the same validator a block later moves the pool by less than a token, which is all the
+test asks (the fixture pays no reward and mints nothing): a tombstoned
 validator is punished once. The supply balances, and a genesis with the rate at 10,001 is
 refused (`/amnesiaSlashBps must be 0 to 10000/`).
 
@@ -2766,9 +2768,9 @@ stray value cannot stop a node from starting".
 
 ### test/review4.test.ts
 
-Ten tests, nine for the thirteen items the first review noted and left (REVIEW-2026-10-28.md,
-"Fourth pass: the judgement calls") and one added when the transaction index was put in
-segments, listed by group and title with what each sets up and
+Thirteen tests, for the thirteen items the first review noted and left (REVIEW-2026-10-28.md,
+"Fourth pass: the judgement calls") and for the transaction index as it was put in
+segments (six of them), listed by group and title with what each sets up and
 asserts.
 
 `state queries at a height, and a batch that pays for its calls`, one case on a testnet with an

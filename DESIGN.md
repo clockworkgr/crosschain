@@ -45,7 +45,9 @@ Principle: as simple as possible, borrowing proven ideas from other chains.
   A validator that names a later round falsely to avoid that is not counted, and is
   convicted of the false citation where the prevotes of that round allow it.
 - **Double-sign protection:** every validator persists last signed (height, round, step)
-  to disk *before* broadcasting any vote. Non-negotiable. The same record holds the
+  to disk *before* broadcasting any vote. Non-negotiable. (A node with a data directory
+  keeps the record in a file there; one without, as in tests, keeps it in memory, and
+  `NodeConfig.signState` hands the node a store of the embedder's choosing.) The same record holds the
   validator's lock (the block it last precommitted in the height, and the round), so a
   restart in the middle of a height takes the lock up again, and the signer itself refuses
   a prevote for another block that names no majority from the lock's round on.
@@ -172,7 +174,9 @@ transactions checked at once no more are let through and applied than the pool h
     what it announces after it reconnects is asked for again. Committed blocks are announced by a
     status message (height) and pulled through block sync.
   - **Direct push (no round trip):** consensus proposals and votes. Dedup by
-    (height, round, validator, vote type). Inventory would add a round trip to each of
+    (height, round, validator, vote type) and what the vote says (block hash and
+    `polRound`): a vote for the same place that says something else is verified, and is
+    evidence. Inventory would add a round trip to each of
     the three Tendermint phases.
   - **Re-send, because a flooded message is sent once:** a peer that was not connected
     at that moment, or was briefly partitioned, never gets it, and one missing vote can
@@ -181,7 +185,9 @@ transactions checked at once no more are let through and applied than the pool h
     (the polka a peer needs before it can accept a re-proposal); the proposer of the
     current round re-sends that round's proposal, whether it built the block or
     re-proposed another validator's; and a newly connected peer is handed every
-    proposal and vote held for the current height plus the ids of pending evidence.
+    valid proposal held for the current height that came signed (not a block that was
+    fetched) and the vote held in each place of its vote sets (not the other vote of a
+    double signer, kept beside them for evidence) plus the ids of pending evidence.
     Receivers drop duplicates before verifying. This replaces Tendermint's per-peer
     state tracking with something far simpler at the cost of some bandwidth.
 - **Block sync:** no fork-point synopsis. Lagging node requests blocks from height H+1.
@@ -376,7 +382,7 @@ transactions checked at once no more are let through and applied than the pool h
   deleted with the block of its height when the block is pruned. A set by hash goes
   once the heights that carried its hash are pruned and no header still held names it,
   as `validatorsHash` or `nextValidatorsHash`, and the current state does not use it. The double-sign
-  guard (last signed height/round/step/bytes/signature) is its own file, written
+  guard (last signed height/round/step/bytes/signature, and the lock) is its own file, written
   temp-fsync-rename before any vote is broadcast. The test app keeps a JSON snapshot of
   its entries and its validator set.
 - **Persistence order on commit:** app.finalizeBlock (in memory: begin-block steps,
@@ -684,7 +690,8 @@ left out (`paged`), and `rebuildWhatFits` rebuilds the tiers later if room appea
   signature bytes that verified, so a second valid signature by the same key over the
   same body is verified and cached on its own. CheckTx verifies on mempool admission;
   FinalizeBlock consults the cache and verifies only what it has not seen, in one
-  batch. The cached fact is pure crypto and never goes stale; authority thresholds,
+  batch (and, one by one as it applies them, the signatures whose keys an earlier
+  transaction of the same block set). The cached fact is pure crypto and never goes stale; authority thresholds,
   which depend on state, are rechecked every time. The cache holds 20 000 bodies and
   at most 40,000 signatures across them, four per signer and body, and evicts the
   oldest.
@@ -920,7 +927,8 @@ ids make adding one unusually easy.
   the trusted header named; a later header is accepted when +2/3 of its own set
   signed it and more than a third of the set the trusted header promised for its next
   height is among the signers; otherwise it bisects. Trust expires after a trusting
-  period, and headers may not come from the future beyond a clock drift. A state or
+  period (checked when trust is established and each time it is moved forward, not
+  when a header already trusted is walked back from or a query is checked against it), and headers may not come from the future beyond a clock drift. A state or
   key query is checked by verifying the header after the proven height, comparing it
   with the one the node sent, and checking the proof against its app hash. A height
   before the trusted one is reached backwards: each header must hash to what the one
@@ -1105,7 +1113,7 @@ The first real application on the object database, BitShares style.
   rare, and it will be revisited with the fee market if there ever is one.
 - **Applying a block:** undo the pending session; open a block session; prune expired
   tx ids; run the staking begin-block steps (STAKING.md section 7); verify every
-  uncached signature in one batch on the worker pool (a cache entry says only that a
+  uncached signature whose key the state before the block holds in one batch on the worker pool (a cache entry says only that a
   signer signed a body, which no state change can invalidate); then for each
   transaction in order, resolve the signers' keys against the state as it stands at
   that point, check the thresholds and apply in its own session; run end-block (the
@@ -1219,8 +1227,9 @@ sign. A header therefore carries one more hash, `prioritiesHash`:
 the hash of the priorities and proposer of the set of its height, then of the set of the
 next. Block validation checks it against the state like the two set hashes, and a
 joining node takes the sets of H+1 and H+2 only as a pair header H+1 commits to, and
-the set of H only as header H commits to it with the set of H+1; a peer serving others
-is charged and the next one asked.
+the set of H only as header H commits to it with the set of H+1; a peer whose sets have
+the right members and powers and other priorities is charged and the next one asked (one
+whose set does not hash to the header's set hash is passed over without a charge).
 
 ## 10. Implementation status (2026-11-19)
 
@@ -1329,9 +1338,12 @@ Known simplifications, all deliberate and all revisitable:
   validator if that is more; the rest wait, up to 1,024 of one peer or 64 for each validator (32,768 at most), and are verified as
   the budget allows, and a peer whose votes find no room to wait is charged 10 points
   for the second. Proposals are not counted this way: a bad
-  signature costs 20 points, and a proposal for a round that has one costs a
-  verification only if it says something else. A vote more than 1,000 rounds ahead
-  of the node's round is dropped before its signature is verified.
+  signature costs 20 points, and a proposal for a round whose signed proposal the node holds costs a
+  verification only if it says something else (a block that was fetched fills the
+  round without a signed proposal, so the proposal for it is still verified once). A vote
+  for the height being decided or the next that is more than 1,000 rounds ahead
+  of the node's round is dropped before its signature is verified; a vote for a kept
+  past height is dropped beyond the last round that height reached.
 - Proposals for the next height are held until it starts, 8 in all. One is held only
   if it is fresh (no proof of lock), its round is within 1,000, its block is of that
   height and its signature verifies with the key of the validator, in the next
@@ -1419,8 +1431,10 @@ done about each finding.
   carries such evidence.
 - A store write that fails under the application aborts the block's transaction and
   leaves the application's memory a block ahead; a failure while a block's root is
-  taken leaves changes that cannot be undone. Either way the application refuses to go
-  on and the node needs a restart, which finds the state of the block before.
+  taken leaves changes that cannot be undone. The first halts consensus on the node,
+  the block still waiting to be written; the second makes the application refuse every
+  check and block. Either way the node needs a restart, which finds the state of the
+  block before.
 - An authority is checked for keys that could satisfy it when it is set. A later
   change to a member account (`accountUpdate`) can still leave another account's authority with no keys
   that reach its threshold, or needing more than the 16 signatures a transaction
@@ -1433,15 +1447,16 @@ done about each finding.
 - In a store pruned by an earlier build the validator sets by height below the lowest
   block stay, and so do the sets by hash that only heights pruned then carried.
 - `changedSince()` does not see an object removed outside a session since the last
-  root. The node never writes outside a session.
+  root. The node writes outside a session only at genesis, before the first root.
 - Index roots inside a type leaf are the SMT roots at that height; the B+ tree indices used for lookups are not authenticated.
 - The version history window is trimmed in memory as the heap fills: from `warn` until
   the window has grown back, proofs and queries at heights older than the last two are
   read from the history records in the store, which is slower than from memory, the more
   so the further back the height, since every later record is scanned and nothing is
   cached: 0.1 to 0.35 ms per height back, 9 to 36 ms at the oldest of a hundred at 192,000 accounts, against a tenth of a millisecond or less from memory (docs/benchmarks.md 4.13). A store written before the
-  records carried the sparse tree nodes cannot prove such a height until those records
-  have aged out of the window (100 blocks by default). The recent transaction ids are
+  records carried the sparse tree nodes cannot prove a key, or an object of a type with
+  an authenticated index, at such a height until those records
+  have aged out of the window (100 blocks by default); an object of a type without one is still proven. The recent transaction ids are
   still growth no dial sheds.
 - The mempool is bounded by count, 10,000 transactions, not by bytes; each may be up to
   1 MiB, or four bytes under half the block size where that is less. Under pressure the node lowers the count it admits up to (a half at `warn`, a
