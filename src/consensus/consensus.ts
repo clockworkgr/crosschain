@@ -46,7 +46,7 @@ import { blockDataBytes, blockHash, commitHash, evidenceHash, type Block, type C
 import { txsRoot } from '../types/txproof.ts';
 import { evidenceHeight, evidenceKey, evidenceValidator, isAmnesia, makeDuplicateProposalEvidence, makeDuplicateVoteEvidence, speaksAgainst, type Evidence, type ProposalHead } from '../types/evidence.ts';
 import { zeroSignature } from '../crypto/keys.ts';
-import { proposalSignBytes, type Proposal } from '../types/proposal.ts';
+import { proposalHeadSignBytes, proposalSignBytes, type Proposal } from '../types/proposal.ts';
 import type { ChainState } from '../types/state.ts';
 import { prioritiesHash, type Validator, type ValidatorSet } from '../types/validator.ts';
 import { VoteType, blockHashKey, encodeVote, sameVoteContent, voteSignBytes, voteTypeName, type Vote } from '../types/vote.ts';
@@ -101,6 +101,8 @@ const MAX_NEXT_HEIGHT_PROPOSALS_PER_VALIDATOR = 2;
  * that signs twice, or forgets a lock, may show one node the second signature only once the height is decided.
  */
 export const PAST_HEIGHTS_KEPT = 16;
+/** Proposal heads in signature verification at one time; one over that is dropped. */
+export const MAX_HEADS_VERIFYING = 64;
 
 /**
  * Votes of one peer whose signatures a node verifies in a second: this many, or eight for each validator if that
@@ -168,6 +170,13 @@ export interface ConsensusDeps {
   evidencePool: EvidencePool;
   broadcastProposal(p: Proposal, exceptPeer: string | null): void;
   broadcastVote(v: Vote, exceptPeer: string | null): void;
+  /** What a round's proposer signed, for a proposal this node does not send on itself. */
+  broadcastProposalHead?(height: bigint, round: number, head: ProposalHead, exceptPeer: string | null): void;
+  /**
+   * Why this validator is not to sign for now, or null. Nothing else changes while it is held: the state machine
+   * goes through its steps as that of a node without a key, and decides on what the others sign.
+   */
+  signingHeld?(): string | null;
   timeouts?: Partial<ConsensusTimeouts>;
   limits?: Partial<ValidationLimits>;
   now?: () => bigint;
@@ -216,6 +225,8 @@ export class Consensus {
    * `proposals`, which holds what the round decides on and may be a block fetched without a signature.
    */
   private heads = new Map<number, ProposalHead>();
+  /** Proposal heads whose signature is being verified, by what they say and the signature. */
+  private readonly verifyingHeads = new Set<string>();
   /** Rounds of this height whose proposer was already reported for two proposals. */
   private proposedTwice = new Set<number>();
   private readonly past = new Map<bigint, PastHeight>();
@@ -289,6 +300,27 @@ export class Consensus {
     this.startHeight();
   }
 
+  /**
+   * Signing was held and is not any more. Nothing of this round was signed, so the round is begun again as one in
+   * which this validator may sign: it proposes if the round is its own, and prevotes and precommits by what the
+   * round holds already. A validator on which the others wait, or one alone, would otherwise sit in a step it
+   * passed without its vote until somebody else moved the round on.
+   *
+   * What the state machine did in the round without a signature is taken back first. A lock it took on a polka it
+   * could not precommit is no lock: the lock is what the private validator wrote, as when a height starts. And the
+   * round's polka and its two timeouts are due again, since each was acted on once, without a vote.
+   */
+  signingResumed(): void {
+    if (!this.running || this.decided || !this.isValidator) return;
+    if (this.d.getState().lastHeight + 1n !== this.height) return; // block sync is ahead of us; the restart begins the height
+    const lock = this.d.privValidator?.lockAt(this.height) ?? null;
+    this.lockedHash = lock ? lock.blockHash : null;
+    this.lockedRound = lock ? lock.round : -1;
+    this.polkaHandled.delete(this.round);
+    this.prevoteTimeoutScheduled.delete(this.round);
+    this.precommitTimeoutScheduled.delete(this.round);
+    this.startRound(this.round);
+  }
 
   // ------------------------------------------------------------------ heights
 
@@ -381,6 +413,12 @@ export class Consensus {
 
   private propose(): void {
     const pv = this.d.privValidator!;
+    const held = this.d.signingHeld?.() ?? null;
+    if (held) {
+      this.log('info', 'not proposing', { h: this.height, r: this.round, why: held });
+      this.schedule('propose', this.timeouts.proposeMs + this.timeouts.proposeDeltaMs * this.round, () => this.onTimeoutPropose(this.height, this.round));
+      return;
+    }
     const block = this.validBlock ?? this.createBlock();
     if (!block) {
       this.log('warn', 'cannot build a block (no last commit yet); skipping proposal');
@@ -500,8 +538,8 @@ export class Consensus {
     // A proposal for a round that has one is looked at only for what its proposer signed: nothing, if that is known
     // and this says the same, or if the proposer was already reported for signing two.
     const taken = this.proposals.has(p.round);
-    const head = this.heads.get(p.round);
-    if (taken && head && (this.proposedTwice.has(p.round) || sameProposal(head, p))) return;
+    const held = this.heads.get(p.round);
+    if (taken && held && (this.proposedTwice.has(p.round) || sameProposal(held, p))) return;
     if (p.polRound < -1 || p.polRound >= p.round) return;
     if (p.block.header.height !== p.height) return;
 
@@ -524,15 +562,17 @@ export class Consensus {
     if (!this.running) return;
     // Whatever becomes of the proposal, its proposer signed it. The height may have moved on meanwhile, and then
     // it is held against what is kept of that height.
-    this.signedProposal(p);
-    if (taken || p.height !== this.height) return;
+    // What it signed is sent on as well: as the proposal below if the round takes it, and without the block if not.
+    const head: ProposalHead = { polRound: p.polRound, blockHash: blockHash(p.block), signature: p.signature };
+    const relayHead = this.recordHead(p.height, p.round, head) ? () => this.d.broadcastProposalHead?.(p.height, p.round, head, fromPeer) : () => {};
+    if (taken || p.height !== this.height) return relayHead();
 
     // The signature covers the header; a relay can pair it with another body. That is a corrupt message, not
     // the round's proposal: drop it without recording the round, so the real one can still arrive.
     if (!bodyMatchesHeader(p.block)) {
       this.log('warn', 'proposal body does not match its header', { h: p.height, r: p.round });
       if (fromPeer) this.d.scorePeer?.(fromPeer, 20, 'proposal body mismatch');
-      return;
+      return relayHead();
     }
 
     // Validity of the block itself.
@@ -544,12 +584,15 @@ export class Consensus {
     if (!invalid) invalid = await verifyBlockSignatures(this.d.chainId, st, p.block, this.d.verifier, this.d.validatorSetAtHeight);
 
     // State may have moved while we were verifying.
-    if (!this.running || p.height !== this.height || this.proposals.has(p.round)) return;
+    if (!this.running) return;
+    if (p.height !== this.height || this.proposals.has(p.round)) return relayHead();
 
-    const hash = blockHash(p.block);
+    const hash = head.blockHash;
     this.proposals.set(p.round, { proposal: p, valid: invalid === null, hash });
-    if (invalid) this.log('warn', 'invalid proposal', { h: p.height, r: p.round, reason: invalid });
-    else {
+    if (invalid) {
+      this.log('warn', 'invalid proposal', { h: p.height, r: p.round, reason: invalid });
+      relayHead();
+    } else {
       this.log('debug', 'got proposal', { h: p.height, r: p.round, hash });
       this.d.broadcastProposal(p, fromPeer);
     }
@@ -557,30 +600,69 @@ export class Consensus {
   }
 
   /**
-   * A proposal whose signature verified under the proposer of its round, of this height or a kept one. The first
+   * What the proposer of a round signed, by a signature that verified, for this height or a kept one. The first
    * for a round is what the proposer signed; another that says something else is the second half of the proof
-   * that it signed twice.
+   * that it signed twice. True if this is the first held for its round.
+   *
+   * A node sends the first on to its peers, as the proposal if its round takes it and as the head alone if not
+   * (the block is invalid, the round had a fetched block, the height moved on). So of two nodes that were each
+   * sent a different proposal, one next to the other hears what the other holds, and the proof is made there.
    */
-  private signedProposal(p: Proposal): void {
-    const kept = p.height === this.height ? null : this.past.get(p.height);
-    if (p.height !== this.height && (!kept || p.round > kept.maxRound)) return;
+  private recordHead(height: bigint, round: number, second: ProposalHead): boolean {
+    const kept = height === this.height ? null : this.past.get(height);
+    if (height !== this.height && (!kept || round > kept.maxRound)) return false;
     const [heads, reported, validators] = kept ? [kept.proposals, kept.proposedTwice, kept.validators] : [this.heads, this.proposedTwice, this.validators];
-    const second = { polRound: p.polRound, blockHash: blockHash(p.block), signature: p.signature };
-    const first = heads.get(p.round);
+    const first = heads.get(round);
     if (!first) {
-      heads.set(p.round, second);
-      return;
+      heads.set(round, second);
+      return true;
     }
-    if (reported.has(p.round) || sameProposal(first, p)) return;
+    if (reported.has(round) || sameHead(first, second)) return false;
     // Marked once the pool holds the proof or it waits for room there.
-    if (this.report(makeDuplicateProposalEvidence(p.height, p.round, validators.indexOf(proposerOf(validators, p.round).address), first, second))) reported.add(p.round);
+    if (this.report(makeDuplicateProposalEvidence(height, round, validators.indexOf(proposerOf(validators, round).address), first, second))) reported.add(round);
+    return false;
   }
 
-  /** A proposal for a kept height: nothing to decide any more, but beside the one its proposer is known to have signed it may show two. */
+  /**
+   * A proposal's head without its block, sent on by a peer that held it and did not send the proposal. Nothing is
+   * decided on it. It is verified only where it can tell something: for a round of this height within reach or a
+   * round a kept height reached, and not if it says what is held for the round or the proposer was already reported.
+   */
+  async handleProposalHead(height: bigint, round: number, head: ProposalHead, fromPeer: string | null): Promise<void> {
+    if (!this.running || !this.hvs) return;
+    if (head.polRound < -1 || head.polRound >= round) return;
+    const kept = height === this.height ? null : this.past.get(height);
+    if (height !== this.height && !kept) return;
+    if (kept ? round > kept.maxRound : round > this.round + MAX_ROUND_AHEAD) return;
+    const first = (kept ? kept.proposals : this.heads).get(round);
+    if ((kept ? kept.proposedTwice : this.proposedTwice).has(round) || (first && sameHead(first, head))) return;
+    // One signed head is verified once however many peers send it at once, and no more than a fixed number are in
+    // verification together: a head over that is dropped, and comes again from whoever holds it when a peer connects.
+    const key = `${height}/${round}/${head.polRound}/${toHex(head.blockHash)}/${toHex(sha256(head.signature))}`;
+    if (this.verifyingHeads.has(key) || this.verifyingHeads.size >= MAX_HEADS_VERIFYING) return;
+    this.verifyingHeads.add(key);
+    let ok: boolean;
+    try {
+      const proposer = kept ? proposerOf(kept.validators, round) : this.validators.byAddress(this.proposerAt(round))!;
+      ok = await this.d.verifier.verifyOne({ sig: head.signature, msg: proposalHeadSignBytes(this.d.chainId, height, round, head.polRound, head.blockHash), publicKey: proposer.publicKey, context: this.proposalCtx });
+    } finally {
+      this.verifyingHeads.delete(key);
+    }
+    if (!ok) {
+      if (fromPeer) this.d.scorePeer?.(fromPeer, 20, 'bad proposal signature');
+      return;
+    }
+    if (this.running && this.recordHead(height, round, head)) this.d.broadcastProposalHead?.(height, round, head, fromPeer);
+  }
+
+  /**
+   * A proposal for a kept height: nothing to decide any more, but what its proposer signed is one half of a proof
+   * if something else is held for the round, and the first half, to send on, if nothing is.
+   */
   private async handlePastProposal(p: Proposal, fromPeer: string | null): Promise<void> {
     const kept = this.past.get(p.height);
     const first = kept?.proposals.get(p.round);
-    if (!kept || !first || kept.proposedTwice.has(p.round) || sameProposal(first, p)) return;
+    if (!kept || p.round > kept.maxRound || kept.proposedTwice.has(p.round) || (first && sameProposal(first, p))) return;
     if (p.polRound < -1 || p.polRound >= p.round || p.block.header.height !== p.height) return;
     // The proposer of the round in that height's set; the round is one the height reached, so the walk is bounded.
     const ok = await this.d.verifier.verifyOne({ sig: p.signature, msg: proposalSignBytes(this.d.chainId, p), publicKey: proposerOf(kept.validators, p.round).publicKey, context: this.proposalCtx });
@@ -588,7 +670,8 @@ export class Consensus {
       if (fromPeer) this.d.scorePeer?.(fromPeer, 20, 'bad proposal signature');
       return;
     }
-    if (this.running) this.signedProposal(p);
+    const head: ProposalHead = { polRound: p.polRound, blockHash: blockHash(p.block), signature: p.signature };
+    if (this.running && this.recordHead(p.height, p.round, head)) this.d.broadcastProposalHead?.(p.height, p.round, head, fromPeer);
   }
 
   /**
@@ -789,6 +872,11 @@ export class Consensus {
     if (!pv) return;
     const idx = this.validators.indexOf(pv.address);
     if (idx < 0) return;
+    const held = this.d.signingHeld?.() ?? null;
+    if (held) {
+      this.log('debug', 'not voting', { h: this.height, r: this.round, why: held });
+      return;
+    }
     const unsigned = { type, height: this.height, round: this.round, blockHash: hash, polRound, validatorIndex: idx };
     let signature: Uint8Array;
     try {
@@ -895,10 +983,13 @@ export class Consensus {
   }
 
   /** Everything held for the current height, to hand a newly connected peer. */
-  messagesForPeer(): { proposals: Proposal[]; votes: Vote[] } {
-    if (!this.running || !this.hvs) return { proposals: [], votes: [] };
+  messagesForPeer(): { proposals: Proposal[]; heads: { round: number; head: ProposalHead }[]; votes: Vote[] } {
+    if (!this.running || !this.hvs) return { proposals: [], heads: [], votes: [] };
     const proposals = [...this.proposals.values()].filter((p) => p.valid && !p.fetched).map((p) => p.proposal);
-    return { proposals, votes: this.hvs.allVotes() };
+    // What a proposer signed for a round whose proposal is not among those: the peer may hold another.
+    const sent = new Set(proposals.map((p) => p.round));
+    const heads = [...this.heads].filter(([round]) => !sent.has(round)).map(([round, head]) => ({ round, head }));
+    return { proposals, heads, votes: this.hvs.allVotes() };
   }
 
   // ----------------------------------------------------------------- timeouts
@@ -1104,6 +1195,10 @@ export class Consensus {
 /** What tells one signed vote from every other: what it says, whose it is, and the signature, by its hash. */
 function signedVoteKey(v: Vote): string {
   return `${v.height}/${v.round}/${v.type}/${v.validatorIndex}/${blockHashKey(v.blockHash)}/${v.polRound}/${toHex(sha256(v.signature))}`;
+}
+
+function sameHead(a: ProposalHead, b: ProposalHead): boolean {
+  return a.polRound === b.polRound && bytesEqual(a.blockHash, b.blockHash);
 }
 
 /** Whether a proposal says what its proposer is known to have signed for the round: the same block on the same proof-of-lock round. */

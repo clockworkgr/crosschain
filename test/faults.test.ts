@@ -52,6 +52,9 @@ function machine(verify: Verifier = verifier) {
   let synced: Commit | null = null;
   const clock = { now: BigInt(Date.now()) };
   const scored: { peer: string; points: number; reason: string }[] = [];
+  const hold: { why: string | null } = { why: null };
+  const pv = new PrivValidator(mine, new MemorySignStateStore(), CHAIN);
+  const sent: { proposals: Proposal[]; heads: { height: bigint; round: number; head: ProposalHead; except: string | null }[] } = { proposals: [], heads: [] };
   const state = genesisState({ chainId: CHAIN, genesisTime: 1n, signatureScheme: schemeName(DEFAULT_SCHEME), validators: keys.map((k, i) => ({ publicKey: k.publicKey, power: i === 0 ? 1n : 10n })), appState: new Uint8Array(0) }, new Uint8Array(32));
   const set = state.validators;
   const pool = new EvidencePool();
@@ -66,11 +69,13 @@ function machine(verify: Verifier = verifier) {
     getLastCommit: () => synced,
     validatorSetAtHeight: () => set,
     reapTxs: () => [],
-    privValidator: new PrivValidator(mine, new MemorySignStateStore(), CHAIN),
+    privValidator: pv,
+    signingHeld: () => hold.why,
     verifier: verify,
     evidencePool: pool,
-    broadcastProposal: () => {},
+    broadcastProposal: (p) => void sent.proposals.push(p),
     broadcastVote: () => {},
+    broadcastProposalHead: (height, round, head, except) => void sent.heads.push({ height, round, head, except }),
     timeouts: { proposeMs: never, prevoteMs: never, precommitMs: never, commitMs: never, gossipMs: never },
     scorePeer: (peer, points, reason) => void scored.push({ peer, points, reason }),
     now: () => clock.now,
@@ -92,7 +97,7 @@ function machine(verify: Verifier = verifier) {
     synced = { height: 1n, round, blockHash: hash, signatures: [] };
     consensus.restart();
   };
-  return { consensus, set, pool, proposerOf, make, propose, vote, sync, clock, scored, me: set.indexOf(mine.address) };
+  return { consensus, set, pool, proposerOf, make, propose, vote, sync, clock, scored, sent, hold, pv, me: set.indexOf(mine.address) };
 }
 
 describe('two proposals for one round', () => {
@@ -176,6 +181,107 @@ describe('two proposals for one round', () => {
       expect(await verifyEvidence(CHAIN, second, m.set, verifier)).toBeNull();
     } finally {
       m.consensus.stop();
+    }
+  });
+
+  it('are found by a node that has one and is sent what was signed of the other, which a node sends on where it does not send the proposal', async () => {
+    const m = machine();
+    try {
+      m.consensus.start();
+      const now = BigInt(Date.now());
+      const headOf = (round: number, b: Block, polRound = -1, by = m.proposerOf(round)) => head(by, 1n, round, polRound, blockHash(b));
+      const [D, E] = [m.make(0, now), m.make(0, now + 1n)];
+      // A proposal the round takes is sent on whole, and nothing beside it.
+      await m.propose(0, D, -1);
+      expect(m.sent.proposals.map((p) => toHex(blockHash(p.block)))).toEqual([toHex(blockHash(D))]);
+      expect(m.sent.heads).toEqual([]);
+      // What a neighbour holds for the round, if it is the same, costs nothing and tells nothing.
+      await m.consensus.handleProposalHead(1n, 0, headOf(0, D), 'peer');
+      expect(m.pool.list()).toEqual([]);
+      // Signed by another than the round's proposer, or of a round it could not name, it is nothing.
+      await m.consensus.handleProposalHead(1n, 0, headOf(0, E, -1, m.proposerOf(1)), 'liar');
+      expect(m.scored).toEqual([{ peer: 'liar', points: 20, reason: 'bad proposal signature' }]);
+      await m.consensus.handleProposalHead(1n, 0, headOf(0, E, 0), 'peer');
+      await m.consensus.handleProposalHead(9n, 0, head(m.proposerOf(0), 9n, 0, -1, blockHash(E)), 'peer');
+      expect(m.pool.list()).toEqual([]);
+      expect(m.scored.length).toBe(1);
+      // The other proposal's head is the second half of the proof, and is not sent further: the evidence is.
+      await m.consensus.handleProposalHead(1n, 0, headOf(0, E), 'peer');
+      const [ev] = m.pool.list() as DuplicateProposalEvidence[];
+      expect(ev).toMatchObject({ kind: 'duplicateProposal', height: 1n, round: 0 });
+      expect([ev!.a.blockHash, ev!.b.blockHash].map(toHex).sort()).toEqual([blockHash(D), blockHash(E)].map(toHex).sort());
+      expect(await verifyEvidence(CHAIN, ev!, m.set, verifier)).toBeNull();
+      expect(m.sent.heads).toEqual([]);
+
+      // A proposal whose block is invalid is not sent on, and the round does not prevote it; what its proposer
+      // signed is sent on, to every peer but the one it came from.
+      const good = m.make(1, now + 2n);
+      const bad: Block = { ...good, header: { ...good.header, appHash: block(9) } };
+      await m.propose(1, bad, -1);
+      expect(m.sent.proposals.length).toBe(1);
+      expect(m.sent.heads).toEqual([{ height: 1n, round: 1, head: headOf(1, bad), except: 'peer' }]);
+      await m.propose(1, bad, -1);
+      expect(m.sent.heads.length).toBe(1);
+      // A neighbour that was sent the valid one learns of the two from that.
+      await m.consensus.handleProposalHead(1n, 1, headOf(1, good), 'peer');
+      expect(m.pool.list().map(evidenceKey).sort()).toEqual([evidenceKey(ev!), `proposal/1/1/${m.set.indexOf(m.proposerOf(1).address)}`].sort());
+
+      // The first thing heard of a round may be a head: it is kept and sent on, and the proposal that comes after
+      // and says something else is the second.
+      const [G, H] = [m.make(2, now + 3n), m.make(2, now + 4n)];
+      await m.consensus.handleProposalHead(1n, 2, headOf(2, G), 'peer');
+      expect(m.sent.heads.slice(1)).toEqual([{ height: 1n, round: 2, head: headOf(2, G), except: 'peer' }]);
+      await m.consensus.handleProposalHead(1n, 2, headOf(2, G), 'other');
+      expect(m.sent.heads.length).toBe(2);
+      await m.propose(2, H, -1);
+      expect(m.pool.list().length).toBe(3);
+      // The round had no proposal yet and H is a valid one, so H is what the round goes on with and what is sent on.
+      expect(m.sent.proposals.map((p) => p.round)).toEqual([0, 2]);
+      // And the proposal that says the same is the round's, sent on whole.
+      const J = m.make(3, now + 5n);
+      await m.consensus.handleProposalHead(1n, 3, headOf(3, J), 'peer');
+      await m.propose(3, J, -1);
+      expect(m.sent.proposals.map((p) => p.round)).toEqual([0, 2, 3]);
+      expect(m.pool.list().length).toBe(3);
+
+      // A peer that connects now is handed the proposals the rounds took and, for a round that took none, the head.
+      const forPeer = m.consensus.messagesForPeer();
+      expect(forPeer.proposals.map((p) => p.round)).toEqual([0, 2, 3]);
+      expect(forPeer.heads).toEqual([{ round: 1, head: headOf(1, bad) }]);
+
+      // Once the height is over, a head is still held against what was kept of it.
+      m.sync(4, blockHash(J));
+      const K = m.make(3, now + 6n);
+      await m.consensus.handleProposalHead(1n, 3, headOf(3, K), 'peer');
+      expect(m.pool.list().length).toBe(4);
+      await m.consensus.handleProposalHead(1n, 5, headOf(5, K), 'peer'); // a round the height never reached
+      await m.propose(5, m.make(5, now + 7n), -1);
+      expect(m.pool.list().length).toBe(4);
+      expect(m.sent.heads.length).toBe(3);
+      // A whole proposal that comes late for a round of it that holds nothing: its head is kept and sent on, and the
+      // head of another is then the second.
+      const [P, Q] = [m.make(4, now + 8n), m.make(4, now + 9n)];
+      await m.propose(4, P, -1);
+      expect(m.sent.heads.slice(3)).toEqual([{ height: 1n, round: 4, head: headOf(4, P), except: 'peer' }]);
+      expect(m.sent.proposals.length).toBe(3);
+      await m.consensus.handleProposalHead(1n, 4, headOf(4, Q), 'peer');
+      expect(m.pool.list().length).toBe(5);
+    } finally {
+      m.consensus.stop();
+    }
+
+    // One head sent by many peers at once is verified once.
+    let verified = 0;
+    const counting: Verifier = { verify: (jobs) => verifier.verify(jobs), close: () => verifier.close(), verifyOne: (job) => (verified++, verifier.verifyOne(job)) };
+    const n = machine(counting);
+    try {
+      n.consensus.start();
+      const h = head(n.proposerOf(0), 1n, 0, -1, blockHash(n.make(0, BigInt(Date.now()))));
+      await Promise.all(['a', 'b', 'c'].map((peer) => n.consensus.handleProposalHead(1n, 0, h, peer)));
+      expect(verified).toBe(1);
+      expect(n.sent.heads.length).toBe(1);
+    } finally {
+      n.consensus.stop();
     }
   });
 
@@ -428,6 +534,38 @@ describe('a prevote on a majority that never was', () => {
       for (const e of n.pool.list()) expect(await verifyEvidence(CHAIN, e, n.set, verifier)).toBeNull();
     } finally {
       n.consensus.stop();
+    }
+  });
+});
+
+describe('a validator whose signing is held', () => {
+  it('goes through the round without a vote, and when it may sign takes its part in the round as it stands, a polka included', async () => {
+    const m = machine();
+    try {
+      m.hold.why = 'held by the test';
+      m.consensus.start();
+      const D = m.make(0, BigInt(Date.now()));
+      await m.propose(0, D, -1);
+      for (const r of [0, 1, 2]) await m.vote(m.proposerOf(r), VoteType.Prevote, 0, blockHash(D));
+      // The state machine saw the proposal and the polka and is where a validator that precommitted would be.
+      expect(m.consensus.status().step).toBe('precommit');
+      expect(m.pv.lastSigned()).toBeNull();
+      expect(m.consensus.messagesForPeer().votes.filter((v) => v.validatorIndex === m.me)).toEqual([]);
+
+      m.hold.why = null;
+      m.consensus.signingResumed();
+      // It prevoted the block on no earlier majority, and precommitted it on the polka it held: the lock is the
+      // one the precommit wrote.
+      const mine = m.consensus.messagesForPeer().votes.filter((v) => v.validatorIndex === m.me);
+      expect(mine.map((v) => [v.type, v.round, v.polRound, toHex(v.blockHash!)])).toEqual([
+        [VoteType.Prevote, 0, -1, toHex(blockHash(D))],
+        [VoteType.Precommit, 0, -1, toHex(blockHash(D))],
+      ]);
+      expect(m.pv.lockAt(1n)).toMatchObject({ round: 0 });
+      expect(m.consensus.lockedRound).toBe(0);
+      expect(m.consensus.status().step).toBe('precommit');
+    } finally {
+      m.consensus.stop();
     }
   });
 });

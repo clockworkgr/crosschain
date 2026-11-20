@@ -266,6 +266,43 @@ describe('staking', () => {
     expect(t.lost).toBeLessThanOrEqual(t.cut);
   });
 
+  it('lets a slash that follows redelegated stake take an operator below the self-bond, and keeps its validator out of the set until the operator delegates again', async () => {
+    const app = makeApp(makeGenesis(PARAMS, [0, 1, 2], [200, 100, 100]));
+    const all = { signers: cons };
+    const active = () => app.dynamic().active.map((a) => a.validator);
+    await block(app, [], all);
+    // The operator of validator 1 delegates 60 to validator 0 and moves it into its own validator.
+    await block(app, [tx(app, [{ type: 'delegate', delegator: OP_ID(1), validator: VAL_ID(0), amount: T(60) }], [ops[1]!])], all);
+    const infraction = app.lastHeight;
+    await block(app, [tx(app, [{ type: 'redelegate', delegator: OP_ID(1), source: VAL_ID(0), destination: VAL_ID(1), shares: delegationOf(app.db, OP_ID(1), VAL_ID(0))!.shares }], [ops[1]!])], all);
+    // Then it takes out all it may: what is left is worth 101, and no transaction takes it below 100.
+    const own = () => delegationOf(app.db, OP_ID(1), VAL_ID(1));
+    const worth = () => tokensForShares(val(app, 1), own()?.shares ?? 0n);
+    const keep = (T(101) * val(app, 1).shares) / val(app, 1).tokens + 1n;
+    await block(app, [tx(app, [{ type: 'undelegate', delegator: OP_ID(1), validator: VAL_ID(1), shares: own()!.shares - keep }], [ops[1]!])], all);
+    expect(worth()).toBeGreaterThanOrEqual(T(101));
+    expect(worth()).toBeLessThan(T(102));
+    expect((await app.checkTx(tx(app, [{ type: 'undelegate', delegator: OP_ID(1), validator: VAL_ID(1), shares: (own()!.shares * 2n) / 101n }], [ops[1]!]))).error).toMatch(/self-bond would fall below/);
+    expect(active()).toContain(VAL_ID(1));
+
+    // Validator 0 signed twice while the 60 were still behind it: 3 of them are taken where they went.
+    await block(app, [], { misbehavior: [{ address: cons[0]!.address, height: infraction }], signers: [cons[1]!, cons[2]!], proposer: cons[1]! });
+    checkSupply(app);
+    expect(worth()).toBeLessThan(T(100));
+    expect(worth()).toBeGreaterThan(T(97));
+    // Not jailed and not slashed itself: it is a candidate below the self-bond, which the set does not take.
+    expect(val(app, 1).status).toBe(ValidatorStatus.candidate);
+    expect(active()).toEqual([VAL_ID(2)]);
+    expect((await app.checkTx(tx(app, [{ type: 'unjail', operator: OP_ID(1), validator: VAL_ID(1) }], [ops[1]!]))).error).toMatch(/not jailed/);
+    // Nothing but the operator's own stake brings it back: another's delegation does not count toward the self-bond.
+    await block(app, [tx(app, [{ type: 'delegate', delegator: FAUCET_ID, validator: VAL_ID(1), amount: T(50) }], [faucet])], { signers: [cons[2]!], proposer: cons[2]! });
+    expect(active()).toEqual([VAL_ID(2)]);
+    await block(app, [tx(app, [{ type: 'delegate', delegator: OP_ID(1), validator: VAL_ID(1), amount: T(3) }], [ops[1]!])], { signers: [cons[2]!], proposer: cons[2]! });
+    expect(worth()).toBeGreaterThanOrEqual(T(100));
+    expect(active()).toContain(VAL_ID(1));
+    checkSupply(app);
+  });
+
   it('creates validators with the fee and minimums, ranks the top N, and rotates keys', async () => {
     const app = makeApp();
     await block(app);

@@ -9,7 +9,7 @@ import { linkSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileS
 import type { Application } from '../app/types.ts';
 import { CoreApp } from '../app/core/app.ts';
 import { loadAppGenesis } from '../app/core/genesis.ts';
-import { Consensus, DEFAULT_LIMITS, type ConsensusTimeouts } from '../consensus/consensus.ts';
+import { Consensus, DEFAULT_LIMITS, DEFAULT_TIMEOUTS, type ConsensusTimeouts } from '../consensus/consensus.ts';
 import { EvidencePool, evidenceId, verifyEvidence } from '../consensus/evidence.ts';
 import { decodeEvidence, encodeEvidence, evidenceHeight, evidenceValidator } from '../types/evidence.ts';
 import { decode } from '../codec/reader.ts';
@@ -87,6 +87,11 @@ export interface NodeConfig {
   limits?: Partial<Omit<ValidationLimits, 'maxBlockBytes'>>;
   network?: Partial<Pick<NetworkConfig, 'desiredOutbound' | 'maxInbound' | 'connectIntervalMs' | 'pingIntervalMs' | 'idleTimeoutMs'>>;
   lagGraceMs?: number;
+  /**
+   * How long a validator that hears from no peer after its start waits before it signs (default: the propose
+   * timeout). With a peer to hear from it signs once it is level with every peer it has heard, however long that takes.
+   */
+  signGraceMs?: number;
   /**
    * Where the validator's last signature and lock are kept, for a node without a data directory that is to be
    * stopped and made again: a validator that comes back without them signs heights it already signed, and its
@@ -470,6 +475,8 @@ export class Node {
       evidencePool: this.evidencePool,
       broadcastProposal: (p, except) => this.network.broadcast({ type: 'proposal', proposal: p }, except),
       broadcastVote: (v, except) => this.network.broadcast({ type: 'vote', vote: v }, except),
+      broadcastProposalHead: (height, round, head, except) => this.network.broadcast({ type: 'proposalHead', height, round, head }, except),
+      signingHeld: () => (this.signingOpen ? null : 'not level with a peer since the start'),
       timeouts: this.cfg.timeouts,
       limits,
       log: this.log,
@@ -502,10 +509,15 @@ export class Node {
     // Consensus messages are pushed straight through; no inventory round trip.
     this.network.on('proposal', (peer, m) => this.detached(this.consensus.handleProposal(m.proposal, peer.id), 'proposal'));
     this.network.on('vote', (peer, m) => this.detached(this.consensus.handleVote(m.vote, peer.id), 'vote'));
+    this.network.on('proposalHead', (peer, m) => this.detached(this.consensus.handleProposalHead(m.height, m.round, m.head, peer.id), 'proposal head'));
+    // After block sync's own handlers for these, which keep the heights this reads.
+    this.network.on('status', () => this.checkSigning());
+    this.network.onPeer(() => this.checkSigning());
     // A peer that just connected missed everything flooded before; catch it up on the current height.
     this.network.onPeer((peer) => {
-      const { proposals, votes } = this.consensus.messagesForPeer();
+      const { proposals, heads, votes } = this.consensus.messagesForPeer();
       for (const proposal of proposals) peer.send({ type: 'proposal', proposal });
+      for (const { round, head } of heads) peer.send({ type: 'proposalHead', height: this.consensus.height, round, head });
       for (const vote of votes) peer.send({ type: 'vote', vote });
       // Evidence still waiting for a block is announced too; it was flooded before this peer existed.
       const pending = this.evidencePool.list(Infinity).map(evidenceId);
@@ -617,6 +629,7 @@ export class Node {
     // Every commit is announced so lagging peers know to sync, and the evidence age tracks the unbonding period.
     this.executor.onCommitted((block) => {
       this.network.broadcast({ type: 'status', height: block.header.height });
+      this.checkSigning();
       // The idle moment after a commit is where collections are least in the way.
       if (!this.stopping) {
         this.afterCommit ??= setImmediate(() => {
@@ -664,6 +677,50 @@ export class Node {
     });
   }
 
+  /**
+   * A validator signs nothing from its start until it has stood level with a peer: heard from one, and is behind
+   * none it has heard from. What it would sign before that is for heights the others may have decided, or that it
+   * signed in itself before it was stopped; with its sign state gone it would sign them a second time, and with it
+   * the signatures are of no use to anybody. A validator alone has nobody to wait for, and signs after `signGraceMs`.
+   *
+   * It does not cover a validator that comes back, without its sign state, into the height it stopped in while the
+   * others are still in it: that one is level, and signs.
+   */
+  private signingOpen = true;
+  private signGraceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private holdSigning(): void {
+    if (!this.privValidator) return;
+    this.signingOpen = false;
+    this.checkSigning();
+    const grace = this.cfg.signGraceMs ?? this.cfg.timeouts?.proposeMs ?? DEFAULT_TIMEOUTS.proposeMs;
+    const wait = (): void => {
+      if (this.signingOpen) return;
+      this.signGraceTimer = setTimeout(() => {
+        this.signGraceTimer = null;
+        // Nobody to hear from, or the peers that said they were ahead have gone or did not serve what they said.
+        if (this.blockSync.levelWith(this.executor.state.lastHeight) === 'nobody') this.openSigning();
+        else this.checkSigning();
+        wait();
+      }, grace);
+    };
+    wait();
+  }
+
+  private checkSigning(): void {
+    if (this.signingOpen || !this.started || this.stopping) return;
+    if (this.blockSync.levelWith(this.executor.state.lastHeight) === 'level') this.openSigning();
+  }
+
+  private openSigning(): void {
+    if (this.signingOpen) return;
+    this.signingOpen = true;
+    if (this.signGraceTimer) clearTimeout(this.signGraceTimer);
+    this.signGraceTimer = null;
+    this.log('info', 'validator signing', { height: this.executor.state.lastHeight + 1n });
+    this.consensus.signingResumed();
+  }
+
   private starting: Promise<void> | null = null;
 
   /** A start that a stop overtakes goes no further, and the stop waits for it before it closes anything. */
@@ -681,6 +738,7 @@ export class Node {
     }
     if (this.stopping) return;
     this.blockSync.start();
+    this.holdSigning();
     this.consensus.start();
     // Opening a store leaves garbage several times what it keeps (every stored entry read and checked), and the
     // guard's first sample would take it for a full heap and stop a node that fits: collect it first.
@@ -735,6 +793,8 @@ export class Node {
           this.gcScheduler.stop();
           this.consensus.stop();
           this.blockSync.stop();
+          if (this.signGraceTimer) clearTimeout(this.signGraceTimer);
+          this.signGraceTimer = null;
         }
         // The network may be up from a state-sync join even if start() was never called.
         if (this.networkStarted) {

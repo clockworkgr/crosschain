@@ -74,6 +74,8 @@ The constructor subscribes:
     deps.network.on('blockRequest', (peer, m) => this.serveBlock(peer, m.height));
     deps.network.on('blocksRequest', (peer, m) => this.serveBlocks(peer, m.from, m.count));
     deps.network.onPeer((peer) => this.onPeerStatus(peer.id, peer.height));
+    // Peers connected before this was made (a state-sync join makes its connections first) are heard as well.
+    for (const peer of deps.network.peers.values()) this.peerHeights.set(peer.id, peer.height);
     deps.network.onPeerGone((peer) => {
       this.peerHeights.delete(peer.id);
       this.busyPeers.delete(peer.id);
@@ -82,9 +84,9 @@ The constructor subscribes:
   }
 ```
 
-A new peer's height comes from its hello (`peer.height` at `onPeer`); later heights come from `status` messages, which every node broadcasts after each commit. Serving is registered here too, so a node serves blocks whether or not it is itself caught up.
+A new peer's height comes from its hello (`peer.height` at `onPeer`); later heights come from `status` messages, which every node broadcasts after each commit. The loop at the end takes the heights of peers that were connected before this object was made: a state-sync join makes its connections first ([chapter 8](08-node.md)), and for those `onPeer` has already fired. Serving is registered here too, so a node serves blocks whether or not it is itself caught up.
 
-Public methods: `start()` sets `running` and runs `check()`; `stop()` clears the flag, the grace timer, the backfill retry timer and the immediate of the next backfill step (`nextBackfill`), and does not wait for a `drain` or a `backfill` step that is under way: a drain applies nothing more and sets no timer once it sees the flag cleared, and a backfill step returns after whichever wait it was in (below); `isSyncing` is true while anything is buffered or requested; `bestPeerHeight()` is the maximum over `peerHeights`.
+Public methods: `start()` sets `running` and runs `check()`; `stop()` clears the flag, the grace timer, the backfill retry timer and the immediate of the next backfill step (`nextBackfill`), and does not wait for a `drain` or a `backfill` step that is under way: a drain applies nothing more and sets no timer once it sees the flag cleared, and a backfill step returns after whichever wait it was in (below); `isSyncing` is true while anything is buffered or requested; `bestPeerHeight()` is the maximum over `peerHeights`; `levelWith(ours)` answers `'nobody'`, `'behind'` or `'level'` for a node at height `ours`, over the peers heard that are not in `unserved`, and is what the node holds its validator's signature by at a start ([chapter 8](08-node.md)). `unserved` is the set of peers that said they were ahead and then did not serve the blocks: `notServed(peerId)` adds one when a request to it fails or times out, when its response does not match the request or carries no blocks, and when a block of its fails verification, and a response with blocks takes it out again. Sync itself does not read the set, and goes on asking such a peer whenever it announces a height; the set is kept past a disconnection, so that reconnecting does not clear it, and is emptied when it reaches 4,096 ids.
 
 #### The decision: `check`
 
@@ -166,14 +168,18 @@ The target is the lesser of the best peer height and `ours + window`. Heights ne
         this.d.log('warn', 'blocks response does not match the request', { from, count, got: m.blocks.length, peer: peer.id.slice(0, 8) });
         this.d.scorePeer?.(peer.id, 50, 'blocks response does not match the request');
         this.peerHeights.delete(peer.id);
+        this.notServed(peer.id);
       } else if (m.blocks.length === 0) {
         this.peerHeights.set(peer.id, from - 1n); // it does not have them after all
+        this.notServed(peer.id);
       } else {
+        this.unserved.delete(peer.id);
         m.blocks.forEach((b, i) => this.buffer.set(from + BigInt(i), { block: b.block, commit: b.commit, peerId: peer.id }));
       }
     } catch (e) {
       this.d.log('warn', 'block request failed', { from, count, peer: peer.id.slice(0, 8), err: (e as Error).message });
       this.peerHeights.delete(peer.id);
+      this.notServed(peer.id);
     } finally {
       for (let i = 0; i < count; i++) this.requested.delete(from + BigInt(i));
       this.busyPeers.delete(peer.id);
@@ -219,6 +225,7 @@ The response is matched on `from`, and then held against the request as a whole:
           this.d.log('warn', 'bad block from peer', { h: ours + 1n, from: next.peerId.slice(0, 8), err });
           this.d.scorePeer?.(next.peerId, 50, 'bad block in sync');
           this.peerHeights.delete(next.peerId);
+          this.notServed(next.peerId);
           continue;
         }
         try {

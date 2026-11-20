@@ -108,11 +108,11 @@ As with the duplicate vote, the usual cause is not malice but a restart: a valid
 
 Evidence is a self-contained proof of misbehaviour. Any node that holds the signatures can build it (consensus does, when a vote set reports a conflict, when a precommit and a later prevote of one validator show a lock forgotten, when the prevotes of a round rule out the polka a later prevote names, and when a second proposal arrives for a round), nodes gossip it by inventory like transactions (`RPC-SYNC-PROOFS.md` section 4.4), proposers include it in blocks, every validator verifies it against the validator set of the height it refers to, and the executor hands it to the application as `misbehavior` (next chapter). Evidence older than the unbonding period is rejected, by block time, so that stake cannot escape a slash by leaving before the proof lands (`STAKING.md` section 2.2).
 
-The two halves of a proof need not arrive in the same height. A validator that signs twice can show one node the second signature when the height is already decided, and a node that dropped everything of a height on leaving it would never hold both. So consensus keeps the votes and the proposals' signatures of the last `PAST_HEIGHTS_KEPT` heights, 16, takes late votes and proposals for them, and passes a late vote on if it is new, so that two votes shown to two nodes still meet at one of them. Nothing kept there can change a decision. The price is paid by a validator that is restarted without the record of what it last signed: it signs again in heights it already signed in, and its peers now hold the first signatures. That was always a double sign; it is now also found (`privval.ts`, below, is what prevents it).
+The two halves of a proof need not arrive in the same height. A validator that signs twice can show one node the second signature when the height is already decided, and a node that dropped everything of a height on leaving it would never hold both. So consensus keeps the votes and the proposals' signatures of the last `PAST_HEIGHTS_KEPT` heights, 16, takes late votes and proposals for them, and passes a late vote on if it is new, so that two votes shown to two nodes still meet at one of them. Nothing kept there can change a decision. The price is paid by a validator that is restarted without the record of what it last signed: it signs again in heights it already signed in, and its peers now hold the first signatures. That was always a double sign; it is now also found. `privval.ts`, below, is what prevents it, and for a validator that lost the record the node adds one thing: it signs nothing from its start until it is level with the peers it has heard ([chapter 8](08-node.md)), which keeps it out of the heights those peers have decided, and not out of the one they are in.
 
 ### Message flow
 
-Proposals and votes are pushed directly to every peer with no inventory round trip (`DESIGN.md` section 3). A vote for the current height is dropped before verification when the node already holds it: the same height, round, type and validator index with the same block hash and the same `polRound`. A vote that differs from the held one in its hash or in the round it names goes on to verification, because the pair may be evidence, and the same holds for the next height: a vote for it that is already held, the same round, type, validator index, block hash and `polRound`, is dropped before its signature is verified, and one that says something else is verified and held beside it. Three mechanisms make up for the fact that a flooded message is sent once: each validator re-sends its own current-round votes every `gossipMs`, the proposer re-sends its proposal, and a newly connected peer is handed every valid proposal held for the current height that came signed, not a block that was fetched, and the vote held in each place of the vote sets, a prevote still waiting for the majority it names included and the other vote of a double signer not (`messagesForPeer`). Signature verification is asynchronous in worker threads ([chapter 2](02-crypto.md)), so each handler awaits the verifier and re-checks that the message is still relevant before touching state. All state mutation is synchronous on the main thread; there are no locks.
+Proposals and votes are pushed directly to every peer with no inventory round trip (`DESIGN.md` section 3). A vote for the current height is dropped before verification when the node already holds it: the same height, round, type and validator index with the same block hash and the same `polRound`. A vote that differs from the held one in its hash or in the round it names goes on to verification, because the pair may be evidence, and the same holds for the next height: a vote for it that is already held, the same round, type, validator index, block hash and `polRound`, is dropped before its signature is verified, and one that says something else is verified and held beside it. Where a node does not send a proposal on (its block is invalid, or the round or the height has no more use for it), it sends the proposal's head, what the proposer signed without the block, if that is the first it holds for the round; a head is taken only as one half of a proof that the proposer signed two. Three mechanisms make up for the fact that a flooded message is sent once: each validator re-sends its own current-round votes every `gossipMs`, the proposer re-sends its proposal, and a newly connected peer is handed every valid proposal held for the current height that came signed, not a block that was fetched, the head held for each round whose proposal is not among those, and the vote held in each place of the vote sets, a prevote still waiting for the majority it names included and the other vote of a double signer not (`messagesForPeer`). Signature verification is asynchronous in worker threads ([chapter 2](02-crypto.md)), so each handler awaits the verifier and re-checks that the message is still relevant before touching state. All state mutation is synchronous on the main thread; there are no locks.
 
 ### A worked height
 
@@ -459,7 +459,7 @@ The state machine. Its file header is a good summary and should be read first; t
 - **`VOTES_PER_PEER_SECOND`** is 200: the votes of one peer whose signatures a node verifies in a second, "or eight for each validator if that is more"; `MAX_DEFERRED_VOTES_PER_PEER`, 1,024, is the least number of votes over it that may wait for one peer (64 for each validator if that is more, up to `DEFERRED_VOTES_CAP`, 32,768), and `DEFERRED_VOTES_MS`, 250, how long before they are tried again; `VOTE_FLOOD_POINTS`, 10, is what a peer is charged for a second in which a vote of its found no room, and `MAX_REFUSED`, 64, the most evidence that waits for room in the pool.
 - **`PAST_HEIGHTS_KEPT`** is 16: the heights that are over whose votes and proposals are kept, "to hold a late vote or proposal against". The private **`PastHeight`** is what is kept of one: `validators`, `votes` (the height's `HeightVoteSet`), `maxRound` (the round it ended in), `proposals` (what each round's proposer signed, a `ProposalHead` by round; the height's `heads`) and `proposedTwice` (the rounds already reported).
 - **`StaleHeightError`** is thrown by the executor when a block arrives for a height that has already passed; `decide` treats it as "block sync got there first".
-- **`ConsensusDeps`** is everything consensus needs from the node. Reading the fields is reading the node wiring in `src/node/node.ts`: `chainId`; `getState()` is the executor's chain state; `applyBlock` and `updateCommit` go to the executor; `blockTimeAt` reads stored headers for evidence age; `requestBlock` broadcasts a `blockRequest` (the hash argument is accepted but the node sends only the height); `scorePeer` feeds the p2p scoring; `getLastCommit` loads the previous block's commit, needed to build a block; `validatorSetAtHeight` for evidence verification and for votes of the next height; `reapTxs(maxBytes)` is `mempool.reap`; `privValidator` is null on a full node; `verifier`; `evidencePool`; `broadcastProposal` and `broadcastVote` with an `exceptPeer` so a message is not echoed to its sender; optional `timeouts`, `limits` and `now` (injectable clock); `log`.
+- **`ConsensusDeps`** is everything consensus needs from the node. Reading the fields is reading the node wiring in `src/node/node.ts`: `chainId`; `getState()` is the executor's chain state; `applyBlock` and `updateCommit` go to the executor; `blockTimeAt` reads stored headers for evidence age; `requestBlock` broadcasts a `blockRequest` (the hash argument is accepted but the node sends only the height); `scorePeer` feeds the p2p scoring; `getLastCommit` loads the previous block's commit, needed to build a block; `validatorSetAtHeight` for evidence verification and for votes of the next height; `reapTxs(maxBytes)` is `mempool.reap`; `privValidator` is null on a full node; `verifier`; `evidencePool`; `broadcastProposal` and `broadcastVote` with an `exceptPeer` so a message is not echoed to its sender; the optional `broadcastProposalHead`, which sends what a round's proposer signed without the block (below); the optional `signingHeld()`, which answers why this validator is not to sign for now, or null (the node holds a validator back from its start until it is level with a peer, [chapter 8](08-node.md)); optional `timeouts`, `limits` and `now` (injectable clock); `log`.
 - `RoundProposal` (private) is what the machine stores per round: the `proposal`, whether the block was `valid`, its `hash`, and `fetched` for a block obtained through `handleFetchedBlock` rather than from the proposer.
 
 #### State
@@ -568,6 +568,12 @@ This is the paper's `StartRound(round)`: if we are the proposer, propose; otherw
 ```ts
   private propose(): void {
     const pv = this.d.privValidator!;
+    const held = this.d.signingHeld?.() ?? null;
+    if (held) {
+      this.log('info', 'not proposing', { h: this.height, r: this.round, why: held });
+      this.schedule('propose', this.timeouts.proposeMs + this.timeouts.proposeDeltaMs * this.round, () => this.onTimeoutPropose(this.height, this.round));
+      return;
+    }
     const block = this.validBlock ?? this.createBlock();
     if (!block) {
       this.log('warn', 'cannot build a block (no last commit yet); skipping proposal');
@@ -599,7 +605,7 @@ This is the paper's `StartRound(round)`: if we are the proposer, propose; otherw
   }
 ```
 
-Paper lines 14 to 21: if `validValue` is set, propose it with `validRound`; otherwise get a new value and propose with `-1`. The proposal is broadcast and also fed to the proposer's own `handleProposal`, so the proposer treats its block exactly as everyone else does, including verifying its own signature. When no block can be built (no stored last commit yet), the proposer arms the same round-scaled propose timeout `startRound` would have, so the round still ends in a nil prevote instead of hanging.
+Paper lines 14 to 21: if `validValue` is set, propose it with `validRound`; otherwise get a new value and propose with `-1`. The proposal is broadcast and also fed to the proposer's own `handleProposal`, so the proposer treats its block exactly as everyone else does, including verifying its own signature. When no block can be built (no stored last commit yet), the proposer arms the same round-scaled propose timeout `startRound` would have, so the round still ends in a nil prevote instead of hanging. It does the same while signing is held: `signingHeld()` gives a reason, the line `not proposing` is logged with it, and the round goes on as one whose proposer is silent.
 
 Neither `propose` nor `startHeight` waits for `handleProposal`: both are synchronous, and `handleProposal` waits on the verification of the proposal's signature. A proposal that comes from a peer has the node's handler behind it, which takes whatever the call ends with ([chapter 8](08-node.md)). The proposer's own proposal and the ones held for the height have nobody, so `proposalUnawaited` attaches the `catch` itself. Before it did, both calls were `void this.handleProposal(...)`, and a failure there was a rejected promise with no handler, which ends a Node process. A stop is what produced one: a node that made its own verifier pool closes it as the last step of its stop, and a verification that is out at that moment rejects with `verifier closed`. A validator stopped while its own proposal's signature was being verified, or one held for the height that had just begun, could so end its process with that error where an orderly exit was due. The failure is now logged as `handling a proposal failed` with the proposal's height and round, at `debug` when consensus has been stopped, where it is expected, and at `error` while it runs, where `handleProposal` is not expected to throw at all.
 
@@ -640,8 +646,8 @@ Half, and not the whole limit, because of the transaction at the head of the que
     // A proposal for a round that has one is looked at only for what its proposer signed: nothing, if that is known
     // and this says the same, or if the proposer was already reported for signing two.
     const taken = this.proposals.has(p.round);
-    const head = this.heads.get(p.round);
-    if (taken && head && (this.proposedTwice.has(p.round) || sameProposal(head, p))) return;
+    const held = this.heads.get(p.round);
+    if (taken && held && (this.proposedTwice.has(p.round) || sameProposal(held, p))) return;
     if (p.polRound < -1 || p.polRound >= p.round) return;
     if (p.block.header.height !== p.height) return;
 
@@ -658,7 +664,7 @@ Half, and not the whole limit, because of the transaction at the head of the que
 
 Cheap filters first: a proposal for the next height goes to `holdNextHeightProposal` (below), one for an earlier height to `handlePastProposal` (further below), other heights are dropped, one proposal per round is kept (the first to verify wins), `polRound` must be `-1` or an earlier round, the block's own height must match, and the round must be within `MAX_ROUND_AHEAD`. Then the signature is checked against the *round's* proposer, not the block's `proposerAddress`. Review finding 4 found three honest validators stuck forever because a re-proposal of a polka'd block was rejected for carrying the original builder's address.
 
-A round that has its proposal does not take another, but a second one is no longer dropped unseen. Beside `proposals`, which holds what each round decides on, consensus keeps `heads`: for each round, the `ProposalHead` (`polRound`, block hash, signature) of the first proposal whose signature verified under the round's proposer. If a proposal for a taken round says what the head says (`sameProposal`), which is what the proposer's re-sending and every relay produce, or the proposer was already reported, it is dropped at no cost as before. Otherwise it goes on to the signature check, because with a good signature it is the second half of a proof (`signedProposal`, below). The two maps are apart because they can differ: a round may decide on a block that was fetched after +2/3 precommitted it (`handleFetchedBlock`), which replaces the round's entry in `proposals` with a placeholder that carries no signature, while what the proposer signed for the round is still what it signed.
+A round that has its proposal does not take another, but a second one is no longer dropped unseen. Beside `proposals`, which holds what each round decides on, consensus keeps `heads`: for each round, the `ProposalHead` (`polRound`, block hash, signature) of the first proposal whose signature verified under the round's proposer. If a proposal for a taken round says what the head says (`sameProposal`), which is what the proposer's re-sending and every relay produce, or the proposer was already reported, it is dropped at no cost as before. Otherwise it goes on to the signature check, because with a good signature it is the second half of a proof (`recordHead`, below). The two maps are apart because they can differ: a round may decide on a block that was fetched after +2/3 precommitted it (`handleFetchedBlock`), which replaces the round's entry in `proposals` with a placeholder that carries no signature, while what the proposer signed for the round is still what it signed.
 
 A proposal for the next height arrives when a peer has decided this height a moment before the node has. It cannot be handled yet, since the round's proposer is not known until the height starts, but it is not held unchecked either:
 
@@ -706,19 +712,21 @@ So a place is taken only by a proposal that carries the valid signature of a val
     if (!this.running) return;
     // Whatever becomes of the proposal, its proposer signed it. The height may have moved on meanwhile, and then
     // it is held against what is kept of that height.
-    this.signedProposal(p);
-    if (taken || p.height !== this.height) return;
+    // What it signed is sent on as well: as the proposal below if the round takes it, and without the block if not.
+    const head: ProposalHead = { polRound: p.polRound, blockHash: blockHash(p.block), signature: p.signature };
+    const relayHead = this.recordHead(p.height, p.round, head) ? () => this.d.broadcastProposalHead?.(p.height, p.round, head, fromPeer) : () => {};
+    if (taken || p.height !== this.height) return relayHead();
 
     // The signature covers the header; a relay can pair it with another body. That is a corrupt message, not
     // the round's proposal: drop it without recording the round, so the real one can still arrive.
     if (!bodyMatchesHeader(p.block)) {
       this.log('warn', 'proposal body does not match its header', { h: p.height, r: p.round });
       if (fromPeer) this.d.scorePeer?.(fromPeer, 20, 'proposal body mismatch');
-      return;
+      return relayHead();
     }
 ```
 
-A bad signature costs the sending peer 20 points, the same as a bad vote signature: a proposal is as expensive to verify as a vote and the signer is just as well known, so there is no reason to let a peer send them for free. Then `running` is read again, and `signedProposal` is told of the proposal, whatever becomes of it next: its proposer signed it. A proposal for a round that had one ends here, as evidence or as nothing; it is never the round's proposal, so its body and its block are not looked at. So does one whose height ended during the verification, which `signedProposal` holds against what was kept of that height. The verification is a wait on the worker pool, and the node may have been stopped during it: `stop()` clears the flag and does not wait for a proposal that is being verified, and a node that stops closes its store soon after ([chapter 8](08-node.md)). "The checks below read stored blocks, and the store may be closed": the validity checks ask for the time of an earlier block and for the validator sets of earlier heights, which come from the block store. A proposal whose verification outlasted the stop therefore ends here, having read nothing. The node's handler does not wait for `handleProposal`; it hands the promise to `detached` ([chapter 8](08-node.md)), which takes whatever the call ends with. A proposal that resumes after a stop somewhere this check does not cover, to a closed verifier pool or a closed store, therefore ends as the line `handling a proposal failed` in the log, at `debug`, and nothing more. The two kinds of proposal no handler of the node stands behind, the proposer's own and one held for the height, end with the same line in `proposalUnawaited` (above). Then the body. `proposalSignBytes` covers the proposal's header, and the header commits to the body only through its three roots (`dataHash`, `evidenceHash`, `lastCommitHash`); a relay could keep the signed header and pair it with other transactions, other evidence or a different commit. `bodyMatchesHeader` (in `src/consensus/validate.ts`, re-exported by state sync, which needs the same check on a fetched block) recomputes the three roots and compares. A mismatch is a corrupt message rather than the round's proposal, so it is dropped *without* recording the round: if it were recorded as an invalid proposal, the `proposals.has(p.round)` filter above would then reject the genuine proposal when it arrived, and the whole round would be lost to one bad relay.
+A bad signature costs the sending peer 20 points, the same as a bad vote signature: a proposal is as expensive to verify as a vote and the signer is just as well known, so there is no reason to let a peer send them for free. Then `running` is read again, and `recordHead` is given what the proposal's proposer signed, whatever becomes of the proposal next. It answers whether this is the first held for the round, and if it is, `relayHead` is a function that sends the head to every peer but the one the proposal came from; otherwise it does nothing. Each `return` from here on that does not end in the proposal being sent on whole calls it, so the first thing a node learns a proposer signed for a round always goes to its peers in one form or the other (why is below, under the two proposals). A proposal for a round that had one ends here, as evidence or as nothing; it is never the round's proposal, so its body and its block are not looked at. So does one whose height ended during the verification, which `recordHead` holds against what was kept of that height. The verification is a wait on the worker pool, and the node may have been stopped during it: `stop()` clears the flag and does not wait for a proposal that is being verified, and a node that stops closes its store soon after ([chapter 8](08-node.md)). "The checks below read stored blocks, and the store may be closed": the validity checks ask for the time of an earlier block and for the validator sets of earlier heights, which come from the block store. A proposal whose verification outlasted the stop therefore ends here, having read nothing. The node's handler does not wait for `handleProposal`; it hands the promise to `detached` ([chapter 8](08-node.md)), which takes whatever the call ends with. A proposal that resumes after a stop somewhere this check does not cover, to a closed verifier pool or a closed store, therefore ends as the line `handling a proposal failed` in the log, at `debug`, and nothing more. The two kinds of proposal no handler of the node stands behind, the proposer's own and one held for the height, end with the same line in `proposalUnawaited` (above). Then the body. `proposalSignBytes` covers the proposal's header, and the header commits to the body only through its three roots (`dataHash`, `evidenceHash`, `lastCommitHash`); a relay could keep the signed header and pair it with other transactions, other evidence or a different commit. `bodyMatchesHeader` (in `src/consensus/validate.ts`, re-exported by state sync, which needs the same check on a fetched block) recomputes the three roots and compares. A mismatch is a corrupt message rather than the round's proposal, so it is dropped *without* recording the round: if it were recorded as an invalid proposal, the `proposals.has(p.round)` filter above would then reject the genuine proposal when it arrived, and the whole round would be lost to one bad relay.
 
 After the signature and the body, the block itself:
 
@@ -734,10 +742,16 @@ After the signature and the body, the block itself:
 `validateBlockStructure` gets the local clock only for a fresh proposal. Review finding 37 describes the failure this prevents: every proposal used to be checked for drift, so after a round that stalled longer than `maxClockDriftMs` the polka'd block could never be re-proposed validly, the validators locked on it prevoted nil for everything else, and the height stalled for good. Then `verifyBlockSignatures` for the `lastCommit` and evidence. Both results are strings or null. Because another await has passed, the handler re-checks `running`, the height, and that no proposal for the round has been stored meanwhile; a node stopped during this second verification ends there, before anything is recorded or sent. Then:
 
 ```ts
-    const hash = blockHash(p.block);
+    // State may have moved while we were verifying.
+    if (!this.running) return;
+    if (p.height !== this.height || this.proposals.has(p.round)) return relayHead();
+
+    const hash = head.blockHash;
     this.proposals.set(p.round, { proposal: p, valid: invalid === null, hash });
-    if (invalid) this.log('warn', 'invalid proposal', { h: p.height, r: p.round, reason: invalid });
-    else {
+    if (invalid) {
+      this.log('warn', 'invalid proposal', { h: p.height, r: p.round, reason: invalid });
+      relayHead();
+    } else {
       this.log('debug', 'got proposal', { h: p.height, r: p.round, hash });
       this.d.broadcastProposal(p, fromPeer);
     }
@@ -745,36 +759,75 @@ After the signature and the body, the block itself:
   }
 ```
 
-Before the proposal is recorded the round is looked up once more, since two proposals for one round can both be in verification at once and only the first to come out is the round's. If they differ, that was already seen: each went through `signedProposal` when its signature verified. An invalid proposal is still recorded (with `valid: false`), because the paper's rules say to prevote nil on an invalid proposal rather than wait for the timeout, and the record stops a second copy from being verified. Only valid proposals are forwarded to peers. Contrast the two earlier failures: a bad signature or a body that does not match the header is not the round's proposal at all, so neither is recorded, and the round stays open for the real one.
+Before the proposal is recorded the round is looked up once more, since two proposals for one round can both be in verification at once and only the first to come out is the round's. If they differ, that was already seen: each went through `recordHead` when its signature verified. An invalid proposal is still recorded (with `valid: false`), because the paper's rules say to prevote nil on an invalid proposal rather than wait for the timeout, and the record stops a second copy from being verified. Only valid proposals are forwarded to peers; of an invalid one the head is, if it is the first held for its round. Contrast the two earlier failures: a bad signature or a body that does not match the header is not the round's proposal at all, so neither is recorded, and the round stays open for the real one.
 
 #### Two proposals for a round
 
 ```ts
   /**
-   * A proposal whose signature verified under the proposer of its round, of this height or a kept one. The first
+   * What the proposer of a round signed, by a signature that verified, for this height or a kept one. The first
    * for a round is what the proposer signed; another that says something else is the second half of the proof
-   * that it signed twice.
+   * that it signed twice. True if this is the first held for its round.
+   *
+   * A node sends the first on to its peers, as the proposal if its round takes it and as the head alone if not
+   * (the block is invalid, the round had a fetched block, the height moved on). So of two nodes that were each
+   * sent a different proposal, one next to the other hears what the other holds, and the proof is made there.
    */
-  private signedProposal(p: Proposal): void {
-    const kept = p.height === this.height ? null : this.past.get(p.height);
-    if (p.height !== this.height && (!kept || p.round > kept.maxRound)) return;
+  private recordHead(height: bigint, round: number, second: ProposalHead): boolean {
+    const kept = height === this.height ? null : this.past.get(height);
+    if (height !== this.height && (!kept || round > kept.maxRound)) return false;
     const [heads, reported, validators] = kept ? [kept.proposals, kept.proposedTwice, kept.validators] : [this.heads, this.proposedTwice, this.validators];
-    const second = { polRound: p.polRound, blockHash: blockHash(p.block), signature: p.signature };
-    const first = heads.get(p.round);
+    const first = heads.get(round);
     if (!first) {
-      heads.set(p.round, second);
-      return;
+      heads.set(round, second);
+      return true;
     }
-    if (reported.has(p.round) || sameProposal(first, p)) return;
+    if (reported.has(round) || sameHead(first, second)) return false;
     // Marked once the pool holds the proof or it waits for room there.
-    if (this.report(makeDuplicateProposalEvidence(p.height, p.round, validators.indexOf(proposerOf(validators, p.round).address), first, second))) reported.add(p.round);
+    if (this.report(makeDuplicateProposalEvidence(height, round, validators.indexOf(proposerOf(validators, round).address), first, second))) reported.add(round);
+    return false;
   }
 
-  /** A proposal for a kept height: nothing to decide any more, but beside the one its proposer is known to have signed it may show two. */
+  /**
+   * A proposal's head without its block, sent on by a peer that held it and did not send the proposal. Nothing is
+   * decided on it. It is verified only where it can tell something: for a round of this height within reach or a
+   * round a kept height reached, and not if it says what is held for the round or the proposer was already reported.
+   */
+  async handleProposalHead(height: bigint, round: number, head: ProposalHead, fromPeer: string | null): Promise<void> {
+    if (!this.running || !this.hvs) return;
+    if (head.polRound < -1 || head.polRound >= round) return;
+    const kept = height === this.height ? null : this.past.get(height);
+    if (height !== this.height && !kept) return;
+    if (kept ? round > kept.maxRound : round > this.round + MAX_ROUND_AHEAD) return;
+    const first = (kept ? kept.proposals : this.heads).get(round);
+    if ((kept ? kept.proposedTwice : this.proposedTwice).has(round) || (first && sameHead(first, head))) return;
+    // One signed head is verified once however many peers send it at once, and no more than a fixed number are in
+    // verification together: a head over that is dropped, and comes again from whoever holds it when a peer connects.
+    const key = `${height}/${round}/${head.polRound}/${toHex(head.blockHash)}/${toHex(sha256(head.signature))}`;
+    if (this.verifyingHeads.has(key) || this.verifyingHeads.size >= MAX_HEADS_VERIFYING) return;
+    this.verifyingHeads.add(key);
+    let ok: boolean;
+    try {
+      const proposer = kept ? proposerOf(kept.validators, round) : this.validators.byAddress(this.proposerAt(round))!;
+      ok = await this.d.verifier.verifyOne({ sig: head.signature, msg: proposalHeadSignBytes(this.d.chainId, height, round, head.polRound, head.blockHash), publicKey: proposer.publicKey, context: this.proposalCtx });
+    } finally {
+      this.verifyingHeads.delete(key);
+    }
+    if (!ok) {
+      if (fromPeer) this.d.scorePeer?.(fromPeer, 20, 'bad proposal signature');
+      return;
+    }
+    if (this.running && this.recordHead(height, round, head)) this.d.broadcastProposalHead?.(height, round, head, fromPeer);
+  }
+
+  /**
+   * A proposal for a kept height: nothing to decide any more, but what its proposer signed is one half of a proof
+   * if something else is held for the round, and the first half, to send on, if nothing is.
+   */
   private async handlePastProposal(p: Proposal, fromPeer: string | null): Promise<void> {
     const kept = this.past.get(p.height);
     const first = kept?.proposals.get(p.round);
-    if (!kept || !first || kept.proposedTwice.has(p.round) || sameProposal(first, p)) return;
+    if (!kept || p.round > kept.maxRound || kept.proposedTwice.has(p.round) || (first && sameProposal(first, p))) return;
     if (p.polRound < -1 || p.polRound >= p.round || p.block.header.height !== p.height) return;
     // The proposer of the round in that height's set; the round is one the height reached, so the walk is bounded.
     const ok = await this.d.verifier.verifyOne({ sig: p.signature, msg: proposalSignBytes(this.d.chainId, p), publicKey: proposerOf(kept.validators, p.round).publicKey, context: this.proposalCtx });
@@ -782,7 +835,8 @@ Before the proposal is recorded the round is looked up once more, since two prop
       if (fromPeer) this.d.scorePeer?.(fromPeer, 20, 'bad proposal signature');
       return;
     }
-    if (this.running) this.signedProposal(p);
+    const head: ProposalHead = { polRound: p.polRound, blockHash: blockHash(p.block), signature: p.signature };
+    if (this.running && this.recordHead(p.height, p.round, head)) this.d.broadcastProposalHead?.(p.height, p.round, head, fromPeer);
   }
 
   /**
@@ -809,9 +863,13 @@ Before the proposal is recorded the round is looked up once more, since two prop
   }
 ```
 
-`signedProposal` is given every proposal whose signature verified with the key of its round's proposer. The first for a round becomes the round's head. A later one that says something else, with the first, is `DuplicateProposalEvidence` against the proposer (`proposerOf`, a function at the end of the file that advances a copy of a set by the round), and once the pool holds the proof, or the proof waits for room there, the round is marked in `proposedTwice`, so that when the round has its proposal a third is not verified at all. If the proof is one the pool will never take, the round is left unmarked. It does not matter what else became of either proposal: the first may have been judged invalid, or dropped because its body did not match its header, and its signature was verified all the same, which is all the evidence needs. A second proposal is not passed on to peers, and the round keeps the proposal it had: the evidence travels by inventory. For a proposal of a height that is over, the heads, the reported rounds and the validator set are the kept ones, and a round the height never reached is ignored; that is the path of a proposal that was in verification when its height ended.
+`recordHead` is given the head of every proposal whose signature verified with the key of its round's proposer: `polRound`, the block's hash and the signature, which is all the proposer signed. The first for a round becomes the round's head, and the answer is true. A later one that says something else (`sameHead`, a function at the end of the file), with the first, is `DuplicateProposalEvidence` against the proposer (`proposerOf`, also there, advances a copy of a set by the round), and once the pool holds the proof, or the proof waits for room there, the round is marked in `proposedTwice`, so that when the round has its proposal a third is not verified at all. If the proof is one the pool will never take, the round is left unmarked. It does not matter what else became of either proposal: the first may have been judged invalid, or dropped because its body did not match its header, and its signature was verified all the same, which is all the evidence needs. A second proposal is not passed on to peers, and the round keeps the proposal it had: the evidence travels by inventory. For a head of a height that is over, the heads, the reported rounds and the validator set are the kept ones, and a round the height never reached is ignored; that is the path of a proposal that was in verification when its height ended.
 
-`handlePastProposal` is for a proposal that arrives when its height is already over. It is verified only if the kept height has a head for the round that says something else and the proposer was not reported, so a late proposal costs a verification only when it may complete a proof. A single late proposal for a round with no head proves nothing, and the node that holds the other one will see this one if it was ever relayed.
+A proposer that signs two proposals for a round need not show both to anybody. It can send one to each of two nodes, and each node then holds one head and no proof. Where both proposals are valid, flooding brings them together: each node sends the proposal it took to all its peers, and a node that receives the other one beside its own makes the proof. Where one of them is not sent on, they used to stay apart: a proposal with an invalid block is recorded and not forwarded, one whose body does not match its header is dropped, one for a round that already decided on a fetched block is looked at for its signature only, and one whose height ended during verification is no proposal of anything any more. In each of these the node now sends the head. The rule is that a node sends on the first thing it learns a proposer signed for a round, as the proposal if its round takes it and as the head alone if not. Take two nodes that hold different heads for a round, and a path of connections between them that stood while the heads went round: somewhere on it two neighbours hold different heads, each of them sent its own to the other when it first held it (to every peer but the one it had it from, and that peer held it already), and so one of the two has seen both. A peer that connects later is handed the heads of the height its neighbour is in (`messagesForPeer`), not those of the heights kept, so two parts of a network that were apart while a proposer showed each a different proposal, and came together a height later, hold the two halves and do not compare them. The head is a `proposalHead` message, 2,474 bytes under ML-DSA-44 and 118 under secp256k1 ([chapter 6](06-p2p.md)), against a proposal that carries a block.
+
+`handleProposalHead` is what receives one. A head decides nothing: no round takes it as its proposal, no rule runs, and a validator does not prevote on it. It is verified only where it can tell something. The `polRound` must be one a proposal of that round could carry. The height must be the current one or a kept one, and the round within `MAX_ROUND_AHEAD` of the node's own or, for a kept height, one that height reached. If the round's proposer was already reported, or the head says what is held for the round, it is dropped before the signature is looked at, which is the case of every head and every proposal an honest proposer's round produces after the first. Otherwise the signature is verified over `proposalHeadSignBytes`, the bytes a proposal's signature covers, built from the hash instead of the block ([chapter 3](03-types.md)), with the key of the round's proposer; a bad one costs the sender 20 points, as a bad proposal signature does. Before the verification the head is looked up in `verifyingHeads`, by what it says and its signature: the same signed head from several peers at once is verified once, and no more than `MAX_HEADS_VERIFYING`, 64, are in verification together. One over that is dropped without a charge; whoever holds it sends it again to the next peer that connects. A head that verifies goes to `recordHead`, and if it is the first for its round it is sent on to every other peer. A proposal that comes later for that round and says the same becomes the round's proposal in the ordinary way, its signature verified a second time, since the round has no proposal yet; one that says something else is the second half. An honest proposer's round with a valid block sends no head at all: heads are sent only where proposals are not. A proposer that signs many proposals for its round costs each node a verification for the first and for the second, and for whatever else was already in verification when the second came out, up to the 64; from then on the round is marked and nothing more for it is verified. It is marked when the pool took the proof or the proof waits for room (`report`, below). It stays unmarked, and each further proposal or head costs a verification, when the proof is larger than the pool ever takes or the 64 places for waiting proofs are full.
+
+`handlePastProposal` is for a proposal that arrives when its height is already over. It is verified if its round is one the kept height reached, the proposer of that round was not reported, and the head held for the round, if there is one, says something else. With a head held it is the second half of a proof. With none it is the first thing this node learns the proposer signed for that round, and its head is recorded and sent on like any other first, since another node may hold a different one; the block is of no use any more and goes no further. A late head is taken through `handleProposalHead` in the same way.
 
 `report` is where all evidence this node makes itself goes into the pool. The pool refuses a second proof of an offence it holds, so the log line `fault detected`, with the kind, the height and the validator's index, appears once per offence. If the pool has no room (it is bounded in number and in bytes), the proof is kept in `refused`, by offence and at most `MAX_REFUSED`, 64, of them, unless it is larger than the pool takes at all. The votes or proposals that made it are held already and are dropped as duplicates when they come again, so nothing would make the proof a second time. `reportRefused` offers the pool what waits there when each height starts, which is when a block has just taken evidence out of the pool, and lets go of what has grown too old for any block. `report` answers whether the proof is in the pool or waiting for it.
 
@@ -1099,6 +1157,11 @@ It is added to the kept vote set, where a conflict is a double sign as in the cu
     if (!pv) return;
     const idx = this.validators.indexOf(pv.address);
     if (idx < 0) return;
+    const held = this.d.signingHeld?.() ?? null;
+    if (held) {
+      this.log('debug', 'not voting', { h: this.height, r: this.round, why: held });
+      return;
+    }
     const unsigned = { type, height: this.height, round: this.round, blockHash: hash, polRound, validatorIndex: idx };
     let signature: Uint8Array;
     try {
@@ -1128,7 +1191,7 @@ It is added to the kept vote set, where a conflict is a double sign as in the cu
   }
 ```
 
-A full node (no key) or a node whose key is not in the current set silently does nothing: it still runs every rule and follows the decision, it just never votes. The guard's refusal is caught and logged; any other error propagates. A signed vote enters through the same `addVote` as a peer's vote, which broadcasts it (with `fromPeer` null, so to everyone) and re-runs the rules. This is the only place votes are signed; `prevote(hash, polRound)` and `precommit(hash)` are one-line wrappers. `prevote` is given the `polRound` of the proposal it answers. A prevote for nil names nothing; a prevote for the block the validator is locked on names the round of the lock if that is later than the proposal's, since that is the majority the lock stands on and the one that answers for every precommit before it; any other names the proposal's round. The guard's refusals now include a prevote that would leave a lock on too old a round, which the rules never ask for; if a bug ever did, the vote would not be cast. `test/amnesia.test.ts`, "prevotes the block its lock moved to on the round of that lock, when the block comes back on an older majority", drives one `Consensus` through four rounds with the other three validators played by the test: locked on B in round 1, moved to D in round 2, and D proposed in round 3 with `polRound` 0. Its prevote names round 2. With the proposal's round in it the guard refuses and the validator casts no prevote, which is the test failing.
+A full node (no key) or a node whose key is not in the current set silently does nothing: it still runs every rule and follows the decision, it just never votes. A validator whose signing is held (`signingHeld()` gives a reason) does the same, with the line `not voting` at `debug`: the step it is in passes without its vote. When the node lets it sign, it calls `signingResumed()`, which begins the round the state machine is in again, unless the height is decided or block sync has already taken the chain past it. Nothing of that round was signed, so the round can be gone through a second time, once what the state machine did in it without a signature is taken back. The lock is set to what the private validator holds for the height, as `startHeight` sets it: on a polka the state machine locks and moves to `precommit` whether or not the precommit was signed, and a lock no precommit stands behind would have the next prevote name the round it is cast in, which the signer refuses. The round is taken out of `polkaHandled`, `prevoteTimeoutScheduled` and `precommitTimeoutScheduled`, since each of those marks something done once, without a vote. Then `startRound(this.round)`: the validator proposes if the round is its own, and `evaluateRules` prevotes by the proposal the round holds and, if the polka is there already, locks and precommits on it, this time with the signature. Without that a validator alone, or one the others wait on, would sit in a step it had passed until somebody else moved the round on, and alone nobody does. The guard's refusal is caught and logged; any other error propagates. A signed vote enters through the same `addVote` as a peer's vote, which broadcasts it (with `fromPeer` null, so to everyone) and re-runs the rules. This is the only place votes are signed; `prevote(hash, polRound)` and `precommit(hash)` are one-line wrappers. `prevote` is given the `polRound` of the proposal it answers. A prevote for nil names nothing; a prevote for the block the validator is locked on names the round of the lock if that is later than the proposal's, since that is the majority the lock stands on and the one that answers for every precommit before it; any other names the proposal's round. The guard's refusals now include a prevote that would leave a lock on too old a round, which the rules never ask for; if a bug ever did, the vote would not be cast. `test/amnesia.test.ts`, "prevotes the block its lock moved to on the round of that lock, when the block comes back on an older majority", drives one `Consensus` through four rounds with the other three validators played by the test: locked on B in round 1, moved to D in round 2, and D proposed in round 3 with `polRound` 0. Its prevote names round 2. With the proposal's round in it the guard refuses and the validator casts no prevote, which is the test failing.
 
 #### Gossip, fetched blocks and catch-up
 
@@ -1406,9 +1469,9 @@ The engine tests build several nodes in one process over the in-memory transport
 Known simplifications, from `DESIGN.md` section 10 and from reading the code:
 
 - Evidence is found in what a node holds: the votes and proposals of its height and of the 16 heights before it, in memory. A node that was restarted, or that joined later, holds nothing of the heights before, and the second half of a proof that arrives after 16 heights is dropped. A late vote for a round the height never reached is dropped too.
-- A validator restarted without its sign-state record signs again where it signed before, and is now reported for it within those 16 heights. The record is the defence, and a node does not otherwise hold back from signing while it catches up.
+- A validator restarted without its sign-state record signs again where it signed before, and is now reported for it within those 16 heights. The record is the defence. The node holds a validator back from its start until it is level with the peers it has heard, which covers the heights those decided while it was away. It is held once, by what its first peers say: one whose first peers are behind themselves is let go early, and one that comes back into the height it stopped in, with the others still in it, is level and signs.
 - A prevote that names a polka which never formed is punished only where +2/3 of the power prevoted something else in the round named, and on the assumption that less than a third signs twice; elsewhere it is only never counted. That evidence carries a vote for most of the set, and no node takes into its pool one that is larger than half a block less the builder's slack.
-- A proposer that sends different proposals for the same round to different peers is reported by a node that receives both; a second proposal is not relayed, so two nodes that were each sent one find out only if the proposals crossed while both were being flooded. Two proposals held for the next height, before it starts, are not compared.
+- A proposer that sends different proposals for the same round to different peers is reported by a node that holds one and is sent the other, or its head. Two proposals held for the next height, before it starts, are not compared, and neither are their heads sent on then; a head for a height a node is not in and has not kept is dropped; and heads are sent when first held and to a peer that connects during their height, so nodes that were not connected then do not compare what they kept.
 - A proposal carries the whole block in one message; Tendermint splits large blocks into gossiped parts.
 - Vote verification is limited by peer and by second, with one figure for every peer. A peer that relays for many validators and one that relays for few have the same budget; votes over it wait up to a bound and are verified late, and beyond the bound they are dropped: a peer that hands over more rounds of a height at once than the receiver's budget and queue take (36 with 100 validators, 12 with 2,000) loses the rest, and a node left without the votes it needs is caught up by block sync when the height is decided. Proposals are not counted.
 - The 8 proposals held for the next height can be filled by four validators signing two each for rounds that will not come; the real proposal then has to wait for the proposer's next gossip tick. A place needs the valid signature of a next-height validator, so a peer that is no validator cannot fill one with a proposal of its own, though any peer may relay a validator's.
@@ -1417,7 +1480,7 @@ Exercises:
 
 1. Persist `lockedRound` and the locked block hash in `LastSigned`, restore them in `startHeight`, and write a test that restarts a validator between a precommit and the decision and checks that it prevotes only its locked block in later rounds.
 2. Drive `Consensus` directly in a unit test with an injected `now`, a scripted `ConsensusDeps` and forged votes, and make rule 28 fire: a polka in round 0, a timeout, and a re-proposal with `polRound: 0` that a validator locked in round 0 accepts.
-3. A second proposal for a round is not relayed, so two nodes that were each sent a different one may never compare. Relay the head of a second proposal (not the block) once per round, and work out what that costs a node when the proposer is honest and when it is not.
+3. A proposal held for the next height is not looked at for what its proposer signed until that height starts, and its head is not sent on before. Record and relay heads for the next height too, and work out what bounds the verifications a peer can then make a node do for rounds that will never come.
 4. A node hands a newly connected peer every vote of the height at once, and the peer makes them wait if they are over its budget. Send them paced instead: so many a second, newest round first, stopping when the height ends. What does the receiver's queue then need to hold, and what does a full node that relays for a validator need to do when a vote it passed on was dropped?
 5. Drive `Consensus` with an injected `now` that runs ahead of the proposer's clock by more than `maxClockDriftMs`, and show that the same block is refused as a fresh proposal and accepted when re-proposed with a proof of lock; then decide whether a re-proposal should still be bounded by some larger window, and what it would be.
 6. Replace the fixed `commitMs` pause with one that ends early once every validator's precommit has arrived, and measure the block rate on the four-validator benchmark.

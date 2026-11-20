@@ -76,6 +76,7 @@ What is shed and what is not follows from what the node is for. The mempool, the
 - `timeouts?`, `limits?`: consensus timeouts and validation limits, partial overrides. `limits` is `Partial<Omit<ValidationLimits, 'maxBlockBytes'>>`: "The clock drift this node votes within, and for tests the evidence age. The block size is the chain's and comes from the genesis."
 - `network?`: the subset `desiredOutbound`, `maxInbound`, `connectIntervalMs`, `pingIntervalMs`, `idleTimeoutMs` of `NetworkConfig`.
 - `lagGraceMs?`: block sync's one-block grace.
+- `signGraceMs?`: how long a validator that hears from no peer after its start waits before it signs; by default the propose timeout (`start`, below).
 - `signState?`: where the validator's last signature and lock are kept, for a node without a data directory that is to be stopped and made again (the test harness does this). A validator that comes back without that record signs heights it already signed, and its peers hold the first signatures against the second for as long as they keep those heights ([chapter 4](04-consensus.md)). With a data directory the file there is used and this is left unset.
 - `log?`, `logLevel?`: a `Logger`, or a level for `makeLogger(name, level)`.
 - `memory?`: the memory guard's thresholds and sampling (`warnAt`, `pressureAt`, `criticalAt`, `hysteresis`, `intervalMs`) and, for tests, a `stats` function that supplies the samples: everything of `MemoryGuardOptions` but the logger and the two callbacks, `onLevel` and `onSample`, which the node provides.
@@ -457,13 +458,15 @@ Both take the node's logger and whatever `cfg.gc` and `cfg.memory` override. The
       evidencePool: this.evidencePool,
       broadcastProposal: (p, except) => this.network.broadcast({ type: 'proposal', proposal: p }, except),
       broadcastVote: (v, except) => this.network.broadcast({ type: 'vote', vote: v }, except),
+      broadcastProposalHead: (height, round, head, except) => this.network.broadcast({ type: 'proposalHead', height, round, head }, except),
+      signingHeld: () => (this.signingOpen ? null : 'not level with a peer since the start'),
       timeouts: this.cfg.timeouts,
       limits,
       log: this.log,
     });
 ```
 
-What is wired to what: state reads and block application go to the executor; `updateCommit` lets consensus store a fuller commit when late precommits arrive during the commit timeout (STAKING.md section 2.1); `blockTimeAt` serves evidence age checks; `requestBlock` broadcasts a `blockRequest` to every peer (the `hash` argument consensus passes is ignored; the response is matched by height, as RPC-SYNC-PROOFS.md section 4.5 puts it: "consensus broadcasts a request for the block by height"); `scorePeer` charges bad signatures; `reapTxs` takes transactions from the mempool when this node proposes; the two broadcasts push consensus messages, skipping the peer the message came from.
+What is wired to what: state reads and block application go to the executor; `updateCommit` lets consensus store a fuller commit when late precommits arrive during the commit timeout (STAKING.md section 2.1); `blockTimeAt` serves evidence age checks; `requestBlock` broadcasts a `blockRequest` to every peer (the `hash` argument consensus passes is ignored; the response is matched by height, as RPC-SYNC-PROOFS.md section 4.5 puts it: "consensus broadcasts a request for the block by height"); `scorePeer` charges bad signatures; `reapTxs` takes transactions from the mempool when this node proposes; the three broadcasts push consensus messages, skipping the peer the message came from, `broadcastProposalHead` being the one for what a proposer signed of a proposal that is not sent on whole ([chapter 4](04-consensus.md)); `signingHeld` answers consensus, each time it is about to sign, whether the validator may: null once `signingOpen` is set, and a reason until then (`start`, below).
 
 **10. Block sync.**
 
@@ -524,10 +527,15 @@ Consensus messages are pushed through unchanged, and a new peer is caught up:
 ```ts
     this.network.on('proposal', (peer, m) => this.detached(this.consensus.handleProposal(m.proposal, peer.id), 'proposal'));
     this.network.on('vote', (peer, m) => this.detached(this.consensus.handleVote(m.vote, peer.id), 'vote'));
+    this.network.on('proposalHead', (peer, m) => this.detached(this.consensus.handleProposalHead(m.height, m.round, m.head, peer.id), 'proposal head'));
+    // After block sync's own handlers for these, which keep the heights this reads.
+    this.network.on('status', () => this.checkSigning());
+    this.network.onPeer(() => this.checkSigning());
     // A peer that just connected missed everything flooded before; catch it up on the current height.
     this.network.onPeer((peer) => {
-      const { proposals, votes } = this.consensus.messagesForPeer();
+      const { proposals, heads, votes } = this.consensus.messagesForPeer();
       for (const proposal of proposals) peer.send({ type: 'proposal', proposal });
+      for (const { round, head } of heads) peer.send({ type: 'proposalHead', height: this.consensus.height, round, head });
       for (const vote of votes) peer.send({ type: 'vote', vote });
       // Evidence still waiting for a block is announced too; it was flooded before this peer existed.
       const pending = this.evidencePool.list(Infinity).map(evidenceId);
@@ -535,7 +543,7 @@ Consensus messages are pushed through unchanged, and a new peer is caught up:
     });
 ```
 
-Passing `peer.id` into `handleProposal` and `handleVote` is what lets consensus skip the source when it re-broadcasts, and charge it for a bad signature. `messagesForPeer` returns every valid proposal (except fetched ones, which carry no real signature) and every vote held for the current height. Evidence still in the pool is announced by `inv` messages of its ids (`evidenceId` from `src/consensus/evidence.ts`), all of it (`list(Infinity)`; a plain `list()` stops at 100, and the proposer asks for `MAX_EVIDENCE_PER_BLOCK`, 16) in slices of 256, the most a `fetch` may name, so the new peer fetches what it lacks; RPC-SYNC-PROOFS.md section 4.4: "A newly connected peer receives every pending evidence key, in `inv` messages of 256, with its catch-up proposals and votes." DESIGN.md section 3 explains the choice: a flooded message is sent once, so a peer that was not connected at that moment never gets it, and one missing vote can stall a round; re-sending and catching up new peers "replaces Tendermint's per-peer state tracking with something far simpler at the cost of some bandwidth."
+Passing `peer.id` into `handleProposal`, `handleVote` and `handleProposalHead` is what lets consensus skip the source when it re-broadcasts, and charge it for a bad signature. The second handler for `status` and the first for a new peer call `checkSigning` (`start`, below); they are registered here, after `BlockSync` was constructed and registered its own for the same two, because handlers run in the order they were registered and `checkSigning` reads the heights block sync has just recorded. `messagesForPeer` returns every valid proposal (except fetched ones, which carry no real signature), the head of what the proposer signed for each round whose proposal is not among them, and every vote held for the current height. Evidence still in the pool is announced by `inv` messages of its ids (`evidenceId` from `src/consensus/evidence.ts`), all of it (`list(Infinity)`; a plain `list()` stops at 100, and the proposer asks for `MAX_EVIDENCE_PER_BLOCK`, 16) in slices of 256, the most a `fetch` may name, so the new peer fetches what it lacks; RPC-SYNC-PROOFS.md section 4.4: "A newly connected peer receives every pending evidence key, in `inv` messages of 256, with its catch-up proposals and votes." DESIGN.md section 3 explains the choice: a flooded message is sent once, so a peer that was not connected at that moment never gets it, and one missing vote can stall a round; re-sending and catching up new peers "replaces Tendermint's per-peer state tracking with something far simpler at the cost of some bandwidth."
 
 Inventory gossip for transactions and evidence:
 
@@ -667,6 +675,7 @@ An `item` is taken only if its hash was fetched from that peer with that kind, w
 ```ts
     this.executor.onCommitted((block) => {
       this.network.broadcast({ type: 'status', height: block.header.height });
+      this.checkSigning();
       // The idle moment after a commit is where collections are least in the way.
       if (!this.stopping) {
         this.afterCommit ??= setImmediate(() => {
@@ -678,7 +687,7 @@ An `item` is taken only if its hash was fetched from that peer with that kind, w
     });
 ```
 
-The `status` broadcast is how every peer's block sync learns that this node moved. The collection is scheduled through `setImmediate` rather than called: `afterCommit` runs a minor collection synchronously, and deferring it lets the rest of this commit's listeners (the RPC's event push among them) and whatever is already queued on the event loop finish first, so the pause lands in the gap before the next proposal arrives, where the previous version's garbage is fresh and nothing is waiting on the thread. The immediate is kept in the field `afterCommit` ("so that a stop can take it back"), one at a time: the callback empties the field before it runs the collection, and a commit that finds one queued queues no second. A commit made once the node is stopping queues none, as the block being applied when a stop begins still commits, and `shutDown()` clears the one that is queued (below). Without the field a collection queued by the last commit ran after `stop()` had returned, and could start a major collection on a node that was stopped. The call to `evidenceAge()` is the evidence-age coupling described in the concepts: it leaves the shared limits at the unbonding period the committed block left, for the validation of the next height, and changes nothing when the operator pinned `maxEvidenceAgeMs` explicitly.
+The `status` broadcast is how every peer's block sync learns that this node moved. `checkSigning` is asked here because a commit is what brings a validator that started behind level with its peers. The collection is scheduled through `setImmediate` rather than called: `afterCommit` runs a minor collection synchronously, and deferring it lets the rest of this commit's listeners (the RPC's event push among them) and whatever is already queued on the event loop finish first, so the pause lands in the gap before the next proposal arrives, where the previous version's garbage is fresh and nothing is waiting on the thread. The immediate is kept in the field `afterCommit` ("so that a stop can take it back"), one at a time: the callback empties the field before it runs the collection, and a commit that finds one queued queues no second. A commit made once the node is stopping queues none, as the block being applied when a stop begins still commits, and `shutDown()` clears the one that is queued (below). Without the field a collection queued by the last commit ran after `stop()` had returned, and could start a major collection on a node that was stopped. The call to `evidenceAge()` is the evidence-age coupling described in the concepts: it leaves the shared limits at the unbonding period the committed block left, for the validation of the next height, and changes nothing when the operator pinned `maxEvidenceAgeMs` explicitly.
 
 #### Every handler on the network, in one place
 
@@ -695,14 +704,15 @@ Handlers registered by the node and by the two objects it constructs. The networ
 | `blockResponse`, `blocksResponse`, `headerResponse`, `headersResponse`, `validatorSetResponse`, `validatorsResponse`, `snapshotsResponse`, `manifestResponse`, `chunkResponse`, `addrResponse` | `Requester` | settle the first matching pending request |
 | `proposal` | `Node.init` | `consensus.handleProposal(proposal, peer.id)` |
 | `vote` | `Node.init` | `consensus.handleVote(vote, peer.id)` |
+| `proposalHead` | `Node.init` | `consensus.handleProposalHead(height, round, head, peer.id)` |
 | `inv` | `Node.init` | `fetch` the hashes the mempool or evidence pool lacks and no fetch is outstanding for, 256 per message, within the limits on remembered fetches (20,000 in all, 2,048 for one peer); no transaction fetches while the mempool would refuse them (full, at a lowered limit, or paused) |
 | `fetch` | `Node.init` | `item` or `itemNotFound` per hash, at most 256, 5 points if trimmed |
 | `item` | `Node.init` | taken only if fetched from this peer with this kind within the last minute: settle the fetch, then `mempool.addTx(data, peer.id)` or `acceptEvidence`; otherwise dropped unread |
 | `itemNotFound` | `Node.init` | take this peer out of the fetch if it was asked; the entry goes when no asked peer is left |
-| `status` | `BlockSync` | record the peer's height, `check` |
+| `status` | `BlockSync`, then `Node.init` | record the peer's height, `check`; then `checkSigning` |
 | `blockRequest` | `BlockSync` | `blockResponse` from the store |
 | `blocksRequest` | `BlockSync` | `blocksResponse`, up to 64 consecutive blocks and about 16 MiB |
-| peer connected | `Node.init`, `BlockSync` | send the current height's proposals and votes and `inv`s of all pending evidence, 256 ids each; record the hello height |
+| peer connected | `BlockSync`, then `Node.init` | record the hello height; then `checkSigning`, and send the current height's proposals, proposal heads and votes and `inv`s of all pending evidence, 256 ids each |
 | peer gone | `Requester`, `BlockSync` | fail its pending requests; forget its height |
 
 #### The life of a transaction
@@ -977,6 +987,7 @@ Shedding itself is the last method:
     }
     if (this.stopping) return;
     this.blockSync.start();
+    this.holdSigning();
     this.consensus.start();
     // Opening a store leaves garbage several times what it keeps (every stored entry read and checked), and the
     // guard's first sample would take it for a full heap and stop a node that fits: collect it first.
@@ -994,9 +1005,65 @@ Shedding itself is the last method:
   }
 ```
 
-`startUp()` starts the network (unless state sync already did), then block sync, then consensus; then it awaits one major collection from the scheduler (`gcScheduler.major()`, which does nothing without `--expose-gc`), because opening a store leaves garbage several times what it keeps and the guard's first sample would otherwise take it for a full heap; then the memory guard's sampling timer (unreferenced, so it never keeps the process alive on its own) and the scheduler's collection observer, and logs the height, the validator address if any, and the node id. The order matters: block sync must be listening for `status` before consensus starts, and consensus must start after the executor has replayed.
+`startUp()` starts the network (unless state sync already did), then block sync, then holds the validator's signature (`holdSigning`, below), then starts consensus; then it awaits one major collection from the scheduler (`gcScheduler.major()`, which does nothing without `--expose-gc`), because opening a store leaves garbage several times what it keeps and the guard's first sample would otherwise take it for a full heap; then the memory guard's sampling timer (unreferenced, so it never keeps the process alive on its own) and the scheduler's collection observer, and logs the height, the validator address if any, and the node id. The order matters: block sync must be listening for `status` before consensus starts, and consensus must start after the executor has replayed.
 
 The first call keeps the promise of `startUp()` in `starting` and every later call is handed the same one, so a node is started once however often `start()` is called, and a stop can wait for a start that has not finished. That matters because a start has waits in it, and a stop may come during any of them: the command line stops a node on a signal, and the memory guard's listener stops one that is `critical` at its first sample, which is taken inside `start()`. A start that went on after such a stop would start consensus and block sync on a node whose store is being closed. So `startUp()` does nothing if a stop has already begun, and after each of its waits it reads `stopping` and "goes no further": after the network's start, before block sync and consensus are started; after the collection, before the guard is started; and after the guard's start, whose first sample "may have found the heap critical and its listener begun a stop", before the scheduler is started and the line `node started` is logged. `networkStarted` is set before the network's start is awaited and not after it, "so a stop that comes during it stops the network this is starting": `shutDown()` stops the network only when the flag is set. `stop()` is one line over a private `shutDown()`, quoted with it:
+
+A validator does not sign from the moment it starts. These are the fields and the three methods between `detached` and `start` in the file:
+
+```ts
+  /**
+   * A validator signs nothing from its start until it has stood level with a peer: heard from one, and is behind
+   * none it has heard from. What it would sign before that is for heights the others may have decided, or that it
+   * signed in itself before it was stopped; with its sign state gone it would sign them a second time, and with it
+   * the signatures are of no use to anybody. A validator alone has nobody to wait for, and signs after `signGraceMs`.
+   *
+   * It does not cover a validator that comes back, without its sign state, into the height it stopped in while the
+   * others are still in it: that one is level, and signs.
+   */
+  private signingOpen = true;
+  private signGraceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private holdSigning(): void {
+    if (!this.privValidator) return;
+    this.signingOpen = false;
+    this.checkSigning();
+    const grace = this.cfg.signGraceMs ?? this.cfg.timeouts?.proposeMs ?? DEFAULT_TIMEOUTS.proposeMs;
+    const wait = (): void => {
+      if (this.signingOpen) return;
+      this.signGraceTimer = setTimeout(() => {
+        this.signGraceTimer = null;
+        // Nobody to hear from, or the peers that said they were ahead have gone or did not serve what they said.
+        if (this.blockSync.levelWith(this.executor.state.lastHeight) === 'nobody') this.openSigning();
+        else this.checkSigning();
+        wait();
+      }, grace);
+    };
+    wait();
+  }
+
+  private checkSigning(): void {
+    if (this.signingOpen || !this.started || this.stopping) return;
+    if (this.blockSync.levelWith(this.executor.state.lastHeight) === 'level') this.openSigning();
+  }
+
+  private openSigning(): void {
+    if (this.signingOpen) return;
+    this.signingOpen = true;
+    if (this.signGraceTimer) clearTimeout(this.signGraceTimer);
+    this.signGraceTimer = null;
+    this.log('info', 'validator signing', { height: this.executor.state.lastHeight + 1n });
+    this.consensus.signingResumed();
+  }
+```
+
+The case this is for is a validator that comes back without the record of what it last signed: the file was lost, or the data directory was restored from a copy, or the node was set up again from nothing. Its guard is empty and refuses nothing. It starts at the height its store ends at, which may be height 1, and consensus begins that height at once: if the round is its own it proposes, after a timeout it prevotes nil, and with the prevotes of the others it precommits. Each of those is a second signature for a height, round and step it signed in before, and its peers keep the first for 16 heights ([chapter 4](04-consensus.md)): they report it, and the application takes its stake and removes it for good. With the record in place the same signatures are refused by the guard or, where the height is one the validator never signed in, are only of no use, since the others decided that height long ago. So nothing is lost by waiting.
+
+`signingOpen` is true on a node without a validator key and stays so. `holdSigning`, called by `startUp()` just before consensus starts, sets it to false on a validator, and `signingHeld` (step 9) then answers consensus with the reason until something sets it back. `checkSigning` is what does: it opens when block sync's `levelWith` answers `'level'`, which is when at least one peer has said a height and none of them is above this node's own ([chapter 7](07-sync.md)). It is asked when a peer connects and when one announces a height, which is how four validators started together at height 0 begin within a few milliseconds of finding each other, and after every commit, which is how a validator that started behind begins: block sync applies the blocks it lacks, and the commit that brings it level opens it. `openSigning` logs `validator signing` with the height and calls `consensus.signingResumed()`, which begins the round consensus is in again so that the validator takes its part in it ([chapter 4](04-consensus.md)).
+
+The timer is for the validator that hears nobody. A chain of one validator has no peer to be level with, and neither has the first validator of a network to come up, so after `signGraceMs` (the propose timeout unless the config says otherwise: 3 seconds by default, 400 ms in the test harness) without a peer heard, it opens. The timer runs again as long as signing is held, for the peer that said it was ahead and then went away or did not serve the blocks. What a peer says of its height costs it nothing and it can say it again every second, so `levelWith` leaves out a peer from the moment a request for the blocks it claimed failed, timed out or came back empty or wrong, until that peer serves blocks ([chapter 7](07-sync.md)); the next turn of the timer then finds either nobody heard or nobody ahead. A peer that says it is ahead and serves nothing thus holds a starting validator back for one request timeout, 5 seconds, and a turn of the timer, under each node id it comes with; one that keeps its word holds it for as long as the sync takes. The other side of that rule is an honest peer that is ahead and whose answer was lost: it is left out too, and a validator with no other peer ahead signs before it has caught up. `shutDown()` clears the timer with the rest.
+
+The hold is by the heights of the peers the node has heard, and ends once. A validator whose first peers are themselves behind, or that hears a peer ahead only after it has stood level with another, signs in heights the rest of the network has decided, and nothing holds it again. And what the comment says it does not cover: a validator that lost its record and comes back into the very height it stopped in, with the others still in that height, is level with them and signs. Nothing distinguishes it from a validator the others are waiting for, and holding it would stop a chain that needs its vote. For that case the record is the only defence, which is why it is written before any signature leaves ([chapter 4](04-consensus.md)) and why the operator's guide says to keep the file with the key. `test/signing.test.ts` has three cases: a validator alone that waits out its grace and then makes the blocks, one that comes back behind its peers with an empty guard, signs nothing until it is level and is reported by nobody, and one beside a peer that says it is ahead and serves nothing ([chapter 15](15-tests.md)).
 
 ```ts
   private stopping: Promise<void> | null = null;
@@ -1037,6 +1104,8 @@ The first call keeps the promise of `startUp()` in `starting` and every later ca
           this.gcScheduler.stop();
           this.consensus.stop();
           this.blockSync.stop();
+          if (this.signGraceTimer) clearTimeout(this.signGraceTimer);
+          this.signGraceTimer = null;
         }
         // The network may be up from a state-sync join even if start() was never called.
         if (this.networkStarted) {
@@ -1350,7 +1419,7 @@ The late node is a full node (`validatorSeed: null`) seeded with the validators'
 
 ## How it is tested
 
-Most tests that run whole nodes build them through `makeTestnet` in `test/helpers.ts`, which is a compact version of the localnet: one `MemoryHub`, N validators plus optional full nodes, each seeded with every other address, the fast timeouts and network intervals, `lagGraceMs: 500`, the key-value test app by default or an `appFor` factory, and `makeNode(i, overrides)` to create extra or replacement nodes with the same seeds and genesis. The suites that use it are `consensus`, `engine`, `recovery`, `chain`, `light`, `staking-net`, `rpc`, `sync`, `schemes`, `amnesia`, `faults`, `priorities`, `review`, `review2`, `review4`, `review5-net`, `review5-node`, `review5-rpc` and `memory`. Not every case goes through it: the peer-layer cases in `test/network.test.ts`, and some in `review3`, `review4` and `review5-net`, construct `Network` objects directly, and a few node cases in `review3` and `review4` call `Node.create` themselves. The helper asks for `indexTrees: 'memory'` on every node it makes, or `'store'` when the suite runs under `INDEX_TREES=0`, so that dropping and rebuilding the index trees is exercised.
+Most tests that run whole nodes build them through `makeTestnet` in `test/helpers.ts`, which is a compact version of the localnet: one `MemoryHub`, N validators plus optional full nodes, each seeded with every other address, the fast timeouts and network intervals, `lagGraceMs: 500`, the key-value test app by default or an `appFor` factory, and `makeNode(i, overrides)` to create extra or replacement nodes with the same seeds and genesis. The suites that use it are `consensus`, `engine`, `recovery`, `chain`, `light`, `staking-net`, `rpc`, `sync`, `schemes`, `amnesia`, `faults`, `signing`, `priorities`, `review`, `review2`, `review4`, `review5-net`, `review5-node`, `review5-rpc` and `memory`. Not every case goes through it: the peer-layer cases in `test/network.test.ts`, and some in `review3`, `review4` and `review5-net`, construct `Network` objects directly, and a few node cases in `review3` and `review4` call `Node.create` themselves. The helper asks for `indexTrees: 'memory'` on every node it makes, or `'store'` when the suite runs under `INDEX_TREES=0`, so that dropping and rebuilding the index trees is exercised.
 
 The cases that exercise the node's own wiring:
 

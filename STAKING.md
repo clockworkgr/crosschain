@@ -112,13 +112,18 @@ and a node running this application then follows `staking.unbondingPeriodMs`
   summed again over the validators at the end of every block.
 
 The operator's own stake is an ordinary `delegation` object; commission shares are
-minted into it. A validator exists only with its operator's delegation present:
-`minSelfBond` is at least 1, undelegation and redelegation refuse to take the
-operator below it, and a tombstone empties the delegation. One other thing can: a
-slash that follows stake the operator redelegated into its own validator from one
-since punished is taken from that delegation (section 8, step 6), below `minSelfBond`
-or to nothing if the delegation is worth less than the cut. The validator stays, and
-the next commission makes the delegation again.
+minted into it. No transaction takes the operator's
+delegation below `minSelfBond`, which is at least 1: undelegation and redelegation
+refuse to, unless the validator is tombstoned, and a tombstone empties the delegation.
+Two things other than a transaction can leave it below: a proposal that raises
+`minSelfBond`, and a slash that follows stake the operator redelegated into its own
+validator from one since punished, which is taken from that delegation (section 8,
+step 6) and removes it if it is worth no more than the cut. Neither jails the
+validator or slashes it. It stays a candidate that the active set does not take
+(section 6), and it can be taken again from the end of the block in which the operator
+has delegated enough to itself, if its power is at least 1 and it ranks among the
+`maxValidators`; stake delegated by others does not count toward the self-bond. Commission still owed for the blocks its last commits were in is
+minted into the delegation, or into a new one if it was removed.
 
 ## 4. Parameters
 
@@ -183,7 +188,7 @@ nothing.
   the delegation.
 - Unbond `s` shares: release `floor(s * tokens / shares)` tokens; subtract both. A
   delegation whose shares reach zero is removed. The operations keep the operator's
-  above `minSelfBond`; it reaches zero when the validator is tombstoned, or when a
+  at or above `minSelfBond`; it reaches zero when the validator is tombstoned, or when a
   slash following stake redelegated into it takes all of it (section 3).
 - Reward `r` to a validator with commission `c = floor(r * commissionBps / 10000)`:
   add `r` to tokens, then mint `x = floor(c * shares / (tokens - c))` shares into the

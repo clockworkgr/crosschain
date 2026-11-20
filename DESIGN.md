@@ -177,7 +177,15 @@ transactions checked at once no more are let through and applied than the pool h
     (height, round, validator, vote type) and what the vote says (block hash and
     `polRound`): a vote for the same place that says something else is verified, and is
     evidence. Inventory would add a round trip to each of
-    the three Tendermint phases.
+    the three Tendermint phases. A proposal is sent on whole only if it is valid and the
+    round takes it. Of any other whose signature verified (an invalid block, a body
+    that does not match its header, a round that decided on a fetched block, a height
+    that ended meanwhile) a node sends on the head, what the proposer signed without the
+    block (`proposalHead`: height, round, proof-of-lock round, block hash, signature),
+    if it is the first it holds for that round. A head decides nothing; a node that
+    holds something else for the round has in it the second half of the proof that
+    the proposer signed two. So two nodes that were each sent a different proposal
+    are connected through two neighbours of which one hears what the other holds.
   - **Re-send, because a flooded message is sent once:** a peer that was not connected
     at that moment, or was briefly partitioned, never gets it, and one missing vote can
     stall a round. So while a round is unresolved every validator re-sends, every
@@ -186,7 +194,8 @@ transactions checked at once no more are let through and applied than the pool h
     current round re-sends that round's proposal, whether it built the block or
     re-proposed another validator's; and a newly connected peer is handed every
     valid proposal held for the current height that came signed (not a block that was
-    fetched) and the vote held in each place of its vote sets (not the other vote of a
+    fetched), the head held for each round whose proposal is not among those, and the
+    vote held in each place of its vote sets (not the other vote of a
     double signer, kept beside them for evidence) plus the ids of pending evidence.
     Receivers drop duplicates before verifying. This replaces Tendermint's per-peer
     state tracking with something far simpler at the cost of some bandwidth.
@@ -220,6 +229,14 @@ transactions checked at once no more are let through and applied than the pool h
   it. Signing stays on the main thread: once per
   consensus step, ~3 ms under ML-DSA-44 and a twelfth of that under secp256k1, and it
   keeps the persist-then-broadcast order of the double-sign guard trivial.
+- **A validator signs only once it is level:** from its start a node's validator signs
+  nothing until block sync has heard a height from a peer and none it has heard is above
+  its own, a peer that did not serve the blocks it claimed left out; hearing no peer, it signs after the propose timeout (`signGraceMs`). The
+  state machine runs meanwhile as a full node's does, and when the hold ends the round
+  it is in is begun again, without the lock and the marks the state machine set in it
+  unsigned, so the validator proposes or votes in it. A validator back
+  without its sign state would otherwise sign, in every height the others decided while
+  it was away, a second time what its peers still hold the first of.
 - **Integers:** heights, times, amounts and voting power are BigInt. Plain numbers are
   doubles and carry only bounded integer fields whose encoding is u8, u16 or u32:
   rounds, the protocol version, basis-point rates, counters, instance numbers. Where
@@ -1231,72 +1248,40 @@ the set of H only as header H commits to it with the set of H+1; a peer whose se
 the right members and powers and other priorities is charged and the next one asked (one
 whose set does not hash to the header's set hash is passed over without a charge).
 
-## 10. Implementation status (2026-11-19)
+## 10. Implementation status (2026-11-20)
 
-Everything above is implemented in TypeScript under `src/`. 322 tests in 32 files
+Everything above is implemented in TypeScript under `src/`. 328 tests in 33 files
 pass, and the whole suite passes under either signature scheme
 (`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there) and with
 either tier of state paging dropped from the start (`INDEX_TREES=0`, `TREES=0`, or
-both: every lookup, scan, root and proof through the store). The engine
-tests (consensus, recovery, network, units) run on the key-value test app; the
-database and application have their own suites, and one test runs the core application
-on a live four-validator network with a full node, gossiping signed transactions and
-checking a proof from one node against the app hash in the next header on every node,
-then querying a past height and a name and verifying them with the light client. A
-separate test grows a validator set and shrinks it past the trust level and watches
-the light client bisect. The priorities suite hashes a set by its members and by its priorities, refuses a block whose header commits to other priorities than the state's, and joins from a snapshot past sources that serve sets with shifted priorities. The amnesia suite signs the round a prevote relies on, keeps a validator's lock through a restart and refuses to sign past it, proves a forgotten lock from two votes, counts a prevote that names a majority only once that majority is held, has a network find a forgotten lock and every application punish it, and decides a block proposed again in a later round on prevotes that name the first. The faults suite proves two proposals for a round from their signatures and a prevote on a majority that never was from the prevotes of the round it names, has one state machine report each, and has a network punish a double sign, a second proposal and a false citation that came to light when their height was over. The staking suite walks every rule one block at a time with
-a supply invariant checked after each scenario, and a network test runs an
-application-owned set through delegation, a stopped validator being jailed, its
-return by unjail, and a light client following the whole sequence. The fee suite prices
-operations against the schedule (FEES.md), checks that a stated fee is what is charged,
-and adopts a schedule change by proposal, after which a transaction priced under the
-old schedule fails instead of paying more. The schemes suite signs, verifies and
-round-trips tagged keys under each scheme, refuses cross-scheme keys and signatures,
-unknown tags and the high-S twin, keeps each key's scheme in the keystore, and runs a
-four-validator chain on secp256k1 end to end. The memory suite moves the guard through
-its levels on injected samples, checks the scheduler's decisions against an injected
-collector and its observer against real collections, and runs a full node of the core
-application in a two-validator testnet through load shedding and back while it keeps
-following the chain, its database's cache capped at `pressure` and unbounded again at
-`ok`, its index trees (the test helper asks for `indexTrees: 'memory'`) dropped and its history window trimmed to two versions at `warn`
-with the Merkle trees still resident and nothing shed, its Merkle trees dropped at
-`pressure` while it follows the chain
-and proves objects through the store, both tiers kept dropped at `ok` while rebuilding is estimated
-not to fit (after waiting at `ok` as long as it had run before the drop, and saying once that it stays paged), and rebuilt once it does, its history window restored after the trees, and its mempool admitting up to half its
-limit at `warn`, a tenth at `pressure` (a transaction beyond it refused as `full`) and all of it at `ok`; and a node with
-`retain.memoryVersions` set keeps that many past versions in memory and proves an older height from the store, and with `indexTrees: 'store'` leaves its index trees there and still finds an account by name. The history
-suite appends blocks of entries to the account history log and pages every account out
-of it in both directions against a model, counts the reads that reach the old end of a
-long history, checks that a block writes the heads of one slice of the account numbers and that a log opened after a stop has the waiting ones back, and moves a store written with the earlier layout into the log. The fourth review's suite (`test/review4.test.ts`) asks a node for a balance, an account, a key, a validator and a delegation as of past heights and checks their proofs against the next header's app hash, spends a rate limit with batches, indexes one transaction in three blocks, moves the index's entries into larger segments over 34,000 blocks, moves a transaction index of the earlier layout when its store is opened, refuses a snapshot without every type's section and a number too large to hold exactly, prunes and bounds the evidence pool, removes a key from the keystore, reads a peer clock seven seconds ahead from its pong and runs a node on a verifier pool of its own. Four more suites hold one case for each rule added after it. `test/review5-net.test.ts` (20 cases) counts one success for an outbound dial, leaves a refused connection open for the rejection to leave, sends nothing on a connection that opened after the network was stopped and leaves no refused connection or timer behind, does not wait on a connection that closed between two steps of its handshake and leaves no timer of the in-memory wire behind, ends a dial still connecting when the transport is closed, bans and excludes a peer by the address dialed, takes an address list only in answer to a request, starts from the seeds on a peer file cut short, stops block sync cleanly, sets no timer when block sync was stopped while a block was being applied, catches the failure of a proposal nobody waits for, refuses a block response that does not match its request, passes over a snapshot below the trust height, drops a vote far ahead before verifying it, holds a vote for the next height once, holds for the next height only proposals a validator signed, and admits one of two transactions checked at once for the pool's last place. `test/review5-node.test.ts` (26 cases) claims a data directory by its real path and releases it last, takes a stale claim over only while holding the takeover file, closes a store it was handed for a directory it claimed before giving the claim up, waits for whoever still reads the store before closing it, does not go on starting once it is being stopped and answers a closed store with an error, leaves nothing queued behind a stop made from a commit and no file open behind a genesis that does not parse, refuses every step of an iteration and every use of a writer once the disk environment is closed, reads the evidence age from the application when asked, stores nothing of a block whose application commit throws, prunes in one transaction with the set by height going with its block, answers for a past height with the set as that height had it, removes a validator set by hash once no header held names it, indexes a repeated transaction where it succeeded, undoes the writes of a memory environment transaction that throws, does not pool gossiped evidence that is too old, takes an item only from the peer asked for it, remembers no more than 2,048 fetches for a peer that announces and never answers, takes the block size from the genesis for every node alike, bounds a block by its transactions and evidence and a validator set by what a frame holds, and refuses a block with more than 16 pieces of evidence. `test/review5-app.test.ts` (17 cases) fails a store write under the application and writes the block again with a correct history, stops the application after a failure past the block's session, refuses a delegation to a validator with shares and no tokens and an authority no key leads to or that needs more signatures than a transaction carries, reads the state of the last root after writes outside a session, bounds the object types and the authenticated indices, and has the toy application refuse a validator key of another scheme than its set's. `test/review5-rpc.test.ts` (12 cases) stops a server's events with it, stops a server only once a method it was running has returned (the method ends within the server's one-second wait), replays a block event with the fields of a live one, opens an account stream only for an account there is, finds a validator by its operator's account id, keeps a key under a name every object inherits, and runs the command line for a block size given to `init` and written into the genesis or refused, a node started from it that holds its directory against a second start and stops on a signal with exit code 0 and the directory released, an unknown command, an asset of precision 0, a light client anchor of another chain and a block whose results the node lacks. State paging (`STATE-PAGING.md`) has cases of its
-own: the arena suite grows slabs, counts dead bytes and compacts, and releases whole
-slabs down to a byte limit, unread ones first; the database suite
-evicts clean objects and never dirty ones, keeps history as bytes, checks that the
-entries, chunks and nodes each root reports equal the trees when applied to a store,
-plays randomised writes, nested sessions, roots, drops and rebuilds against a database
-that never drops, and requires the roots, object proofs, key proofs and range proofs of
-a dropped database to equal a resident one's at every version in the window, trims the
-history window and lets it grow back against a database that never trims, reads every
-version the store has a record of from those records with the window in memory trimmed
-to two versions and to none (the roots, proofs and past values of a database that never
-trims, and a refusal for a key proof from a record written without the sparse tree
-nodes), and holds an
-arena to a byte limit of zero over a store with the roots, proofs and reads of an
-unbounded one; the
-application suite restarts from the stored entries and trees, catches a tampered object
-by the leaf check, fills in a store written before them, runs blocks with both tiers
-dropped and rebuilt against an application that never drops, restarts with its whole
-history window from a store written while the window in memory was trimmed, proves the
-same heights from the store's records while it is trimmed, and opens a
-store with no room for its tiers (both dropped, no history window read, the earlier
-heights proven from the records left in the store) and with no room
-in the arena (every object read from the store), running blocks on each with the hashes
-and proofs of a resident application. All five phases are built;
-the paging benchmark (`docs/benchmarks.md` section 4.13) ran a node on its defaults
-under a heap limit of
-1.25 times its resident state for 40 seconds: opened with its Merkle trees and its history
-left in the store, through `warn` once, with the history window in memory cut to two
-versions from then on and without reaching `pressure`, for 129
-blocks and 72,092 transfers without an abort.
+both: every lookup, scan, root and proof through the store). The engine tests run on
+the key-value test app; the database and the application have their own suites.
+`docs/tutorial/15-tests.md` goes through every case by its title; this is what each
+suite is for:
+
+| suite (`test/*.test.ts`) | what it covers |
+|---|---|
+| `units` | codec, keys and the verifier pool, proposer selection and validator set updates, the private validator's guard, the mempool |
+| `schemes` | keys, signatures and the keystore under each scheme, cross-scheme refusals, a four-validator chain on secp256k1 |
+| `network` | the peer layer: handshake, status and addresses, refused and simultaneous connections, a silent peer, on the in-memory transport and over real sockets |
+| `consensus`, `engine`, `recovery` | a network deciding blocks with validators down, partitioned, added and removed; a late precommit folded into the stored commit, evidence age, the protocol version; a validator restarted from disk, and double-sign evidence built, carried in a block and handed to the application |
+| `amnesia` | the round a prevote signs, the lock kept through a restart, a forgotten lock proven and punished, a prevote that names a majority counted only once that majority is held |
+| `faults` | two proposals for a round (given whole or as one proposal and the other's head), a prevote on a majority that never was, the vote budget of a peer, and either half of a proof arriving after its height |
+| `signing` | a validator that signs nothing from its start until it is level with a peer, or has waited for one in vain |
+| `priorities` | the two hashes of a validator set, a header's commitment to the priorities, a snapshot join past sources that serve shifted ones |
+| `db`, `arena`, `store` | the object database (indices, sessions, roots, proofs, history, dropped and rebuilt tiers against one that never drops), the arena of encoded objects, the key-value stores and the block store |
+| `app`, `chain` | the core application's accounts, authorities, assets and transfers, paging from the store, and one run on a live four-validator network with proofs checked on every node |
+| `staking`, `staking-net` | every staking rule one block at a time with a supply invariant, and an application-owned set on a network: delegation, jail, unjail, a light client following |
+| `fees`, `genesis`, `history` | the fee schedule and its change by proposal, genesis documents, the account history log |
+| `txproof`, `light`, `rpc`, `sync` | transaction and result proofs, a light client bisecting over a changing set, the RPC with its limits and token, state sync, block sync and backfill |
+| `memory` | the memory guard's levels, the collection scheduler, and a full node shedding load and rebuilding while it follows the chain |
+| `review`, `review2`, `review3`, `review4`, `review5-net`, `review5-node`, `review5-app`, `review5-rpc` | one regression case for each finding of the reviews and for each rule added after them |
+
+The paging benchmark (`docs/benchmarks.md` section 4.13) ran a node on its defaults
+under a heap limit of 1.25 times its resident state for 40 seconds: opened with its
+Merkle trees and its history left in the store, through `warn` once, with the history
+window in memory cut to two versions from then on and without reaching `pressure`, for
+129 blocks and 72,092 transfers without an abort.
 
 | module | what it is |
 |---|---|
@@ -1327,10 +1312,18 @@ Known simplifications, all deliberate and all revisitable:
   than that, or to a node that was restarted since, is dropped. A prevote that names a
   majority which never formed is punished only where +2/3 of the power prevoted something
   else in the round named, and on the assumption that less than a third signs twice;
-  elsewhere it is only never counted. A second proposal for a round is not relayed, so two
-  nodes that were each sent a different one may never compare.
-- A validator restarted without its sign-state record signs again in heights it signed in
-  before and is reported for it; a node does not hold back from signing while it catches up.
+  elsewhere it is only never counted. Of two proposals for a round, a node that holds one is
+  sent the other or what was signed of it (section 3) by the peers it is connected to
+  during that height; not for a height it is not in and has not kept, not while both are
+  held for a height that has not started, and not by a peer it meets after the height.
+- A validator restarted without its sign-state record may sign again where it signed before,
+  and is reported for it. A node holds its validator back from its start until it is level
+  with the peers it has heard (or, hearing none, for the propose timeout), which keeps it
+  out of the heights those decided while it was away. The hold ends once and goes by what
+  those peers say: first peers that are behind themselves let it go early, a peer that
+  claims to be ahead and serves no block is left out after one failed request, and so is an
+  honest one whose answer was lost. One that comes back into the height it stopped in, with
+  the others still in it, is level and signs: only the record guards that height.
 - There is one protocol version, 1, and it changes in place while the chain is
   unreleased: a data directory written by an earlier build of the header, vote or
   evidence formats is not carried over.
@@ -1375,9 +1368,6 @@ Known simplifications, all deliberate and all revisitable:
 - The light client's trusting period is the client's choice and must stay below the
   chain's unbonding period; the engine's evidence age follows the unbonding period
   automatically.
-
-`REVIEW-2026-10-28.md` records an external review of the whole codebase and what was
-done about each finding.
 - History records are written in full per version and read back on restart (unless the
   store is opened paged for want of heap, section 4), so the provable window survives a
   restart; replaying the blocks missed while down then
@@ -1504,3 +1494,6 @@ done about each finding.
   for a window that holds a record written before the nodes were kept. And chunks of 1,024 hashes on disk make a
   block scattered over the state rewrite nearly every chunk it touches, a fifth of the
   commit at that size when the chunks were first written; smaller chunks would cut it about in half.
+
+`REVIEW-2026-10-28.md` records an external review of the whole codebase and what was
+done about each finding.

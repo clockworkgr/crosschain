@@ -648,7 +648,24 @@ that sends it, as that kind, within that minute; any other is dropped
 unread and without a charge, so a peer cannot push transactions or evidence past the
 announce-and-fetch round. A newly
 connected peer receives every pending evidence key, in `inv` messages of 256, with
-its catch-up proposals and votes.
+its catch-up proposals, proposal heads and votes.
+
+The two halves of a proof of two proposals reach one node without the pool. A node
+sends a proposal on whole only when it is valid and its round takes it; of any other
+whose signature verified it sends the head (`proposalHead`, code 22: height, round,
+proof-of-lock round, block hash and signature, 2,474 bytes under ML-DSA-44 and 118
+under secp256k1) to every peer but the sender, if that is the first thing it holds
+for the round, and it sends one on in the same way when a head is the first it hears
+of a round. A head is verified only for a round of the current height within 1,000 of
+the node's own or a round a kept height reached, and not when it says what is held
+for the round or the round's proposer was already reported; one signed head is
+verified once however many peers send it together, 64 are verified at a time and one
+over that is dropped; a bad signature costs 20 points. A whole proposal that arrives
+after its height, for a round the kept height holds nothing for, has its head recorded
+and sent on in the same way. Heads go to the peers connected when they are first held
+and to a peer that connects during their height, so nodes that meet later do not
+compare what they kept. With what the node holds for the round it is the evidence, which then travels
+as above.
 
 ### 4.5 Immediate block fetch
 
@@ -658,7 +675,7 @@ is validated and decided as if proposed. This replaces falling a height behind.
 
 ### 4.6 Peer scoring
 
-Points per offence: bad vote or proposal signature 20, proposal body not matching
+Points per offence: bad signature on a vote, a proposal or a proposal head 20, proposal body not matching
 its header 20, malformed message 20, malformed or invalid evidence 20, bad manifest,
 chunk, commit or batch of headers during state sync 50, bad block during sync or
 backfill 50, a block sync response that does not match its request 50, an

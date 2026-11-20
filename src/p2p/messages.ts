@@ -9,6 +9,7 @@ import { HASH_SIZE } from '../crypto/hash.ts';
 import { decodePublicKey, decodeSignature } from '../crypto/keys.ts';
 import { decodeBlock, decodeCommit, decodeHeader, encodeBlock, encodeCommit, encodeHeader, type Block, type Commit, type Header } from '../types/block.ts';
 import { ValidatorSet } from '../types/validator.ts';
+import { decodeHead, encodeHead, type ProposalHead } from '../types/evidence.ts';
 import { decodeProposal, encodeProposal, type Proposal } from '../types/proposal.ts';
 import { decodeVote, encodeVote, type Vote } from '../types/vote.ts';
 
@@ -48,6 +49,8 @@ export type Message =
   | { type: 'itemNotFound'; kind: number; hash: Uint8Array }
   | { type: 'proposal'; proposal: Proposal }
   | { type: 'vote'; vote: Vote }
+  /** What a round's proposer signed, without the block: sent on where the proposal itself is not. */
+  | { type: 'proposalHead'; height: bigint; round: number; head: ProposalHead }
   | { type: 'blockRequest'; height: bigint }
   | { type: 'blockResponse'; height: bigint; block: Block | null; commit: Commit | null }
   | { type: 'blocksRequest'; from: bigint; count: number }
@@ -85,6 +88,7 @@ const CODES: Record<MessageType, number> = {
   itemNotFound: 13,
   proposal: 20,
   vote: 21,
+  proposalHead: 22,
   blockRequest: 30,
   blockResponse: 31,
   blocksRequest: 32,
@@ -189,6 +193,10 @@ export function encodeMessage(m: Message): Uint8Array {
       case 'vote':
         encodeVote(w, m.vote);
         break;
+      case 'proposalHead':
+        w.u64(m.height).u32(m.round);
+        encodeHead(w, m.head);
+        break;
       case 'blockRequest':
         w.u64(m.height);
         break;
@@ -285,6 +293,8 @@ export function decodeMessage(buf: Uint8Array): Message {
         return { type, proposal: decodeProposal(r) };
       case 'vote':
         return { type, vote: decodeVote(r) };
+      case 'proposalHead':
+        return { type, height: r.u64(), round: r.u32(), head: decodeHead(r) };
       case 'blockRequest':
         return { type, height: r.u64() };
       case 'blockResponse':

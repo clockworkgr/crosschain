@@ -70,6 +70,7 @@ const MAX_SERVED_BYTES = 16 * 1024 * 1024;
 export class BlockSync {
   private readonly d: BlockSyncDeps;
   private readonly peerHeights = new Map<string, bigint>();
+  private readonly unserved = new Set<string>();
   private readonly buffer = new Map<bigint, { block: Block; commit: Commit; peerId: string }>();
   private readonly requested = new Set<bigint>();
   private readonly busyPeers = new Set<string>();
@@ -92,6 +93,8 @@ export class BlockSync {
     deps.network.on('blockRequest', (peer, m) => this.serveBlock(peer, m.height));
     deps.network.on('blocksRequest', (peer, m) => this.serveBlocks(peer, m.from, m.count));
     deps.network.onPeer((peer) => this.onPeerStatus(peer.id, peer.height));
+    // Peers connected before this was made (a state-sync join makes its connections first) are heard as well.
+    for (const peer of deps.network.peers.values()) this.peerHeights.set(peer.id, peer.height);
     deps.network.onPeerGone((peer) => {
       this.peerHeights.delete(peer.id);
       this.busyPeers.delete(peer.id);
@@ -116,6 +119,28 @@ export class BlockSync {
 
   get isSyncing(): boolean {
     return this.buffer.size > 0 || this.requested.size > 0;
+  }
+
+  /**
+   * Whether this node, at height `ours`, is level with the peers it has heard: 'nobody' if none has said a height,
+   * 'behind' if one is above, 'level' otherwise. A peer that said it was ahead and then did not serve the blocks
+   * (no answer, none, or wrong ones) is left out until it serves some: what a peer says of its height costs it
+   * nothing, and it can say it again.
+   */
+  levelWith(ours: bigint): 'nobody' | 'behind' | 'level' {
+    let heard = 0;
+    for (const [id, h] of this.peerHeights) {
+      if (this.unserved.has(id)) continue;
+      if (h > ours) return 'behind';
+      heard++;
+    }
+    return heard > 0 ? 'level' : 'nobody';
+  }
+
+  /** A peer did not serve blocks it had said it has. Remembered past its disconnection, up to a bound. */
+  private notServed(peerId: string): void {
+    if (this.unserved.size >= 4096) this.unserved.clear();
+    this.unserved.add(peerId);
   }
 
   bestPeerHeight(): bigint {
@@ -203,14 +228,18 @@ export class BlockSync {
         this.d.log('warn', 'blocks response does not match the request', { from, count, got: m.blocks.length, peer: peer.id.slice(0, 8) });
         this.d.scorePeer?.(peer.id, 50, 'blocks response does not match the request');
         this.peerHeights.delete(peer.id);
+        this.notServed(peer.id);
       } else if (m.blocks.length === 0) {
         this.peerHeights.set(peer.id, from - 1n); // it does not have them after all
+        this.notServed(peer.id);
       } else {
+        this.unserved.delete(peer.id);
         m.blocks.forEach((b, i) => this.buffer.set(from + BigInt(i), { block: b.block, commit: b.commit, peerId: peer.id }));
       }
     } catch (e) {
       this.d.log('warn', 'block request failed', { from, count, peer: peer.id.slice(0, 8), err: (e as Error).message });
       this.peerHeights.delete(peer.id);
+      this.notServed(peer.id);
     } finally {
       for (let i = 0; i < count; i++) this.requested.delete(from + BigInt(i));
       this.busyPeers.delete(peer.id);
@@ -251,6 +280,7 @@ export class BlockSync {
           this.d.log('warn', 'bad block from peer', { h: ours + 1n, from: next.peerId.slice(0, 8), err });
           this.d.scorePeer?.(next.peerId, 50, 'bad block in sync');
           this.peerHeights.delete(next.peerId);
+          this.notServed(next.peerId);
           continue;
         }
         try {

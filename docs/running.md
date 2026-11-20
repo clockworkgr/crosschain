@@ -17,7 +17,7 @@ the subject of the [tutorial](tutorial/00-overview.md); design decisions are in
 ```sh
 git clone <this repository> crosschain && cd crosschain
 npm install
-npm test                 # 322 tests, about two minutes
+npm test                 # 328 tests, about two minutes
 CHAIN_SCHEME=secp256k1 npm test   # the same suite on secp256k1 keys (one ML-DSA-only case is skipped)
 INDEX_TREES=0 npm test   # the same suite with every index B+ tree dropped from the start: lookups and scans through the store
 TREES=0 npm test         # and with every Merkle tree dropped: roots and proofs from the stored chunks and nodes; the two combine
@@ -641,7 +641,14 @@ among the top `maxValidators`; the engine applies set changes two heights later.
    sign state file remembers the last signature and the lock; asked for the same signature
    again, it gives the one it made. Keep that file with the key: a validator started on an
    empty one may sign something else for a height, round and step it has signed already, and
-   the two signatures are evidence.
+   the two signatures are evidence. A node guards against the common form of that accident: a
+   validator signs nothing from its start until it has heard from a peer and is behind none
+   it has heard from (the log line `validator signing` marks the moment), so one that comes
+   back without the file does not sign the heights those peers decided while it was away. It
+   goes by the peers heard first and holds once: it does not help a validator whose first
+   peers are behind themselves, nor one that comes back into the very height it stopped in. A validator
+   that hears from no peer signs after the propose timeout, 3 seconds, which is the delay a
+   chain of one validator has at every start.
 
 5. Validators change the chain's parameters by proposal: `propose` with the changes, `signal`
    from the others; more than two thirds of active stake adopts at the end of the block. Fees and

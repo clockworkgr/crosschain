@@ -227,13 +227,13 @@ export function evidenceKey(ev: Evidence): string {
 
 const TAG = { duplicateVote: 1, amnesia: 2, duplicateProposal: 3, falseCitation: 4 } as const;
 
-function encodeHead(w: Writer, h: ProposalHead): void {
+export function encodeHead(w: Writer, h: ProposalHead): void {
   w.i64(BigInt(h.polRound));
   w.fixed(h.blockHash);
   w.fixed(h.signature);
 }
 
-function decodeHead(r: Reader): ProposalHead {
+export function decodeHead(r: Reader): ProposalHead {
   return { polRound: r.i53(), blockHash: r.fixed(HASH_SIZE), signature: decodeSignature(r) };
 }
 

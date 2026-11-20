@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: thirty-two files, 322 cases, about 11,400 lines counting the shared harness
+`test/**/*.test.ts`: thirty-three files, 328 cases, about 11,700 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (321 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (327 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -24,7 +24,7 @@ guard's dials on the object database show; `chain`, `app`, `staking`, `staking-n
 `genesis` cover the core application, and `history` the log its account history is stored in; `txproof`, `light`, `rpc` and
 `sync` cover proofs, clients and catching up, and `priorities` the proposer priorities a header
 commits to, from the two hashes of a validator set to a join from a snapshot; `amnesia` covers a
-validator's lock, from the round a prevote signs to a forgotten lock punished on a network, and `faults` the other evidence: two proposals for a round, a prevote on a majority that never was, and what arrives when its height is over; `review` holds one regression test per finding of
+validator's lock, from the round a prevote signs to a forgotten lock punished on a network, and `faults` the other evidence: two proposals for a round, a prevote on a majority that never was, and what arrives when its height is over; `signing` covers the hold on a validator's signature from its start until it is level with a peer; `review` holds one regression test per finding of
 the external review and the later cases of the same kind, `review2` five more that each
 span several layers, and `review3` the twelve regressions of the review of the paging and
 scheme work (the memory guard, the node and the signature schemes), which this chapter lists
@@ -1673,7 +1673,7 @@ ones.
 
 ### test/staking.test.ts
 
-Fifteen unit tests that walk the staking rules of [STAKING.md](../../STAKING.md) and the
+Sixteen unit tests that walk the staking rules of [STAKING.md](../../STAKING.md) and the
 application chapter ([11](11-application.md)) one block at a time. The genesis has a faucet,
 three operator accounts `op-a`, `op-b`, `op-c`, a community pool of 1,000 tokens, and two
 genesis validators: A with a self-bond of 200 and B with 100, so A alone holds exactly two thirds
@@ -1748,6 +1748,19 @@ downtime (a genesis with `downtimeSlashBps` at 10,000) after half was undelegate
 whole cut comes out of that unbonding entry: the empty delegation pays nothing and is not
 counted as having paid. Before the change the delegator who undelegated all lost
 nothing.
+
+**`it('lets a slash that follows redelegated stake take an operator below the self-bond, and keeps its validator out of the set until the operator delegates again')`**.
+Three genesis validators, A with 200 and B and C with 100 each, all three signing. The operator
+of B delegates 60 to A and redelegates all of it into B, its own validator, then undelegates
+from B until its delegation there is worth just over 101; a further undelegation of about 2
+fails `checkTx` with `/self-bond would fall below/`, and B is in the active set. A is then
+punished for a double sign at the height of the delegation. The cut of 3 follows the 60 to B
+and comes out of the operator's delegation: it is now worth between 97 and 100, below the
+floor no transaction could have taken it under, and the supply still adds up. B is still a
+`candidate`, neither jailed (`unjail` fails with `/not jailed/`) nor slashed itself, and the
+active set is C alone. A delegation of 50 to B by the faucet changes nothing, since only the
+operator's own stake counts toward the self-bond; a delegation of 3 by the operator brings its
+delegation back to the floor and B back into the set.
 
 **`it('creates validators with the fee and minimums, ranks the top N, and rotates keys')`**.
 `op-c` creating a validator with a 99 self-bond is `/self-bond must be at least/`; with A's
@@ -2281,13 +2294,14 @@ fails the test at the prevote of round 3: the guard refuses to sign it.
 
 ### test/faults.test.ts
 
-Eleven tests on the evidence that is not two votes of the height a node is in, and on the votes one peer may have verified
+Thirteen tests on the evidence that is not two votes of the height a node is in, on the votes one peer may have verified, and on a validator whose signing is held
 ([03](03-types.md), [04](04-consensus.md)). The helpers sign votes, proposal heads and whole
 proposals with one of four fixed keys. `equal` is a set of the four with power 1 each, and
 `pre(i, round, hash, polRound)` a prevote of the validator at index `i` of it for height 7.
 `machine()` is the single `Consensus` of the last amnesia case: height 1, the validator under
 test with power 1 beside three of power 10 played by the test, timeouts of ten minutes, and an
-`EvidencePool` the test reads. It takes the verifier to use, and its `sync(round, hash)` stands
+`EvidencePool` the test reads. It takes the verifier to use, keeps in `sent` every proposal and every proposal head consensus
+asks the node to send on (the head with the peer left out), and its `sync(round, hash)` stands
 for block sync: from then on the state it serves is at height 1, with a commit of that round as
 the last one, and `consensus.restart()` is called.
 
@@ -2311,6 +2325,28 @@ proposer: one `duplicateProposal` against that proposer, with the hashes of D an
 `prevote`: it prevoted D and the round kept D. With the pool's `maxRecordBytes` at 0, two proposals for round 1 leave the pool as it was; with the limit lifted, the second handed in again is taken, so a proof the pool had no room for is not lost. Then two proposals of D for round 2, on
 `polRound` 0 and 1, handed in at once with `Promise.all`, so that both are in verification
 together and the second finds the first recorded: evidence for round 2 with the two rounds.
+
+**`it('are found by a node that has one and is sent what was signed of the other, which a node sends on where it does not send the proposal')`**.
+One machine, and `headOf(round, block)` signs a head with the round's proposer. D for round 0
+is taken and sent on whole, and no head with it. A head for round 0 that says D does nothing.
+One signed by round 1's proposer costs its sender, `liar`, 20 points for `bad proposal
+signature`; one that names `polRound` 0 for round 0 and one for height 9 are dropped without a
+charge. The head of E for round 0, signed by its proposer, makes the `duplicateProposal`
+against it, which `verifyEvidence` accepts, and is not sent on. For round 1 the proposer's
+block has a wrong `appHash`: the proposal is not sent on, and its head is, once, with the peer
+it came from left out; the same proposal again sends nothing. The head of the valid block for
+round 1 then makes the second proof. For round 2 the head of G comes first: it is kept and
+sent on (and not a second time when another peer sends it), and the proposal of H that follows
+is both the third proof and, being valid in a round that had no proposal, the round's
+proposal, sent on whole. For round 3 a head and then the proposal that says the same: no proof,
+and the proposal is sent on. `messagesForPeer` then holds the proposals of rounds 0, 2 and 3
+and one head, round 1's. After `sync(4, …)` the height is a kept one that reached round 4:
+the head of another block for round 3 makes a fourth proof; a head and a whole proposal for
+round 5, which the height never reached, do nothing, and three heads were sent on so far. A
+whole proposal for round 4, for which nothing is held, has its head kept and sent on and is
+itself not sent on, and the head of another block for round 4 makes the fifth proof. A second
+machine has a verifier that counts: one head handed in by three peers at once is verified
+once and sent on once.
 
 **`it('are found when the second comes out of verification after the height is over, and when the round decided on a block fetched without a signature')`**.
 Two machines. The first has a verifier whose `verifyOne` can be made to wait. D is proposed for
@@ -2355,6 +2391,16 @@ A second machine is given the same false prevote and then, from one of the two o
 prevote of round 0 for block 9 before its prevote for D: the second is a conflict, and the pool
 ends with a `duplicateVote` against that validator and the `falseCitation` its second vote
 completed, both verified.
+
+**`it('goes through the round without a vote, and when it may sign takes its part in the round as it stands, a polka included')`**
+(`describe('a validator whose signing is held')`). The machine's `signingHeld` gives a reason.
+It is given the proposal of round 0 and the three heavy validators' prevotes for its block:
+the state machine is in step `precommit`, the private validator has signed nothing and no
+vote of the validator is held. The reason is taken away and `signingResumed()` called: the
+validator's prevote for the block, naming no round, and its precommit for it are held, the
+private validator's lock is of round 0 and so is the state machine's, in step `precommit`.
+Before the lock and the round's marks were taken back on resuming, the prevote named round
+0, the signer refused it, and nothing was signed.
 
 **`it('are verified up to a number a second, the rest waiting their turn, and a peer is charged only for what there is no room to keep')`**
 (`describe('votes from one peer')`). The machine's clock is one the test moves. One validator's
@@ -2408,6 +2454,38 @@ the three kinds and each application was told of three faults: nothing came of t
 round 5. Last, once the chain is `PAST_HEIGHTS_KEPT` and three heights past `late`, two
 conflicting prevotes of a fourth validator for `late` are handed to node 0, and a second later
 the count is still three and the pool is empty.
+
+### test/signing.test.ts
+
+Three tests on the hold a node puts on its validator's signature from its start
+([08](08-node.md)), on testnets of `makeTestnet`.
+
+**`it('alone, waits for a peer as long as it is told and then makes the blocks itself')`**
+(`describe('a validator that starts')`). One validator, made with `signGraceMs: 1200` and
+started. After 700 ms, longer than its propose timeout of 400 ms, it is at height 0 and its
+private validator has signed nothing: round 0 was its own and it did not propose. It then
+reaches height 2, not sooner than 1,200 ms after the start, and block 1 was committed in
+round 0: when the hold ended the validator began the round again and proposed, where a
+validator left in the prevote step it had passed would have had nobody to move it on.
+
+**`it('behind its peers and without its sign state, signs nothing in the heights they decided and is not reported')`**.
+Four validators to height 3. The one that proposed height 1 in round 0 is stopped, and the
+other three go on for two heights. It is made again with an empty store and a new
+`MemorySignStateStore`, so it starts at height 0 with a guard that refuses nothing; started so
+without the hold, it proposes height 1 a second time, and its peers, which keep what it signed
+there, report it (the case fails with the hold taken out). With it the validator catches up, a
+later commit carries its precommit, the first signature its sign state store was given (the
+store notes the height of each) is of a height above the one its peers had decided when it
+started, no node has evidence pending and no block of the chain
+carries any.
+
+**`it('is not kept from signing by a peer that says it is ahead and serves none of the blocks')`**.
+One validator with `signGraceMs: 1500`, and a bare `Network` that dials it, gives height 100
+in its handshake, broadcasts a `status` of 100 every 100 ms and answers no request. Two
+seconds after it connected, past the grace, the validator is at height 0 and has signed
+nothing. Its request for the blocks then times out, the peer is left out of `levelWith`
+however often it repeats its height, and the validator reaches height 2 within fifteen
+seconds with the peer still connected.
 
 ### test/review.test.ts
 
