@@ -1,11 +1,11 @@
 # 15. The tests
 
 `npm test` runs `vitest run` (the `test` script in `package.json`) over every file matching
-`test/**/*.test.ts`: thirty-three files, 328 cases, about 11,700 lines counting the shared harness
+`test/**/*.test.ts`: thirty-three files, 335 cases, about 12,000 lines counting the shared harness
 in `test/helpers.ts` and the setup file. The whole suite takes about two minutes under the
 default ML-DSA-44 keys; nearly all of that time is the network scenarios, which run real
 consensus timers. The same suite runs
-on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (327 passing and
+on the chain's other signature scheme with `CHAIN_SCHEME=secp256k1 npm test` (334 passing and
 one skipped, the case that is about ML-DSA signing): every testnet and application genesis the
 suites build names the scheme `DEFAULT_SCHEME` resolves to ([chapter 2](02-crypto.md)), and
 every key is derived with it. It also runs with the object database's accelerators turned off
@@ -395,7 +395,7 @@ then walks every case by its exact title.
 
 ### test/units.test.ts
 
-Eleven unit tests on the smallest pieces: the codec ([01](01-codec.md)), keys and the worker
+Twelve unit tests on the smallest pieces: the codec ([01](01-codec.md)), keys and the worker
 verifier ([02](02-crypto.md)), the validator set ([03](03-types.md)), the signing guard
 ([04](04-consensus.md)) and the mempool ([05](05-mempool-executor.md)). Nothing here starts a
 node.
@@ -460,6 +460,17 @@ from ever producing the evidence that would slash it.
 same bytes again are `'seen'`, `bad` (no `=`) is `'invalid'`, 100 bytes is `'too-large'`,
 `b=2` is `'added'`. `reap(1_000_000)` returns `['a=1', 'b=2']` in arrival order; `reap(8)` fits
 only one. After `update([tx('a=1')])`, the committed transaction is gone and `size` is 1.
+
+**`it('holds no more bytes than its limit, and at a commit puts out the newest of what lowered limits have no room for')`**.
+A `Mempool` of ten places and 100 bytes over the key-value application, whose `checkTx` is
+wrapped to note what it is asked. Five transactions of 20 bytes are `added` and the pool's
+`bytes` is 100: with half its places free it is full, `accepting` is false, and a sixth is
+answered `full` without the application being asked. `update` with the first as committed
+leaves 80 bytes and the sixth is `added`. `setLimit(3)` makes `currentByteLimit` 30, one
+transaction's worth, and leaves the five in the pool. The next `update([])` returns 4: the
+oldest transaction is the pool, 20 bytes, and it alone was checked again. One that was put out
+is not `seen`, and with the limit back at ten it is `added`. A second pool of four places and
+bytes to spare is lowered to two places, and `update` leaves its two oldest.
 
 **`it('remembers the last transactions it saw, the newest taking the oldest one\'s place')`**.
 A `Mempool` with `cacheSize: 3`. Three transactions are `'added'` and then committed through
@@ -644,7 +655,7 @@ and `stats.slabs` is 2. This is `Arena.shrink`, the arena as a cache over a stor
 
 ### test/db.test.ts
 
-Forty-five tests on the object database and the trees beneath it ([the database
+Forty-seven tests on the object database and the trees beneath it ([the database
 chapter](09-database.md)). The fixture defines two object types: `ItemType` (type id 7) with
 a unique, authenticated index `byName` and a non-unique one, authenticated as well, `byGroup`, and `CounterType` (type id
 3) with no indices. `fresh()` makes a database over both, `mk` creates an item, `byName` and
@@ -658,6 +669,18 @@ middle of each) as one string; `proofsAt(db, v, names)` is everything a version 
 prove (its root, every item's and the counter's object proof, the key proofs of a list of
 names, several range proofs and both type leaves); and `prng(seed)` is a small deterministic
 generator so a failing sequence can be replayed.
+
+**`it('keeps a place for the instances that are there and not for every one there ever was')`**
+(`describe('object database: arena and hot cache')`). A window of a hundred counters moves up
+the instance numbers: each version creates fifty and removes the fifty oldest, four hundred
+times, and every hundredth version each counter that is there is read back. After 20,100
+instances the type's tables (`refs` and `low`, read through a cast) have at most 800 places
+and begin within 800 of the newest instance and not above the oldest one there. Instance 0 and
+the one just below the window read as absent, and `exportObjects` lists exactly the hundred.
+Then a session that created an object is undone, all but the oldest of the hundred are
+removed, and five thousand more are created with all but the last ten removed again: each
+gets the next instance number, the one that stayed reads back with its value, and `low` is
+still its number, the tables having kept a place for everything above it.
 
 **`it('serves reads from the arena once decoded objects are evicted, and never evicts what is dirty')`**
 (describe `object database: arena and hot cache`). A database with `hotObjects: 2`. Five items
@@ -1020,6 +1043,19 @@ counter's proof are what they were: the dense trees, the objects and the counter
 old records, and `CounterType` has no authenticated index, so its proof needs no sparse tree
 node. `proveKeyAt` on `byName` and `proofAt` of an item, whose type leaf carries the root of
 `byName`, each throw `/not available/`.
+
+**`it('follows a window of objects that moves up the instances with its trees dropped and its bytes in the store, and loads in any order')`**
+(describe `object database: an arena within a byte limit`). Two databases, one resident and
+one over a `MemoryKv` with an arena limit of 0, a cache of 20 objects and, from the first
+version, its trees dropped. Sixty versions each create 500 items of some 420 bytes and, once
+2,000 are there, remove the 500 oldest; the roots agree at every version, and every fifth
+version a sample of the items that are there reads the same from both, at times from the store
+alone (the most the paged one had there at once is over 500). At the end the item below the
+window is absent, the newest item's proof is byte for byte the resident one's, and the chunk
+cache holds at most 30 chunks: 22 in this run, 72 when the chunks the window left empty are
+kept. Last, a type's tables are loaded from instance 4,999 down to 1,000 through
+`importBytes`: fewer than twenty tables are made for the four thousand, and both ends read
+back.
 
 **`it('reads released objects from the store, gives the same roots and proofs, and takes written objects back')`**
 (describe `object database: an arena within a byte limit`). `persistObjects(db, kv)` writes a
@@ -2345,7 +2381,11 @@ the head of another block for round 3 makes a fourth proof; a head and a whole p
 round 5, which the height never reached, do nothing, and three heads were sent on so far. A
 whole proposal for round 4, for which nothing is held, has its head kept and sent on and is
 itself not sent on, and the head of another block for round 4 makes the fifth proof. A second
-machine has a verifier that counts: one head handed in by three peers at once is verified
+`messagesForPeer` now gives the heads of height 1 as `pastHeads`, one for each of rounds 0 to
+4, round 0's being D's. Another machine was sent E for round 0 and went on to height 2 with it;
+its own `pastHeads` is E's head alone. Handed the first machine's five, it makes the proof for
+round 0 and sends none of them on, the other rounds being above the one its height ended in. A
+last machine has a verifier that counts: one head handed in by three peers at once is verified
 once and sent on once.
 
 **`it('are found when the second comes out of verification after the height is over, and when the round decided on a block fetched without a signature')`**.
@@ -2457,8 +2497,8 @@ the count is still three and the pool is empty.
 
 ### test/signing.test.ts
 
-Three tests on the hold a node puts on its validator's signature from its start
-([08](08-node.md)), on testnets of `makeTestnet`.
+Five tests on the hold a node puts on its validator's signature, from its start and again
+when it falls behind ([08](08-node.md)), on testnets of `makeTestnet`.
 
 **`it('alone, waits for a peer as long as it is told and then makes the blocks itself')`**
 (`describe('a validator that starts')`). One validator, made with `signGraceMs: 1200` and
@@ -2479,6 +2519,19 @@ store notes the height of each) is of a height above the one its peers had decid
 started, no node has evidence pending and no block of the chain
 carries any.
 
+**`it('holds its signing again when blocks reach it by sync while peers are still ahead')`**.
+Four validators of which three are started and make the chain; the fourth has never run, so
+nothing it signs can be a second signature. It is made with a sign state store that notes the
+height of every signature and `signGraceMs: 200`, and started cut off from the others
+(`hub.isolate`): it hears nobody, its hold ends, and it signs in height 1. The others go on to
+height 14, far enough that the fourth is the proposer of several heights between and would
+sign in each the moment it began it. The partition is healed. Block 1 reaches the fourth by
+sync while its peers are above, which lays the hold on again; it catches up, and a later commit
+carries its precommit. Its store was given no signature for a height above 1 and below the one
+the others had decided when the first block arrived, and some for heights above. With
+`holdSigningIfBehind` taken out the case fails: the store notes two signatures in every fourth
+height on the way.
+
 **`it('is not kept from signing by a peer that says it is ahead and serves none of the blocks')`**.
 One validator with `signGraceMs: 1500`, and a bare `Network` that dials it, gives height 100
 in its handshake, broadcasts a `status` of 100 every 100 ms and answers no request. Two
@@ -2486,6 +2539,13 @@ seconds after it connected, past the grace, the validator is at height 0 and has
 nothing. Its request for the blocks then times out, the peer is left out of `levelWith`
 however often it repeats its height, and the validator reaches height 2 within fifteen
 seconds with the peer still connected.
+
+**`it('signs when no block has come of what peers say for as long as it is told, whoever says it')`**.
+One validator with `signGraceMs: 300` and `signIdleMs: 1200`, and the same kind of peer, which
+says height 100 and answers nothing. After 700 ms the validator has signed nothing. It reaches
+height 1 not sooner than 1,200 ms after its start and within 4.5 seconds: before the request
+to the peer has failed, which takes five, so while the peer still counts as ahead. That is what
+keeps a line of such peers, each under a new id, from holding a validator for good.
 
 ### test/review.test.ts
 
@@ -3087,7 +3147,7 @@ verifier rejects with `/closed/`.
 
 ### test/review5-net.test.ts
 
-Twenty tests for the peer layer, block sync, state sync, what consensus takes in ahead of
+Twenty-two tests for the peer layer, block sync, state sync, what consensus takes in ahead of
 its round or its height, and the mempool, each at an edge: a failure, a peer that misbehaves, or two things
 happening at once. They are listed by group and title with what each sets up and asserts.
 
@@ -3160,7 +3220,7 @@ file parses to that one record with `failures: 1`, no `peers.json.tmp` is left b
 second `PeerDb` on the file reads the failure back. A file holding valid JSON that is an object
 and not a list opens as a database of size 0.
 
-`block sync`, five cases. `harness(opts)` builds a `BlockSync` whose network has one peer, whose
+`block sync`, six cases. `harness(opts)` builds a `BlockSync` whose network has one peer, whose
 requester answers every `blocksRequest` with what the case's `respond(from, count)` returns,
 whose `applyBlock` notes the height and whose `scorePeer` notes the charge; `blockAt(height)`
 is a block of zero hashes with a commit naming its hash, and `status(height)` delivers the
@@ -3169,6 +3229,14 @@ peer's status message. Nothing here verifies a block for real.
 **`it('applies nothing after it was stopped, though a block was being verified')`**. The sync's
 `verify` is replaced by one that waits on a gate. The peer reports height 2, the first block
 reaches verification, the sync is stopped and the gate released: `applied` stays empty.
+
+**`it('stops counting a peer among those a node may be behind once it has not served what it said three times, whatever it serves between')`**.
+The peer's answers follow a flag: a block for every height asked, or none. Three times over it
+serves the next block (`levelWith` is `'level'` when the block is applied), then reports a
+height fifty above and answers with nothing: `levelWith` is `'behind'` at the report and
+`'nobody'` after the empty answer, the peer being in `unserved`. A served block took it out of
+`unserved` each time. After the third failure it serves a block once more, and `levelWith` is
+`'nobody'` all the same, and stays so when it reports the far height again.
 
 **`it('sets no timer when it was stopped while a block was being applied')`**. `verify` passes
 every block, `applyBlock` waits on a gate before it notes the height and moves the node's own
@@ -3245,7 +3313,7 @@ encoding of `ValidatorSet.create([])` decodes to a set of size 0, and so does an
 followed by a proposer index of −1. An empty list followed by 0, 5 or −2 throws
 `/proposer index out of range/`.
 
-`the mempool`, three cases. `gatedApp()` is an application whose `checkTx` waits on a gate,
+`the mempool`, four cases. `gatedApp()` is an application whose `checkTx` waits on a gate,
 then asks `admit` as the core application does after its last wait, refuses the byte `0xee`
 after admitting it, and notes what it applied.
 
@@ -3254,6 +3322,17 @@ A pool of one place is given two transactions before the gate opens. The first i
 the second `'full'`, and the application applied the first alone. `accepting` is false; after
 `update` commits the first it is true, and the second, submitted again, is `'added'`: the
 refusal was not remembered.
+
+**`it('counts the bytes of a transaction once: while it is checked, when it is pooled, and when the same one is checked twice at once')`**.
+Three pools. The first has 30 bytes and is given two transactions of 20 at once through the
+gated application: one is `added`, the other `full`, and only the first was applied, its bytes
+held from its admission on. One refused after admission gives its bytes back (a 10-byte one is
+then `added`, 30 bytes pooled), and committing the first leaves 10 and room for the second.
+The second pool has `cacheSize: 0` and is given the same transaction twice at once: `added`
+and `seen`, one transaction and 20 bytes, and none after it is committed. The third is over an
+application that notes its calls and has a `resetPending`: an `update` that puts nothing out
+only checks the three pooled, and one after `setLimit(2)` puts one out and calls
+`resetPending` before it checks the two that stay.
 
 **`it('gives back the place of a transaction that was admitted and then refused')`**. In a pool
 of one place the `0xee` transaction is `'invalid'`, `accepting` is true, and another

@@ -16,6 +16,7 @@ CHAIN_SCHEME=secp256k1 BENCH_GENESIS_MB=56 npm run bench -- paging   # the pagin
 BENCH_PAGING_HEAP=700 CHAIN_SCHEME=secp256k1 BENCH_GENESIS_MB=56 npm run bench -- paging   # with the node's heap limit set in MiB
 BENCH_PAGING_SECONDS=600 BENCH_PAGING_WINDOW=20 BENCH_PAGING_AHEAD=4000 BENCH_PAGING_MODES=0 CHAIN_SCHEME=secp256k1 BENCH_GENESIS_MB=56 npm run bench -- paging   # a stress run: ten minutes, 20 s windows, 4,000 transfers kept ahead, node only
 node bench/cold-reads.ts <dir> <accounts> [reads]   # time index reads one by one from a store the paging suite built (section 4.13)
+node --expose-gc bench/recent-ids.ts [resident]     # what a moving window of recent transaction ids holds in memory (section 6)
 BENCH_KEEP=1 npm run bench:genesis           # keep the generated files and stores for inspection
 BENCH_LOG=debug npm run bench -- network     # log the late-joining node of the network suite
 CHAIN_SCHEME=secp256k1 npm run bench         # every suite on secp256k1 keys; ML-DSA-44 without it
@@ -1850,6 +1851,35 @@ at `pressure`, minutes into the run; the index trees and the history window were
 a second, and to 1,619 in the build after. A third followed: the index trees are left in the
 store by default and a stored state is opened against half the limit, and the same run reads
 1,610 in this batch, 1,768 in its first window and 1,607 in its last.
+
+A script found two more, on 2026-11-20. `bench/recent-ids.ts` makes the application's record
+of recent transactions without the transactions: every version creates 1,600 ids and removes
+the 1,600 oldest once 96,000 are there, writes the block to an LMDB store as the application
+does, and reports the heap and the array buffers over what the process held before the first
+id. By default the database is as the memory guard leaves it at `pressure` (cache capped at
+10,000 objects, both tiers of trees dropped, two past versions) and its arena is held to
+16 MiB as well, which the guard does not do: that is `start --arena`, and without it the
+arena holds every id that is there. The
+window is the same size throughout, so a figure that rises with the count follows every
+transaction ever applied.
+
+| ids made, 96,000 there | array buffers before | after | tree chunks cached before | after |
+|---|---|---|---|---|
+| 500,800 | +49.9 MiB | +21.3 MiB | 1,006 | 221 |
+| 1,000,000 | +86.9 MiB | +21.4 MiB | 1,982 | 224 |
+| 2,000,000 | +161.0 MiB | +21.4 MiB | 3,936 | 224 |
+| 4,000,000 | +192.0 MiB | +21.4 MiB | 4,096 | 226 |
+
+The heap was never the trouble: +10 to +11 MiB at every row, before and after. Two things grew
+outside it. A type's tables of arena references had a place for every instance from zero, 13
+bytes and up to twice that after a doubling, and instance numbers are not given again; they now
+begin at the oldest instance that is there ([chapter 9](tutorial/09-database.md)). And a
+dropped tree handed every chunk a root had written to the chunk cache, the emptied ones
+included, so the chunks the ids had left filled the cache to its 4,096, 128 MiB of empty
+chunks; an emptied chunk is now taken out of the cache. With nothing dropped (`resident`) the
+array buffers are +23.0 MiB at every row after the change, and the heap +522 MiB, which is the
+history window of a hundred versions and the trees of a state that changes 3,200 objects a
+version. One process, one run of each, on the machine of section 3.
 
 ## 7. Sizing a node
 

@@ -57,6 +57,56 @@ const byName = (db: ObjectDatabase, name: string) => db.lookup(ItemType, 'byName
 const inGroup = (db: ObjectDatabase, g: number) => db.range(ItemType, 'byGroup', key((k) => k.u32(g))).map((o) => o.name);
 
 describe('object database: arena and hot cache', () => {
+  it('keeps a place for the instances that are there and not for every one there ever was', () => {
+    const db = new ObjectDatabase([ItemType, CounterType]);
+    const tables = () => {
+      const ti = (db as unknown as { typeIndex(t: unknown): { refs: Float64Array; low: number } }).typeIndex(CounterType);
+      return { places: ti.refs.length, low: ti.low };
+    };
+    // A window of 100 objects moves up the instance numbers: each version makes fifty and removes the fifty oldest.
+    const WINDOW = 100;
+    let made = 0;
+    let version = 0;
+    const step = (remove: boolean) => {
+      for (let i = 0; i < 50; i++) db.create(CounterType, (id) => ({ id, n: BigInt(made + i) }));
+      if (remove) for (let i = 0; i < 50; i++) db.remove(CounterType, objectId(CounterType.id, made - WINDOW + i));
+      made += 50;
+      db.root(version++);
+    };
+    step(false);
+    step(false);
+    for (let v = 0; v < 400; v++) {
+      step(true);
+      // What is there reads back, wherever the tables have moved to.
+      if (v % 100 === 99) {
+        for (let i = made - WINDOW; i < made; i++) expect(db.get(CounterType, objectId(CounterType.id, i))).toEqual({ id: objectId(CounterType.id, i), n: BigInt(i) });
+      }
+    }
+    expect(made).toBe(20_100);
+    // Twenty thousand instances made, a hundred there: the tables hold some hundreds of places, far up the numbers.
+    expect(tables().places).toBeLessThanOrEqual(8 * WINDOW);
+    expect(tables().low).toBeGreaterThan(made - 8 * WINDOW);
+    expect(tables().low).toBeLessThanOrEqual(made - WINDOW);
+    // What is below is absent, what is there reads, and the instances are listed from where they begin.
+    expect(db.get(CounterType, objectId(CounterType.id, 0))).toBeNull();
+    expect(db.get(CounterType, objectId(CounterType.id, made - WINDOW - 1))).toBeNull();
+    expect([...db.exportObjects()].map(([id]) => instanceOf(id))).toEqual(Array.from({ length: WINDOW }, (_, i) => made - WINDOW + i));
+    // An undone session's instances are given again, and an object that stays keeps its place however far the rest moves on.
+    const s = db.startSession();
+    db.create(CounterType, (id) => ({ id, n: 7n }));
+    s.undo();
+    const kept = objectId(CounterType.id, made - WINDOW);
+    for (let i = 1; i < WINDOW; i++) db.remove(CounterType, objectId(CounterType.id, made - WINDOW + i));
+    for (let i = 0; i < 5_000; i++) {
+      const c = db.create(CounterType, (id) => ({ id, n: 1n }));
+      expect(instanceOf(c.id)).toBe(made + i);
+      if (i >= 10) db.remove(CounterType, objectId(CounterType.id, made + i - 10));
+      if (i % 500 === 499) db.root(version++);
+    }
+    expect(db.get(CounterType, kept)).toEqual({ id: kept, n: BigInt(made - WINDOW) });
+    expect(tables().low).toBe(made - WINDOW);
+  });
+
   it('serves reads from the arena once decoded objects are evicted, and never evicts what is dirty', () => {
     const db = new ObjectDatabase([ItemType, CounterType], { hotObjects: 2 });
     const ids = ['a', 'b', 'c', 'd', 'e'].map((n, i) => mk(db, n, i).id);
@@ -1492,6 +1542,53 @@ describe('object database: an arena within a byte limit', () => {
     db.dropChanges();
   };
   const objectStore = (kv: MemoryKv) => (id: bigint) => kv.get(encode((wr) => wr.u8(0x6f).u64(id)));
+
+  it('follows a window of objects that moves up the instances with its trees dropped and its bytes in the store, and loads in any order', () => {
+    const kv = new MemoryKv();
+    const whole = new ObjectDatabase([ItemType, CounterType], { retainVersions: 2 });
+    const paged = new ObjectDatabase([ItemType, CounterType], { retainVersions: 2, indexStore: kv, objectStore: objectStore(kv), arenaBytes: 0, hotObjects: 20 });
+    const WINDOW = 2000;
+    let made = 0;
+    let maxStored = 0;
+    const step = (db: ObjectDatabase, v: number) => {
+      for (let i = 0; i < 500; i++) mk(db, `${'x'.repeat(400)}${made + i}`, 0, BigInt(made + i));
+      if (made >= WINDOW) for (let i = 0; i < 500; i++) db.remove(ItemType, objectId(7, made - WINDOW + i));
+      return toHex(db.root(v));
+    };
+    for (let v = 0; v < 60; v++) {
+      const root = step(whole, v);
+      expect(step(paged, v)).toBe(root);
+      made += 500;
+      persistObjects(paged, kv);
+      if (v === 0) paged.dropTrees();
+      paged.setArenaLimit(0);
+      maxStored = Math.max(maxStored, paged.memory().storedObjects);
+      // Objects whose bytes the arena let go of after the tables had moved up read back from the store.
+      if (v % 5 === 4) for (let i = Math.max(0, made - WINDOW); i < made; i += 37) expect(paged.get(ItemType, objectId(7, i))).toEqual(whole.get(ItemType, objectId(7, i)));
+    }
+    // Thirty thousand instances made and two thousand there, at times many of them with their bytes only in the store.
+    expect(maxStored).toBeGreaterThan(500);
+    for (let i = made - WINDOW; i < made; i += 37) expect(paged.get(ItemType, objectId(7, i))).toEqual(whole.get(ItemType, objectId(7, i)));
+    expect(paged.get(ItemType, objectId(7, made - 1))!.value).toBe(BigInt(made - 1));
+    expect(paged.get(ItemType, objectId(7, made - WINDOW - 1))).toBeNull();
+    expect(toHex(proofToBytes(paged.proof(objectId(7, made - 1))))).toBe(toHex(proofToBytes(whole.proof(objectId(7, made - 1)))));
+    // The chunks the window left behind are not kept cached as empty ones: 22 are cached here, and 72 if they are.
+    expect(paged.memory().treeChunks).toBeLessThanOrEqual(30);
+
+    // A load that gives the instances from the highest down grows the tables downward by doubling, not by one.
+    const loaded = new ObjectDatabase([ItemType, CounterType]);
+    const ti = (loaded as unknown as { typeIndex(t: unknown): { refs: Float64Array; low: number; importBytes(i: number, b: Uint8Array): void; get(i: number): unknown } }).typeIndex(CounterType);
+    const tables = new Set<Float64Array>();
+    for (let i = 4999; i >= 1000; i--) {
+      ti.importBytes(i, encode((w) => w.u64(BigInt(i))));
+      tables.add(ti.refs);
+    }
+    expect(tables.size).toBeLessThan(20);
+    expect(ti.low).toBeLessThanOrEqual(1000);
+    expect(ti.get(1000)).toEqual({ id: objectId(3, 1000), n: 1000n });
+    expect(ti.get(4999)).toEqual({ id: objectId(3, 4999), n: 4999n });
+    expect(ti.get(999)).toBeUndefined();
+  });
 
   it('reads released objects from the store, gives the same roots and proofs, and takes written objects back', () => {
     const kv = new MemoryKv();

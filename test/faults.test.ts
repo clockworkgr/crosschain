@@ -266,6 +266,25 @@ describe('two proposals for one round', () => {
       expect(m.sent.proposals.length).toBe(3);
       await m.consensus.handleProposalHead(1n, 4, headOf(4, Q), 'peer');
       expect(m.pool.list().length).toBe(5);
+
+      // A peer that connects after the height is handed what its proposers signed, as this node holds it. One that
+      // was apart from this node during the height and was sent another proposal for a round makes the proof of that.
+      const past = m.consensus.messagesForPeer().pastHeads;
+      expect(past.map((h) => [h.height, h.round])).toEqual([0, 1, 2, 3, 4].map((r) => [1n, r]));
+      expect(past[0]!.head).toEqual(headOf(0, D));
+      const o = machine();
+      try {
+        o.consensus.start();
+        await o.propose(0, E, -1);
+        o.sync(0, blockHash(E));
+        expect(o.consensus.messagesForPeer().pastHeads).toEqual([{ height: 1n, round: 0, head: headOf(0, E) }]);
+        for (const h of past) await o.consensus.handleProposalHead(h.height, h.round, h.head, 'peer');
+        expect(o.pool.list().map(evidenceKey)).toEqual([evidenceKey(ev!)]);
+        // The rounds above the one its height ended in tell it nothing, and it sends none of them on.
+        expect(o.sent.heads).toEqual([]);
+      } finally {
+        o.consensus.stop();
+      }
     } finally {
       m.consensus.stop();
     }

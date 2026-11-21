@@ -196,9 +196,9 @@ The working copy starts as a copy of the committed map, so a block's effects are
 
 ### src/mempool.ts
 
-**`MempoolOptions`**: `maxTxs` (10 000), `maxTxBytes` (1 MiB; the node passes the smaller of that and four bytes under half the chain's block size, so that an admitted transaction always fits the half of a block the builder keeps for transactions, [chapter 8](08-node.md)), `cacheSize` (100 000 hashes). **`AddTxStatus`** is `'added' | 'seen' | 'invalid' | 'full' | 'too-large' | 'paused'` and **`AddTxResult`** carries the status, the hash (for `too-large` a getter that works it out only when it is read), and the application's error for `invalid`, for `paused` the reason the pool is not admitting, or for `full` whether the pool is simply full or full at a limit that was lowered. `Node.submitTx` returns this result, and the RPC's `broadcastTx` method answers from it.
+**`MempoolOptions`**: `maxTxs` (10 000), `maxBytes` (64 MiB, the most bytes of transactions the pool holds: the count alone would let in ten thousand of the largest, 10 GiB), `maxTxBytes` (1 MiB; the node passes the smaller of that and four bytes under half the chain's block size, so that an admitted transaction always fits the half of a block the builder keeps for transactions, [chapter 8](08-node.md)), `cacheSize` (100 000 hashes). **`AddTxStatus`** is `'added' | 'seen' | 'invalid' | 'full' | 'too-large' | 'paused'` and **`AddTxResult`** carries the status, the hash (for `too-large` a getter that works it out only when it is read), and the application's error for `invalid`, for `paused` the reason the pool is not admitting, or for `full` whether the pool is simply full or full at a limit that was lowered. `Node.submitTx` returns this result, and the RPC's `broadcastTx` method answers from it.
 
-**`Mempool`** extends `EventEmitter` with one typed event, `tx: [hash, tx, source]`, emitted on every admission; `Node.init` listens and broadcasts an inventory announcement to every peer except `source`, the peer the transaction came from. State: `txs`, a `Map` from hex hash to bytes whose insertion order is the FIFO order; `cache`, a `Map` from the hex hashes seen lately to the place in the ring that stands for each; `cacheOrder` and `cacheHead`, the ring itself, the hashes in the order they came and the position of the oldest, which let the cache evict its oldest entry; `reserved`, the number of checks the application has admitted that are not in the pool yet, each holding a place; `pausedReason`, null while the pool admits and otherwise the reason it does not; `limit`, how many transactions the pool admits up to just now, `maxTxs` unless the node has lowered it.
+**`Mempool`** extends `EventEmitter` with one typed event, `tx: [hash, tx, source]`, emitted on every admission; `Node.init` listens and broadcasts an inventory announcement to every peer except `source`, the peer the transaction came from. State: `txs`, a `Map` from hex hash to bytes whose insertion order is the FIFO order; `cache`, a `Map` from the hex hashes seen lately to the place in the ring that stands for each; `cacheOrder` and `cacheHead`, the ring itself, the hashes in the order they came and the position of the oldest, which let the cache evict its oldest entry; `reserved`, the number of checks the application has admitted that are not in the pool yet, each holding a place; `pausedReason`, null while the pool admits and otherwise the reason it does not; `pooledBytes` and `reservedBytes`, the bytes of the pooled transactions and of those that hold a place; `limit`, how many transactions the pool admits up to just now, `maxTxs` unless the node has lowered it, and `byteLimit`, the same share of `maxBytes`.
 
 - `size`: pending count.
 - `has(hash)`: in the pool.
@@ -252,25 +252,28 @@ The pool's size is a dial the node turns as its heap fills ([chapter 8](08-node.
   }
 
   /**
-   * Admit up to this many transactions from now on (never more than maxTxs). The memory guard lowers it as the heap
-   * fills, since every pooled transaction holds its bytes and its writes in the pending state. Lowering it evicts
-   * nothing: what is pooled stays and is reaped, and admission begins again once blocks have taken the pool below it.
+   * Admit up to this many transactions from now on (never more than maxTxs), and the same share of maxBytes. The
+   * memory guard lowers it as the heap fills, since every pooled transaction holds its bytes and its writes in the
+   * pending state. Lowering it takes nothing out at once: what the pool holds above the new limits leaves at the
+   * next commit, the newest first (update), where the pending state is rebuilt without it.
    */
   setLimit(limit: number): void {
     this.limit = Math.max(0, Math.min(this.opts.maxTxs, Math.floor(limit)));
+    this.byteLimit = this.opts.maxTxs === 0 ? 0 : Math.floor((this.opts.maxBytes * this.limit) / this.opts.maxTxs);
   }
 
-  /** Whether a transaction arriving now could be admitted: not paused, and room under the limit. */
+  /** Whether there is a place and the bytes for a transaction of this length, beside what is pooled and what holds a place. */
+  private room(length: number): boolean {
+    return this.txs.size + this.reserved < this.limit && this.pooledBytes + this.reservedBytes + length <= this.byteLimit;
+  }
+
+  /** Whether a transaction arriving now could be admitted: not paused, and room under the limits for one byte at least. */
   get accepting(): boolean {
-    return this.pausedReason === null && this.txs.size + this.reserved < this.limit;
-  }
-
-  private get fullReason(): string {
-    return this.limit < this.opts.maxTxs ? 'mempool full: its limit is lowered while the node is short of memory' : 'mempool full';
+    return this.pausedReason === null && this.room(1);
   }
 ```
 
-`setLimit` clamps to between zero and `maxTxs` and rounds down. It only changes what `addTx` compares the pool's size with: a pool already larger than a lowered limit keeps what it holds, the proposer reaps it and the recheck after each commit goes on, and once blocks have taken the pool below the limit transactions are admitted again. `accepting` is the question the node's inventory handler asks before fetching what a peer announces: there is no point fetching a transaction that would be refused. It counts the places held by checks in flight (`reserved`, below) with the pool's size, as `addTx` does. `fullReason` is the `error` of a `full` result, and it differs when the limit is lowered, because that refusal is the node's doing and not the transaction's, and the RPC answers it differently ([chapter 12](12-rpc.md)).
+`setLimit` clamps to between zero and `maxTxs` and rounds down, and sets `byteLimit` to the same share of `maxBytes`: half the places is half the bytes. It takes nothing out of the pool at once. A pool larger than a lowered limit keeps what it holds until the next commit, where `update` (below) puts out what the limits have no room for; a chain that commits no block therefore keeps it. `room(length)` is the one comparison with the two limits: a place free, counting the pool's size and the places held by checks in flight (`reserved`, below), and the bytes for a transaction of that length, counting the pooled bytes and those of the checks in flight. `accepting` is the question the node's inventory handler asks before fetching what a peer announces: there is no point fetching a transaction that would be refused. It asks `room` for a single byte, since the handler does not know the announced transaction's length; `addTx` asks it for the transaction's own. `fullReason` is the `error` of a `full` result, and it differs when the limit is lowered, because that refusal is the node's doing and not the transaction's, and the RPC answers it differently ([chapter 12](12-rpc.md)).
 
 Admission can also be suspended as a whole. The node pauses the pool only at the memory guard's last level, when it is about to stop; what is pooled stays, is still reaped by the proposer and still rechecked after each commit, and only new admissions are refused:
 
@@ -305,7 +308,7 @@ Admission can also be suspended as a whole. The node pauses the pool only at the
     const key = toHex(hash);
     if (this.pausedReason !== null) return { status: 'paused', hash, error: this.pausedReason };
     if (this.known(key)) return { status: 'seen', hash };
-    if (this.txs.size + this.reserved >= this.limit) return { status: 'full', hash, error: this.fullReason };
+    if (!this.room(tx.length)) return { status: 'full', hash, error: this.fullReason };
     // Mark before the await so a concurrent duplicate is not checked twice.
     this.remember(key);
     // The application asks this again after its last wait, so a transaction refused here is not applied to its
@@ -320,16 +323,20 @@ Admission can also be suspended as a whole. The node pauses the pool only at the
         return this.pausedReason;
       }
       if (holdsPlace) return null;
-      if (this.txs.size + this.reserved >= this.limit) {
+      if (!this.room(tx.length)) {
         refused = 'full';
         return this.fullReason;
       }
       holdsPlace = true;
       this.reserved++;
+      this.reservedBytes += tx.length;
       return null;
     };
     const release = () => {
-      if (holdsPlace) this.reserved--;
+      if (holdsPlace) {
+        this.reserved--;
+        this.reservedBytes -= tx.length;
+      }
       holdsPlace = false;
     };
     try {
@@ -348,13 +355,16 @@ Admission can also be suspended as a whole. The node pauses the pool only at the
       }
       // A check that holds a place has room whatever came since. One that holds none (the application did not
       // ask, or refused the transaction before asking) is measured against the pool and the places others hold.
-      if (refused === 'full' || (!holdsPlace && this.txs.size + this.reserved >= this.limit)) {
+      if (refused === 'full' || (!holdsPlace && !this.room(tx.length))) {
         this.forget(key); // the pool filled while we checked; let the sender try again rather than hear "seen"
         return { status: 'full', hash, error: this.fullReason };
       }
       if (!res.ok) return { status: 'invalid', hash, error: res.error };
       release(); // the place it held becomes its place in the pool
+      // Checked twice at once (the cache had let go of it, or holds nothing): it is pooled once and counted once.
+      if (this.txs.has(key)) return { status: 'seen', hash };
       this.txs.set(key, tx);
+      this.pooledBytes += tx.length;
       this.emit('tx', hash, tx, source);
       return { status: 'added', hash };
     } finally {
@@ -363,9 +373,9 @@ Admission can also be suspended as a whole. The node pauses the pool only at the
   }
 ```
 
-Order of the checks: size first, a comparison, so a transaction refused for its size costs nothing in proportion to it. Every result carries the hash, and the `too-large` one carries it as a getter, so the bytes are hashed only if the caller reads it. Then the transaction is hashed, whatever the pool's condition; then paused, so a pool that is not admitting does nothing beyond that hash and leaves no trace in the cache, and the reason travels back in `error` (the RPC turns it into `-32004`, [chapter 12](12-rpc.md)); then seen (in the cache or in the pool), full (the pool's size and the places held by checks in flight against `limit`, which is `maxTxs` unless the node lowered it), then the application. The hash is cached *before* the await so that a second copy arriving while `checkTx` runs is answered `seen` rather than checked again; that also means an `invalid` transaction stays in the cache and is not re-checked when a peer announces it again. A `checkTx` that *throws* (the verifier pool closed underneath it, say) decided nothing, so the `catch` has `forget` remove the hash from the cache before rethrowing; otherwise the transaction would be `seen` on this node for as long as the cache remembered it without ever having been judged, and a client resubmitting a perfectly good transaction would be told it was already known. The second `full` check, after the await, covers the pool filling, or its limit being lowered, while this transaction was being checked; because the hash was already cached, that refusal forgets it again, so a resubmission hears `full` (and `added` once there is room) rather than `seen` (review finding 38). The check before it does the same for a pause that began during the await. Both come before the application's verdict is looked at, so a transaction the pool would not take is refused as `paused` or `full`, which a sender may retry, whatever the application said.
+Order of the checks: size first, a comparison, so a transaction refused for its size costs nothing in proportion to it. Every result carries the hash, and the `too-large` one carries it as a getter, so the bytes are hashed only if the caller reads it. Then the transaction is hashed, whatever the pool's condition; then paused, so a pool that is not admitting does nothing beyond that hash and leaves no trace in the cache, and the reason travels back in `error` (the RPC turns it into `-32004`, [chapter 12](12-rpc.md)); then seen (in the cache or in the pool), full (`room`: the pool's size and the places held by checks in flight against `limit`, and their bytes with this transaction's against `byteLimit`), then the application. The hash is cached *before* the await so that a second copy arriving while `checkTx` runs is answered `seen` rather than checked again; that also means an `invalid` transaction stays in the cache and is not re-checked when a peer announces it again. A `checkTx` that *throws* (the verifier pool closed underneath it, say) decided nothing, so the `catch` has `forget` remove the hash from the cache before rethrowing; otherwise the transaction would be `seen` on this node for as long as the cache remembered it without ever having been judged, and a client resubmitting a perfectly good transaction would be told it was already known. The second `full` check, after the await, covers the pool filling, or its limit being lowered, while this transaction was being checked; because the hash was already cached, that refusal forgets it again, so a resubmission hears `full` (and `added` once there is room) rather than `seen` (review finding 38). The check before it does the same for a pause that began during the await. Both come before the application's verdict is looked at, so a transaction the pool would not take is refused as `paused` or `full`, which a sender may retry, whatever the application said.
 
-The `admit` function handed to `checkTx` asks the same two questions from inside the application, after its last wait and just before the transaction would be applied to the pending state (`CoreApp.checkTx` in `src/app/core/app.ts`; the key-value test app ignores the option): a transaction the pool no longer takes must not leave its writes there for later checks to run against. A transaction enters `txs` only when `addTx` resumes after `checkTx` has returned, so the pool's size alone would let two transactions checked at the same time both be admitted to the last place and both be applied to the pending state. That is what `reserved` prevents. An `admit` that finds room takes a place (`holdsPlace`, `reserved++`), and every comparison with the limit, in `admit`, in `addTx` and in `accepting`, counts `txs.size + reserved`. The second of the two is therefore refused by its own `admit`, before the application applies it; `admit` notes the refusal in `refused`, and `addTx` answers `paused` or `full` from it and forgets the hash, whatever result the application made of the refusal. A check that holds a place has room whatever came since and is not measured again; one that holds none, because the application never asked or refused the transaction before asking, is measured against the pool and the places others hold. A place is given back on every way out: `release()` runs just before the transaction is pooled, when the place it held becomes its place in the pool, and again in the `finally`, where it does nothing unless the place is still held, which covers a transaction the application admitted and then found invalid, a `checkTx` that threw after admitting, and a pause that began after the place was taken.
+The `admit` function handed to `checkTx` asks the same two questions from inside the application, after its last wait and just before the transaction would be applied to the pending state (`CoreApp.checkTx` in `src/app/core/app.ts`; the key-value test app ignores the option): a transaction the pool no longer takes must not leave its writes there for later checks to run against. A transaction enters `txs` only when `addTx` resumes after `checkTx` has returned, so the pool's size alone would let two transactions checked at the same time both be admitted to the last place and both be applied to the pending state. That is what `reserved` prevents. An `admit` that finds room takes a place and the transaction's bytes (`holdsPlace`, `reserved++`, `reservedBytes += tx.length`), and every comparison with the limits, in `admit`, in `addTx` and in `accepting`, is `room`, which counts `txs.size + reserved` and `pooledBytes + reservedBytes`. The second of the two is therefore refused by its own `admit`, before the application applies it; `admit` notes the refusal in `refused`, and `addTx` answers `paused` or `full` from it and forgets the hash, whatever result the application made of the refusal. A check that holds a place has room whatever came since and is not measured again; one that holds none, because the application never asked or refused the transaction before asking, is measured against the pool and the places others hold. Just before a transaction is pooled the pool is asked once more whether it holds it, and answers `seen` if it does: with a cache of no entries, or one that has let go of a hash while its check was still running, the same transaction can be checked twice at once, and pooled a second time it would be counted twice in `pooledBytes` and taken off once. A place is given back on every way out: `release()` runs just before the transaction is pooled, when the place it held becomes its place in the pool, and again in the `finally`, where it does nothing unless the place is still held, which covers a transaction the application admitted and then found invalid, a `checkTx` that threw after admitting, and a pause that began after the place was taken.
 
 ```ts
   /** Take transactions in FIFO order up to a byte budget. They stay in the pool until committed. */
@@ -385,17 +395,58 @@ The `admit` function handed to `checkTx` asks the same two questions from inside
 `Consensus.createBlock` calls this with `maxBlockBytes` less `blockDataBytes({ txs: [], evidence })`, the size of the block's data before any transaction is in it, and less 1 KiB of slack; the header and the last commit do not count against the limit ([chapter 4](04-consensus.md)). The `+ 4` is the codec's length prefix per `bytes` element; the count prefixes of the two arrays are already in that measurement. Reaping does not remove: the proposal may fail, and the transactions must still be there for the next proposer. The loop breaks at the first transaction that does not fit rather than skipping it, which keeps strict FIFO at the cost of a partially filled block when a large transaction is at the head.
 
 ```ts
-  /** Called after a block commits: drop what was included, re-check what remains. */
-  async update(committed: Uint8Array[]): Promise<void> {
-    for (const tx of committed) this.txs.delete(toHex(txHash(tx)));
+  private drop(key: string): void {
+    const tx = this.txs.get(key);
+    if (tx === undefined) return;
+    this.txs.delete(key);
+    this.pooledBytes -= tx.length;
+  }
+
+  /**
+   * Called after a block commits: drop what was included, put out what the limits no longer have room for, re-check
+   * what remains.
+   *
+   * The pool is above its limits only after they were lowered. This is the one moment a transaction can leave
+   * without a trace: the application undid its pending state for the block (and is asked to once more here, for
+   * what was checked since), and the re-check below rebuilds it from what is still pooled. The oldest stay, as they are the next a block takes; the ones put out are forgotten, so
+   * they are checked again when they come again. Returns how many were put out.
+   */
+  async update(committed: Uint8Array[]): Promise<number> {
+    for (const tx of committed) this.drop(toHex(txHash(tx)));
+    let evicted = 0;
+    if (this.txs.size > this.limit || this.pooledBytes > this.byteLimit) {
+      let count = 0;
+      let bytes = 0;
+      let over = false;
+      for (const [key, tx] of [...this.txs]) {
+        over ||= count + 1 > this.limit || bytes + tx.length > this.byteLimit;
+        if (!over) {
+          count++;
+          bytes += tx.length;
+          continue;
+        }
+        this.drop(key);
+        this.forget(key);
+        evicted++;
+      }
+      // A transaction checked after the block was finalized and before this ran was applied to the new pending
+      // state. If one of those was put out its writes are still there, so the application begins that state again,
+      // and the re-check below applies what is left.
+      if (evicted > 0) this.app.resetPending?.();
+    }
     for (const [key, tx] of [...this.txs]) {
       const res = await this.app.checkTx(tx);
-      if (!res.ok) this.txs.delete(key);
+      if (!res.ok) this.drop(key);
     }
+    return evicted;
   }
 ```
 
-The executor calls this with the block's transactions after `app.commit`. Committed transactions leave the pool but stay in the seen cache, so a re-gossiped copy is ignored. The recheck is one `checkTx` per remaining transaction, sequential, on the commit path; the executor awaits it before notifying its listeners. The file's header comment: "Without this the proposer would fill blocks with dead transactions." (`DESIGN.md` section 2 has the rule: "After every commit, all pending txs are re-checked and failures evicted.") `list()` returns the contents in FIFO order for tests and status.
+The executor calls this with the block's transactions after `app.commit`. Committed transactions leave the pool but stay in the seen cache, so a re-gossiped copy is ignored. `drop` is the one way out of `txs`, and takes the transaction's bytes off `pooledBytes`.
+
+The middle part is the eviction, and runs only when the pool is above a limit, which it can be only after `setLimit` lowered them. The pool is walked in its order; the transactions are kept while a place and the bytes remain, and from the first one that does not fit every later one is put out, so what stays is the oldest and the order a proposer reaps in is unchanged. A transaction can leave cleanly only here. `checkTx` applied each pooled transaction to the application's pending state, which the application undid for the block, and the recheck that follows rebuilds it from the pool: one put out before the recheck leaves no writes behind, where one taken out at any other moment would leave its writes for later checks to run against until the next block. One case needs more. The application opens its new pending state when it has finalized the block, and the executor reaches `update` only after the block is saved, so a check that was waiting for the block can be applied to the new pending state and pooled in between. If that transaction is among those put out, its writes are in the pending state the recheck builds on, and sending it again would be answered `duplicate transaction`. So when anything was put out the pool asks the application to begin its pending state again (`resetPending`, an optional method of `Application`; `CoreApp` undoes the pending session and opens another, [chapter 11](11-application.md)), and the recheck applies what is left to a clean one. A check still in flight at that moment may be pooled afterwards with its writes undone; the recheck after the next block applies it, as it does every pooled transaction. Each is also forgotten (`forget`), so that it is checked again when a client or a peer sends it again, and not answered `seen`. The count is returned, and the executor logs it at `warn` (`mempool: transactions put out, its limits are lowered`).
+
+The recheck is one `checkTx` per remaining transaction, sequential, on the commit path; the executor awaits it before notifying its listeners. The file's header comment: "Without this the proposer would fill blocks with dead transactions." (`DESIGN.md` section 2 has the rule: "After every commit, all pending txs are re-checked and failures evicted.") `list()` returns the contents in FIFO order for tests and status.
 
 There is no expiry by time or height in the mempool itself; a transaction that stays valid forever stays pending forever. The core application gives transactions an expiration and `checkTx` rejects expired ones, so the recheck evicts them (chapter 11).
 
@@ -595,7 +646,8 @@ Evidence this node cannot place, because it holds neither the block nor the head
       appHash: res.appHash,
       valUpdates: res.validatorUpdates.length,
     });
-    await this.d.mempool.update(block.txs);
+    const evicted = await this.d.mempool.update(block.txs);
+    if (evicted > 0) this.d.log('warn', 'mempool: transactions put out, its limits are lowered', { evicted, left: this.d.mempool.size });
     for (const fn of [...this.committedListeners]) fn(block, commit, res.txResults, res.validatorUpdates);
   }
 ```
@@ -766,6 +818,8 @@ Three cases. The application ahead of the chain is impossible under the persiste
 
 `test/units.test.ts`, `describe('mempool')`, "dedupes, rejects invalid, reaps FIFO, and drops committed transactions": with `maxTxBytes: 64` and the key-value application, `a=1` is `added`, a second `a=1` is `seen`, `bad` (no `=`) is `invalid`, 100 zero bytes are `too-large`, `b=2` is `added`; `reap` with a large budget returns `[a=1, b=2]` in order and with a budget of 8 bytes returns one (`a=1` costs 3 + 4 = 7; adding `b=2` would exceed 8); `update([a=1])` leaves one.
 
+`test/units.test.ts`, "holds no more bytes than its limit, and at a commit puts out the newest of what lowered limits have no room for": a pool of ten places and 100 bytes takes five transactions of 20 bytes and is then full with half its places free: `accepting` is false, and a sixth is answered `full` without reaching the application. After `update` commits one, the sixth is `added`. `setLimit(3)` lowers the byte limit to 30 and takes nothing out; the next `update([])` returns 4, leaves the oldest transaction alone in the pool, and checks only that one again. One of those put out is not `seen`, and is `added` again once the limit is raised. A second pool, with bytes to spare, is lowered from four places to two and keeps its two oldest.
+
 `test/units.test.ts`, "remembers the last transactions it saw, the newest taking the oldest one's place": with `cacheSize: 3`, three transactions are added and committed through `update`; submitted again, each is `seen`, since a committed transaction stays in the cache. Seven more transactions take the ring round more than twice. The three newest are still `seen`. The one before them has left the cache and is `seen` all the same, because it is still pooled; once `update` has committed the seven, `seen(hash)` is false for it and for the first transaction of all.
 
 `test/consensus.test.ts`:
@@ -807,7 +861,8 @@ Three cases. The application ahead of the chain is impossible under the persiste
 - No `PrepareProposal` or `ProcessProposal`: the application cannot reorder, drop or veto transactions in a proposal; it sees them when decided and can only mark them failed.
 - The validator set by height, a whole set written at every block, goes with its block when the block is pruned, so on a node that keeps every block that part of the store grows with the chain even when the membership does not change; records below the lowest block of a store pruned before the two were deleted together stay. `pruneValidatorSets` looks only at the sets of the heights a pass removes, so sets by hash that only heights pruned by an earlier build carried stay as well.
 - Lengthening the unbonding period does not bring back what a pruning node deleted under the shorter evidence window. Until a full new window has passed, such a node refuses evidence for those heights, and the block that carries it.
-- The pool is bounded by count, not bytes: 10 000 transactions of up to 1 MiB each (or four bytes under half the block size, where that is less) is the ceiling, and under memory pressure the node lowers the count it admits up to rather than trimming what is pooled.
+- The pool is bounded by count and by bytes, 10 000 transactions and 64 MiB, and no node option changes either. What lowered limits have no room for leaves at the next commit and not before: on a chain that has stopped committing, the pool stays as large as it was.
+- What is put out is the newest, whatever it pays. There is no ordering by fee anywhere in the pool.
 
 Exercises:
 

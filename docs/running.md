@@ -17,7 +17,7 @@ the subject of the [tutorial](tutorial/00-overview.md); design decisions are in
 ```sh
 git clone <this repository> crosschain && cd crosschain
 npm install
-npm test                 # 328 tests, about two minutes
+npm test                 # 335 tests, about two minutes
 CHAIN_SCHEME=secp256k1 npm test   # the same suite on secp256k1 keys (one ML-DSA-only case is skipped)
 INDEX_TREES=0 npm test   # the same suite with every index B+ tree dropped from the start: lookups and scans through the store
 TREES=0 npm test         # and with every Merkle tree dropped: roots and proofs from the stored chunks and nodes; the two combine
@@ -645,8 +645,12 @@ among the top `maxValidators`; the engine applies set changes two heights later.
    validator signs nothing from its start until it has heard from a peer and is behind none
    it has heard from (the log line `validator signing` marks the moment), so one that comes
    back without the file does not sign the heights those peers decided while it was away. It
-   goes by the peers heard first and holds once: it does not help a validator whose first
-   peers are behind themselves, nor one that comes back into the very height it stopped in. A validator
+   goes by the peers heard first, and holds again when a block reaches the node by block sync
+   while a peer that serves blocks is still ahead (`validator not signing: behind its peers`).
+   Either hold ends when 15 seconds pass without a block applied, whatever peers say of
+   their heights (`validator signing though peers say they are ahead: no block came of it`).
+   It does not help in the height a validator is in when it first meets a peer ahead of peers
+   that were behind themselves, nor one that comes back into the very height it stopped in. A validator
    that hears from no peer signs after the propose timeout, 3 seconds, which is the delay a
    chain of one validator has at every start.
 
@@ -784,8 +788,11 @@ node's answer, unproven.
   running on the store at `ok`, and the guard says once what it is waiting for (`memory:
   staying paged until the heap has room to rebuild`, with `needs` and `room` in MiB, once
   per drop) and asks again at every sample. The mempool's limit follows the level rather than the pool being
-  paused: lowering it evicts nothing, what is pooled is still reaped, and transactions are
-  admitted again as soon as blocks have taken the pool below the limit; while the pool would
+  paused: the pool holds at most 10,000 transactions and 64 MiB of them, and admits up to
+  the level's share of both. What it holds above a lowered limit is put out at the next
+  commit, the newest first (`mempool: transactions put out, its limits are lowered`, with
+  how many), and may be sent again; transactions are
+  admitted again as soon as the pool is below the limit; while the pool would
   refuse, the node fetches none that peers announce. A refusal at a lowered limit says so
   (`mempool full: its limit is lowered while the node is short of memory`). The history
   window: from `warn` the database keeps only the last two past versions in memory and
@@ -966,7 +973,7 @@ node's answer, unproven.
 | `rate limited` (`-32004`) | the client exceeded the token bucket: a JSON-RPC request spends one token, each further call of a batch one more and each costly call four more, from 100 refilled at 50 a second |
 | `peer clock differs from this node` in the log, with `offsetMs` | a peer's clock, as its pong states it, is 2 seconds or more from this node's (`clockOffsetMs` in `peers`). The line comes when a peer is first seen to be that far off, and again only after its offset has been below 2 seconds in between. The offset is what the peer claims. A node tolerates 15 s of clock drift on a fresh proposal (section 5), so a clock that is off should be set right before it reaches that |
 | `node under memory pressure` (`-32004`), or HTTP 503 from `/events` | the node is shedding load at the guard's `pressure` level (section 12): costly calls other than `broadcastTx` and new event streams are refused until the heap eases; cheap calls and `/health`, which reports the level, still answer, and `broadcastTx` is admitted up to the mempool's lowered limit |
-| `mempool full: its limit is lowered while the node is short of memory` (`-32004`) | the heap is at `warn` or above and the mempool already holds as many transactions as it admits at that level (half its limit at `warn`). Nothing is wrong with the transaction: send it again once blocks have taken some out |
+| `mempool full: its limit is lowered while the node is short of memory` (`-32004`) | the heap is at `warn` or above and the mempool already holds as many transactions, or as many bytes of them, as it admits at that level (half its limits at `warn`). Nothing is wrong with the transaction: send it again once blocks have taken some out |
 | `... is not available: the record of version N was written without the sparse tree nodes`, for a height inside `retain.versions` | the history window in memory was trimmed at `warn` or above (`status` shows `history: trimmed`), is kept short by `retain.memoryVersions`, or the store was opened paged without it, so the height is read from the store's history records, and the record named was written by an earlier build that did not keep what a proof of an account or a name needs. Such records age out after `retain.versions` blocks; a restart with enough heap reads the whole window into memory and proves the height at once |
 | `... is not available: the store has no history record of version V`, or after a restart a `provableFrom` in the line `loaded application state` (`lowestVersion` in `status`) higher than `retain.versions` gives | the store has lost a history record (a damaged store). A height whose proof would need the missing record is refused, since answering from the records that are left would give a wrong proof. At the next start the node uses only the records that are unbroken up to the current height: the heights below the gap are not provable, their records are deleted with the next commit, and the window fills again as blocks are applied |
 | a proof or query at a past height is slow | the same situation with current records: heights older than the window in memory (`historyWindow` in `status`) are read from the store's history records (section 12). The window grows back a block at a time once the heap has room (`memory: history window restored`), up to `retain.memoryVersions` when that is set |

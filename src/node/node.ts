@@ -93,6 +93,12 @@ export interface NodeConfig {
    */
   signGraceMs?: number;
   /**
+   * The longest a validator's signing stays held while no block is applied (default 15 seconds). A hold stands on
+   * what peers say of their heights, which costs them nothing to say; it is kept up by blocks that arrive, and
+   * without one for this long it ends whatever the peers say.
+   */
+  signIdleMs?: number;
+  /**
    * Where the validator's last signature and lock are kept, for a node without a data directory that is to be
    * stopped and made again: a validator that comes back without them signs heights it already signed, and its
    * peers hold the first signatures against the second for as long as they keep those heights.
@@ -476,7 +482,7 @@ export class Node {
       broadcastProposal: (p, except) => this.network.broadcast({ type: 'proposal', proposal: p }, except),
       broadcastVote: (v, except) => this.network.broadcast({ type: 'vote', vote: v }, except),
       broadcastProposalHead: (height, round, head, except) => this.network.broadcast({ type: 'proposalHead', height, round, head }, except),
-      signingHeld: () => (this.signingOpen ? null : 'not level with a peer since the start'),
+      signingHeld: () => (this.signingOpen ? null : 'not level with its peers'),
       timeouts: this.cfg.timeouts,
       limits,
       log: this.log,
@@ -494,7 +500,10 @@ export class Node {
       network: this.network,
       requester: this.requester,
       isConsensusDeciding: () => this.consensus.isDeciding,
-      onBlockApplied: () => this.consensus.restart(),
+      onBlockApplied: () => {
+        this.holdSigningIfBehind();
+        this.consensus.restart();
+      },
       log: this.log,
       lagGraceMs: this.cfg.lagGraceMs,
       backfill: this.cfg.stateSync?.backfill ?? true,
@@ -515,9 +524,11 @@ export class Node {
     this.network.onPeer(() => this.checkSigning());
     // A peer that just connected missed everything flooded before; catch it up on the current height.
     this.network.onPeer((peer) => {
-      const { proposals, heads, votes } = this.consensus.messagesForPeer();
+      const { proposals, heads, pastHeads, votes } = this.consensus.messagesForPeer();
       for (const proposal of proposals) peer.send({ type: 'proposal', proposal });
       for (const { round, head } of heads) peer.send({ type: 'proposalHead', height: this.consensus.height, round, head });
+      // And what the proposers signed in the heights just over: a peer that was apart from this node then may hold another.
+      for (const { height, round, head } of pastHeads) peer.send({ type: 'proposalHead', height, round, head });
       for (const vote of votes) peer.send({ type: 'vote', vote });
       // Evidence still waiting for a block is announced too; it was flooded before this peer existed.
       const pending = this.evidencePool.list(Infinity).map(evidenceId);
@@ -629,6 +640,7 @@ export class Node {
     // Every commit is announced so lagging peers know to sync, and the evidence age tracks the unbonding period.
     this.executor.onCommitted((block) => {
       this.network.broadcast({ type: 'status', height: block.header.height });
+      this.signProgressAt = Date.now();
       this.checkSigning();
       // The idle moment after a commit is where collections are least in the way.
       if (!this.stopping) {
@@ -688,23 +700,47 @@ export class Node {
    */
   private signingOpen = true;
   private signGraceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** When the hold began or a block was last applied under it. */
+  private signProgressAt = 0;
 
   private holdSigning(): void {
     if (!this.privValidator) return;
     this.signingOpen = false;
+    this.signProgressAt = Date.now();
     this.checkSigning();
     const grace = this.cfg.signGraceMs ?? this.cfg.timeouts?.proposeMs ?? DEFAULT_TIMEOUTS.proposeMs;
+    const idle = this.cfg.signIdleMs ?? 15_000;
     const wait = (): void => {
       if (this.signingOpen) return;
       this.signGraceTimer = setTimeout(() => {
         this.signGraceTimer = null;
         // Nobody to hear from, or the peers that said they were ahead have gone or did not serve what they said.
         if (this.blockSync.levelWith(this.executor.state.lastHeight) === 'nobody') this.openSigning();
-        else this.checkSigning();
+        // Peers say they are ahead and no block has come of it for this long: one after another may be saying so
+        // under a new id each time, and a validator is not kept from signing by what is only said.
+        else if (Date.now() - this.signProgressAt >= idle) {
+          this.log('warn', 'validator signing though peers say they are ahead: no block came of it', { height: this.executor.state.lastHeight, waitedMs: Date.now() - this.signProgressAt });
+          this.openSigning();
+        } else this.checkSigning();
         wait();
-      }, grace);
+        // The next look is a grace on, or sooner if the wait without a block ends before that.
+      }, Math.max(1, Math.min(grace, idle - (Date.now() - this.signProgressAt))));
     };
     wait();
+  }
+
+  /**
+   * A block came by block sync: the others decided a height without this node. If a peer that serves blocks is
+   * still above, more such heights follow, and signing is held until the node is level again, as at its start.
+   * Only a block that verified brings this about, never what a peer says of its height alone, so a peer has to
+   * hand over a block the node lacks for every time it would hold a validator. The hold then lasts while blocks
+   * go on arriving, and `signIdleMs` at most without one.
+   */
+  private holdSigningIfBehind(): void {
+    if (!this.signingOpen || !this.privValidator || this.stopping) return;
+    if (this.blockSync.levelWith(this.executor.state.lastHeight) !== 'behind') return;
+    this.log('info', 'validator not signing: behind its peers', { height: this.executor.state.lastHeight });
+    this.holdSigning();
   }
 
   private checkSigning(): void {

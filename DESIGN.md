@@ -64,6 +64,11 @@ Principle: as simple as possible, borrowing proven ideas from other chains.
 export interface Application {
   initChain(genesis: Genesis): Promise<InitChainResult>;
   checkTx(tx: Uint8Array, opts?: CheckTxOptions): Promise<CheckTxResult>;
+  /**
+   * Undo what checkTx applied since the last block, for an application that keeps a pending state. The mempool
+   * calls it after a commit when it has put transactions out, and then checks again what it still holds.
+   */
+  resetPending?(): void;
   finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult>;
   /**
    * Persist the block just finalized. An application that keeps its state in the engine's store environment does
@@ -79,7 +84,10 @@ check, `finalizeBlock` returns the app hash, the transaction results and the val
 updates, and `info` is the crash recovery handshake. `FinalizeBlockRequest` is what the
 executor extracts from a decided block: height, time, the transactions, the proposer
 address, the addresses whose precommits are in `lastCommit`, and the misbehaviour the
-block's evidence proves. `checkTx` takes an optional `admit` function (`CheckTxOptions`),
+block's evidence proves. `resetPending` is optional: an application that keeps a pending
+state undoes in it what `checkTx` applied since the last block, and the mempool calls it
+after a commit at which it put transactions out, before it checks again what it holds.
+`checkTx` takes an optional `admit` function (`CheckTxOptions`),
 which the mempool passes: the application asks it after its last wait, just before the
 transaction would go into its pending state, and a transaction the pool no longer takes
 (paused, or filled meanwhile) is refused and leaves nothing behind. A transaction the pool lets
@@ -451,10 +459,13 @@ transactions checked at once no more are let through and applied than the pool h
   left between two samples still aborts the process). The mempool is not paused under pressure. Its limit follows
   the level instead (`Node.MEMPOOL_SHARE`, `Mempool.setLimit`): the pool admits up to its
   whole limit at `ok`, half at `warn`, a tenth at `pressure` and nothing at `critical`
-  (10,000, 5,000, 1,000 and 0 transactions). Lowering the limit evicts nothing: what is
-  pooled stays and is still reaped, and admission begins again once blocks have taken the
-  pool below the limit, a check already under way when the limit is reached being refused
-  too. A transaction refused at a lowered limit is `full` with an error that says so, which
+  (10,000, 5,000, 1,000 and 0 transactions, and the same shares of the 64 MiB of
+  transaction bytes it holds at most). Lowering the limit takes nothing out at once: what
+  the pool holds above it leaves at the next commit, the newest first
+  (`Mempool.update`), where the application's pending state is begun again and rebuilt
+  from what is still pooled, so that a transaction put out leaves no writes behind. Admission begins again once
+  the pool is below the limit, a check already under way when the limit is reached being
+  refused too. A transaction refused at a lowered limit is `full` with an error that says so, which
   `broadcastTx` answers with `-32004` (try again later) while the level is not `ok`; a
   pool that would refuse fetches no transaction its peers announce. Only at `critical` is
   the pool paused (`node out of memory`). `broadcastTx` is a costly method but is not
@@ -1250,7 +1261,7 @@ whose set does not hash to the header's set hash is passed over without a charge
 
 ## 10. Implementation status (2026-11-20)
 
-Everything above is implemented in TypeScript under `src/`. 328 tests in 33 files
+Everything above is implemented in TypeScript under `src/`. 335 tests in 33 files
 pass, and the whole suite passes under either signature scheme
 (`CHAIN_SCHEME=secp256k1 npm test`; one ML-DSA-only case is skipped there) and with
 either tier of state paging dropped from the start (`INDEX_TREES=0`, `TREES=0`, or
@@ -1266,8 +1277,8 @@ suite is for:
 | `network` | the peer layer: handshake, status and addresses, refused and simultaneous connections, a silent peer, on the in-memory transport and over real sockets |
 | `consensus`, `engine`, `recovery` | a network deciding blocks with validators down, partitioned, added and removed; a late precommit folded into the stored commit, evidence age, the protocol version; a validator restarted from disk, and double-sign evidence built, carried in a block and handed to the application |
 | `amnesia` | the round a prevote signs, the lock kept through a restart, a forgotten lock proven and punished, a prevote that names a majority counted only once that majority is held |
-| `faults` | two proposals for a round (given whole or as one proposal and the other's head), a prevote on a majority that never was, the vote budget of a peer, and either half of a proof arriving after its height |
-| `signing` | a validator that signs nothing from its start until it is level with a peer, or has waited for one in vain |
+| `faults` | two proposals for a round (given whole, as one proposal and the other's head, or as the heads kept of a height that is over), a prevote on a majority that never was, the vote budget of a peer, and either half of a proof arriving after its height |
+| `signing` | a validator that signs nothing from its start until it is level with a peer, or has waited for one in vain, and is held again when blocks reach it by sync |
 | `priorities` | the two hashes of a validator set, a header's commitment to the priorities, a snapshot join past sources that serve shifted ones |
 | `db`, `arena`, `store` | the object database (indices, sessions, roots, proofs, history, dropped and rebuilt tiers against one that never drops), the arena of encoded objects, the key-value stores and the block store |
 | `app`, `chain` | the core application's accounts, authorities, assets and transfers, paging from the store, and one run on a live four-validator network with proofs checked on every node |
@@ -1289,7 +1300,7 @@ window in memory cut to two versions from then on and without reaching `pressure
 | `src/crypto/` | sha256, tagged keys and signing under ML-DSA-44 or secp256k1, verification worker pool |
 | `src/types/` | validator set and proposer selection, votes, evidence, blocks, proposals, genesis, chain state |
 | `src/consensus/` | the Tendermint state machine, vote sets with the counting of prevotes that name a majority, evidence pool, private validator with double-sign guard and durable lock, block validation |
-| `src/mempool.ts` | FIFO pool with checkTx admission and post-commit recheck |
+| `src/mempool.ts` | FIFO pool bounded by count and by bytes, with checkTx admission, post-commit recheck and eviction of what lowered limits have no room for |
 | `src/p2p/` | transport interface, in-memory and TCP transports, wire messages, peer database, network with handshake and peer exchange |
 | `src/node/` | block executor with crash recovery, the memory guard with load shedding and the collection scheduler, and the node that wires everything |
 | `src/db/` | object ids, index keys, B+ tree, sparse Merkle tree with its nodes on disk, the arena of encoded objects (`arena.ts`), per-type indices with a bounded cache of decoded objects and droppable B+ trees, the index entries' disk form and the merged cursor over store and overlay (`indexstore.ts`), deep freezing of records (`freeze.ts`), dense Merkle tree with chunks and versions and a shared chunk cache for dropped trees, ICS23-shaped object and key proofs, the database with undo sessions, persisted history and the memory dials |
@@ -1313,16 +1324,22 @@ Known simplifications, all deliberate and all revisitable:
   majority which never formed is punished only where +2/3 of the power prevoted something
   else in the round named, and on the assumption that less than a third signs twice;
   elsewhere it is only never counted. Of two proposals for a round, a node that holds one is
-  sent the other or what was signed of it (section 3) by the peers it is connected to
-  during that height; not for a height it is not in and has not kept, not while both are
-  held for a height that has not started, and not by a peer it meets after the height.
+  sent the other or what was signed of it (section 3), by the peers it is connected to
+  during that height or by a peer it meets within the 16 heights after, which hands over
+  what it kept of them; not for a height it is not in and has not kept, and not while
+  both are held for a height that has not started.
 - A validator restarted without its sign-state record may sign again where it signed before,
   and is reported for it. A node holds its validator back from its start until it is level
   with the peers it has heard (or, hearing none, for the propose timeout), which keeps it
-  out of the heights those decided while it was away. The hold ends once and goes by what
-  those peers say: first peers that are behind themselves let it go early, a peer that
+  out of the heights those decided while it was away. The hold goes by what those peers
+  say: first peers that are behind themselves let it go early, a peer that
   claims to be ahead and serves no block is left out after one failed request, and so is an
-  honest one whose answer was lost. One that comes back into the height it stopped in, with
+  honest one whose answer was lost. It is laid on again when a block reaches the node by
+  block sync while a peer that serves blocks is above it: by a block that verified, never
+  by a claimed height alone, so the height the node was in when it met that peer is not
+  covered, and a peer that has failed to serve three times no longer counts. Either hold
+  ends when 15 seconds (`signIdleMs`) pass without a block applied, whatever peers say:
+  a validator behind peers slower than that signs in a height they decided. One that comes back into the height it stopped in, with
   the others still in it, is level and signs: only the record guards that height.
 - There is one protocol version, 1, and it changes in place while the chain is
   unreleased: a data directory written by an earlier build of the header, vote or
@@ -1446,12 +1463,19 @@ Known simplifications, all deliberate and all revisitable:
   cached: 0.1 to 0.35 ms per height back, 9 to 36 ms at the oldest of a hundred at 192,000 accounts, against a tenth of a millisecond or less from memory (docs/benchmarks.md 4.13). A store written before the
   records carried the sparse tree nodes cannot prove a key, or an object of a type with
   an authenticated index, at such a height until those records
-  have aged out of the window (100 blocks by default); an object of a type without one is still proven. The recent transaction ids are
-  still growth no dial sheds.
-- The mempool is bounded by count, 10,000 transactions, not by bytes; each may be up to
-  1 MiB, or four bytes under half the block size where that is less. Under pressure the node lowers the count it admits up to (a half at `warn`, a
-  tenth at `pressure`) and evicts nothing: a pool already above the lowered limit stays as
-  large as it is until blocks reap it.
+  have aged out of the window (100 blocks by default); an object of a type without one is still proven. The recent transaction ids
+  cost what their live window holds and the dials shed it like the rest: a window of
+  96,000 ids takes 10 MiB of heap and 21 MiB of array buffers with every dial down and
+  the arena held to 16 MiB by hand (`start --arena`; the guard does not bound it),
+  the same after four million transactions as after half a million. (Until 2026-11-20 the
+  per-instance tables began at instance zero and the dropped trees' chunk cache kept the
+  chunks the ids had left empty: 13 to 26 bytes for every transaction ever applied, and up
+  to 128 MiB of chunks.)
+- The mempool is bounded by count and by bytes, 10,000 transactions and 64 MiB, each
+  transaction up to 1 MiB, or four bytes under half the block size where that is less.
+  Under pressure the node lowers both (a half at `warn`, a tenth at `pressure`); what the
+  pool holds above them leaves at the next commit, so on a chain that commits nothing it
+  stays. What is put out is the newest, whatever it pays.
 - ArrayBuffers (ML-DSA keys, stored bytes, the arena's slabs) live outside the V8 heap and
   outside the memory guard's fraction; a machine that runs out of physical memory for them
   meets the operating system's killer, not V8's limit. The guard reports `arrayBuffers` and

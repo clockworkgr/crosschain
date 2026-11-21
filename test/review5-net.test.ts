@@ -27,7 +27,7 @@ import { Requester } from '../src/p2p/request.ts';
 import type { Conn, Transport } from '../src/p2p/transport.ts';
 import { MemoryBlockStore } from '../src/store/blockstore.ts';
 import { MemoryKv } from '../src/store/kv.ts';
-import { BlockSync } from '../src/sync/blocksync.ts';
+import { BlockSync, NOT_SERVED_LIMIT } from '../src/sync/blocksync.ts';
 import { stateSync } from '../src/sync/statesync.ts';
 import { blockHash, headerHash, txHash, type Block, type Commit } from '../src/types/block.ts';
 import { proposalSignBytes, type Proposal } from '../src/types/proposal.ts';
@@ -349,6 +349,48 @@ describe('block sync', () => {
     expect(t.h.applied).toEqual([]);
   });
 
+  it('stops counting a peer among those a node may be behind once it has not served what it said three times, whatever it serves between', async () => {
+    let serving = true;
+    const t = harness({ respond: (from, count) => (serving ? Array.from({ length: count }, (_, i) => blockAt(from + BigInt(i))) : []), perRequest: 1 });
+    const inner = t.sync as unknown as { verify: () => Promise<string | null>; d: { applyBlock: (b: Block) => Promise<void> } };
+    inner.verify = async () => null;
+    inner.d.applyBlock = async (block) => {
+      t.h.ours = block.header.height;
+    };
+    t.sync.start();
+    try {
+      // It serves a block, and a higher height it then says is one the node is behind.
+      const serve = async () => {
+        serving = true;
+        const next = t.h.ours + 1n;
+        t.status(next);
+        await waitFor(() => t.h.ours === next, 2000, 'the block it serves');
+        expect(t.sync.levelWith(t.h.ours)).toBe('level');
+      };
+      // It says it is far ahead and has nothing: from the answer on it is left out.
+      const lie = async () => {
+        serving = false;
+        t.status(t.h.ours + 50n);
+        expect(t.sync.levelWith(t.h.ours)).toBe('behind');
+        await waitFor(() => t.sync.levelWith(t.h.ours) === 'nobody', 2000, 'the empty answer');
+      };
+      for (let i = 0; i < NOT_SERVED_LIMIT; i++) {
+        await serve();
+        await lie();
+      }
+      // Serving a block brought it back among the peers heard each time before. Not any more.
+      serving = true;
+      const next = t.h.ours + 1n;
+      t.status(next);
+      await waitFor(() => t.h.ours === next, 2000, 'the block it serves');
+      expect(t.sync.levelWith(t.h.ours)).toBe('nobody');
+      t.status(t.h.ours + 50n);
+      expect(t.sync.levelWith(t.h.ours)).toBe('nobody');
+    } finally {
+      t.sync.stop();
+    }
+  });
+
   it('sets no timer when it was stopped while a block was being applied', async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>((r) => (release = r));
@@ -603,6 +645,52 @@ describe('the mempool', () => {
     await pool.update([new Uint8Array([1])]);
     expect(pool.accepting).toBe(true);
     expect((await pool.addTx(new Uint8Array([2]))).status).toBe('added');
+  });
+
+  it('counts the bytes of a transaction once: while it is checked, when it is pooled, and when the same one is checked twice at once', async () => {
+    const big = (n: number) => new Uint8Array(20).fill(n);
+    {
+      // Room for one of two that are checked together: the first holds the bytes from its admission on.
+      const { app, applied, release } = gatedApp();
+      const pool = new Mempool(app, { maxTxs: 10, maxBytes: 30 });
+      const [a, b] = [pool.addTx(big(1)), pool.addTx(big(2))];
+      release();
+      expect([(await a).status, (await b).status]).toEqual(['added', 'full']);
+      expect(applied).toEqual([big(1)]);
+      expect(pool.bytes).toBe(20);
+      // One that was admitted and then refused gives its bytes back, and so does one committed.
+      expect((await pool.addTx(new Uint8Array(10).fill(0xee))).status).toBe('invalid');
+      expect((await pool.addTx(new Uint8Array(10).fill(3))).status).toBe('added');
+      expect(pool.bytes).toBe(30);
+      await pool.update([big(1)]);
+      expect(pool.bytes).toBe(10);
+      expect((await pool.addTx(big(2))).status).toBe('added');
+    }
+    {
+      // With no cache of hashes the same transaction is checked twice at once; it is pooled and counted once.
+      const { app, release } = gatedApp();
+      const pool = new Mempool(app, { maxTxs: 10, maxBytes: 100, cacheSize: 0 });
+      const [a, b] = [pool.addTx(big(1)), pool.addTx(big(1))];
+      release();
+      expect([(await a).status, (await b).status]).toEqual(['added', 'seen']);
+      expect([pool.size, pool.bytes]).toEqual([1, 20]);
+      await pool.update([big(1)]);
+      expect([pool.size, pool.bytes]).toEqual([0, 0]);
+    }
+    {
+      // When a commit puts transactions out, the application begins its pending state again before any is checked.
+      const calls: string[] = [];
+      const app = { checkTx: async (bytes: Uint8Array) => (calls.push(`check ${bytes[0]}`), { ok: true }), resetPending: () => void calls.push('reset') } as unknown as Application;
+      const pool = new Mempool(app, { maxTxs: 4, maxBytes: 1000 });
+      for (const n of [1, 2, 3]) await pool.addTx(big(n));
+      calls.length = 0;
+      await pool.update([]);
+      expect(calls).toEqual(['check 1', 'check 2', 'check 3']);
+      pool.setLimit(2);
+      calls.length = 0;
+      expect(await pool.update([])).toBe(1);
+      expect(calls).toEqual(['reset', 'check 1', 'check 2']);
+    }
   });
 
   it('gives back the place of a transaction that was admitted and then refused', async () => {

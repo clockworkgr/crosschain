@@ -67,6 +67,11 @@ export interface InitChainResult {
 export interface Application {
   initChain(genesis: Genesis): Promise<InitChainResult>;
   checkTx(tx: Uint8Array, opts?: CheckTxOptions): Promise<CheckTxResult>;
+  /**
+   * Undo what checkTx applied since the last block, for an application that keeps a pending state. The mempool
+   * calls it after a commit when it has put transactions out, and then checks again what it still holds.
+   */
+  resetPending?(): void;
   finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult>;
   /**
    * Persist the block just finalized. An application that keeps its state in the engine's store environment does

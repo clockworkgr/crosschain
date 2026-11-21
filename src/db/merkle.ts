@@ -154,6 +154,11 @@ export class ChunkCache {
     this.trim();
   }
 
+  delete(key: number): void {
+    this.map.delete(key);
+    if (key === this.newest) this.newest = -1;
+  }
+
   trim(): void {
     while (this.map.size > this.limit) this.map.delete(this.map.keys().next().value!);
     if (this.map.size === 0) this.newest = -1;
@@ -568,7 +573,13 @@ export class DenseMerkleTree {
     this.changed.clear();
     if (this.source) {
       this.levels.forEach((level, k) => {
-        for (const [c, chunk] of level) this.cache!.set(this.slot * SLOT_SPAN + k * LEVEL_SPAN + c, chunk);
+        // A chunk with nothing left in it is deleted from the store, and read from there as absent: the cache has
+        // no use for it. Objects that come and go would otherwise fill the cache with the chunks they left behind.
+        for (const [c, chunk] of level) {
+          const key = this.slot * SLOT_SPAN + k * LEVEL_SPAN + c;
+          if (usedLength(chunk) > 0) this.cache!.set(key, chunk);
+          else this.cache!.delete(key);
+        }
       });
       this.levels.length = 0;
       this.counts.length = 0;

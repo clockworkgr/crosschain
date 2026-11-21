@@ -642,7 +642,7 @@ after the index entries in the same `kv.write`, and laid over the store until
 
 | level | heap in use of limit (the old generation's, under a heap limit) | what the database does | what the mempool admits |
 |---|---|---|---|
-| ok | under 70% | caches unbounded; dropped index trees and Merkle trees rebuilt, each only if it fits; then the history window let grow back, if what it held fits | up to its limit (10,000 transactions) |
+| ok | under 70% | caches unbounded; dropped index trees and Merkle trees rebuilt, each only if it fits; then the history window let grow back, if what it held fits | up to its limit (10,000 transactions, 64 MiB) |
 | warn | 70% | hot cache capped at 100,000 decoded objects; index trees dropped; the history window cut to the last two versions; major collection started | up to half its limit (5,000) |
 | pressure | 85% | hot cache capped at 10,000; the Merkle trees dropped as well; costly RPC methods refused | up to a tenth of its limit (1,000) |
 | critical | 95% | everything kept dropped and trimmed; clean stop. The guard compares a sample of the heap with the threshold and does not know what filled it, and one sample can go from `ok` straight to `critical` | nothing: the pool is paused |
@@ -806,9 +806,10 @@ As built (`src/node/node.ts`, `onMemoryLevel`):
   everything until `ok` and then admitted everything at once. The pool's size is now a
   dial like the others (`Node.MEMPOOL_SHARE`, `Mempool.setLimit`): the pool admits up to
   its whole limit at `ok`, half of it at `warn`, a tenth at `pressure` and nothing at
-  `critical` (10,000, 5,000, 1,000 and 0 transactions at the default). Lowering the limit
-  evicts nothing: what is pooled stays and is reaped, and admission begins again as soon
-  as blocks have taken the pool below the limit, so under pressure the node goes on
+  `critical` (10,000, 5,000, 1,000 and 0 transactions at the default, and the same shares of
+  its 64 MiB of transaction bytes). Lowering the limit takes nothing out at once: what
+  the pool holds above it is put out at the next commit, the newest first, and admission
+  begins again as soon as the pool is below the limit, so under pressure the node goes on
   admitting at the rate its blocks take transactions out. A transaction refused at a
   lowered limit gets the status `full` with an error that says the limit is lowered; the
   `broadcastTx` method answers it with `RATE_LIMITED` (-32004, try again later) while the
@@ -881,8 +882,11 @@ and `pressure` for its last ten seconds with the mempool paused and resumed, for
 blocks and 59,128 transfers: the history window (100 versions of overwritten tree nodes
 and object bytes, each block of scattered transfers adding tens of thousands of records)
 was what kept the heap at its limit once the trees were gone, and trimming it is what
-took the heap from 640 to 50 MiB in one sample. What still grows under this load and no
-dial sheds is the recent transaction ids.
+took the heap from 640 to 50 MiB in one sample. What still grew under this load and no
+dial shed was the recent transaction ids: not their objects, which the dials cover, but
+the per-instance tables of arena references, which had a place for every instance from
+zero, and the chunks their trees had emptied, which the chunk cache kept. Both follow the
+ids that are there since 2026-11-20 (docs/benchmarks.md section 6).
 
 Then the database alone, in the parent process after the node session (so with a full
 history window): blocks of 500 random transfers, six per mode, checked through `checkTx`
@@ -1300,7 +1304,7 @@ it keeps, which the guard's first sample took for a full heap at 208 MiB (211 of
 |---|---|
 | hotObjects | unbounded; the guard caps it at 100,000 (`warn`) and 10,000 (`pressure`) |
 | arenaBytes | unbounded; `start --arena <MiB>` sets it (at least 16); needs an object store, never releases the current slab |
-| mempool limit | 10,000 transactions; the guard admits up to all of it at `ok`, half at `warn`, a tenth at `pressure`, none at `critical` |
+| mempool limit | 10,000 transactions and 64 MiB of them; the guard admits up to all of it at `ok`, half at `warn`, a tenth at `pressure`, none at `critical` |
 | index trees | `indexTrees: 'store'` (the default): never built, read from LMDB, not counted as waiting to be rebuilt; `indexTrees: 'memory'`: resident when they fit at opening, dropped from `warn` on, rebuilt at `ok` after the wait below when they fit |
 | history window in memory | the configured retention (100 versions), or `retain.memoryVersions` of it when set; 2 from `warn` on (`Node.HISTORY_WHEN_PAGED`), let grow back at `ok` once both tiers are resident and what it held fits |
 | wait before a rebuild | the guard samples since something was last rebuilt or the node started, at least 10 (`Node.REBUILD_WINDOW`) and at most 600 (`Node.REBUILD_WAIT_MAX`), all of them at `ok` in a row; then a tier is rebuilt if it fits within 0.5 of the heap limit (`Node.REBUILD_FILL`) beside the highest of the last 10 samples |

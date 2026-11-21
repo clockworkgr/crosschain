@@ -161,7 +161,14 @@ export class TypeIndex<T extends { id: ObjectId }> {
   private readonly secondary: Secondary<T>[] = [];
   private readonly byName = new Map<string, Secondary<T>>();
   private readonly retain: number;
-  /** Arena reference of each committed instance (ABSENT when there is none, STORED when its bytes are only in the store) and its encoding's length. */
+  /**
+   * Arena reference of each committed instance (ABSENT when there is none, STORED when its bytes are only in the
+   * store) and its encoding's length, for the instances from `low` on: the place of an instance in these tables is
+   * its number less `low`. Below `low` there is nothing, committed or cached. Instance numbers only rise, so the
+   * objects of a type that come and go (the recent transaction ids) stand in a window that moves up the numbers,
+   * and tables that began at zero would grow by an entry for every object ever made.
+   */
+  private low = 0;
   private refs = new Float64Array(0);
   private lens = new Uint32Array(0);
   /**
@@ -220,34 +227,74 @@ export class TypeIndex<T extends { id: ObjectId }> {
     this.trees.set(name, tree);
   }
 
+  /** Make the tables hold a place for an instance. */
   private ensure(instance: number): void {
-    if (instance < this.refs.length) return;
-    const size = Math.max(instance + 1, this.refs.length * 2, 16);
+    const at = instance - this.low;
+    if (at >= 0 && at < this.refs.length) return;
+    if (this.refs.length === 0) {
+      this.low = instance;
+      this.resize(0, 16);
+      return;
+    }
+    if (at < 0) {
+      // Below everything held: only a load does this, in whatever order its source gives the objects. The tables
+      // double downward, as far as instance zero, so that a load in descending order does not copy them for each.
+      const more = Math.min(this.low, Math.max(-at, this.refs.length));
+      this.resize(-more, this.refs.length + more);
+      this.low -= more;
+      return;
+    }
+    // Above: first let go of the places at the front that hold nothing any more. If they are half the tables, what
+    // is left moves down in place and nothing is allocated; each such move frees half, so its cost is spread over
+    // as many new instances. Otherwise the tables double, without the places let go.
+    let dead = 0;
+    while (dead < this.refs.length && this.refs[dead]! === ABSENT && !this.hot.has(this.low + dead)) dead++;
+    const span = at - dead + 1;
+    if (span <= this.refs.length && 2 * dead >= this.refs.length) {
+      this.refs.copyWithin(0, dead);
+      this.refs.fill(ABSENT, this.refs.length - dead);
+      this.lens.copyWithin(0, dead);
+      this.lens.fill(0, this.lens.length - dead);
+      this.touched.copyWithin(0, dead);
+      this.touched.fill(0, this.touched.length - dead);
+    } else this.resize(dead, Math.max(span, (this.refs.length - dead) * 2, 16));
+    this.low += dead;
+  }
+
+  /** New tables of `size` places, the first of them being place `from` of the old ones (negative: that many new places in front). */
+  private resize(from: number, size: number): void {
     const refs = new Float64Array(size).fill(ABSENT);
-    refs.set(this.refs);
-    this.refs = refs;
     const lens = new Uint32Array(size);
-    lens.set(this.lens);
-    this.lens = lens;
     const touched = new Uint8Array(size);
-    touched.set(this.touched);
+    if (from >= 0) {
+      refs.set(this.refs.subarray(from));
+      lens.set(this.lens.subarray(from));
+      touched.set(this.touched.subarray(from));
+    } else {
+      refs.set(this.refs, -from);
+      lens.set(this.lens, -from);
+      touched.set(this.touched, -from);
+    }
+    this.refs = refs;
+    this.lens = lens;
     this.touched = touched;
   }
 
   /** The arena reference of an instance's committed encoding; negative when the arena holds none. */
   refAt(instance: number): number {
-    return instance < this.refs.length ? this.refs[instance]! : ABSENT;
+    const at = instance - this.low;
+    return at >= 0 && at < this.refs.length ? this.refs[at]! : ABSENT;
   }
 
   /** The arena released the slab an instance's bytes were in: from now on they are read from the store. */
   released(instance: number): void {
-    this.refs[instance] = STORED;
+    this.refs[instance - this.low] = STORED;
     this.storedCount++;
   }
 
   /** The committed encoding of an instance that has one: a view into the arena, or the store's copy. */
   private committedBytes(instance: number): Uint8Array {
-    const ref = this.refs[instance]!;
+    const ref = this.refAt(instance);
     if (ref >= 0) return this.arena.read(ref);
     const bytes = this.fetch?.(objectId(this.type.id, instance));
     if (!bytes) throw new DbError(`${this.type.name} ${instance}: its bytes are neither in the arena nor in the store`);
@@ -256,14 +303,14 @@ export class TypeIndex<T extends { id: ObjectId }> {
 
   /** Compaction moved an entry. */
   relocate(instance: number, ref: number): void {
-    this.refs[instance] = ref;
+    this.refs[instance - this.low] = ref;
   }
 
   private cache(instance: number, value: T | null): void {
     this.ensure(instance);
     if (!this.hot.has(instance)) this.budget.size++;
     this.hot.set(instance, value);
-    this.touched[instance] = 0;
+    this.touched[instance - this.low] = 0;
     if (!this.saturated) this.evict();
   }
 
@@ -290,8 +337,8 @@ export class TypeIndex<T extends { id: ObjectId }> {
     let visits = 2 * this.hot.size;
     for (const [i, value] of this.hot) {
       if (over <= 0 || visits-- <= 0) break;
-      if (this.pinned.has(i) || this.touched[i]) {
-        this.touched[i] = 0;
+      if (this.pinned.has(i) || this.touched[i - this.low]) {
+        this.touched[i - this.low] = 0;
         // To the back of the ring; iteration reaches it again after the rest.
         this.hot.delete(i);
         this.hot.set(i, value);
@@ -321,7 +368,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
     const v = this.hot.get(instance);
     if (v !== undefined) {
       // A cached object, or a tombstone (null), which reads as absent.
-      this.touched[instance] = 1;
+      this.touched[instance - this.low] = 1;
       this.budget.hits++;
       return v ?? undefined;
     }
@@ -482,8 +529,8 @@ export class TypeIndex<T extends { id: ObjectId }> {
     if (instance > MAX_INSTANCE) throw new DbError(`${this.type.name}: instance ${instance} is beyond the index`);
     if (this.has(instance)) throw new DbError(`${this.type.name}: instance ${instance} imported twice`);
     this.ensure(instance);
-    this.refs[instance] = this.arena.alloc(this.type.id, instance, bytes);
-    this.lens[instance] = bytes.length;
+    this.refs[instance - this.low] = this.arena.alloc(this.type.id, instance, bytes);
+    this.lens[instance - this.low] = bytes.length;
     this.committedCount++;
   }
 
@@ -493,7 +540,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
     if (this.has(instance)) throw new DbError(`${this.type.name}: instance ${instance} imported twice`);
     if (!this.fetch) throw new DbError(`${this.type.name}: no store to leave an object's bytes in`);
     this.ensure(instance);
-    this.refs[instance] = STORED;
+    this.refs[instance - this.low] = STORED;
     this.committedCount++;
     this.storedCount++;
   }
@@ -528,8 +575,8 @@ export class TypeIndex<T extends { id: ObjectId }> {
    */
   checkEntries(): void {
     if (this.secondary.length === 0) return;
-    for (let instance = 0; instance < this.refs.length; instance++) {
-      if (this.refs[instance]! === ABSENT) continue;
+    for (let instance = this.low; instance < this.low + this.refs.length; instance++) {
+      if (this.refs[instance - this.low]! === ABSENT) continue;
       const id = objectId(this.type.id, instance);
       const keys = this.keysOf(decode(this.committedBytes(instance), (r) => this.type.decode(r, id)));
       for (let i = 0; i < keys.length; i++) {
@@ -667,11 +714,11 @@ export class TypeIndex<T extends { id: ObjectId }> {
     this.ensure(instance);
     if (bytes) {
       this.committedCount++;
-      this.refs[instance] = this.arena.alloc(this.type.id, instance, bytes);
-      this.lens[instance] = bytes.length;
+      this.refs[instance - this.low] = this.arena.alloc(this.type.id, instance, bytes);
+      this.lens[instance - this.low] = bytes.length;
     } else {
-      this.refs[instance] = ABSENT;
-      this.lens[instance] = 0;
+      this.refs[instance - this.low] = ABSENT;
+      this.lens[instance - this.low] = 0;
       this.uncache(instance);
     }
     this.pinned.delete(instance);
@@ -687,7 +734,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
 
   /** Every present instance, ascending. */
   *instances(): IterableIterator<number> {
-    for (let i = 0; i < this.nextInstance; i++) if (this.has(i)) yield i;
+    for (let i = this.low; i < this.nextInstance; i++) if (this.has(i)) yield i;
   }
 
   /**
@@ -715,6 +762,7 @@ export class TypeIndex<T extends { id: ObjectId }> {
     this.refs = new Float64Array(0);
     this.lens = new Uint32Array(0);
     this.touched = new Uint8Array(0);
+    this.low = 0;
     this.budget.size -= this.hot.size;
     this.hot.clear();
     this.pinned.clear();

@@ -746,7 +746,13 @@ The chunk index is six bytes, big-endian, written in two halves for the reason g
     this.changed.clear();
     if (this.source) {
       this.levels.forEach((level, k) => {
-        for (const [c, chunk] of level) this.cache!.set(this.slot * SLOT_SPAN + k * LEVEL_SPAN + c, chunk);
+        // A chunk with nothing left in it is deleted from the store, and read from there as absent: the cache has
+        // no use for it. Objects that come and go would otherwise fill the cache with the chunks they left behind.
+        for (const [c, chunk] of level) {
+          const key = this.slot * SLOT_SPAN + k * LEVEL_SPAN + c;
+          if (usedLength(chunk) > 0) this.cache!.set(key, chunk);
+          else this.cache!.delete(key);
+        }
       });
       this.levels.length = 0;
       this.counts.length = 0;
@@ -754,7 +760,7 @@ The chunk index is six bytes, big-endian, written in two halves for the reason g
   }
 ```
 
-`changed` collected the level and index of every chunk `writeNode` touched, as one number. A chunk's used length is its bytes up to the last non-empty slot, so a chunk that emptied is reported as a deletion (its value null), and the one-chunk upper levels cost what they hold rather than 32 KiB each; a chunk read back from the store is padded to full size again. The values of a resident tree's chunks are views of the live chunks, not copies, which is what keeps a root over a resident tree from copying anything; the price is `handedOut`:
+`changed` collected the level and index of every chunk `writeNode` touched, as one number. A chunk's used length is its bytes up to the last non-empty slot, so a chunk that emptied is reported as a deletion (its value null), and the one-chunk upper levels cost what they hold rather than 32 KiB each. A dropped tree hands the chunks the root wrote to the cache, except those that emptied, which it takes out of the cache (`ChunkCache.delete`): the store reads them as absent from then on, which is what an empty chunk is. They used to go into the cache like the rest, 32 KiB each of nothing, and a type whose objects come and go filled the cache with the chunks its objects had left: the recent transaction ids alone took it to its 4,096 chunks, 128 MiB, where the ids that were there needed some two hundred. a chunk read back from the store is padded to full size again. The values of a resident tree's chunks are views of the live chunks, not copies, which is what keeps a root over a resident tree from copying anything; the price is `handedOut`:
 
 ```ts
   /**
@@ -841,6 +847,11 @@ The root works on private full-size copies of the chunks it changes, each filled
     this.map.set(key, v);
     this.newest = key;
     this.trim();
+  }
+
+  delete(key: number): void {
+    this.map.delete(key);
+    if (key === this.newest) this.newest = -1;
   }
 
   trim(): void {
@@ -1605,7 +1616,14 @@ The type's private fields are the design of "Objects as bytes" and of the index 
   private readonly secondary: Secondary<T>[] = [];
   private readonly byName = new Map<string, Secondary<T>>();
   private readonly retain: number;
-  /** Arena reference of each committed instance (ABSENT when there is none, STORED when its bytes are only in the store) and its encoding's length. */
+  /**
+   * Arena reference of each committed instance (ABSENT when there is none, STORED when its bytes are only in the
+   * store) and its encoding's length, for the instances from `low` on: the place of an instance in these tables is
+   * its number less `low`. Below `low` there is nothing, committed or cached. Instance numbers only rise, so the
+   * objects of a type that come and go (the recent transaction ids) stand in a window that moves up the numbers,
+   * and tables that began at zero would grow by an entry for every object ever made.
+   */
+  private low = 0;
   private refs = new Float64Array(0);
   private lens = new Uint32Array(0);
   /**
@@ -1631,7 +1649,70 @@ The type's private fields are the design of "Objects as bytes" and of the index 
   private readonly fetch: ObjectFetch | null;
 ```
 
-`refs`, `lens` and `touched` grow together in `ensure`, doubling and never below 16 slots, with new references set to `ABSENT`; a reference needs a `Float64Array` because it packs a slab number above the low 24 bits, up to 53 bits in all. A reference is never negative, so two negative numbers serve as marks:
+`refs`, `lens` and `touched` are three tables with one place for each instance, and the place of an instance is its number less `low`. They grow together in `ensure`:
+
+```ts
+  /** Make the tables hold a place for an instance. */
+  private ensure(instance: number): void {
+    const at = instance - this.low;
+    if (at >= 0 && at < this.refs.length) return;
+    if (this.refs.length === 0) {
+      this.low = instance;
+      this.resize(0, 16);
+      return;
+    }
+    if (at < 0) {
+      // Below everything held: only a load does this, in whatever order its source gives the objects. The tables
+      // double downward, as far as instance zero, so that a load in descending order does not copy them for each.
+      const more = Math.min(this.low, Math.max(-at, this.refs.length));
+      this.resize(-more, this.refs.length + more);
+      this.low -= more;
+      return;
+    }
+    // Above: first let go of the places at the front that hold nothing any more. If they are half the tables, what
+    // is left moves down in place and nothing is allocated; each such move frees half, so its cost is spread over
+    // as many new instances. Otherwise the tables double, without the places let go.
+    let dead = 0;
+    while (dead < this.refs.length && this.refs[dead]! === ABSENT && !this.hot.has(this.low + dead)) dead++;
+    const span = at - dead + 1;
+    if (span <= this.refs.length && 2 * dead >= this.refs.length) {
+      this.refs.copyWithin(0, dead);
+      this.refs.fill(ABSENT, this.refs.length - dead);
+      this.lens.copyWithin(0, dead);
+      this.lens.fill(0, this.lens.length - dead);
+      this.touched.copyWithin(0, dead);
+      this.touched.fill(0, this.touched.length - dead);
+    } else this.resize(dead, Math.max(span, (this.refs.length - dead) * 2, 16));
+    this.low += dead;
+  }
+
+  /** New tables of `size` places, the first of them being place `from` of the old ones (negative: that many new places in front). */
+  private resize(from: number, size: number): void {
+    const refs = new Float64Array(size).fill(ABSENT);
+    const lens = new Uint32Array(size);
+    const touched = new Uint8Array(size);
+    if (from >= 0) {
+      refs.set(this.refs.subarray(from));
+      lens.set(this.lens.subarray(from));
+      touched.set(this.touched.subarray(from));
+    } else {
+      refs.set(this.refs, -from);
+      lens.set(this.lens, -from);
+      touched.set(this.touched, -from);
+    }
+    this.refs = refs;
+    this.lens = lens;
+    this.touched = touched;
+  }
+```
+
+Instance numbers only rise: a removed object's number is not given again. For a type whose objects stay (accounts, balances) the tables are as long as the type has ever had instances, and nothing is lost by that. For one whose objects come and go it matters. Every transfer makes a recent transaction id, which is removed when the transaction's expiration has passed, an hour later at most; the ids that are there at any moment are a window some hundred thousand wide that moves up the numbers by every transaction applied. Tables that begin at instance zero grow by a place, 13 bytes (and up to twice that just after a doubling), for every transaction the chain has ever applied: 52 to 104 MiB at four million, on a node that holds 96,000 ids, and no dial of the memory guard touches them, since they are array buffers and not a cache. That is what the tables did until `low` was added.
+
+`ensure` is asked for a place before every write of a table. An instance above the tables is the ordinary case, a new object. Before the tables grow, the places at the front that hold nothing are counted: no committed reference (`ABSENT`) and nothing in the cache, which is where a pending object or a pending removal stands until the root. If they are at least half the tables and the rest with the new instance fits, what is left is moved down in place (`copyWithin`) and nothing is allocated; each such move frees half the places, so it happens once in as many new instances as it copies, and its cost per instance is constant. Otherwise new tables are made of twice what is left, without the places let go. Either way `low` rises by what was let go. An instance below `low` is only met when objects are loaded and a lower one comes after a higher, and the tables then grow downward, by as many places as they have or as the instance needs if that is more, and not below instance zero, so that a load from the highest instance down copies them a logarithmic number of times and not once for each object. A read below `low` or above the tables is `ABSENT` (`refAt`), and `instances()` starts at `low`.
+
+The tables are no part of the state: nothing about `low` reaches a root, a proof or the store, and a database opened from a store begins its tables at the first instance it loads. One object that stays holds the window open from its number up, so the tables follow the oldest live instance, not the count of live ones; the recent transaction ids leave in the order of their expirations, which is close to the order they were made in.
+
+New references are set to `ABSENT`; a reference needs a `Float64Array` because it packs a slab number above the low 24 bits, up to 53 bits in all. A reference is never negative, so two negative numbers serve as marks:
 
 ```ts
 /** What the reference table holds for an instance with no committed encoding, and for one whose encoding is only in the store. */
@@ -1677,13 +1758,13 @@ The constructor takes the arena, the shared budget and the store view besides th
 ```ts
   /** The arena released the slab an instance's bytes were in: from now on they are read from the store. */
   released(instance: number): void {
-    this.refs[instance] = STORED;
+    this.refs[instance - this.low] = STORED;
     this.storedCount++;
   }
 
   /** The committed encoding of an instance that has one: a view into the arena, or the store's copy. */
   private committedBytes(instance: number): Uint8Array {
-    const ref = this.refs[instance]!;
+    const ref = this.refAt(instance);
     if (ref >= 0) return this.arena.read(ref);
     const bytes = this.fetch?.(objectId(this.type.id, instance));
     if (!bytes) throw new DbError(`${this.type.name} ${instance}: its bytes are neither in the arena nor in the store`);
@@ -1702,7 +1783,7 @@ The constructor takes the arena, the shared budget and the store view besides th
     const v = this.hot.get(instance);
     if (v !== undefined) {
       // A cached object, or a tombstone (null), which reads as absent.
-      this.touched[instance] = 1;
+      this.touched[instance - this.low] = 1;
       this.budget.hits++;
       return v ?? undefined;
     }
@@ -1728,7 +1809,7 @@ Anything in the cache answers, and counts a hit: an object, whose touched bit is
     this.ensure(instance);
     if (!this.hot.has(instance)) this.budget.size++;
     this.hot.set(instance, value);
-    this.touched[instance] = 0;
+    this.touched[instance - this.low] = 0;
     if (!this.saturated) this.evict();
   }
 
@@ -1755,8 +1836,8 @@ Anything in the cache answers, and counts a hit: an object, whose touched bit is
     let visits = 2 * this.hot.size;
     for (const [i, value] of this.hot) {
       if (over <= 0 || visits-- <= 0) break;
-      if (this.pinned.has(i) || this.touched[i]) {
-        this.touched[i] = 0;
+      if (this.pinned.has(i) || this.touched[i - this.low]) {
+        this.touched[i - this.low] = 0;
         // To the back of the ring; iteration reaches it again after the rest.
         this.hot.delete(i);
         this.hot.set(i, value);
@@ -1893,7 +1974,7 @@ A third import leaves the bytes where they are:
     if (this.has(instance)) throw new DbError(`${this.type.name}: instance ${instance} imported twice`);
     if (!this.fetch) throw new DbError(`${this.type.name}: no store to leave an object's bytes in`);
     this.ensure(instance);
-    this.refs[instance] = STORED;
+    this.refs[instance - this.low] = STORED;
     this.committedCount++;
     this.storedCount++;
   }
@@ -1935,11 +2016,11 @@ The database calls it at a restart for the objects that would take the arena ove
     this.ensure(instance);
     if (bytes) {
       this.committedCount++;
-      this.refs[instance] = this.arena.alloc(this.type.id, instance, bytes);
-      this.lens[instance] = bytes.length;
+      this.refs[instance - this.low] = this.arena.alloc(this.type.id, instance, bytes);
+      this.lens[instance - this.low] = bytes.length;
     } else {
-      this.refs[instance] = ABSENT;
-      this.lens[instance] = 0;
+      this.refs[instance - this.low] = ABSENT;
+      this.lens[instance - this.low] = 0;
       this.uncache(instance);
     }
     this.pinned.delete(instance);
@@ -3360,7 +3441,7 @@ Known simplifications, from DESIGN.md section 10 and the code:
 - All consensus state is resident by default, by design: README.md measures a 1 GB genesis at about 1.0 GB of heap and array buffers after a restart, and 961 MiB of heap plus 1,637 MiB of array buffers with the original and the synced state both loaded at the end of a local state-sync run. The peak while a node joins, when the chunks, the rebuilt state and the opened store are held together, was not measured; README.md's figure for it, about three times the state's resting memory, is an estimate to plan with. Every tier is now also in LMDB, a node leaves its index trees there unless its config says `indexTrees: 'memory'` ([chapter 8](08-node.md)), and the memory guard can drop the index trees and the Merkle trees, which took the database to 57% of the heap it holds resident with a full history window (40 to 50% in an earlier build's run on a state with no history yet), and a store whose tiers do not fit the heap is opened with them dropped (STATE-PAGING.md section 9.1).
 - A version the window in memory no longer covers is read from the store's history records, and that read scans the record of every later version each time: nothing is cached, and no index says which records name an entry, so the cost grows with how far back the version is and with the size of the blocks since. That is the price of keeping the read free of memory. A record written before the sparse tree nodes were kept cannot serve an object proof for a type with an authenticated index, or a key proof. A store that has lost a record inside the window is refused and not answered for from what is left: the read throws, and at the next opening the heights below the gap are no longer provable ([chapter 11](11-application.md)).
 - The arena's limit is a byte budget set by hand, because the slabs are outside the heap the memory guard watches; nothing lowers it when the machine runs short of memory, the current slab (16 MiB at most) always stays, and an object read from the store is not kept in the arena, so a state read far more than it is written pays an LMDB read on every miss of the hot cache.
-- The recent transaction ids are still growth no dial sheds.
+- A type's tables of references follow its oldest live instance, not its number of live ones: one object that stays while millions above it come and go keeps a place for each of those.
 - `changedSince()` takes the removals of the block in progress from the open sessions, so it does not list an object removed with no session open since the last root, although the committed view still holds it. The application never writes that way.
 - A database holds at most 511 object types, the chunk cache having 512 slots for the dense trees, and a type at most 16 authenticated indices, the number of index roots a proof or a snapshot manifest is decoded with.
 - The arena's compaction budget is tested between slabs, so one pass can copy up to the live bytes of its last slab (under 8 MiB) more than the budget.

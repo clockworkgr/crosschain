@@ -18,11 +18,13 @@ import { txHash } from './types/block.ts';
 
 export interface MempoolOptions {
   maxTxs: number;
+  /** The most bytes of transactions the pool holds. The count alone would let ten thousand of the largest in. */
+  maxBytes: number;
   maxTxBytes: number;
   cacheSize: number;
 }
 
-const DEFAULTS: MempoolOptions = { maxTxs: 10_000, maxTxBytes: 1024 * 1024, cacheSize: 100_000 };
+const DEFAULTS: MempoolOptions = { maxTxs: 10_000, maxBytes: 64 * 1024 * 1024, maxTxBytes: 1024 * 1024, cacheSize: 100_000 };
 
 export type AddTxStatus = 'added' | 'seen' | 'invalid' | 'full' | 'too-large' | 'paused';
 
@@ -47,15 +49,36 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
    * a place, so two checks running at once cannot both be admitted to the last one.
    */
   private reserved = 0;
+  /** The bytes of the pooled transactions, and of those that hold a place while they are checked. */
+  private pooledBytes = 0;
+  private reservedBytes = 0;
   private pausedReason: string | null = null;
   /** How many transactions the pool admits up to just now: maxTxs, or less while the node is short of memory. */
   private limit: number;
+  /** How many bytes it admits up to just now: the same share of maxBytes as the limit is of maxTxs. */
+  private byteLimit: number;
 
   constructor(app: Application, opts: Partial<MempoolOptions> = {}) {
     super();
     this.app = app;
     this.opts = { ...DEFAULTS, ...opts };
     this.limit = this.opts.maxTxs;
+    this.byteLimit = this.opts.maxBytes;
+  }
+
+  /** The most bytes the pool may hold, whatever it admits up to just now. */
+  get maxBytes(): number {
+    return this.opts.maxBytes;
+  }
+
+  /** How many bytes of transactions the pool admits up to just now. */
+  get currentByteLimit(): number {
+    return this.byteLimit;
+  }
+
+  /** The bytes of the transactions in the pool. */
+  get bytes(): number {
+    return this.pooledBytes;
   }
 
   /** The most the pool may hold, whatever it admits up to just now. */
@@ -69,17 +92,24 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
   }
 
   /**
-   * Admit up to this many transactions from now on (never more than maxTxs). The memory guard lowers it as the heap
-   * fills, since every pooled transaction holds its bytes and its writes in the pending state. Lowering it evicts
-   * nothing: what is pooled stays and is reaped, and admission begins again once blocks have taken the pool below it.
+   * Admit up to this many transactions from now on (never more than maxTxs), and the same share of maxBytes. The
+   * memory guard lowers it as the heap fills, since every pooled transaction holds its bytes and its writes in the
+   * pending state. Lowering it takes nothing out at once: what the pool holds above the new limits leaves at the
+   * next commit, the newest first (update), where the pending state is rebuilt without it.
    */
   setLimit(limit: number): void {
     this.limit = Math.max(0, Math.min(this.opts.maxTxs, Math.floor(limit)));
+    this.byteLimit = this.opts.maxTxs === 0 ? 0 : Math.floor((this.opts.maxBytes * this.limit) / this.opts.maxTxs);
   }
 
-  /** Whether a transaction arriving now could be admitted: not paused, and room under the limit. */
+  /** Whether there is a place and the bytes for a transaction of this length, beside what is pooled and what holds a place. */
+  private room(length: number): boolean {
+    return this.txs.size + this.reserved < this.limit && this.pooledBytes + this.reservedBytes + length <= this.byteLimit;
+  }
+
+  /** Whether a transaction arriving now could be admitted: not paused, and room under the limits for one byte at least. */
   get accepting(): boolean {
-    return this.pausedReason === null && this.txs.size + this.reserved < this.limit;
+    return this.pausedReason === null && this.room(1);
   }
 
   private get fullReason(): string {
@@ -162,7 +192,7 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
     const key = toHex(hash);
     if (this.pausedReason !== null) return { status: 'paused', hash, error: this.pausedReason };
     if (this.known(key)) return { status: 'seen', hash };
-    if (this.txs.size + this.reserved >= this.limit) return { status: 'full', hash, error: this.fullReason };
+    if (!this.room(tx.length)) return { status: 'full', hash, error: this.fullReason };
     // Mark before the await so a concurrent duplicate is not checked twice.
     this.remember(key);
     // The application asks this again after its last wait, so a transaction refused here is not applied to its
@@ -177,16 +207,20 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
         return this.pausedReason;
       }
       if (holdsPlace) return null;
-      if (this.txs.size + this.reserved >= this.limit) {
+      if (!this.room(tx.length)) {
         refused = 'full';
         return this.fullReason;
       }
       holdsPlace = true;
       this.reserved++;
+      this.reservedBytes += tx.length;
       return null;
     };
     const release = () => {
-      if (holdsPlace) this.reserved--;
+      if (holdsPlace) {
+        this.reserved--;
+        this.reservedBytes -= tx.length;
+      }
       holdsPlace = false;
     };
     try {
@@ -205,13 +239,16 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
       }
       // A check that holds a place has room whatever came since. One that holds none (the application did not
       // ask, or refused the transaction before asking) is measured against the pool and the places others hold.
-      if (refused === 'full' || (!holdsPlace && this.txs.size + this.reserved >= this.limit)) {
+      if (refused === 'full' || (!holdsPlace && !this.room(tx.length))) {
         this.forget(key); // the pool filled while we checked; let the sender try again rather than hear "seen"
         return { status: 'full', hash, error: this.fullReason };
       }
       if (!res.ok) return { status: 'invalid', hash, error: res.error };
       release(); // the place it held becomes its place in the pool
+      // Checked twice at once (the cache had let go of it, or holds nothing): it is pooled once and counted once.
+      if (this.txs.has(key)) return { status: 'seen', hash };
       this.txs.set(key, tx);
+      this.pooledBytes += tx.length;
       this.emit('tx', hash, tx, source);
       return { status: 'added', hash };
     } finally {
@@ -232,13 +269,50 @@ export class Mempool extends EventEmitter<{ tx: [hash: Uint8Array, tx: Uint8Arra
     return out;
   }
 
-  /** Called after a block commits: drop what was included, re-check what remains. */
-  async update(committed: Uint8Array[]): Promise<void> {
-    for (const tx of committed) this.txs.delete(toHex(txHash(tx)));
+  private drop(key: string): void {
+    const tx = this.txs.get(key);
+    if (tx === undefined) return;
+    this.txs.delete(key);
+    this.pooledBytes -= tx.length;
+  }
+
+  /**
+   * Called after a block commits: drop what was included, put out what the limits no longer have room for, re-check
+   * what remains.
+   *
+   * The pool is above its limits only after they were lowered. This is the one moment a transaction can leave
+   * without a trace: the application undid its pending state for the block (and is asked to once more here, for
+   * what was checked since), and the re-check below rebuilds it from what is still pooled. The oldest stay, as they are the next a block takes; the ones put out are forgotten, so
+   * they are checked again when they come again. Returns how many were put out.
+   */
+  async update(committed: Uint8Array[]): Promise<number> {
+    for (const tx of committed) this.drop(toHex(txHash(tx)));
+    let evicted = 0;
+    if (this.txs.size > this.limit || this.pooledBytes > this.byteLimit) {
+      let count = 0;
+      let bytes = 0;
+      let over = false;
+      for (const [key, tx] of [...this.txs]) {
+        over ||= count + 1 > this.limit || bytes + tx.length > this.byteLimit;
+        if (!over) {
+          count++;
+          bytes += tx.length;
+          continue;
+        }
+        this.drop(key);
+        this.forget(key);
+        evicted++;
+      }
+      // A transaction checked after the block was finalized and before this ran was applied to the new pending
+      // state. If one of those was put out its writes are still there, so the application begins that state again,
+      // and the re-check below applies what is left.
+      if (evicted > 0) this.app.resetPending?.();
+    }
     for (const [key, tx] of [...this.txs]) {
       const res = await this.app.checkTx(tx);
-      if (!res.ok) this.txs.delete(key);
+      if (!res.ok) this.drop(key);
     }
+    return evicted;
   }
 
   /** Current pool contents in FIFO order; for tests and status. */

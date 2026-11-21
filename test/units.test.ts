@@ -158,6 +158,52 @@ describe('mempool', () => {
     expect(mp.size).toBe(1);
   });
 
+  it('holds no more bytes than its limit, and at a commit puts out the newest of what lowered limits have no room for', async () => {
+    // Each transaction is 'kNN=' and a value: 20 bytes.
+    const t = (i: number) => tx(`k${String(i).padStart(2, '0')}=${'x'.repeat(16)}`);
+    expect(t(0).length).toBe(20);
+    const checked: string[] = [];
+    const app = new KvStoreApp();
+    const check = app.checkTx.bind(app);
+    app.checkTx = async (bytes: Uint8Array) => {
+      checked.push(new TextDecoder().decode(bytes).slice(0, 3));
+      return check(bytes);
+    };
+    const mp = new Mempool(app, { maxTxs: 10, maxBytes: 100 });
+    for (let i = 0; i < 5; i++) expect((await mp.addTx(t(i))).status).toBe('added');
+    expect(mp.bytes).toBe(100);
+    // Half the places are free and none of the bytes: the pool is full, and says it takes no more.
+    expect(mp.accepting).toBe(false);
+    checked.length = 0;
+    expect((await mp.addTx(t(5))).status).toBe('full');
+    expect(checked).toEqual([]);
+    // A refused one is not remembered: with room it gets in.
+    await mp.update([t(0)]);
+    expect(mp.bytes).toBe(80);
+    expect((await mp.addTx(t(5))).status).toBe('added');
+
+    // The limit lowered to three places, and with it to three tenths of the bytes: one transaction's worth. Nothing
+    // leaves until a block commits; then the oldest stays, the rest go, and only what stays is checked again.
+    mp.setLimit(3);
+    expect(mp.currentByteLimit).toBe(30);
+    expect(mp.size).toBe(5);
+    checked.length = 0;
+    expect(await mp.update([])).toBe(4);
+    expect(mp.list()).toEqual([t(1)]);
+    expect(mp.bytes).toBe(20);
+    expect(checked).toEqual(['k01']);
+    // What was put out is forgotten, so it is taken again when there is room for it.
+    expect(mp.seen(txHash(t(2)))).toBe(false);
+    mp.setLimit(10);
+    expect((await mp.addTx(t(2))).status).toBe('added');
+    // By count alone: two places, bytes to spare.
+    const few = new Mempool(new KvStoreApp(), { maxTxs: 4, maxBytes: 1_000 });
+    for (let i = 0; i < 4; i++) expect((await few.addTx(t(i))).status).toBe('added');
+    few.setLimit(2);
+    expect(await few.update([])).toBe(2);
+    expect(few.list()).toEqual([t(0), t(1)]);
+  });
+
   it('remembers the last transactions it saw, the newest taking the oldest one\'s place', async () => {
     const mp = new Mempool(new KvStoreApp(), { cacheSize: 3 });
     const seen = async (t: string) => (await mp.addTx(tx(t))).status === 'seen';

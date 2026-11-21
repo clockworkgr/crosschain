@@ -722,6 +722,13 @@ export class CoreApp implements Application {
     return a ? { active: a.active, owner: a.owner } : null;
   };
 
+  /** The pending state begins again from the committed one; the mempool then checks again what it holds. */
+  resetPending(): void {
+    if (this.applying || !this.pending) return;
+    this.pending.undo();
+    this.pending = this.db.startSession();
+  }
+
   private closePending(): void {
     if (this.pending) {
       this.pending.undo();

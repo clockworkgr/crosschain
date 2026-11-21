@@ -260,7 +260,8 @@ export class BlockExecutor {
       appHash: res.appHash,
       valUpdates: res.validatorUpdates.length,
     });
-    await this.d.mempool.update(block.txs);
+    const evicted = await this.d.mempool.update(block.txs);
+    if (evicted > 0) this.d.log('warn', 'mempool: transactions put out, its limits are lowered', { evicted, left: this.d.mempool.size });
     for (const fn of [...this.committedListeners]) fn(block, commit, res.txResults, res.validatorUpdates);
   }
 

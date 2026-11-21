@@ -982,14 +982,26 @@ export class Consensus {
     this.evaluateRules();
   }
 
-  /** Everything held for the current height, to hand a newly connected peer. */
-  messagesForPeer(): { proposals: Proposal[]; heads: { round: number; head: ProposalHead }[]; votes: Vote[] } {
-    if (!this.running || !this.hvs) return { proposals: [], heads: [], votes: [] };
+  /**
+   * Everything held for the current height, to hand a newly connected peer, and what the proposers signed in the
+   * kept heights: the peer may have been somewhere else in the network while those went by and hold another head
+   * for one of their rounds, which neither side would otherwise hear of. The newest heights first, and no more
+   * than the peer verifies at one time; where it holds the same it verifies nothing.
+   */
+  messagesForPeer(): { proposals: Proposal[]; heads: { round: number; head: ProposalHead }[]; pastHeads: { height: bigint; round: number; head: ProposalHead }[]; votes: Vote[] } {
+    if (!this.running || !this.hvs) return { proposals: [], heads: [], pastHeads: [], votes: [] };
+    const pastHeads: { height: bigint; round: number; head: ProposalHead }[] = [];
+    past: for (const height of [...this.past.keys()].sort((x, y) => (x < y ? 1 : -1))) {
+      for (const [round, head] of this.past.get(height)!.proposals) {
+        if (pastHeads.length >= MAX_HEADS_VERIFYING) break past;
+        pastHeads.push({ height, round, head });
+      }
+    }
     const proposals = [...this.proposals.values()].filter((p) => p.valid && !p.fetched).map((p) => p.proposal);
     // What a proposer signed for a round whose proposal is not among those: the peer may hold another.
     const sent = new Set(proposals.map((p) => p.round));
     const heads = [...this.heads].filter(([round]) => !sent.has(round)).map(([round, head]) => ({ round, head }));
-    return { proposals, heads, votes: this.hvs.allVotes() };
+    return { proposals, heads, pastHeads, votes: this.hvs.allVotes() };
   }
 
   // ----------------------------------------------------------------- timeouts

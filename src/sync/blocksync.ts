@@ -64,6 +64,8 @@ export interface BlockSyncDeps {
 }
 
 const MAX_SERVED = 64;
+/** A peer that did not serve what it said it has this many times no longer counts where a node asks whether it is level with its peers. */
+export const NOT_SERVED_LIMIT = 3;
 /** Bytes of blocks per response, leaving room under the transport's frame limit. */
 const MAX_SERVED_BYTES = 16 * 1024 * 1024;
 
@@ -71,6 +73,8 @@ export class BlockSync {
   private readonly d: BlockSyncDeps;
   private readonly peerHeights = new Map<string, bigint>();
   private readonly unserved = new Set<string>();
+  /** How often each peer did not serve what it had said it has. */
+  private readonly failures = new Map<string, number>();
   private readonly buffer = new Map<bigint, { block: Block; commit: Commit; peerId: string }>();
   private readonly requested = new Set<bigint>();
   private readonly busyPeers = new Set<string>();
@@ -125,12 +129,13 @@ export class BlockSync {
    * Whether this node, at height `ours`, is level with the peers it has heard: 'nobody' if none has said a height,
    * 'behind' if one is above, 'level' otherwise. A peer that said it was ahead and then did not serve the blocks
    * (no answer, none, or wrong ones) is left out until it serves some: what a peer says of its height costs it
-   * nothing, and it can say it again.
+   * nothing, and it can say it again. One that has done so NOT_SERVED_LIMIT times is left out for good: serving a
+   * block now and then would otherwise buy it the next false height.
    */
   levelWith(ours: bigint): 'nobody' | 'behind' | 'level' {
     let heard = 0;
     for (const [id, h] of this.peerHeights) {
-      if (this.unserved.has(id)) continue;
+      if (this.unserved.has(id) || (this.failures.get(id) ?? 0) >= NOT_SERVED_LIMIT) continue;
       if (h > ours) return 'behind';
       heard++;
     }
@@ -141,6 +146,8 @@ export class BlockSync {
   private notServed(peerId: string): void {
     if (this.unserved.size >= 4096) this.unserved.clear();
     this.unserved.add(peerId);
+    if (this.failures.size >= 4096 && !this.failures.has(peerId)) this.failures.clear();
+    this.failures.set(peerId, (this.failures.get(peerId) ?? 0) + 1);
   }
 
   bestPeerHeight(): bigint {

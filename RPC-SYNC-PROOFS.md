@@ -662,9 +662,10 @@ for the round or the round's proposer was already reported; one signed head is
 verified once however many peers send it together, 64 are verified at a time and one
 over that is dropped; a bad signature costs 20 points. A whole proposal that arrives
 after its height, for a round the kept height holds nothing for, has its head recorded
-and sent on in the same way. Heads go to the peers connected when they are first held
-and to a peer that connects during their height, so nodes that meet later do not
-compare what they kept. With what the node holds for the round it is the evidence, which then travels
+and sent on in the same way. Heads go to the peers connected when they are first held,
+and a peer that connects is handed those of the current height and of the 16 heights
+kept after they are over (the newest first, 64 at most), so nodes that were apart
+during a height compare what they held when they meet within those; later they do not. With what the node holds for the round it is the evidence, which then travels
 as above.
 
 ### 4.5 Immediate block fetch

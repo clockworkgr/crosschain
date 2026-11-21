@@ -77,6 +77,7 @@ What is shed and what is not follows from what the node is for. The mempool, the
 - `network?`: the subset `desiredOutbound`, `maxInbound`, `connectIntervalMs`, `pingIntervalMs`, `idleTimeoutMs` of `NetworkConfig`.
 - `lagGraceMs?`: block sync's one-block grace.
 - `signGraceMs?`: how long a validator that hears from no peer after its start waits before it signs; by default the propose timeout (`start`, below).
+- `signIdleMs?`: the longest a validator's signing stays held while no block is applied, whatever peers say of their heights; 15 seconds by default (`start`, below).
 - `signState?`: where the validator's last signature and lock are kept, for a node without a data directory that is to be stopped and made again (the test harness does this). A validator that comes back without that record signs heights it already signed, and its peers hold the first signatures against the second for as long as they keep those heights ([chapter 4](04-consensus.md)). With a data directory the file there is used and this is left unset.
 - `log?`, `logLevel?`: a `Logger`, or a level for `makeLogger(name, level)`.
 - `memory?`: the memory guard's thresholds and sampling (`warnAt`, `pressureAt`, `criticalAt`, `hysteresis`, `intervalMs`) and, for tests, a `stats` function that supplies the samples: everything of `MemoryGuardOptions` but the logger and the two callbacks, `onLevel` and `onSample`, which the node provides.
@@ -459,7 +460,7 @@ Both take the node's logger and whatever `cfg.gc` and `cfg.memory` override. The
       broadcastProposal: (p, except) => this.network.broadcast({ type: 'proposal', proposal: p }, except),
       broadcastVote: (v, except) => this.network.broadcast({ type: 'vote', vote: v }, except),
       broadcastProposalHead: (height, round, head, except) => this.network.broadcast({ type: 'proposalHead', height, round, head }, except),
-      signingHeld: () => (this.signingOpen ? null : 'not level with a peer since the start'),
+      signingHeld: () => (this.signingOpen ? null : 'not level with its peers'),
       timeouts: this.cfg.timeouts,
       limits,
       log: this.log,
@@ -483,7 +484,10 @@ What is wired to what: state reads and block application go to the executor; `up
       network: this.network,
       requester: this.requester,
       isConsensusDeciding: () => this.consensus.isDeciding,
-      onBlockApplied: () => this.consensus.restart(),
+      onBlockApplied: () => {
+        this.holdSigningIfBehind();
+        this.consensus.restart();
+      },
       log: this.log,
       lagGraceMs: this.cfg.lagGraceMs,
       backfill: this.cfg.stateSync?.backfill ?? true,
@@ -533,9 +537,11 @@ Consensus messages are pushed through unchanged, and a new peer is caught up:
     this.network.onPeer(() => this.checkSigning());
     // A peer that just connected missed everything flooded before; catch it up on the current height.
     this.network.onPeer((peer) => {
-      const { proposals, heads, votes } = this.consensus.messagesForPeer();
+      const { proposals, heads, pastHeads, votes } = this.consensus.messagesForPeer();
       for (const proposal of proposals) peer.send({ type: 'proposal', proposal });
       for (const { round, head } of heads) peer.send({ type: 'proposalHead', height: this.consensus.height, round, head });
+      // And what the proposers signed in the heights just over: a peer that was apart from this node then may hold another.
+      for (const { height, round, head } of pastHeads) peer.send({ type: 'proposalHead', height, round, head });
       for (const vote of votes) peer.send({ type: 'vote', vote });
       // Evidence still waiting for a block is announced too; it was flooded before this peer existed.
       const pending = this.evidencePool.list(Infinity).map(evidenceId);
@@ -543,7 +549,7 @@ Consensus messages are pushed through unchanged, and a new peer is caught up:
     });
 ```
 
-Passing `peer.id` into `handleProposal`, `handleVote` and `handleProposalHead` is what lets consensus skip the source when it re-broadcasts, and charge it for a bad signature. The second handler for `status` and the first for a new peer call `checkSigning` (`start`, below); they are registered here, after `BlockSync` was constructed and registered its own for the same two, because handlers run in the order they were registered and `checkSigning` reads the heights block sync has just recorded. `messagesForPeer` returns every valid proposal (except fetched ones, which carry no real signature), the head of what the proposer signed for each round whose proposal is not among them, and every vote held for the current height. Evidence still in the pool is announced by `inv` messages of its ids (`evidenceId` from `src/consensus/evidence.ts`), all of it (`list(Infinity)`; a plain `list()` stops at 100, and the proposer asks for `MAX_EVIDENCE_PER_BLOCK`, 16) in slices of 256, the most a `fetch` may name, so the new peer fetches what it lacks; RPC-SYNC-PROOFS.md section 4.4: "A newly connected peer receives every pending evidence key, in `inv` messages of 256, with its catch-up proposals and votes." DESIGN.md section 3 explains the choice: a flooded message is sent once, so a peer that was not connected at that moment never gets it, and one missing vote can stall a round; re-sending and catching up new peers "replaces Tendermint's per-peer state tracking with something far simpler at the cost of some bandwidth."
+Passing `peer.id` into `handleProposal`, `handleVote` and `handleProposalHead` is what lets consensus skip the source when it re-broadcasts, and charge it for a bad signature. The second handler for `status` and the first for a new peer call `checkSigning` (`start`, below); they are registered here, after `BlockSync` was constructed and registered its own for the same two, because handlers run in the order they were registered and `checkSigning` reads the heights block sync has just recorded. `messagesForPeer` returns every valid proposal (except fetched ones, which carry no real signature), the head of what the proposer signed for each round whose proposal is not among them, every vote held for the current height, and the heads of the heights consensus keeps after they are over (`pastHeads`, 64 at most), each sent as a `proposalHead` with its own height: the peer may have been apart from this node while those heights went by and hold another head for one of their rounds ([chapter 4](04-consensus.md)). Evidence still in the pool is announced by `inv` messages of its ids (`evidenceId` from `src/consensus/evidence.ts`), all of it (`list(Infinity)`; a plain `list()` stops at 100, and the proposer asks for `MAX_EVIDENCE_PER_BLOCK`, 16) in slices of 256, the most a `fetch` may name, so the new peer fetches what it lacks; RPC-SYNC-PROOFS.md section 4.4: "A newly connected peer receives every pending evidence key, in `inv` messages of 256, with its catch-up proposals and votes." DESIGN.md section 3 explains the choice: a flooded message is sent once, so a peer that was not connected at that moment never gets it, and one missing vote can stall a round; re-sending and catching up new peers "replaces Tendermint's per-peer state tracking with something far simpler at the cost of some bandwidth."
 
 Inventory gossip for transactions and evidence:
 
@@ -675,6 +681,7 @@ An `item` is taken only if its hash was fetched from that peer with that kind, w
 ```ts
     this.executor.onCommitted((block) => {
       this.network.broadcast({ type: 'status', height: block.header.height });
+      this.signProgressAt = Date.now();
       this.checkSigning();
       // The idle moment after a commit is where collections are least in the way.
       if (!this.stopping) {
@@ -728,7 +735,7 @@ Handlers registered by the node and by the two objects it constructs. The networ
 
 1. A peer's `status` says 50; the node is at 40. `BlockSync.check` requests 41 to 48 and 49 to 50 from two peers.
 2. Blocks arrive and are buffered; `drain` verifies 41 (structure, commit against `state.validators`, `lastCommit` against `state.lastValidators`, evidence) and calls `executor.applyBlock`, the same function consensus uses.
-3. `onBlockApplied` calls `consensus.restart()`, which compares the state's height with its own and, since they differ, starts height 42 afresh (`startHeight`, which first clears every timer).
+3. `onBlockApplied` asks `holdSigningIfBehind` (on a validator with a peer still above, signing is held from here on; `start`, below) and calls `consensus.restart()`, which compares the state's height with its own and, since they differ, starts height 42 afresh (`startHeight`, which first clears every timer).
 4. At 50, nothing is missing; the node's own consensus, fed proposals and votes by its peers, decides 51 itself. If a vote set reaches +2/3 precommits for a hash the node never saw proposed, consensus calls `requestBlock`, the node broadcasts `blockRequest { 51 }`, and the first `blockResponse` with that height goes to `handleFetchedBlock`.
 
 #### `acceptEvidence`
@@ -831,7 +838,7 @@ The guard reports every level change to `onMemoryLevel`, and the node decides wh
   }
 ```
 
-`warn` and `pressure` each start a major collection (the scheduler runs one at a time, so a request while one is running is dropped); every level sets the mempool's limit to its share of `maxTxs` from `Node.MEMPOOL_SHARE`, and pauses the pool at `critical` and at no other level; every level sets the object database's cache of decoded objects from `Node.HOT_OBJECTS`, through `setHotLimit` ([chapter 9](09-database.md)), on a core application (the key-value test app has no such database); every level but `ok` drops the index trees, `pressure` and `critical` the Merkle trees as well, and then, if the window in memory is still wider than `HISTORY_WHEN_PAGED` versions, the level cuts it to that after noting what it held; each of them also forgets what an earlier rebuild was waiting for, empties the remembered samples, and sets how long the node will wait at `ok` before it rebuilds anything (`rebuildAfter`, below); `pressure` and `critical` shed, `warn` and `ok` stop shedding; and every listener hears the change with the sample that caused it. `onMemory` also tells a listener added after the guard began sampling the level the node is already at, unless that is `ok`, so a node critical at its first sample is still reported. The whole table of dials, as built:
+`warn` and `pressure` each start a major collection (the scheduler runs one at a time, so a request while one is running is dropped); every level sets the mempool's limit to its share of `maxTxs` from `Node.MEMPOOL_SHARE` (and with it the pool's byte limit to the same share of `maxBytes`), and pauses the pool at `critical` and at no other level; every level sets the object database's cache of decoded objects from `Node.HOT_OBJECTS`, through `setHotLimit` ([chapter 9](09-database.md)), on a core application (the key-value test app has no such database); every level but `ok` drops the index trees, `pressure` and `critical` the Merkle trees as well, and then, if the window in memory is still wider than `HISTORY_WHEN_PAGED` versions, the level cuts it to that after noting what it held; each of them also forgets what an earlier rebuild was waiting for, empties the remembered samples, and sets how long the node will wait at `ok` before it rebuilds anything (`rebuildAfter`, below); `pressure` and `critical` shed, `warn` and `ok` stop shedding; and every listener hears the change with the sample that caused it. `onMemory` also tells a listener added after the guard began sampling the level the node is already at, unless that is `ok`, so a node critical at its first sample is still reported. The whole table of dials, as built:
 
 | level | heap in use of limit | cache of decoded objects | index trees | Merkle trees | history window in memory | mempool admits up to | load |
 |---|---|---|---|---|---|---|---|
@@ -848,7 +855,7 @@ The window in memory is also a setting. `retain.memoryVersions` says how many of
 
 Whether the index trees are in memory at all is a setting too, and what the table says of them is a node with `indexTrees: 'memory'`: resident when they fit, dropped from `warn` on, rebuilt after the wait. The default is `'store'`, which makes a node that never builds them: the application is opened without them (step 5 of `init`), every index read goes to LMDB through the overlay of the block in progress, as it does after a drop, and the guard has no index trees to drop or to rebuild, so `status` shows `indexTrees: dropped` from the start, `warn` still caps the cache and cuts the window, and only the Merkle trees and the window are waited for and rebuilt. `'store'` is the one to keep unless the node mostly serves scans. Measured with `bench/paging-node.ts`, which takes `BENCH_PAGING_INDEX_TREES=store` or `=memory` for it, at 191,896 accounts under a heap of 1,488 MiB, 2.5 times the resident heap, for ten minutes: the node with `'store'` opened with 258 MiB of heap in use against 398 MiB with `'memory'`, a third less, and committed 1,508 transfers a second against 1,522, within 1% of each other, which is less than two runs differ by; the `'memory'` run's own stretches show the cost of the trees, 1,342 to 1,437 a second while they were in memory and 1,488 to 1,667 while they were dropped. It reached `warn` once, at 39 s, from the history window and the cache, where the `'memory'` run reached it twice, and had nothing to rebuild but the window (docs/benchmarks.md section 4.13). What `'store'` gives up is index reads from memory, an account by name or a scan. Measured with 200 reads a second of each kind beside the load (`BENCH_PAGING_READS=200`), a lookup by key takes 4 to 7 microseconds at the median with either setting and a page of twenty accounts in name order 31 to 34 microseconds from the store against 17 to 18 from memory, with a longer tail, while the three runs with `'store'` commit 13% more than the three with `'memory'`, 1,559 transfers a second against 1,385 on average; that is why it is the default. Proofs and the Merkle trees are unaffected.
 
-The last dial is the mempool's limit, which is not the database's but is turned by the same level. Every pooled transaction holds its bytes, its signature-cache entry, the objects it touched pinned decoded in the pending session (where the cache cannot evict them) and its overlay entries; the paging benchmark's node held about 330 MiB more live heap with a full mempool than idle (STATE-PAGING.md section 7). So the pool admits up to its whole limit at `ok`, half at `warn`, a tenth at `pressure` and nothing at `critical`. `setLimit` evicts nothing ([chapter 5](05-mempool-executor.md)): what is pooled is still reaped, and transactions are admitted again as soon as blocks have taken the pool below the limit, so a node under pressure admits at the rate its blocks take transactions out. The node first paused the pool at `pressure` instead, which refused everything until `ok` and then admitted everything at once; admission through the fallbacks was always correct (`test/app.test.ts` checks transactions against dropped index trees and dropped Merkle trees), so there was no reason to refuse it entirely. Only at `critical`, when the node is about to stop, is the pool paused, with the reason `node out of memory`, and any level below resumes it.
+The last dial is the mempool's limit, which is not the database's but is turned by the same level. Every pooled transaction holds its bytes, its signature-cache entry, the objects it touched pinned decoded in the pending session (where the cache cannot evict them) and its overlay entries; the paging benchmark's node held about 330 MiB more live heap with a full mempool than idle (STATE-PAGING.md section 7). So the pool admits up to its whole limit at `ok`, half at `warn`, a tenth at `pressure` and nothing at `critical`. `setLimit` takes nothing out at once ([chapter 5](05-mempool-executor.md)): what the pool holds above the lowered limits is put out at the next commit, the newest first, and transactions are admitted again as soon as the pool is below them, so a node under pressure admits at the rate its blocks take transactions out. The node first paused the pool at `pressure` instead, which refused everything until `ok` and then admitted everything at once; admission through the fallbacks was always correct (`test/app.test.ts` checks transactions against dropped index trees and dropped Merkle trees), so there was no reason to refuse it entirely. Only at `critical`, when the node is about to stop, is the pool paused, with the reason `node out of memory`, and any level below resumes it.
 
 Back at `ok` the trees are not simply rebuilt. The rule was first written that way and measured: dropping both tiers takes a large state from above the pressure line to well below the ok line in one go, rebuilding them takes the heap straight back over the pressure line, and a node under load dropped, read `ok`, rebuilt and read `pressure` again within a second or two, over and over, a second of rebuilding each time; the paging benchmark's node changed level 30 times in 40 seconds that way and committed 622 transfers a second, against 1,508 with the rule below and 1,634 and 1,771 in two runs of the node as it now stands (STATE-PAGING.md section 7; docs/benchmarks.md section 4.13). So a dropped tier is rebuilt only after a wait and only when it fits, and the history window is let grow back last:
 
@@ -1023,37 +1030,52 @@ A validator does not sign from the moment it starts. These are the fields and th
    */
   private signingOpen = true;
   private signGraceTimer: ReturnType<typeof setTimeout> | null = null;
+  /** When the hold began or a block was last applied under it. */
+  private signProgressAt = 0;
 
   private holdSigning(): void {
     if (!this.privValidator) return;
     this.signingOpen = false;
+    this.signProgressAt = Date.now();
     this.checkSigning();
     const grace = this.cfg.signGraceMs ?? this.cfg.timeouts?.proposeMs ?? DEFAULT_TIMEOUTS.proposeMs;
+    const idle = this.cfg.signIdleMs ?? 15_000;
     const wait = (): void => {
       if (this.signingOpen) return;
       this.signGraceTimer = setTimeout(() => {
         this.signGraceTimer = null;
         // Nobody to hear from, or the peers that said they were ahead have gone or did not serve what they said.
         if (this.blockSync.levelWith(this.executor.state.lastHeight) === 'nobody') this.openSigning();
-        else this.checkSigning();
+        // Peers say they are ahead and no block has come of it for this long: one after another may be saying so
+        // under a new id each time, and a validator is not kept from signing by what is only said.
+        else if (Date.now() - this.signProgressAt >= idle) {
+          this.log('warn', 'validator signing though peers say they are ahead: no block came of it', { height: this.executor.state.lastHeight, waitedMs: Date.now() - this.signProgressAt });
+          this.openSigning();
+        } else this.checkSigning();
         wait();
-      }, grace);
+        // The next look is a grace on, or sooner if the wait without a block ends before that.
+      }, Math.max(1, Math.min(grace, idle - (Date.now() - this.signProgressAt))));
     };
     wait();
+  }
+
+  /**
+   * A block came by block sync: the others decided a height without this node. If a peer that serves blocks is
+   * still above, more such heights follow, and signing is held until the node is level again, as at its start.
+   * Only a block that verified brings this about, never what a peer says of its height alone, so a peer has to
+   * hand over a block the node lacks for every time it would hold a validator. The hold then lasts while blocks
+   * go on arriving, and `signIdleMs` at most without one.
+   */
+  private holdSigningIfBehind(): void {
+    if (!this.signingOpen || !this.privValidator || this.stopping) return;
+    if (this.blockSync.levelWith(this.executor.state.lastHeight) !== 'behind') return;
+    this.log('info', 'validator not signing: behind its peers', { height: this.executor.state.lastHeight });
+    this.holdSigning();
   }
 
   private checkSigning(): void {
     if (this.signingOpen || !this.started || this.stopping) return;
     if (this.blockSync.levelWith(this.executor.state.lastHeight) === 'level') this.openSigning();
-  }
-
-  private openSigning(): void {
-    if (this.signingOpen) return;
-    this.signingOpen = true;
-    if (this.signGraceTimer) clearTimeout(this.signGraceTimer);
-    this.signGraceTimer = null;
-    this.log('info', 'validator signing', { height: this.executor.state.lastHeight + 1n });
-    this.consensus.signingResumed();
   }
 ```
 
@@ -1061,9 +1083,11 @@ The case this is for is a validator that comes back without the record of what i
 
 `signingOpen` is true on a node without a validator key and stays so. `holdSigning`, called by `startUp()` just before consensus starts, sets it to false on a validator, and `signingHeld` (step 9) then answers consensus with the reason until something sets it back. `checkSigning` is what does: it opens when block sync's `levelWith` answers `'level'`, which is when at least one peer has said a height and none of them is above this node's own ([chapter 7](07-sync.md)). It is asked when a peer connects and when one announces a height, which is how four validators started together at height 0 begin within a few milliseconds of finding each other, and after every commit, which is how a validator that started behind begins: block sync applies the blocks it lacks, and the commit that brings it level opens it. `openSigning` logs `validator signing` with the height and calls `consensus.signingResumed()`, which begins the round consensus is in again so that the validator takes its part in it ([chapter 4](04-consensus.md)).
 
-The timer is for the validator that hears nobody. A chain of one validator has no peer to be level with, and neither has the first validator of a network to come up, so after `signGraceMs` (the propose timeout unless the config says otherwise: 3 seconds by default, 400 ms in the test harness) without a peer heard, it opens. The timer runs again as long as signing is held, for the peer that said it was ahead and then went away or did not serve the blocks. What a peer says of its height costs it nothing and it can say it again every second, so `levelWith` leaves out a peer from the moment a request for the blocks it claimed failed, timed out or came back empty or wrong, until that peer serves blocks ([chapter 7](07-sync.md)); the next turn of the timer then finds either nobody heard or nobody ahead. A peer that says it is ahead and serves nothing thus holds a starting validator back for one request timeout, 5 seconds, and a turn of the timer, under each node id it comes with; one that keeps its word holds it for as long as the sync takes. The other side of that rule is an honest peer that is ahead and whose answer was lost: it is left out too, and a validator with no other peer ahead signs before it has caught up. `shutDown()` clears the timer with the rest.
+The timer is for the validator that hears nobody. A chain of one validator has no peer to be level with, and neither has the first validator of a network to come up, so after `signGraceMs` (the propose timeout unless the config says otherwise: 3 seconds by default, 400 ms in the test harness) without a peer heard, it opens. The timer runs again as long as signing is held, for the peer that said it was ahead and then went away or did not serve the blocks. What a peer says of its height costs it nothing and it can say it again every second, so `levelWith` leaves out a peer from the moment a request for the blocks it claimed failed, timed out or came back empty or wrong, until that peer serves blocks ([chapter 7](07-sync.md)); the next turn of the timer then finds either nobody heard or nobody ahead. A peer that says it is ahead and serves nothing thus holds a starting validator back for one request timeout, 5 seconds, and a turn of the timer, under each node id it comes with; one that keeps its word holds it for as long as the sync takes. Ids cost nothing either, and a line of peers that each come under a new one before the last one's request has failed would keep `levelWith` at `'behind'` without end. So the hold also ends when nothing has come of what is said: `signProgressAt` is the time the hold began or a block was last applied, by sync or by consensus, and a turn of the timer that finds `signIdleMs` (15 seconds unless the config says otherwise) gone by since then opens signing with a warning, `validator signing though peers say they are ahead: no block came of it`. A hold is kept up by blocks that arrive and by nothing else. The cost is a validator behind peers that are honestly ahead and take longer than that to serve a block: it signs in a height they have decided. The other side of that rule is an honest peer that is ahead and whose answer was lost: it is left out too, and a validator with no other peer ahead signs before it has caught up. `shutDown()` clears the timer with the rest.
 
-The hold is by the heights of the peers the node has heard, and ends once. A validator whose first peers are themselves behind, or that hears a peer ahead only after it has stood level with another, signs in heights the rest of the network has decided, and nothing holds it again. And what the comment says it does not cover: a validator that lost its record and comes back into the very height it stopped in, with the others still in that height, is level with them and signs. Nothing distinguishes it from a validator the others are waiting for, and holding it would stop a chain that needs its vote. For that case the record is the only defence, which is why it is written before any signature leaves ([chapter 4](04-consensus.md)) and why the operator's guide says to keep the file with the key. `test/signing.test.ts` has three cases: a validator alone that waits out its grace and then makes the blocks, one that comes back behind its peers with an empty guard, signs nothing until it is level and is reported by nobody, and one beside a peer that says it is ahead and serves nothing ([chapter 15](15-tests.md)).
+The hold is by the heights of the peers the node has heard, so a validator whose first peers are themselves behind, or that hears a peer ahead only after it has stood level with another, is let go while the rest of the network is further on. `holdSigningIfBehind` is for that validator. Block sync calls it, through `onBlockApplied`, for every block it applies, before consensus is started again in the next height: a block that came by sync is a height the others decided without this node, and if `levelWith` still answers `'behind'` there are more, so signing is held as at the start (`validator not signing: behind its peers`) until a commit brings the node level. What lays the hold on is a block that verified, never what a peer says of its height: a claim costs nothing, and a hold on a claim alone would let any peer stop a running validator for a request timeout whenever it liked. The price of that choice is the height the node was in when it met the peer ahead. Until the first block arrives it signs there, and a validator without its record that signed in that height before is reported. A peer can still lay the hold on by handing over a block the node lacks, before the node's own consensus commits that height, and then saying it is far ahead; the block that lays it on may as well come from an honest peer while another says the height. The hold then lasts until the request to the one that said it fails, 5 seconds, or, if others take its place under new ids, until `signIdleMs` has passed without a block. Also for that `levelWith` counts how often each peer did not serve what it said, and one that has failed `NOT_SERVED_LIMIT` times, three, is left out for good, whatever it serves between ([chapter 7](07-sync.md)). In ordinary running the hold comes and goes unseen: a validator that receives a block by sync a moment before it would have committed it is level again with that block, and `levelWith` does not answer `'behind'`.
+
+What the comment says it does not cover: a validator that lost its record and comes back into the very height it stopped in, with the others still in that height, is level with them and signs. Nothing distinguishes it from a validator the others are waiting for, and holding it would stop a chain that needs its vote. For that case the record is the only defence, which is why it is written before any signature leaves ([chapter 4](04-consensus.md)) and why the operator's guide says to keep the file with the key. `test/signing.test.ts` has five cases: a validator alone that waits out its grace and then makes the blocks, one that comes back behind its peers with an empty guard, signs nothing until it is level and is reported by nobody, one that began signing while cut off and is held again when the others' blocks reach it, one beside a peer that says it is ahead and serves nothing, and one that signs after `signIdleMs` while such a peer still counts ([chapter 15](15-tests.md)).
 
 ```ts
   private stopping: Promise<void> | null = null;
@@ -1454,9 +1478,9 @@ The cases that exercise the node's own wiring:
 - The limits on remembered fetches are constants (20,000 entries, 2,048 for one peer, a minute's life, ten seconds before another peer is asked), not configuration. A peer that announces hashes and never answers holds its 2,048 places for a minute at a time, and during that minute nothing more it announces is fetched from it.
 - The evidence age follows the unbonding period, but a window that grows cannot bring back what the shorter one let go: blocks and headers pruned under the shorter period are gone, and until a full window of the new length has passed a pruning node refuses evidence naming those heights.
 - The data directory's claim is a file, not a lock the operating system holds, because Node's standard library has no such lock; what is listed here follows from that. The lock trusts the PID in the `LOCK` file: a PID recycled by an unrelated process makes a stale claim look live until that process exits. A process killed while it holds `LOCK.takeover`, which it does for a few file operations when it takes over a stale claim, leaves that file behind; it is never removed automatically, and a start that finds it beside a stale claim fails after fifty attempts, about a second, naming the file to remove by hand. A process killed between writing its private `LOCK.<pid>.<hex>` file and unlinking it leaves that file behind too; it is harmless and can be deleted. The claim is made with a hard link, so the data directory must be on a filesystem that has them.
-- From `warn` until the history window has grown back, proofs and queries at heights more than two versions behind the current one (and at any time those older than `retain.memoryVersions`, when it is set) are read from the history records in the store, which is slower than from memory: every record after the height asked about is scanned and nothing is cached between reads. Only a restart reads the whole window back into memory at once. The recent transaction ids are still growth no dial sheds.
+- From `warn` until the history window has grown back, proofs and queries at heights more than two versions behind the current one (and at any time those older than `retain.memoryVersions`, when it is set) are read from the history records in the store, which is slower than from memory: every record after the height asked about is scanned and nothing is cached between reads. Only a restart reads the whole window back into memory at once. The recent transaction ids cost what their live window holds ([chapter 9](09-database.md)).
 - The room a stored state is opened into is an estimate made from object counts before anything is built (STATE-PAGING.md section 9.1); a heap too small even for a state opened with both tiers left in the store still aborts at startup. `start()` runs one major collection before the guard's first sample, because opening leaves garbage several times what it keeps and the sample would otherwise read a node that fits as `critical` (measured at a third of the resident heap, docs/benchmarks.md section 4.13).
-- The mempool's limit counts transactions, not bytes, and lowering it evicts nothing: a pool already above the lowered limit stays as large as it is until blocks reap it.
+- Lowering the mempool's limits takes effect on what is pooled only at the next commit: on a chain that commits nothing, a pool above them stays as large as it is.
 - ArrayBuffers (ML-DSA keys, stored bytes, the database's arena) sit outside the V8 heap and outside the guard's fraction; a machine that runs out of physical memory for them meets the operating system's killer, not V8's limit. The guard reports `arrayBuffers` and `rss` beside the heap figures, but acts on the heap alone. The arena can be bounded by hand with `arenaBytes` (the CLI's `--arena`), which no level turns.
 
 Exercises:

@@ -12,6 +12,11 @@ Everything in this chapter is reached through five methods, declared in `src/app
 export interface Application {
   initChain(genesis: Genesis): Promise<InitChainResult>;
   checkTx(tx: Uint8Array, opts?: CheckTxOptions): Promise<CheckTxResult>;
+  /**
+   * Undo what checkTx applied since the last block, for an application that keeps a pending state. The mempool
+   * calls it after a commit when it has put transactions out, and then checks again what it still holds.
+   */
+  resetPending?(): void;
   finalizeBlock(req: FinalizeBlockRequest): Promise<FinalizeBlockResult>;
   /**
    * Persist the block just finalized. An application that keeps its state in the engine's store environment does
@@ -21,6 +26,8 @@ export interface Application {
   info(): Promise<{ lastHeight: bigint; lastAppHash: Uint8Array }>;
 }
 ```
+
+`resetPending` is the one optional method. An application that applies checked transactions to a pending state undoes there what `checkTx` applied since the last block; the mempool calls it after a commit at which it put transactions out, and then checks again what it still holds ([chapter 5](05-mempool-executor.md)). `CoreApp.resetPending` undoes the pending session and opens a new one, and does nothing while a block is being applied; the key-value test application keeps no pending state and has no such method.
 
 The file's header gives the call order: `initChain` once on a fresh data directory; `checkTx` for every transaction entering the mempool and again for everything still pending after each commit; `finalizeBlock` once per committed block with all its transactions; `commit` immediately after, to persist; `info` on startup so consensus can replay blocks the application missed. `CheckTxOptions` has one field, `admit`, a function the mempool passes so that the application can ask, after its last wait and just before the transaction would go into the pending state, whether the pool still takes it (it may have paused or filled meanwhile); it returns the reason for a refusal, or null. A `finalizeBlock` request carries what the staking rules need to know about the block besides its transactions:
 
@@ -1898,7 +1905,7 @@ The private internals:
 
 - `decode(bytes)` wraps `decodeTransaction` and computes the id.
 - `lookupAuthorities` is the `AuthorityLookup` over the live database.
-- `closePending()` undoes and clears the pending session.
+- `closePending()` undoes and clears the pending session. `resetPending()`, the public one, undoes it and opens another (above).
 - `signingKeys(tx)` gathers the candidate keys of every required account's active and owner authorities with `collectKeys`, or returns the error `account X does not exist`.
 - `cacheVerified(txKey, address, sigHash)`, `isVerified(txKey, address, sigHash)` and `trimCache` maintain `sigCache`, a map from transaction id to a map from signer address to a **set** of signature hashes. `cacheVerified` adds to the set, which holds at most `SIG_CACHE_VARIANTS = 4` hashes, the oldest making way for a fifth; `isVerified` asks whether a particular signature's hash is in the set; `trimCache` drops the oldest transactions while the cache holds more than `SIG_CACHE_MAX = 20,000` bodies or more than `SIG_CACHE_SIGNATURES = 40,000` signature hashes across them, so the bound is on memory and not only on bodies:
 
